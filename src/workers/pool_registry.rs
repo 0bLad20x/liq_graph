@@ -374,15 +374,43 @@ pub async fn run(
 /// Temporary live-test subscriber: proves changed states reach a real consumer.
 pub async fn observe_updates(
     mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
+    require_completion: bool,
 ) -> Result<()> {
     let mut batches = 0_u64;
     let mut pool_updates = 0_u64;
     let mut lagged = 0_u64;
+    let mut completion_batches = 0_u64;
+    let mut completion_pools = 0_usize;
+    let mut completion_prepared = 0_usize;
+    let mut completion_incomplete = 0_usize;
+    let mut completion_with_inventory = 0_usize;
     loop {
         match input.recv().await {
             Ok(batch) => {
                 batches += 1;
                 pool_updates += batch.pools.len() as u64;
+                if batch.source == "dlmm_execution_completion" {
+                    completion_batches += 1;
+                    completion_pools += batch.pools.len();
+                    let prepared = batch.pools.iter().filter(|p|
+                        p.completion_state == CompletionState::Prepared
+                        && p.execution_manifest.is_some()
+                        && p.completion_validated_slot.is_some()).count();
+                    let incomplete = batch.pools.iter().filter(|p|
+                        p.completion_state == CompletionState::Incomplete
+                        && p.execution_manifest.is_none()
+                        && p.completion_validated_slot.is_some()).count();
+                    let with_inventory = batch.pools.iter()
+                        .filter(|p|p.execution_inventory.is_some()).count();
+                    completion_prepared += prepared;
+                    completion_incomplete += incomplete;
+                    completion_with_inventory += with_inventory;
+                    println!("pool registry completion consumer source={} received={} prepared={} incomplete={} inventories={} manifests={} sample_pool={} sample_slot={:?}",
+                        batch.source, batch.pools.len(), prepared, incomplete, with_inventory,
+                        batch.pools.iter().filter(|p|p.execution_manifest.is_some()).count(),
+                        batch.pools.first().map_or(Pubkey::default(), |p|p.address),
+                        batch.pools.first().and_then(|p|p.completion_validated_slot));
+                }
                 if batches == 1 {
                     if let Some(pool) = batch.pools.first() {
                         println!(
@@ -407,7 +435,15 @@ pub async fn observe_updates(
         }
     }
     println!(
-        "pool registry consumer complete received_batches={batches} pool_updates={pool_updates} lagged_batches={lagged}"
+        "pool registry consumer complete received_batches={batches} pool_updates={pool_updates} lagged_batches={lagged} completion_batches={completion_batches} completion_pools={completion_pools} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_inventories={completion_with_inventory}"
     );
+    if require_completion {
+        anyhow::ensure!(completion_batches > 0 && completion_prepared > 0,
+            "registry completion live proof missing prepared output");
+        anyhow::ensure!(completion_pools == completion_prepared + completion_incomplete,
+            "registry completion consumer received incomplete or invalid state updates");
+        anyhow::ensure!(completion_with_inventory == completion_pools,
+            "registry completion consumer missing execution inventory");
+    }
     Ok(())
 }
