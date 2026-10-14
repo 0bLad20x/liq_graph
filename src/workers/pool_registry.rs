@@ -292,6 +292,7 @@ pub async fn run(
     let mut completion_rejected = 0_usize;
     let mut source_open = true;
     let mut completion_open = completion.is_some();
+    let require_completion = completion_open;
 
     while source_open || completion_open {
         tokio::select! {
@@ -368,6 +369,14 @@ pub async fn run(
         "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
         snapshot.len(),
     );
+    if require_completion {
+        anyhow::ensure!(completion_received == 100 && completion_applied == completion_received
+            && completion_rejected == 0,
+            "registry completion live test did not accept all 100 results");
+        anyhow::ensure!(manifests == completion_prepared && prepared == completion_prepared
+            && incomplete == completion_incomplete,
+            "registry RAM completion snapshot does not match accepted results");
+    }
     Ok(())
 }
 
