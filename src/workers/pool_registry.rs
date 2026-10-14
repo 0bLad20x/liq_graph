@@ -73,6 +73,41 @@ impl PoolRegistry {
             .values().cloned().collect()
     }
 
+    /// Bootstrap complete, previously validated state before any producer starts.
+    /// REST observations still own current TVL/freshness; persisted proof is historical.
+    pub fn restore(&self, pools: Vec<PoolState>) -> Result<usize> {
+        use anyhow::ensure;
+        let mut entries = self.entries.write().expect("pool registry lock poisoned");
+        ensure!(entries.is_empty(), "Registry restore requires an empty RAM state");
+        let mut restored = HashMap::with_capacity(pools.len());
+        for pool in pools {
+            ensure!(pool.address != Pubkey::default(), "invalid restored pool address");
+            let (Some(a), Some(b), Some(slot)) =
+                (pool.mint_a, pool.mint_b, pool.completion_validated_slot)
+            else { anyhow::bail!("restored pool missing mints or validated slot"); };
+            ensure!(a != b && a != Pubkey::default() && b != Pubkey::default(),
+                "invalid restored mint pair");
+            ensure!(pool.completion_state != CompletionState::Unknown,
+                "cannot restore transient Unknown status");
+            if pool.completion_state == CompletionState::Prepared {
+                let Some(m) = pool.execution_manifest.as_ref() else {
+                    anyhow::bail!("restored Prepared pool missing manifest");
+                };
+                ensure!(m.pool == pool.address && m.mint_a == a && m.mint_b == b
+                    && m.validated_slot == slot && !m.base_a.is_empty() && !m.base_b.is_empty()
+                    && pool.execution_inventory.is_some() && pool.mint_proofs.is_some(),
+                    "invalid restored manifest identity, slot or RPC evidence");
+            } else {
+                ensure!(pool.execution_manifest.is_none(),
+                    "restored Incomplete pool unexpectedly holds a manifest");
+            }
+            ensure!(restored.insert(pool.address, pool).is_none(),
+                "duplicate persisted pool address");
+        }
+        *entries = restored;
+        Ok(entries.len())
+    }
+
     fn apply(&self, batch: &DataBatch) -> BatchStats {
         let mut stats = BatchStats::default();
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
