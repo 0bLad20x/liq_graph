@@ -494,7 +494,7 @@ async fn ws_session(
             if targets.changed().await.is_err(){return Ok(());}
             continue;
         }
-        let connection=timeout(Duration::from_millis(timeout_ms),connect_async(&endpoint)).await;
+        let connection=timeout(Duration::from_millis(timeout_ms),connect_async(endpoint.as_str())).await;
         let mut ws=match connection {
             Ok(Ok((socket,_)))=>socket,
             failure=>{
@@ -518,6 +518,7 @@ async fn ws_session(
         }
         connected_before=true;failures=0;
         let mut active:HashMap<u64,Pubkey>=HashMap::new();
+        let mut retired:HashSet<u64>=HashSet::new();
         let mut pending:HashMap<u64,Pubkey>=HashMap::new();
         let mut pending_unsub:HashMap<u64,Pubkey>=HashMap::new();
         let mut request_id=1_u64;
@@ -532,6 +533,7 @@ async fn ws_session(
                         "method":"accountUnsubscribe","params":[subscription_id]}).to_string().into()))
                     .await.is_err(){break 'connected;}
                 active.remove(&subscription_id);
+                retired.insert(subscription_id);
                 pending_unsub.insert(id,address);
             }
             let busy:BTreeSet<Pubkey>=active.values().chain(pending.values()).copied().collect();
@@ -588,6 +590,7 @@ async fn ws_session(
                     }
                     let subscription=value.pointer("/params/subscription").and_then(Value::as_u64);
                     let Some(address)=subscription.and_then(|id|active.get(&id).copied()) else {
+                        if subscription.is_some_and(|id|retired.contains(&id)) {continue;}
                         emit(&events,WsEvent::Gap{provider:name.clone(),reason:"unknown_subscription"});
                         continue;
                     };
