@@ -655,18 +655,34 @@ async fn ws_run(settings:Vec<WsSettings>,commitment:String,mut targets:watch::Re
         }
         ensure!(remaining==0,"WS socket budget insufficient");
     }
+    let mut assignments:HashMap<Pubkey,usize>=HashMap::new();
     loop {
         let desired:BTreeSet<Pubkey>=targets.borrow_and_update().iter().copied().collect();
         let capacity:usize=sockets.iter().map(|(limit,_,_)|*limit).sum();
         ensure!(desired.len()<=capacity,"WS account capacity exceeded");
         let mut groups=vec![Vec::new();sockets.len()];
+        let mut next=HashMap::with_capacity(desired.len());
+        // Keep previous technical assignments for existing accounts.
+        for address in &desired {
+            if let Some(index)=assignments.get(address).copied() {
+                if groups[index].len()<sockets[index].0 {
+                    groups[index].push(*address);
+                    next.insert(*address,index);
+                }
+            }
+        }
         for address in desired {
+            if next.contains_key(&address) {continue;}
             let index=groups.iter().enumerate().filter(|(i,group)|group.len()<sockets[*i].0)
                 .min_by_key(|(_,group)|group.len()).map(|(i,_)|i)
                 .context("WS socket distribution exhausted")?;
             groups[index].push(address);
+            next.insert(address,index);
         }
-        for ((_,tx,_),group) in sockets.iter().zip(groups) {tx.send(group).ok();}
+        assignments=next;
+        for ((_,tx,_),group) in sockets.iter().zip(groups) {
+            if *tx.borrow()!=group {tx.send(group).ok();}
+        }
         if targets.changed().await.is_err(){break;}
     }
     drop(sockets);
