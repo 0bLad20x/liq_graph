@@ -6,13 +6,15 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{execution_completion, jupiter_search, meteora_dlmm, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, pool_registry, rpc_transport, source_diagnostic}};
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
     jupiter_only: bool,
     rpc_live: bool,
     completion_live: bool,
+    graph_live: bool,
+    completion_limit: Option<usize>,
 }
 
 fn settings() -> Result<Cli> {
@@ -22,6 +24,8 @@ fn settings() -> Result<Cli> {
     let mut jupiter_only = false;
     let mut rpc_live = false;
     let mut completion_live = false;
+    let mut graph_live = false;
+    let mut completion_limit = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -29,6 +33,14 @@ fn settings() -> Result<Cli> {
             "--jupiter-only" => jupiter_only = true,
             "--rpc-live" => rpc_live = true,
             "--completion-live" => { completion_live = true; once = true; },
+            "--graph-live" => { graph_live = true; once = true; },
+            "--completion-limit" => {
+                let count: usize = args.next()
+                    .context("--completion-limit requires a positive number")?
+                    .parse().context("invalid --completion-limit value")?;
+                ensure!((1..=5000).contains(&count), "--completion-limit must be 1..=5000");
+                completion_limit = Some(count);
+            }
             "--pages" => {
                 let count: u32 = args.next()
                     .context("--pages requires a positive number")?
@@ -36,13 +48,17 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live or --completion-live"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --graph-live or --completion-limit N"),
         }
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some())),
         "--rpc-live is an exclusive RPC transport check");
+    ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
+    ensure!(!(graph_live && jupiter_only), "--graph-live cannot be combined with --jupiter-only");
     ensure!(!(completion_live && jupiter_only),
         "--completion-live cannot be combined with --jupiter-only");
+    ensure!(completion_limit.is_none() || completion_live || graph_live,
+        "--completion-limit requires --completion-live or --graph-live");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
@@ -52,6 +68,8 @@ fn settings() -> Result<Cli> {
         jupiter_only,
         rpc_live,
         completion_live,
+        graph_live,
+        completion_limit,
     })
 }
 
@@ -125,6 +143,7 @@ fn spawn_meteora(
     tasks: &mut JoinSet<Result<()>>,
     settings: meteora_dlmm::Settings,
     completion: Option<(rpc_transport::RpcHandle, execution_completion::Settings)>,
+    graph: Option<liquidity_graph::Settings>,
 ) -> Result<()> {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     let registry_input = output.subscribe();
@@ -132,6 +151,11 @@ fn spawn_meteora(
         broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
     let registry = pool_registry::PoolRegistry::default();
     let completion_live = completion.is_some();
+    if let Some(settings) = graph {
+        let (tx, rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
+        tasks.spawn(liquidity_graph::observe(rx));
+        tasks.spawn(liquidity_graph::run(registry_output.subscribe(), tx, settings));
+    }
 
     let completion_input = if let Some((rpc, config)) = completion {
         let candidate_input = registry_output.subscribe();
@@ -178,11 +202,14 @@ pub async fn run() -> Result<()> {
         task.await??;
         return Ok(());
     }
-    if cli.completion_live {
+    if cli.completion_live || cli.graph_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
+        let mut completion = execution_completion::Settings::from_env()?;
+        completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live {5000} else {100});
+        let graph = if cli.graph_live {Some(liquidity_graph::Settings::from_env()?)} else {None};
         spawn_meteora(&mut tasks, cli.meteora,
-            Some((rpc.clone(), execution_completion::Settings::from_env()?)))?;
+            Some((rpc.clone(), completion)), graph)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
         tasks.spawn(async move { rpc_task.await? });
@@ -208,7 +235,7 @@ pub async fn run() -> Result<()> {
 
     let mut tasks = JoinSet::new();
     if !cli.jupiter_only {
-        spawn_meteora(&mut tasks, cli.meteora, None)?;
+        spawn_meteora(&mut tasks, cli.meteora, None, None)?;
     }
 
     // Keep the provisional watch sender alive until a real input worker takes over.
