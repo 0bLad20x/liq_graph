@@ -60,7 +60,8 @@ pub struct Group {
     /// B/S without conversion, B/Q when conversion is present.
     pub bridge_pools: Arc<[Pubkey]>,
     pub kind: GroupKind,
-    /// Directed paths specific to this template; excludes direct roundtrips\n    /// that are already counted by the standalone Direct group.
+    /// Directed paths specific to this template; excludes direct roundtrips
+    /// that are already counted by the standalone Direct group.
     pub route_options: u64,
 }
 
