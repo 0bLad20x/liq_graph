@@ -554,6 +554,7 @@ async fn ws_session(
         let mut active:HashMap<u64,Pubkey>=HashMap::new();
         let mut retired:HashSet<u64>=HashSet::new();
         let mut pending:HashMap<u64,Pubkey>=HashMap::new();
+        let mut rejected:HashSet<Pubkey>=HashSet::new();
         let mut pending_unsub:HashMap<u64,Pubkey>=HashMap::new();
         let mut request_id=1_u64;
         let mut desired:BTreeSet<Pubkey>=targets.borrow().iter().copied().collect();
@@ -571,7 +572,7 @@ async fn ws_session(
                 pending_unsub.insert(id,address);
             }
             let busy:BTreeSet<Pubkey>=active.values().chain(pending.values()).copied().collect();
-            for address in desired.iter().filter(|address|!busy.contains(address))
+            for address in desired.iter().filter(|address|!busy.contains(address) && !rejected.contains(address))
                 .take(32_usize.saturating_sub(pending.len())).copied().collect::<Vec<_>>() {
                 if active.len()+pending.len()>=capacity {break;}
                 let id=request_id;request_id+=1;
@@ -591,6 +592,7 @@ async fn ws_session(
                 update=targets.changed()=>{
                     if update.is_err(){return Ok(());}
                     desired=targets.borrow().iter().copied().collect();
+                    rejected.retain(|address|desired.contains(address));
                 }
                 _=sleep(Duration::from_millis(timeout_ms)), if !pending.is_empty()=>{
                     emit(&events,WsEvent::Gap{provider:name.clone(),reason:"subscribe_ack_timeout"});
@@ -609,6 +611,7 @@ async fn ws_session(
                     if let Some(id)=value.get("id").and_then(Value::as_u64) {
                         if let Some(address)=pending.remove(&id) {
                             if let Some(code)=value.pointer("/error/code").and_then(Value::as_i64) {
+                                rejected.insert(address);
                                 emit(&events,WsEvent::Rejected{provider:name.clone(),address,code});
                                 emit(&events,WsEvent::Gap{provider:name.clone(),reason:"subscribe_rejected"});
                             }else if let Some(subscription)=value.get("result").and_then(Value::as_u64) {
