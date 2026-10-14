@@ -29,6 +29,7 @@ pub enum AccountView {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum AccountFilter {
     DataSize(usize),
     Memcmp { offset: usize, bytes: Vec<u8> },
@@ -119,6 +120,7 @@ impl RpcOperation {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct AccountData {
     pub address: Pubkey,
     pub owner: Pubkey,
@@ -137,6 +139,7 @@ pub enum RpcAnswer {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum WsEvent {
     Subscribed {provider:String, address:Pubkey},
     Unsubscribed {provider:String, address:Pubkey},
@@ -152,6 +155,7 @@ pub struct RpcHandle {
     targets: watch::Sender<Vec<Pubkey>>,
     events: broadcast::Sender<WsEvent>,
     ws_capacity: usize,
+    capabilities: u64,
 }
 
 impl RpcHandle {
@@ -170,6 +174,10 @@ impl RpcHandle {
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<WsEvent> { self.events.subscribe() }
+    pub fn supports(&self, operation: &RpcOperation) -> bool {
+        self.capabilities & operation.bit() != 0
+    }
+    pub fn can_watch(&self) -> bool { self.ws_capacity > 0 }
 }
 
 struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcAnswer>>}
@@ -639,7 +647,8 @@ pub fn spawn(settings:Settings)->Result<(RpcHandle,JoinHandle<Result<()>>)> {
     let (watch_tx,watch_rx)=watch::channel(Vec::new());
     let (events,_)=broadcast::channel(4096);
     let capacity=settings.ws.iter().map(|cfg|cfg.max_subscriptions).sum();
-    let handle=RpcHandle{requests:tx,targets:watch_tx,events:events.clone(),ws_capacity:capacity};
+    let capabilities=settings.http.iter().fold(0_u64,|mask,cfg|mask|cfg.capabilities);
+    let handle=RpcHandle{requests:tx,targets:watch_tx,events:events.clone(),ws_capacity:capacity,capabilities};
     let task=tokio::spawn(async move {
         let commitment=settings.commitment.clone();
         let ws=settings.ws.clone();
