@@ -29,7 +29,7 @@ fn settings() -> Result<meteora_dlmm::Settings> {
 pub async fn run() -> Result<()> {
     let http = core::http_client()?;
     let config = settings()?;
-    let (output, mut input) = mpsc::channel(2048);
+    let (output, mut input) = mpsc::channel::<core::MarketIdentity>(2048);
 
     let consumer = async move {
         let mut received = 0_u64;
