@@ -272,6 +272,9 @@ pub async fn run() -> Result<()> {
         let mut tasks = JoinSet::new();
         let mut completion = execution_completion::Settings::from_env()?;
         completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live || cli.persistence_write_live || cli.stability_live {5000} else {100});
+        if cli.stability_live {
+            completion.selection_idle_timeout = Some(Duration::from_secs(60));
+        }
         let graph = if cli.graph_live || cli.persistence_write_live || cli.stability_live {
             Some(liquidity_graph::Settings::from_env()?)
         } else {None};
