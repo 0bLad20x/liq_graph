@@ -6,11 +6,12 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{jupiter_search, meteora_dlmm, pool_registry, source_diagnostic}};
+use crate::{core, workers::{jupiter_search, meteora_dlmm, pool_registry, rpc_transport, source_diagnostic}};
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
     jupiter_only: bool,
+    rpc_live: bool,
 }
 
 fn settings() -> Result<Cli> {
@@ -18,11 +19,13 @@ fn settings() -> Result<Cli> {
     let mut once = false;
     let mut max_pages = None;
     let mut jupiter_only = false;
+    let mut rpc_live = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => once = true,
             "--jupiter-only" => jupiter_only = true,
+            "--rpc-live" => rpc_live = true,
             "--pages" => {
                 let count: u32 = args.next()
                     .context("--pages requires a positive number")?
@@ -30,9 +33,11 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N or --jupiter-only"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only or --rpc-live"),
         }
     }
+    ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some())),
+        "--rpc-live is an exclusive RPC transport check");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
@@ -40,6 +45,7 @@ fn settings() -> Result<Cli> {
     Ok(Cli {
         meteora: meteora_dlmm::Settings { once, max_pages },
         jupiter_only,
+        rpc_live,
     })
 }
 
@@ -145,6 +151,20 @@ pub async fn run() -> Result<()> {
     }
 
     let cli = settings()?;
+    if cli.rpc_live {
+        let config = rpc_transport::settings_from_env()?;
+        let (handle, task) = rpc_transport::spawn(config)?;
+        rpc_transport::live_probe(&handle).await?;
+        drop(handle);
+        task.await??;
+        return Ok(());
+    }
+    let rpc_handle = if !cli.meteora.once && rpc_transport::configured() {
+        let (handle, task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+        // Keep the transport available to future worker consumers.
+        // A standalone RPC worker is deliberately idle without explicit requests.
+        Some((handle, task))
+    } else { None };
     let jupiter = if cli.meteora.once && !cli.jupiter_only {
         None
     } else {
@@ -164,6 +184,10 @@ pub async fn run() -> Result<()> {
     let _jupiter_input = jupiter
         .map(|(settings, mints)| spawn_jupiter(&mut tasks, settings, mints));
 
+    let _rpc_handle = rpc_handle.as_ref().map(|(handle,_)|handle);
+    if let Some((_,task)) = rpc_handle {
+        tasks.spawn(async move {task.await?});
+    }
     while let Some(result) = tasks.join_next().await {
         result??;
     }
