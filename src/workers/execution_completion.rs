@@ -330,6 +330,7 @@ async fn process(rpc: &RpcHandle, candidates: &[PoolState], settings: Settings)
         };
         let mut initial = Vec::new();
         let mut wanted_extensions = Vec::new();
+        let mut failed_extensions = HashSet::new();
         for (pool, account) in group.iter().zip(first.accounts.into_iter()) {
             let Some(account) = account else {
                 results.push(retryable(pool.address, "LbPair account missing"));
@@ -366,16 +367,14 @@ async fn process(rpc: &RpcHandle, candidates: &[PoolState], settings: Settings)
                         results.push(retryable(initial[*index].0.address,
                             format!("bitmap RPC: {err:#}")));
                     }
-                    let failed: HashSet<usize> = group.iter().map(|(i, _)| *i).collect();
-                    for index in failed.into_iter() {
-                        initial[index].0.completion_state = CompletionState::Incomplete;
+                    for (index, _) in group {
+                        failed_extensions.insert(initial[*index].0.address);
                     }
                 }
             }
         }
         for (pool, layout, bitmap) in initial {
-            // Temporary skip marker for a failed planning RPC; not written into Registry.
-            if pool.completion_state != CompletionState::Unknown { continue; }
+            if failed_extensions.contains(&pool.address) { continue; }
             let constructed = (|| -> Result<Plan> {
                 if let Some(ref bitmap) = bitmap {
                     decode_bitmap(bitmap, pool.address, &owner)?;
@@ -535,7 +534,7 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                         println!(
                             "execution manifest pool={} status={:?} slot={} mint_a={} mint_b={} \
                              base_a_accounts={:?} base_b_accounts={:?}",
-                            result.pool, result.status, manifest.validated_slot,
+                            manifest.pool, result.status, manifest.validated_slot,
                             manifest.mint_a, manifest.mint_b,
                             manifest.base_a.iter().map(|account|
                                 format!("{}:{}", account.address, if account.writable {"rw"} else {"ro"}))
