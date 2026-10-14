@@ -131,16 +131,19 @@ fn spawn_meteora(
     let (registry_output, registry_observer) =
         broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
     let registry = pool_registry::PoolRegistry::default();
+    let completion_live = completion.is_some();
 
-    if let Some((rpc, config)) = completion {
+    let completion_input = if let Some((rpc, config)) = completion {
         let candidate_input = registry_output.subscribe();
         let (completion_output, completion_observer) = broadcast::channel(4);
+        let receiver = completion_output.subscribe();
         tasks.spawn(execution_completion::observe(completion_observer));
         tasks.spawn(execution_completion::run(candidate_input, rpc, config, completion_output));
-    }
+        Some(receiver)
+    } else { None };
     tasks.spawn(source_diagnostic::run(input));
-    tasks.spawn(pool_registry::observe_updates(registry_observer));
-    tasks.spawn(pool_registry::run(registry_input, registry, registry_output));
+    tasks.spawn(pool_registry::observe_updates(registry_observer, completion_live));
+    tasks.spawn(pool_registry::run(registry_input, completion_input, registry, registry_output));
     tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
     Ok(())
 }
