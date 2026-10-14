@@ -549,6 +549,8 @@ async fn ws_session(
             emit(&events,WsEvent::Gap{provider:name.clone(),reason:"reconnect_requires_resync"});
         }
         connected_before=true;failures=0;
+        let mut heartbeat=tokio::time::interval(Duration::from_secs(20));
+        heartbeat.tick().await;
         let mut active:HashMap<u64,Pubkey>=HashMap::new();
         let mut retired:HashSet<u64>=HashSet::new();
         let mut pending:HashMap<u64,Pubkey>=HashMap::new();
@@ -581,6 +583,11 @@ async fn ws_session(
                 if spacing_ms>0 {sleep(Duration::from_millis(spacing_ms)).await;}
             }
             tokio::select! {
+                _=heartbeat.tick()=>{
+                    if ws.send(Message::Ping(Vec::<u8>::new().into())).await.is_err() {
+                        break 'connected;
+                    }
+                }
                 update=targets.changed()=>{
                     if update.is_err(){return Ok(());}
                     desired=targets.borrow().iter().copied().collect();
@@ -648,6 +655,10 @@ async fn ws_session(
             }
         }
         emit(&events,WsEvent::Gap{provider:name.clone(),reason:"socket_disconnected"});
+        tokio::select! {
+            _=sleep(Duration::from_millis(reconnect_ms))=>{},
+            change=targets.changed()=>if change.is_err(){return Ok(())},
+        }
     }
 }
 
