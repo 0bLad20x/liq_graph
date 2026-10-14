@@ -30,10 +30,18 @@ struct Lane {
     in_flight: bool,
 }
 
+enum RequestOutcome {
+    Success(bytes::Bytes),
+    RateLimited(Option<String>),
+    HttpError(reqwest::StatusCode),
+    TransportError(reqwest::Error),
+    BodyError(reqwest::Error),
+}
+
 struct Completion {
     lane: usize,
     requested: usize,
-    response: Result<reqwest::Response, reqwest::Error>,
+    outcome: RequestOutcome,
 }
 
 pub async fn run(
@@ -102,13 +110,33 @@ pub async fn run(
                 let key = lane.key.clone();
                 let timeout = settings.timeout;
                 pending.spawn(async move {
-                    let response = http.get(&url)
+                    let outcome = match http.get(&url)
                         .query(&[("query", query)])
                         .header("x-api-key", key)
                         .timeout(timeout)
                         .send()
-                        .await;
-                    Completion { lane: index, requested: count, response }
+                        .await
+                    {
+                        Err(error) => RequestOutcome::TransportError(error),
+                        Ok(response) => {
+                            let status = response.status();
+                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                let retry_after = response.headers()
+                                    .get(reqwest::header::RETRY_AFTER)
+                                    .and_then(|header| header.to_str().ok())
+                                    .map(ToOwned::to_owned);
+                                RequestOutcome::RateLimited(retry_after)
+                            } else if !status.is_success() {
+                                RequestOutcome::HttpError(status)
+                            } else {
+                                match response.bytes().await {
+                                    Ok(body) => RequestOutcome::Success(body),
+                                    Err(error) => RequestOutcome::BodyError(error),
+                                }
+                            }
+                        }
+                    };
+                    Completion { lane: index, requested: count, outcome }
                 });
             }
         }
@@ -134,48 +162,35 @@ pub async fn run(
                 let completion = result?;
                 lanes[completion.lane].in_flight = false;
 
-                match completion.response {
-                    Err(error) => eprintln!(
+                match completion.outcome {
+                    RequestOutcome::TransportError(error) => eprintln!(
                         "jupiter source lane={} transport_error={error}",
                         completion.lane
                     ),
-                    Ok(response) => {
-                        let status = response.status();
-                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                            let retry_after = response.headers()
-                                .get(reqwest::header::RETRY_AFTER)
-                                .and_then(|header| header.to_str().ok())
-                                .unwrap_or("unspecified");
-                            eprintln!(
-                                "jupiter source lane={} rate_limited retry_after={retry_after}",
-                                completion.lane
-                            );
-                        } else if !status.is_success() {
-                            eprintln!(
-                                "jupiter source lane={} http_status={status}",
-                                completion.lane
-                            );
-                        } else {
-                            match response.bytes().await {
-                                Err(error) => eprintln!(
-                                    "jupiter source lane={} body_error={error}",
-                                    completion.lane
-                                ),
-                                Ok(body) => {
-                                    let bytes = body.len();
-                                    let delivered = output.send(SourceBatch {
-                                        source: SOURCE,
-                                        kind: RecordKind::Mint,
-                                        body,
-                                    }).is_ok();
-                                    published += 1;
-                                    eprintln!(
-                                        "jupiter source lane={} requested={} bytes={} published={} subscriber={delivered}",
-                                        completion.lane, completion.requested, bytes, published
-                                    );
-                                }
-                            }
-                        }
+                    RequestOutcome::BodyError(error) => eprintln!(
+                        "jupiter source lane={} body_error={error}",
+                        completion.lane
+                    ),
+                    RequestOutcome::RateLimited(retry_after) => eprintln!(
+                        "jupiter source lane={} rate_limited retry_after={}",
+                        completion.lane, retry_after.as_deref().unwrap_or("unspecified")
+                    ),
+                    RequestOutcome::HttpError(status) => eprintln!(
+                        "jupiter source lane={} http_status={status}",
+                        completion.lane
+                    ),
+                    RequestOutcome::Success(body) => {
+                        let bytes = body.len();
+                        let delivered = output.send(SourceBatch {
+                            source: SOURCE,
+                            kind: RecordKind::Mint,
+                            body,
+                        }).is_ok();
+                        published += 1;
+                        eprintln!(
+                            "jupiter source lane={} requested={} bytes={} published={} subscriber={delivered}",
+                            completion.lane, completion.requested, bytes, published
+                        );
                     }
                 }
             }
