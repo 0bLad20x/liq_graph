@@ -397,6 +397,10 @@ fn decode_account(address:Pubkey,value:&Value,view:AccountView)->Result<Option<A
 }
 
 fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
+    let v2_request = match &operation {
+        RpcOperation::ProgramV2{cursor,limit,..}=>Some((cursor.clone(),*limit)),
+        _=>None,
+    };
     fn response_slot(value:&Value)->Result<u64>{
         value.pointer("/context/slot").and_then(Value::as_u64).context("RPC context slot missing")
     }
@@ -424,6 +428,11 @@ fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
                 ensure!(cursor.as_deref().is_none_or(|s|!s.is_empty()),"empty V2 cursor");
                 (items,cursor)
             };
+            if let Some((previous,limit))=&v2_request {
+                ensure!(items.len()<=*limit,"V2 provider exceeded page limit");
+                ensure!(cursor.as_ref().is_none_or(|new|Some(new)!=previous.as_ref()),
+                    "V2 provider returned repeated cursor");
+            }
             let mut accounts=Vec::with_capacity(items.len());
             for item in items {
                 let address:Pubkey=item.get("pubkey").and_then(Value::as_str)
@@ -498,8 +507,13 @@ async fn ws_session(
         let mut ws=match connection {
             Ok(Ok((socket,_)))=>socket,
             failure=>{
-                let reason=match failure {
+                let reason=match &failure {
                     Err(_)=>"connect_timeout",
+                    Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
+                        if response.status().as_u16()==429 => {
+                            emit(&events,WsEvent::Gap{provider:name.clone(),reason:"handshake_http_429"});
+                            return Ok(());
+                        }
                     Ok(Err(_))=>"connect_error",
                     Ok(Ok(_))=>unreachable!(),
                 };
