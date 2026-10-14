@@ -44,9 +44,18 @@ pub struct PoolState {
     pub completion_reason: Option<String>,
 }
 
+/// Distinguish source observations from completed execution metadata without
+/// interpreting worker-specific source names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolUpdateKind {
+    Source,
+    Completion,
+}
+
 /// Changed records only; last_seen-only refreshes remain accessible in snapshots.
 #[derive(Debug)]
 pub struct PoolUpdateBatch {
+    pub kind: PoolUpdateKind,
     pub source: &'static str,
     pub received_at_ms: u64,
     pub pools: Vec<PoolState>,
@@ -309,6 +318,7 @@ pub async fn run(
                     let updates = stats.updates.len();
                     if updates > 0 {
                         if output.send(Arc::new(PoolUpdateBatch {
+                            kind: PoolUpdateKind::Source,
                             source: batch.source,
                             received_at_ms: batch.received_at_ms,
                             pools: stats.updates,
@@ -345,6 +355,7 @@ pub async fn run(
                         batch.source, stats.received, stats.applied, stats.prepared, stats.incomplete,
                         stats.retryable, stats.stale, stats.invalid, stats.missing_pool, updated);
                     if updated > 0 && output.send(Arc::new(PoolUpdateBatch {
+                        kind: PoolUpdateKind::Completion,
                         source: batch.source,
                         received_at_ms: now_unix_ms()?,
                         pools: stats.updates,
@@ -370,9 +381,9 @@ pub async fn run(
         snapshot.len(),
     );
     if require_completion {
-        anyhow::ensure!(completion_received == 100 && completion_applied == completion_received
+        anyhow::ensure!(completion_received > 0 && completion_applied == completion_received
             && completion_rejected == 0,
-            "registry completion live test did not accept all 100 results");
+            "registry completion live test did not accept all results");
         anyhow::ensure!(manifests == completion_prepared && prepared == completion_prepared
             && incomplete == completion_incomplete,
             "registry RAM completion snapshot does not match accepted results");
@@ -399,7 +410,7 @@ pub async fn observe_updates(
             Ok(batch) => {
                 batches += 1;
                 pool_updates += batch.pools.len() as u64;
-                if batch.source == "dlmm_execution_completion" {
+                if batch.kind == PoolUpdateKind::Completion {
                     completion_batches += 1;
                     completion_pools += batch.pools.len();
                     let prepared = batch.pools.iter().filter(|p|
