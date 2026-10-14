@@ -539,9 +539,9 @@ async fn ws_session(
         let mut desired:BTreeSet<Pubkey>=targets.borrow().iter().copied().collect();
         'connected:loop {
             // Remove obsolete subscriptions; keep valid active subscriptions stable.
-            let retired:Vec<_>=active.iter().filter(|(_,address)|!desired.contains(address))
+            let obsolete:Vec<_>=active.iter().filter(|(_,address)|!desired.contains(address))
                 .map(|(id,address)|(*id,*address)).collect();
-            for (subscription_id,address) in retired {
+            for (subscription_id,address) in obsolete {
                 let id=request_id;request_id+=1;
                 if ws.send(Message::Text(json!({"jsonrpc":"2.0","id":id,
                         "method":"accountUnsubscribe","params":[subscription_id]}).to_string().into()))
