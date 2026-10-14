@@ -103,8 +103,8 @@ impl PoolRegistry {
                     // Pool ownership and known mints are stable facts. Reject
                     // identity conflicts instead of corrupting the registry.
                     if current.venue != *venue ||
-                        mint_a.is_some_and(|mint| current.mint_a.is_some_and(|old| old != *mint)) ||
-                        mint_b.is_some_and(|mint| current.mint_b.is_some_and(|old| old != *mint))
+                        mint_a.as_ref().is_some_and(|mint| current.mint_a.is_some_and(|old| old != *mint)) ||
+                        mint_b.as_ref().is_some_and(|mint| current.mint_b.is_some_and(|old| old != *mint))
                     {
                         stats.conflicts += 1;
                         eprintln!("pool registry identity_conflict pool={address} source={}", batch.source);
