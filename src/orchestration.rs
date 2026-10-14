@@ -1,7 +1,7 @@
-//! Composition only: resources, typed channel and worker lifecycle.
+//! Resource provisioning, channel connections, and worker lifecycle only.
 
 use anyhow::{Context, Result, bail, ensure};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use crate::{core, workers::meteora_dlmm};
 
@@ -29,23 +29,40 @@ fn settings() -> Result<meteora_dlmm::Settings> {
 pub async fn run() -> Result<()> {
     let http = core::http_client()?;
     let config = settings()?;
-    let (output, mut input) = mpsc::channel::<core::MarketIdentity>(2048);
+    let (output, mut input) = broadcast::channel::<core::SourceRecord>(4096);
 
+    // CP1 live output inspection; later consumers attach to the same stream.
     let consumer = async move {
         let mut received = 0_u64;
-        while let Some(identity) = input.recv().await {
-            received += 1;
-            if received <= 5 {
-                println!(
-                    "market={} venue={} mint_a={} mint_b={}",
-                    identity.address, identity.venue, identity.mint_a, identity.mint_b
-                );
-            }
-            if received % 10_000 == 0 {
-                println!("MarketIdentity received={received}");
+        let mut lagged = 0_u64;
+        loop {
+            match input.recv().await {
+                Ok(record) => {
+                    received += 1;
+                    if received == 1 {
+                        println!(
+                            "source={} kind={:?} address={} payload_bytes={} payload={}",
+                            record.source, record.kind, record.address, record.payload.len(),
+                            String::from_utf8_lossy(&record.payload)
+                        );
+                    } else if received <= 5 {
+                        println!(
+                            "source={} kind={:?} address={} payload_bytes={}",
+                            record.source, record.kind, record.address, record.payload.len()
+                        );
+                    }
+                    if received % 10_000 == 0 {
+                        println!("SourceRecord received={received}");
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    lagged += skipped;
+                    eprintln!("SourceRecord consumer lagged, missed={skipped}");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-        println!("MarketIdentity output complete, received={received}");
+        println!("SourceRecord output complete, received={received} lagged={lagged}");
         Ok::<(), anyhow::Error>(())
     };
 

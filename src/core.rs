@@ -1,15 +1,21 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use solana_pubkey::Pubkey;
 
-/// Shared public event; providers own their private decoding and state.
+/// Source-neutral output contract. The payload is the complete, unchanged JSON record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MarketIdentity {
+pub enum RecordKind {
+    Pool,
+    Mint,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceRecord {
+    pub source: &'static str,
+    pub kind: RecordKind,
     pub address: Pubkey,
-    pub venue: &'static str,
-    pub mint_a: Pubkey,
-    pub mint_b: Pubkey,
+    pub payload: Arc<[u8]>,
 }
 
 /// Generic HTTP client; no DEX or protocol logic.

@@ -1,29 +1,28 @@
-//! Complete, self-contained Meteora DLMM API worker.
-//! Input: HTTP. Processing: fetch, parse, validate, deduplicate.
-//! Output: typed MarketIdentity channel. No SQL, graph or other workers.
+//! Meteora DLMM API source: fetch pages, extract pool address, forward complete raw records.
+//! No field mapping, normalization, deduplication, or consumer-specific processing.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use solana_pubkey::Pubkey;
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, broadcast},
     task::JoinSet,
     time::{Instant, sleep, sleep_until},
 };
 
-use crate::core::MarketIdentity;
+use crate::core::{RecordKind, SourceRecord};
 
 const URL: &str = "https://dlmm.datapi.meteora.ag/pools";
+const SOURCE: &str = "meteora_dlmm_api";
 const PAGE_SIZE: u32 = 1000;
 const MAX_IN_FLIGHT: usize = 8;
 const MIN_REQUEST_SPACING: Duration = Duration::from_millis(34);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: u32 = 5;
 const RESTART_DELAY: Duration = Duration::from_secs(30);
-const VENUE: &str = "meteora_dlmm";
 
 pub struct Settings {
     pub once: bool,
@@ -34,32 +33,12 @@ pub struct Settings {
 struct Page {
     current_page: u32,
     pages: u32,
-    data: Vec<Value>,
+    data: Vec<Box<RawValue>>,
 }
 
-fn key(pool: &Value, pointer: &str) -> Result<Pubkey> {
-    pool.pointer(pointer)
-        .and_then(Value::as_str)
-        .with_context(|| format!("missing pubkey at {pointer}"))?
-        .parse()
-        .with_context(|| format!("invalid pubkey at {pointer}"))
-}
-
-fn decode(pool: &Value) -> Result<MarketIdentity> {
-    let result = MarketIdentity {
-        address: key(pool, "/address")?,
-        venue: VENUE,
-        mint_a: key(pool, "/token_x/address")?,
-        mint_b: key(pool, "/token_y/address")?,
-    };
-    ensure!(
-        result.address != Pubkey::default()
-            && result.mint_a != Pubkey::default()
-            && result.mint_b != Pubkey::default()
-            && result.mint_a != result.mint_b,
-        "invalid Meteora market identity"
-    );
-    Ok(result)
+#[derive(Deserialize)]
+struct PoolAddress<'a> {
+    address: &'a str,
 }
 
 async fn fetch_page(client: &reqwest::Client, page: u32) -> Result<Page> {
@@ -86,7 +65,7 @@ async fn fetch_page(client: &reqwest::Client, page: u32) -> Result<Page> {
     Ok(result)
 }
 
-/// All concurrent tasks share one request-start limiter.
+/// Shared request-start limiter for all concurrent pages.
 async fn fetch_with_retry(
     client: reqwest::Client,
     gate: Arc<Mutex<Instant>>,
@@ -114,55 +93,45 @@ async fn fetch_with_retry(
     bail!("Meteora retry loop ended unexpectedly")
 }
 
-async fn emit(
-    records: Vec<Value>,
-    known: &mut HashMap<Pubkey, MarketIdentity>,
-    output: &mpsc::Sender<MarketIdentity>,
-) -> Result<(usize, usize)> {
-    let mut new = 0;
-    let mut rejected = 0;
+/// Broadcast never waits for a consumer. A slow consumer may lag and lose records.
+fn publish(records: Vec<Box<RawValue>>, output: &broadcast::Sender<SourceRecord>) -> Result<(usize, usize)> {
+    let count = records.len();
+    let mut without_subscribers = 0;
 
-    for pool in records {
-        match decode(&pool) {
-            Ok(identity) => {
-                match known.get(&identity.address) {
-                    Some(previous) if previous != &identity => {
-                        bail!("conflicting Meteora market identity: {}", identity.address);
-                    }
-                    Some(_) => continue,
-                    None => {}
-                }
-                output.send(identity).await
-                    .map_err(|_| anyhow::anyhow!("MarketIdentity output consumer closed"))?;
-                known.insert(identity.address, identity);
-                new += 1;
-            }
-            Err(error) => {
-                rejected += 1;
-                if rejected <= 3 {
-                    eprintln!("meteora rejected identity: {error:#}");
-                }
-            }
+    for raw in records {
+        let pool: PoolAddress<'_> = serde_json::from_str(raw.get())
+            .context("Meteora pool has no readable address")?;
+        let address: Pubkey = pool.address.parse()
+            .context("Meteora pool address is invalid")?;
+        ensure!(address != Pubkey::default(), "Meteora pool address is zero");
+
+        let message = SourceRecord {
+            source: SOURCE,
+            kind: RecordKind::Pool,
+            address,
+            payload: Arc::from(raw.get().as_bytes()),
+        };
+        if output.send(message).is_err() {
+            without_subscribers += 1;
         }
     }
-    Ok((new, rejected))
+    Ok((count, without_subscribers))
 }
 
-/// One runnable worker. Backpressure is bounded and lossless; no raw-page bridge.
 pub async fn run(
     client: reqwest::Client,
-    output: mpsc::Sender<MarketIdentity>,
+    output: broadcast::Sender<SourceRecord>,
     settings: Settings,
 ) -> Result<()> {
     let gate = Arc::new(Mutex::new(Instant::now()));
-    let mut known: HashMap<Pubkey, MarketIdentity> = HashMap::new();
 
     loop {
         let started = Instant::now();
         let first = fetch_with_retry(client.clone(), gate.clone(), 1).await?;
         let total_pages = first.pages.max(1);
         let pages = settings.max_pages.unwrap_or(total_pages).min(total_pages);
-        let (mut fresh, mut rejected) = emit(first.data, &mut known, &output).await?;
+        let (mut records, mut without_subscribers) =
+            publish(first.data, &output).context("Meteora page 1")?;
         let mut scanned = 1_u32;
 
         let mut pending = JoinSet::new();
@@ -178,16 +147,18 @@ pub async fn run(
             }
             if let Some(task) = pending.join_next().await {
                 let page = task.context("Meteora page task stopped unexpectedly")??;
-                let (new, invalid) = emit(page.data, &mut known, &output).await?;
-                fresh += new;
-                rejected += invalid;
+                let number = page.current_page;
+                let (count, missing) = publish(page.data, &output)
+                    .with_context(|| format!("Meteora page {number}"))?;
+                records += count;
+                without_subscribers += missing;
                 scanned += 1;
             }
         }
 
         eprintln!(
-            "meteora discovery pages={scanned}/{total_pages} new={fresh} rejected={rejected} known={} elapsed_ms={}",
-            known.len(), started.elapsed().as_millis()
+            "meteora source pages={scanned}/{total_pages} records={records} without_subscribers={without_subscribers} elapsed_ms={}",
+            started.elapsed().as_millis()
         );
         if settings.once {
             return Ok(());
