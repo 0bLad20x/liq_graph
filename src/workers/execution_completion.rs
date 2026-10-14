@@ -337,7 +337,7 @@ fn decode_mint(account: &AccountData) -> Result<MintProof> {
     // Public V10 documentation rejects transfer hooks and confidential transfers.
     // NonTransferable mints cannot participate in a swap.
     let unsupported = extensions.iter().copied()
-        .filter(|kind| matches!(kind, 4 | 9 | 14 | 16 | 24))
+        .filter(|kind| matches!(*kind, 4 | 9 | 14 | 16 | 24))
         .collect();
     Ok(MintProof { address: account.address, token_2022: is_token_2022,
         extensions, unsupported })
