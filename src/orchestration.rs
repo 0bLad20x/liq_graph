@@ -186,7 +186,11 @@ fn spawn_meteora(
         let candidate_input = registry_output.subscribe();
         let (completion_output, completion_observer) = broadcast::channel(4);
         let receiver = completion_output.subscribe();
-        tasks.spawn(execution_completion::observe(completion_observer));
+        // The finite live modes retain the strict, verbose manifest proof.
+        // Continuous diagnostics use the worker's bounded summary instead.
+        if config.selection_idle_timeout.is_none() {
+            tasks.spawn(execution_completion::observe(completion_observer));
+        }
         tasks.spawn(execution_completion::run(candidate_input, rpc, config, completion_output));
         Some(receiver)
     } else { None };
