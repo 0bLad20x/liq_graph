@@ -166,15 +166,17 @@ pub async fn run() -> Result<()> {
     if let Some((config, mints)) = jupiter {
         let (input_tx, input_rx) = watch::channel(mints);
         let _keep_input = input_tx;
+        // Jupiter sets its own per-request timeout; the shared Meteora client has a 20s cap.
+        let jupiter_http = reqwest::Client::new();
         if cli.jupiter_only {
             tokio::try_join!(
-                jupiter_search::run(http, config, input_rx, output),
+                jupiter_search::run(jupiter_http, config, input_rx, output),
                 consumer
             )?;
         } else {
             tokio::try_join!(
                 meteora_dlmm::run(http.clone(), output.clone(), cli.meteora),
-                jupiter_search::run(http, config, input_rx, output),
+                jupiter_search::run(jupiter_http, config, input_rx, output),
                 consumer
             )?;
         }
