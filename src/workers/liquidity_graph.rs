@@ -60,7 +60,7 @@ pub struct Group {
     /// B/S without conversion, B/Q when conversion is present.
     pub bridge_pools: Arc<[Pubkey]>,
     pub kind: GroupKind,
-    /// Number of ordered, distinct-pool trade paths represented by this role template.
+    /// Directed paths specific to this template; excludes direct roundtrips\n    /// that are already counted by the standalone Direct group.
     pub route_options: u64,
 }
 
@@ -186,9 +186,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
                             conversion:Some(conversion), direct_s:direct_s.clone(),
                             direct_q:direct_q.clone(), bridge_pools:Arc::from([]),
                             kind:GroupKind::Direct,
-                            route_options: route_count(direct_s.len(), direct_q.len())
-                                .saturating_add((direct_s.len() as u64)
-                                    .saturating_mul(direct_s.len().saturating_sub(1) as u64)),
+                            route_options:route_count(direct_s.len(), direct_q.len()),
                         });
                     }
                 }
@@ -208,9 +206,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
                             settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
                             conversion:None, direct_s:direct_s.clone(), direct_q:Arc::from([]),
                             bridge_pools:return_s.clone(), kind:GroupKind::Bridge,
-                            route_options:route_count(direct_s.len(), return_s.len())
-                                .saturating_add((direct_s.len() as u64)
-                                    .saturating_mul(direct_s.len().saturating_sub(1) as u64)),
+                            route_options:route_count(direct_s.len(), return_s.len()),
                         });
                     }
                 }
@@ -226,9 +222,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
                                 conversion:Some(conversion), direct_s:direct_s.clone(),
                                 direct_q:Arc::from([]), bridge_pools:return_q.clone(),
                                 kind:GroupKind::Bridge,
-                                route_options:route_count(direct_s.len(), return_q.len())
-                                    .saturating_add((direct_s.len() as u64)
-                                        .saturating_mul(direct_s.len().saturating_sub(1) as u64)),
+                                route_options:route_count(direct_s.len(), return_q.len()),
                             });
                         }
                     }
