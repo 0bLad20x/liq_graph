@@ -727,6 +727,21 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                 batches += 1;
                 for result in &batch.results {
                     results += 1;
+                    if let Some(inventory) = &result.inventory {
+                        println!("execution inventory pool={} active_bin={} active_array={} internal_bitmap_bits={} extension_bitmap_bits={} bitmap_extension_present={} initialized={} selected={:?} validated={:?} initialized_addresses={:?}",
+                            result.pool, inventory.active_id, inventory.active_array_index,
+                            inventory.internal_initialized, inventory.extension_initialized,
+                            inventory.extension_present, inventory.initialized.len(),
+                            inventory.selected_indices, inventory.validated_indices,
+                            inventory.initialized.iter().map(|a| format!("{}:{}", a.index, a.address))
+                                .collect::<Vec<_>>());
+                    }
+                    if let Some(mints) = &result.mints {
+                        for mint in mints {
+                            println!("execution mint pool={} mint={} token_2022={} extensions={:?} unsupported={:?}",
+                                result.pool, mint.address, mint.token_2022, mint.extensions, mint.unsupported);
+                        }
+                    }
                     if let Some(manifest) = &result.manifest {
                         manifests += 1;
                         println!(
