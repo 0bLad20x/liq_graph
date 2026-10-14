@@ -184,10 +184,10 @@ pub async fn run() -> Result<()> {
     let _jupiter_input = jupiter
         .map(|(settings, mints)| spawn_jupiter(&mut tasks, settings, mints));
 
-    let _rpc_handle = rpc_handle.as_ref().map(|(handle,_)|handle);
-    if let Some((_,task)) = rpc_handle {
+    let _rpc_handle = if let Some((handle, task)) = rpc_handle {
         tasks.spawn(async move {task.await?});
-    }
+        Some(handle)
+    } else { None };
     while let Some(result) = tasks.join_next().await {
         result??;
     }
