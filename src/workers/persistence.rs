@@ -294,6 +294,13 @@ impl Persistence {
                 mint_proofs:mints,completion_reason:reason,
             });
         }
+        if let Some(sample)=pools.first() {
+            println!("persistence restore sample_pool={} mint_a={} mint_b={} slot={}",
+                sample.address,
+                sample.mint_a.context("restored mint A missing")?,
+                sample.mint_b.context("restored mint B missing")?,
+                sample.completion_validated_slot.context("restored slot missing")?);
+        }
         println!("persistence restored pools={} prepared={} incomplete={} table={TABLE}",
             pools.len(),prepared,incomplete);
         Ok(pools)
@@ -324,8 +331,11 @@ impl Persistence {
                 &addresses,&venues,&mint_a,&mint_b,&status,&slots,&descriptors
             ]).await.context("batch UPSERT completed pools")?;
             *written+=usize::try_from(changed)?;
-            println!("persistence batch input={} upserted={} total_upserted={}",
-                chunk.len(),changed,*written);
+            println!("persistence batch input={} upserted={} total_upserted={} sample_pool={} sample_mint_a={} sample_mint_b={} sample_slot={}",
+                chunk.len(),changed,*written,chunk[0].address,
+                chunk[0].mint_a.context("sample mint A missing")?,
+                chunk[0].mint_b.context("sample mint B missing")?,
+                chunk[0].completion_validated_slot.context("sample slot missing")?);
         }
         Ok(())
     }
