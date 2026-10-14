@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, persistence, pool_registry, rpc_transport, source_diagnostic}};
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
@@ -15,6 +15,8 @@ struct Cli {
     completion_live: bool,
     graph_live: bool,
     completion_limit: Option<usize>,
+    persistence_write_live: bool,
+    persistence_restore_live: bool,
 }
 
 fn settings() -> Result<Cli> {
@@ -26,6 +28,8 @@ fn settings() -> Result<Cli> {
     let mut completion_live = false;
     let mut graph_live = false;
     let mut completion_limit = None;
+    let mut persistence_write_live = false;
+    let mut persistence_restore_live = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -34,6 +38,8 @@ fn settings() -> Result<Cli> {
             "--rpc-live" => rpc_live = true,
             "--completion-live" => { completion_live = true; once = true; },
             "--graph-live" => { graph_live = true; once = true; },
+            "--persistence-write-live" => { persistence_write_live = true; once = true; },
+            "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
             "--completion-limit" => {
                 let count: usize = args.next()
                     .context("--completion-limit requires a positive number")?
@@ -48,16 +54,23 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --graph-live or --completion-limit N"),
         }
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some())),
         "--rpc-live is an exclusive RPC transport check");
     ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
+    ensure!(!(persistence_write_live && (completion_live || graph_live || persistence_restore_live)),
+        "--persistence-write-live is exclusive");
+    ensure!(!(persistence_restore_live && (completion_live || graph_live || jupiter_only
+        || rpc_live || max_pages.is_some() || completion_limit.is_some())),
+        "--persistence-restore-live is exclusive and does not use API/RPC flags");
+    ensure!(!(rpc_live && persistence_write_live), "--rpc-live and --persistence-write-live are exclusive");
     ensure!(!(graph_live && jupiter_only), "--graph-live cannot be combined with --jupiter-only");
+    ensure!(!(persistence_write_live && jupiter_only), "--persistence-write-live cannot use Jupiter-only");
     ensure!(!(completion_live && jupiter_only),
         "--completion-live cannot be combined with --jupiter-only");
-    ensure!(completion_limit.is_none() || completion_live || graph_live,
+    ensure!(completion_limit.is_none() || completion_live || graph_live || persistence_write_live,
         "--completion-limit requires --completion-live or --graph-live");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
@@ -70,6 +83,8 @@ fn settings() -> Result<Cli> {
         completion_live,
         graph_live,
         completion_limit,
+        persistence_write_live,
+        persistence_restore_live,
     })
 }
 
@@ -144,13 +159,16 @@ fn spawn_meteora(
     settings: meteora_dlmm::Settings,
     completion: Option<(rpc_transport::RpcHandle, execution_completion::Settings)>,
     graph: Option<liquidity_graph::Settings>,
+    initial_registry: Option<pool_registry::PoolRegistry>,
+    persist: Option<persistence::Persistence>,
 ) -> Result<()> {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     let registry_input = output.subscribe();
     let (registry_output, registry_observer) =
         broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
-    let registry = pool_registry::PoolRegistry::default();
+    let registry = initial_registry.unwrap_or_default();
     let completion_live = completion.is_some();
+    let persistence_input = persist.as_ref().map(|_| registry_output.subscribe());
     if let Some(settings) = graph {
         let (tx, rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
         tasks.spawn(liquidity_graph::observe(rx));
@@ -167,6 +185,22 @@ fn spawn_meteora(
     } else { None };
     tasks.spawn(source_diagnostic::run(input));
     tasks.spawn(pool_registry::observe_updates(registry_observer, completion_live));
+    // Seed restored, historically validated pool records before any fresh source.
+    // All recipients are already subscribed; the SQL writer ignores Source batches.
+    let restored = registry.snapshot();
+    if !restored.is_empty() {
+        let count = restored.len();
+        registry_output.send(Arc::new(pool_registry::PoolUpdateBatch {
+            kind: pool_registry::PoolUpdateKind::Source,
+            source: "persistence_restore",
+            received_at_ms: 0,
+            pools: restored,
+        })).map_err(|_|anyhow::anyhow!("no registry bootstrap subscriber"))?;
+        println!("orchestration bootstrap seeded_pools={count}");
+    }
+    if let Some(writer) = persist {
+        tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
+    }
     tasks.spawn(pool_registry::run(registry_input, completion_input, registry, registry_output));
     tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
     Ok(())
@@ -202,14 +236,47 @@ pub async fn run() -> Result<()> {
         task.await??;
         return Ok(());
     }
-    if cli.completion_live || cli.graph_live {
+    if cli.persistence_restore_live {
+        let database = persistence::Persistence::connect().await?;
+        let registry = pool_registry::PoolRegistry::default();
+        let restored = registry.restore(database.restore().await?)?;
+        ensure!(restored > 0, "persistence restore-live requires stored completion records");
+        let graph_settings = liquidity_graph::Settings::from_env()?;
+        ensure!(graph_settings.min_tvl_usd.is_none(),
+            "restore-live cannot use GRAPH_MIN_TVL_USD without a fresh TVL source");
+        let (updates, receiver) = broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
+        let (graph_tx, graph_rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(liquidity_graph::observe(graph_rx));
+        tasks.spawn(liquidity_graph::run(receiver,graph_tx,graph_settings));
+        updates.send(Arc::new(pool_registry::PoolUpdateBatch {
+            kind: pool_registry::PoolUpdateKind::Source,
+            source:"persistence_restore",
+            received_at_ms:0,
+            pools:registry.snapshot(),
+        })).map_err(|_|anyhow::anyhow!("no graph bootstrap receiver"))?;
+        drop(updates);
+        while let Some(result)=tasks.join_next().await {result??;}
+        println!("persistence restore-live complete restored_pools={restored} rpc_calls=0");
+        return Ok(());
+    }
+    if cli.completion_live || cli.graph_live || cli.persistence_write_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
         let mut completion = execution_completion::Settings::from_env()?;
-        completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live {5000} else {100});
-        let graph = if cli.graph_live {Some(liquidity_graph::Settings::from_env()?)} else {None};
+        completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live || cli.persistence_write_live {5000} else {100});
+        let graph = if cli.graph_live || cli.persistence_write_live {
+            Some(liquidity_graph::Settings::from_env()?)
+        } else {None};
+        let (registry, writer) = if cli.persistence_write_live {
+            let db = persistence::Persistence::connect().await?;
+            let registry = pool_registry::PoolRegistry::default();
+            let restored = registry.restore(db.restore().await?)?;
+            println!("orchestration initial persistence restored_pools={restored}");
+            (Some(registry), Some(db))
+        } else {(None,None)};
         spawn_meteora(&mut tasks, cli.meteora,
-            Some((rpc.clone(), completion)), graph)?;
+            Some((rpc.clone(), completion)), graph, registry, writer)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
         tasks.spawn(async move { rpc_task.await? });
@@ -235,7 +302,7 @@ pub async fn run() -> Result<()> {
 
     let mut tasks = JoinSet::new();
     if !cli.jupiter_only {
-        spawn_meteora(&mut tasks, cli.meteora, None, None)?;
+        spawn_meteora(&mut tasks, cli.meteora, None, None, None, None)?;
     }
 
     // Keep the provisional watch sender alive until a real input worker takes over.
