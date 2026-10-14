@@ -1,22 +1,22 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::Result;
-use solana_pubkey::Pubkey;
+use bytes::Bytes;
 
-/// Source-neutral output contract. The payload is the complete, unchanged JSON record.
+/// Source-neutral transport classification. Payload semantics belong to consumers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordKind {
     Pool,
-    #[allow(dead_code)] // Defined for mint-producing sources; CP1 emits pools only.
+    #[allow(dead_code)]
     Mint,
 }
 
+/// One unmodified source response, shared without copying its bytes.
 #[derive(Clone, Debug)]
-pub struct SourceRecord {
+pub struct SourceBatch {
     pub source: &'static str,
     pub kind: RecordKind,
-    pub address: Pubkey,
-    pub payload: Arc<[u8]>,
+    pub body: Bytes,
 }
 
 /// Generic HTTP client; no DEX or protocol logic.

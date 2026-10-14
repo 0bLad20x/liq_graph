@@ -1,7 +1,5 @@
 //! Resource provisioning, channel connections, and worker lifecycle only.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::broadcast;
 
@@ -31,42 +29,42 @@ fn settings() -> Result<meteora_dlmm::Settings> {
 pub async fn run() -> Result<()> {
     let http = core::http_client()?;
     let config = settings()?;
-    let (output, mut input) = broadcast::channel::<Arc<Vec<core::SourceRecord>>>(32);
+    let (output, mut input) = broadcast::channel::<core::SourceBatch>(32);
 
-    // CP1 live output inspection; later consumers attach to the same stream.
+    // CP1 transport diagnostics only; consumers own payload interpretation.
     let consumer = async move {
-        let mut received = 0_u64;
+        let mut received_batches = 0_u64;
+        let mut received_bytes = 0_u64;
         let mut lagged_batches = 0_u64;
         loop {
             match input.recv().await {
                 Ok(batch) => {
-                    for record in batch.iter() {
-                        received += 1;
-                        if received == 1 {
-                            println!(
-                                "source={} kind={:?} address={} payload_bytes={} payload={}",
-                                record.source, record.kind, record.address, record.payload.len(),
-                                String::from_utf8_lossy(&record.payload)
-                            );
-                        } else if received <= 5 {
-                            println!(
-                                "source={} kind={:?} address={} payload_bytes={}",
-                                record.source, record.kind, record.address, record.payload.len()
-                            );
-                        }
-                        if received % 10_000 == 0 {
-                            println!("SourceRecord received={received}");
-                        }
+                    received_batches += 1;
+                    received_bytes += batch.body.len() as u64;
+                    if received_batches == 1 {
+                        let preview = &batch.body[..batch.body.len().min(240)];
+                        println!(
+                            "source={} kind={:?} payload_bytes={} payload_preview={}",
+                            batch.source, batch.kind, batch.body.len(),
+                            String::from_utf8_lossy(preview)
+                        );
+                    }
+                    if received_batches % 25 == 0 {
+                        println!(
+                            "SourceBatch received_batches={received_batches} received_bytes={received_bytes}"
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     lagged_batches += skipped;
-                    eprintln!("SourceRecord consumer lagged, missed_batches={skipped}");
+                    eprintln!("SourceBatch consumer lagged, missed_batches={skipped}");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-        println!("SourceRecord output complete, received={received} lagged_batches={lagged_batches}");
+        println!(
+            "SourceBatch output complete, received_batches={received_batches} received_bytes={received_bytes} lagged_batches={lagged_batches}"
+        );
         Ok::<(), anyhow::Error>(())
     };
 

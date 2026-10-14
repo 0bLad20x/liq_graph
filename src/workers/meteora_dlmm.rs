@@ -1,19 +1,18 @@
-//! Meteora DLMM API source: fetch pages, extract pool address, forward complete raw records.
-//! No field mapping, normalization, deduplication, or consumer-specific processing.
+//! Meteora DLMM API source: fetch, validate pagination, broadcast unchanged HTTP bytes.
+//! No pool decoding, individual allocations, normalization, or deduplication.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
-use serde_json::value::RawValue;
-use solana_pubkey::Pubkey;
+use bytes::Bytes;
+use serde::{Deserialize, de::IgnoredAny};
 use tokio::{
     sync::{Mutex, broadcast},
     task::JoinSet,
     time::{Instant, sleep, sleep_until},
 };
 
-use crate::core::{RecordKind, SourceRecord};
+use crate::core::{RecordKind, SourceBatch};
 
 const URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SOURCE: &str = "meteora_dlmm_api";
@@ -28,15 +27,16 @@ pub struct Settings {
 }
 
 #[derive(Deserialize)]
-struct Page {
+struct PageEnvelope {
     current_page: u32,
     pages: u32,
-    data: Vec<Box<RawValue>>,
+    data: Vec<IgnoredAny>,
 }
 
-#[derive(Deserialize)]
-struct PoolAddress<'a> {
-    address: &'a str,
+struct Page {
+    pages: u32,
+    records: usize,
+    body: Bytes,
 }
 
 async fn fetch_page(client: &reqwest::Client, page: u32) -> Result<Page> {
@@ -48,27 +48,32 @@ async fn fetch_page(client: &reqwest::Client, page: u32) -> Result<Page> {
         ])
         .send().await?
         .error_for_status()?;
-    let result: Page = response.json().await
+    let body = response.bytes().await?;
+    let envelope: PageEnvelope = serde_json::from_slice(&body)
         .with_context(|| format!("invalid Meteora page {page} JSON envelope"))?;
-    ensure!(result.current_page == page, "Meteora page number mismatch");
+    ensure!(envelope.current_page == page, "Meteora page number mismatch");
     ensure!(
-        result.pages >= page || (page == 1 && result.pages == 0 && result.data.is_empty()),
+        envelope.pages >= page || (page == 1 && envelope.pages == 0 && envelope.data.is_empty()),
         "Meteora page count inconsistent"
     );
     ensure!(
-        !result.data.is_empty() || (page == 1 && result.pages == 0),
+        !envelope.data.is_empty() || (page == 1 && envelope.pages == 0),
         "Meteora page unexpectedly empty"
     );
-    ensure!(result.data.len() <= PAGE_SIZE as usize, "Meteora page size exceeded");
-    Ok(result)
+    ensure!(envelope.data.len() <= PAGE_SIZE as usize, "Meteora page size exceeded");
+    Ok(Page {
+        pages: envelope.pages.max(1),
+        records: envelope.data.len(),
+        body,
+    })
 }
 
-/// Shared request-start limiter for all concurrent pages.
+/// One request-start limiter shared by concurrent pages and retries.
 async fn fetch_with_retry(
     client: reqwest::Client,
     gate: Arc<Mutex<Instant>>,
     page: u32,
-) -> Result<Page> {
+) -> Page {
     loop {
         let mut next = gate.lock().await;
         sleep_until(*next).await;
@@ -76,7 +81,7 @@ async fn fetch_with_retry(
         drop(next);
 
         match fetch_page(&client, page).await {
-            Ok(result) => return Ok(result),
+            Ok(result) => return result,
             Err(error) => {
                 eprintln!("meteora page={page} retry error={error:#}");
                 sleep(RETRY_DELAY).await;
@@ -85,45 +90,29 @@ async fn fetch_with_retry(
     }
 }
 
-/// One broadcast per API page. Consumers receive a shared immutable batch.
-fn publish(
-    records: Vec<Box<RawValue>>,
-    output: &broadcast::Sender<Arc<Vec<SourceRecord>>>,
-) -> Result<(usize, usize)> {
-    let mut batch = Vec::with_capacity(records.len());
-    for raw in records {
-        let pool: PoolAddress<'_> = serde_json::from_str(raw.get())
-            .context("Meteora pool has no readable address")?;
-        let address: Pubkey = pool.address.parse()
-            .context("Meteora pool address is invalid")?;
-        ensure!(address != Pubkey::default(), "Meteora pool address is zero");
-
-        batch.push(SourceRecord {
-            source: SOURCE,
-            kind: RecordKind::Pool,
-            address,
-            payload: Arc::from(raw.get().as_bytes()),
-        });
-    }
-    let count = batch.len();
-    let without_subscribers = usize::from(output.send(Arc::new(batch)).is_err());
-    Ok((count, without_subscribers))
+/// A batch is one whole API response; broadcast never waits for a receiver.
+fn publish(output: &broadcast::Sender<SourceBatch>, body: Bytes) -> bool {
+    output.send(SourceBatch {
+        source: SOURCE,
+        kind: RecordKind::Pool,
+        body,
+    }).is_ok()
 }
 
 pub async fn run(
     client: reqwest::Client,
-    output: broadcast::Sender<Arc<Vec<SourceRecord>>>,
+    output: broadcast::Sender<SourceBatch>,
     settings: Settings,
 ) -> Result<()> {
     let gate = Arc::new(Mutex::new(Instant::now()));
 
     loop {
         let started = Instant::now();
-        let first = fetch_with_retry(client.clone(), gate.clone(), 1).await?;
-        let total_pages = first.pages.max(1);
+        let first = fetch_with_retry(client.clone(), gate.clone(), 1).await;
+        let total_pages = first.pages;
         let pages = settings.max_pages.unwrap_or(total_pages).min(total_pages);
-        let (mut records, mut without_subscribers) =
-            publish(first.data, &output).context("Meteora page 1")?;
+        let mut records = first.records;
+        let mut unconsumed_batches = usize::from(!publish(&output, first.body));
         let mut scanned = 1_u32;
 
         let mut pending = JoinSet::new();
@@ -138,18 +127,15 @@ pub async fn run(
                 next_page += 1;
             }
             if let Some(task) = pending.join_next().await {
-                let page = task.context("Meteora page task stopped unexpectedly")??;
-                let number = page.current_page;
-                let (count, missing) = publish(page.data, &output)
-                    .with_context(|| format!("Meteora page {number}"))?;
-                records += count;
-                without_subscribers += missing;
+                let page = task.context("Meteora page task stopped unexpectedly")?;
+                records += page.records;
+                unconsumed_batches += usize::from(!publish(&output, page.body));
                 scanned += 1;
             }
         }
 
         eprintln!(
-            "meteora source pages={scanned}/{total_pages} records={records} unconsumed_batches={without_subscribers} elapsed_ms={}",
+            "meteora source pages={scanned}/{total_pages} records={records} unconsumed_batches={unconsumed_batches} elapsed_ms={}",
             started.elapsed().as_millis()
         );
         if settings.once {
