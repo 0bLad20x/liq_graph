@@ -521,13 +521,13 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
         results.len(), prepared, incomplete, retryable);
     let batch = Arc::new(CompletionResultBatch {source: "dlmm_execution_completion", results});
     output.send(batch).map_err(|_|anyhow!("completion results have no consumer"))?;
-    ensure!(prepared>0, "completion live test produced no validated execution manifest");
     Ok(())
 }
 
 pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>) -> Result<()> {
     let mut batches = 0_u64;
     let mut results = 0_usize;
+    let mut manifests = 0_usize;
     loop {
         match input.recv().await {
             Ok(batch) => {
@@ -535,6 +535,7 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                 for result in &batch.results {
                     results += 1;
                     if let Some(manifest) = &result.manifest {
+                        manifests += 1;
                         println!(
                             "execution manifest pool={} status={:?} slot={} mint_a={} mint_b={} \
                              base_a_accounts={:?} base_b_accounts={:?}",
@@ -562,5 +563,6 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
         }
     }
     ensure!(batches > 0, "completion consumer received no batch");
+    ensure!(manifests > 0, "completion live test produced no validated execution manifest");
     Ok(())
 }
