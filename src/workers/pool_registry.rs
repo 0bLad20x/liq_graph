@@ -337,6 +337,13 @@ pub async fn run(
     let mut source_open = true;
     let mut completion_open = completion.is_some();
     let require_completion = completion_open;
+    let bootstrap_snapshot = registry.snapshot();
+    let bootstrap_prepared = bootstrap_snapshot.iter()
+        .filter(|p| p.completion_state == CompletionState::Prepared).count();
+    let bootstrap_incomplete = bootstrap_snapshot.iter()
+        .filter(|p| p.completion_state == CompletionState::Incomplete).count();
+    let bootstrap_manifests = bootstrap_snapshot.iter()
+        .filter(|p| p.execution_manifest.is_some()).count();
 
     while source_open || completion_open {
         tokio::select! {
@@ -419,9 +426,10 @@ pub async fn run(
         anyhow::ensure!(completion_received > 0 && completion_applied == completion_received
             && completion_rejected == 0,
             "registry completion live test did not accept all results");
-        anyhow::ensure!(manifests == completion_prepared && prepared == completion_prepared
-            && incomplete == completion_incomplete,
-            "registry RAM completion snapshot does not match accepted results");
+        anyhow::ensure!(manifests == bootstrap_manifests + completion_prepared
+            && prepared == bootstrap_prepared + completion_prepared
+            && incomplete == bootstrap_incomplete + completion_incomplete,
+            "registry RAM completion snapshot does not match restored and accepted results");
     }
     Ok(())
 }
