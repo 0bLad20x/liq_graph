@@ -5,7 +5,7 @@ use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
-use tokio::sync::broadcast;
+use tokio::{sync::broadcast, task::JoinSet};
 
 use crate::{
     core::{Venue, AccountMeta, ExecutionManifest, BinArrayRef, BinArrayInventory,
@@ -32,6 +32,7 @@ pub struct Settings {
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
+    pub parallel_batches: usize,
     /// Stability runs finalize a nonempty candidate set after a quiet period.
     pub selection_idle_timeout: Option<Duration>,
 }
@@ -49,7 +50,13 @@ impl Settings {
             .unwrap_or_else(|_| "2".to_owned()).parse::<usize>()
             .context("invalid DLMM_EXECUTION_ABOVE")?;
         ensure!(1 + below + above <= 6, "DLMM V10 supports at most six BinArrays");
-        Ok(Self { limit: 100, account_batch_size, below, above, selection_idle_timeout: None })
+        let parallel_batches = env::var("DLMM_COMPLETION_PARALLEL_BATCHES")
+            .unwrap_or_else(|_| "32".to_owned()).parse::<usize>()
+            .context("invalid DLMM_COMPLETION_PARALLEL_BATCHES")?;
+        ensure!((1..=64).contains(&parallel_batches),
+            "DLMM_COMPLETION_PARALLEL_BATCHES must be 1..=64");
+        Ok(Self { limit: 100, account_batch_size, below, above,
+            parallel_batches, selection_idle_timeout: None })
     }
 }
 
@@ -660,14 +667,42 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
         selected.len(), settings.limit);
     ensure!(!selected.is_empty(), "no unknown DLMM pools with positive TVL observed");
 
-    let mut results = process(&rpc, &selected, settings).await;
+    // Independent pool partitions can be completed concurrently. Each partition
+    // retains the existing per-pool multi-slot revalidation and 100-account RPC limit.
+    // The single shared RpcHandle enforces per-provider request limits and failover.
+    let started = Instant::now();
+    let total_batches = selected.len().div_ceil(settings.account_batch_size);
+    let mut partitions = selected.chunks(settings.account_batch_size);
+    let mut tasks = JoinSet::new();
+    let mut results = Vec::with_capacity(selected.len());
+    for _ in 0..settings.parallel_batches {
+        let Some(partition) = partitions.next() else { break; };
+        let rpc = rpc.clone();
+        let pools = partition.to_vec();
+        tasks.spawn(async move { process(&rpc, &pools, settings).await });
+    }
+    let mut finished = 0_usize;
+    while let Some(joined) = tasks.join_next().await {
+        results.extend(joined.context("DLMM parallel completion batch failed")?);
+        finished += 1;
+        if finished % 10 == 0 || finished == total_batches {
+            println!("execution completion progress batches={finished}/{total_batches} pools={} elapsed_ms={}",
+                results.len(), started.elapsed().as_millis());
+        }
+        if let Some(partition) = partitions.next() {
+            let rpc = rpc.clone();
+            let pools = partition.to_vec();
+            tasks.spawn(async move { process(&rpc, &pools, settings).await });
+        }
+    }
     results.sort_by_key(|result| result.pool.to_bytes());
     ensure!(results.len() == selected.len(), "completion output count != selected pool count");
     let prepared = results.iter().filter(|r| r.status == CompletionStatus::Prepared).count();
     let incomplete = results.iter().filter(|r| r.status == CompletionStatus::Incomplete).count();
     let retryable = results.iter().filter(|r| r.status == CompletionStatus::Retryable).count();
-    println!("execution completion complete selected={} prepared={} incomplete={} retryable={}",
-        results.len(), prepared, incomplete, retryable);
+    println!("execution completion complete selected={} prepared={} incomplete={} retryable={} batches={} parallel={} elapsed_ms={}",
+        results.len(), prepared, incomplete, retryable, total_batches,
+        settings.parallel_batches, started.elapsed().as_millis());
     let batch = Arc::new(CompletionResultBatch {source: "dlmm_execution_completion", results});
     output.send(batch).map_err(|_|anyhow!("completion results have no consumer"))?;
     Ok(())
