@@ -310,8 +310,13 @@ fn decode_mint(account: &AccountData) -> Result<MintProof> {
     ensure!(data.len() >= 82 && data[45] == 1, "Mint base layout or initialized flag invalid");
     let mut extensions = Vec::new();
     if is_token_2022 && data.len() > 82 {
-        ensure!(data[82] == 1, "Token-2022 account type is not Mint");
-        let mut offset = 83;
+        // Extended Token-2022 Mints use 82 bytes of base state, 83 bytes of padding,
+        // AccountType::Mint at offset 165, then TLV extensions starting at 166.
+        ensure!(data.len() >= 166, "extended Token-2022 Mint too short");
+        ensure!(data[82..165].iter().all(|byte| *byte == 0),
+            "Token-2022 Mint padding is not zero");
+        ensure!(data[165] == 1, "Token-2022 account type is not Mint");
+        let mut offset = 166;
         while offset < data.len() {
             let trailing = &data[offset..];
             if trailing.iter().all(|byte| *byte == 0) { break; }
