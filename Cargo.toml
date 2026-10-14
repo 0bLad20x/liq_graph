@@ -1,0 +1,13 @@
+[package]
+name = "liq_graph"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-pubkey = { version = "2.4", features = ["curve25519"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
