@@ -578,7 +578,7 @@ async fn ws_session(
                 let id=request_id;request_id+=1;
                 if ws.send(Message::Text(json!({"jsonrpc":"2.0","id":id,
                     "method":"accountSubscribe","params":[address.to_string(),
-                    {"encoding":"base64","commitment":commitment}]]}).to_string().into()))
+                    {"encoding":"base64","commitment":commitment}]}).to_string().into()))
                     .await.is_err(){break 'connected;}
                 pending.insert(id,address);
                 if spacing_ms>0 {sleep(Duration::from_millis(spacing_ms)).await;}
