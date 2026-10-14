@@ -4,9 +4,9 @@ use std::{collections::HashSet, env, fs, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
-use tokio::sync::{broadcast, watch};
+use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{jupiter_search, meteora_dlmm}};
+use crate::{core, workers::{jupiter_search, meteora_dlmm, source_diagnostic}};
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
@@ -43,6 +43,7 @@ fn settings() -> Result<Cli> {
     })
 }
 
+// Temporary startup input for local tests; replaced by a real watch-input producer.
 fn load_mints(path: &str) -> Result<Arc<[Pubkey]>> {
     let raw_file = fs::read_to_string(path)
         .with_context(|| format!("read Jupiter mint input {path}"))?;
@@ -108,6 +109,27 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
     )))
 }
 
+fn spawn_meteora(tasks: &mut JoinSet<Result<()>>, settings: meteora_dlmm::Settings) -> Result<()> {
+    let (output, input) = broadcast::channel::<core::SourceBatch>(32);
+    tasks.spawn(source_diagnostic::run(input));
+    tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
+    Ok(())
+}
+
+fn spawn_jupiter(
+    tasks: &mut JoinSet<Result<()>>,
+    settings: jupiter_search::Settings,
+    mints: Arc<[Pubkey]>,
+) -> watch::Sender<Arc<[Pubkey]>> {
+    let (output, input) = broadcast::channel::<core::SourceBatch>(32);
+    tasks.spawn(source_diagnostic::run(input));
+
+    let (input_tx, input_rx) = watch::channel(mints);
+    // Independent client: the shared HTTP client applies Meteora's 20-second limit.
+    tasks.spawn(jupiter_search::run(reqwest::Client::new(), settings, input_rx, output));
+    input_tx
+}
+
 pub async fn run() -> Result<()> {
     match dotenvy::dotenv() {
         Ok(_) => {}
@@ -126,65 +148,17 @@ pub async fn run() -> Result<()> {
         "Jupiter Search needs API keys and a mint input file"
     );
 
-    let http = core::http_client()?;
-    let (output, mut input) = broadcast::channel::<core::SourceBatch>(32);
+    let mut tasks = JoinSet::new();
+    if !cli.jupiter_only {
+        spawn_meteora(&mut tasks, cli.meteora)?;
+    }
 
-    // Diagnostic subscriber only; no source-specific payload processing.
-    let consumer = async move {
-        let mut received = 0_u64;
-        let mut lagged = 0_u64;
-        let mut seen = HashSet::new();
-        loop {
-            match input.recv().await {
-                Ok(batch) => {
-                    received += 1;
-                    if seen.insert(batch.source) {
-                        let preview = &batch.body[..batch.body.len().min(240)];
-                        println!(
-                            "SourceBatch source={} kind={:?} bytes={} preview={}",
-                            batch.source, batch.kind, batch.body.len(),
-                            String::from_utf8_lossy(preview)
-                        );
-                    } else if received % 25 == 0 {
-                        println!(
-                            "SourceBatch source={} received_batches={} bytes={}",
-                            batch.source, received, batch.body.len()
-                        );
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    lagged += skipped;
-                    eprintln!("SourceBatch consumer lagged missed_batches={skipped}");
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-        println!("SourceBatch output complete received_batches={received} lagged_batches={lagged}");
-        Ok::<(), anyhow::Error>(())
-    };
+    // Keep the provisional watch sender alive until a real input worker takes over.
+    let _jupiter_input = jupiter
+        .map(|(settings, mints)| spawn_jupiter(&mut tasks, settings, mints));
 
-    if let Some((config, mints)) = jupiter {
-        let (input_tx, input_rx) = watch::channel(mints);
-        let _keep_input = input_tx;
-        // Jupiter sets its own per-request timeout; the shared Meteora client has a 20s cap.
-        let jupiter_http = reqwest::Client::new();
-        if cli.jupiter_only {
-            tokio::try_join!(
-                jupiter_search::run(jupiter_http, config, input_rx, output),
-                consumer
-            )?;
-        } else {
-            tokio::try_join!(
-                meteora_dlmm::run(http.clone(), output.clone(), cli.meteora),
-                jupiter_search::run(jupiter_http, config, input_rx, output),
-                consumer
-            )?;
-        }
-    } else {
-        tokio::try_join!(
-            meteora_dlmm::run(http, output, cli.meteora),
-            consumer
-        )?;
+    while let Some(result) = tasks.join_next().await {
+        result??;
     }
     Ok(())
 }
