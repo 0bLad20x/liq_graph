@@ -138,6 +138,13 @@ pub enum RpcAnswer {
     GenesisHash(String),
 }
 
+#[derive(Debug)]
+pub struct RpcResponse {
+    pub provider: String,
+    pub received_at_ms: u64,
+    pub answer: RpcAnswer,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum WsEvent {
@@ -159,7 +166,7 @@ pub struct RpcHandle {
 }
 
 impl RpcHandle {
-    pub async fn call(&self, operation: RpcOperation) -> Result<RpcAnswer> {
+    pub async fn call(&self, operation: RpcOperation) -> Result<RpcResponse> {
         let (reply, receive)=oneshot::channel();
         self.requests.send(Call{operation,reply}).await.context("RPC worker stopped")?;
         receive.await.context("RPC worker dropped response")?
@@ -180,7 +187,7 @@ impl RpcHandle {
     pub fn can_watch(&self) -> bool { self.ws_capacity > 0 }
 }
 
-struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcAnswer>>}
+struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcResponse>>}
 
 #[derive(Clone, Debug)]
 struct HttpSettings {
@@ -469,7 +476,14 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                     let provider=&eligible[(cursor+offset)%eligible.len()];
                     if !provider.eligible(operation.bit()) {continue;}
                     match provider.request(&operation,&params).await {
-                        Ok(value)=>return interpret(operation,value),
+                        Ok(value)=>{
+                            let answer=interpret(operation,value)?;
+                            return Ok(RpcResponse {
+                                provider:provider.cfg.name.clone(),
+                                received_at_ms:now_unix_ms()?,
+                                answer,
+                            });
+                        },
                         Err(err)=>{
                             eprintln!("rpc provider={} method={} error={err:#}",provider.cfg.name,operation.method());
                             error=Some(err);
@@ -690,8 +704,9 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
     ] {
         if !handle.supports(&operation) { continue; }
         let method=operation.method();
-        let result=handle.call(operation).await.with_context(||format!("live RPC {method} failed"))?;
-        match result {
+        let response=handle.call(operation).await.with_context(||format!("live RPC {method} failed"))?;
+        println!("rpc live provider={} received_at_ms={}",response.provider,response.received_at_ms);
+        match response.answer {
             RpcAnswer::GenesisHash(hash)=>println!("rpc live method={method} genesis_hash={hash}"),
             RpcAnswer::Slot(slot)=>println!("rpc live method={method} slot={slot}"),
             RpcAnswer::Account{slot,account}=>println!(
@@ -712,7 +727,9 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
     ] {
         if !handle.supports(&operation) { continue; }
         let method=operation.method();
-        match handle.call(operation).await.with_context(||format!("live RPC {method} failed"))? {
+        let response=handle.call(operation).await.with_context(||format!("live RPC {method} failed"))?;
+        println!("rpc live provider={} received_at_ms={}",response.provider,response.received_at_ms);
+        match response.answer {
             RpcAnswer::Program{accounts,next_cursor}=>println!(
                 "rpc live method={method} accounts={} next_cursor_present={}",
                 accounts.len(),next_cursor.is_some()),
