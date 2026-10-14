@@ -810,6 +810,21 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
         }).await;
         handle.replace_watches(Vec::new())?;
         observed.context("WebSocket subscription ACK timeout")??;
+        let removed=timeout(Duration::from_secs(12),async {
+            loop {
+                match events.recv().await {
+                    Ok(WsEvent::Unsubscribed{provider,address:removed}) if removed==address=>{
+                        println!("rpc live websocket unsubscribed provider={provider} account={removed}");
+                        return Ok(());
+                    }
+                    Ok(WsEvent::Gap{provider,reason})=>
+                        eprintln!("rpc live websocket gap provider={provider} reason={reason}"),
+                    Ok(_)=>{},
+                    Err(error)=>bail!("rpc live unsubscribe event error: {error}"),
+                }
+            }
+        }).await;
+        removed.context("WebSocket unsubscribe ACK timeout")??;
     } else {
         println!("rpc live websocket not configured or not enabled");
     }
