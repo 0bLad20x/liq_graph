@@ -6,3 +6,4 @@ pub mod rpc_transport;
 pub mod execution_completion;
 
 pub mod liquidity_graph;
+pub mod persistence;
