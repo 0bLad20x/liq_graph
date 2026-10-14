@@ -664,25 +664,28 @@ pub fn spawn(settings:Settings)->Result<(RpcHandle,JoinHandle<Result<()>>)> {
 /// Explicit real-provider smoke run; no synthetic data or hidden provider calls.
 pub async fn live_probe(handle:&RpcHandle)->Result<()> {
     let address:Pubkey="So11111111111111111111111111111111111111112".parse()?;
+    let mut passed=0_u64;
     for operation in [
         RpcOperation::GenesisHash,
         RpcOperation::Slot{commitment:"confirmed".to_owned()},
         RpcOperation::Account{address,view:AccountView::Full},
         RpcOperation::Multiple{addresses:vec![address],view:AccountView::Full,min_context_slot:None},
     ] {
+        if !handle.supports(&operation) { continue; }
         let method=operation.method();
-        match handle.call(operation).await {
-            Ok(RpcAnswer::GenesisHash(hash))=>println!("rpc live method={method} genesis_hash={hash}"),
-            Ok(RpcAnswer::Slot(slot))=>println!("rpc live method={method} slot={slot}"),
-            Ok(RpcAnswer::Account{slot,account})=>println!(
+        let result=handle.call(operation).await.with_context(||format!("live RPC {method} failed"))?;
+        match result {
+            RpcAnswer::GenesisHash(hash)=>println!("rpc live method={method} genesis_hash={hash}"),
+            RpcAnswer::Slot(slot)=>println!("rpc live method={method} slot={slot}"),
+            RpcAnswer::Account{slot,account}=>println!(
                 "rpc live method={method} slot={slot} found={} bytes={}",
                 account.is_some(),account.as_ref().map_or(0,|a|a.bytes.len())),
-            Ok(RpcAnswer::Multiple{slot,accounts})=>println!(
+            RpcAnswer::Multiple{slot,accounts}=>println!(
                 "rpc live method={method} slot={slot} returned={} found={}",
                 accounts.len(),accounts.iter().filter(|a|a.is_some()).count()),
-            Ok(_)=>bail!("unexpected RPC live response for {method}"),
-            Err(error)=>eprintln!("rpc live method={method} error={error:#}"),
+            _=>bail!("unexpected RPC live response for {method}"),
         }
+        passed+=1;
     }
     let program:Pubkey="ComputeBudget111111111111111111111111111111".parse()?;
     for operation in [
@@ -690,39 +693,45 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
         RpcOperation::ProgramV2{program,filters:vec![AccountFilter::DataSize(0)],
             view:AccountView::Slice{offset:0,length:0},cursor:None,changed_since_slot:None,limit:10},
     ] {
+        if !handle.supports(&operation) { continue; }
         let method=operation.method();
-        match handle.call(operation).await {
-            Ok(RpcAnswer::Program{accounts,next_cursor})=>println!(
+        match handle.call(operation).await.with_context(||format!("live RPC {method} failed"))? {
+            RpcAnswer::Program{accounts,next_cursor}=>println!(
                 "rpc live method={method} accounts={} next_cursor_present={}",
                 accounts.len(),next_cursor.is_some()),
-            Ok(_)=>bail!("unexpected RPC program response for {method}"),
-            Err(error)=>eprintln!("rpc live method={method} error={error:#}"),
+            _=>bail!("unexpected RPC live response for {method}"),
         }
+        passed+=1;
     }
-    let mut events=handle.subscribe_events();
-    if handle.replace_watches(vec![address]).is_ok() {
-        let outcome=timeout(Duration::from_secs(12),async {
+    println!("rpc live http_methods_passed={passed}");
+    ensure!(passed>0 || handle.can_watch(),"no RPC HTTP method or WebSocket watch enabled");
+
+    if handle.can_watch() {
+        let mut events=handle.subscribe_events();
+        handle.replace_watches(vec![address])?;
+        let observed=timeout(Duration::from_secs(12),async {
             loop {
                 match events.recv().await {
                     Ok(WsEvent::Subscribed{provider,address})=>{
                         println!("rpc live websocket subscribed provider={provider} account={address}");
-                        return;
+                        return Ok(());
                     }
-                    Ok(WsEvent::Account{provider,address,slot,value,..})=>{
-                        println!("rpc live websocket update provider={provider} address={address} slot={slot} found={}",value.is_some());
+                    Ok(WsEvent::Account{provider,address,slot,value,received_at_ms})=>{
+                        println!("rpc live websocket update provider={provider} address={address} slot={slot} received_at_ms={received_at_ms} found={}",value.is_some());
                     }
-                    Ok(WsEvent::Gap{provider,reason})=>eprintln!("rpc live websocket gap provider={provider} reason={reason}"),
-                    Ok(WsEvent::Rejected{provider,address,code})=>{
-                        eprintln!("rpc live websocket rejected provider={provider} address={address} code={code}");
-                        return;
-                    }
+                    Ok(WsEvent::Gap{provider,reason})=>
+                        eprintln!("rpc live websocket gap provider={provider} reason={reason}"),
+                    Ok(WsEvent::Rejected{provider,address,code})=>
+                        bail!("rpc live websocket subscription rejected provider={provider} address={address} code={code}"),
                     Ok(_)=>{},
-                    Err(error)=>{eprintln!("rpc live websocket event error={error}");return;}
+                    Err(error)=>bail!("rpc live WebSocket event stream failed: {error}"),
                 }
             }
         }).await;
-        if outcome.is_err(){eprintln!("rpc live websocket subscription ACK timeout");}
         handle.replace_watches(Vec::new())?;
-    }else {println!("rpc live websocket not configured or not enabled");}
+        observed.context("WebSocket subscription ACK timeout")??;
+    } else {
+        println!("rpc live websocket not configured or not enabled");
+    }
     Ok(())
 }
