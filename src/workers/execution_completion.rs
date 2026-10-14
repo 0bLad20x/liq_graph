@@ -1,7 +1,8 @@
 //! DLMM execution completion: registry candidate -> RPC account observations -> V10 manifest.
 //! No persistence, no writes to Pool Registry, and no hidden RPC clients.
 
-use std::{collections::{HashMap, HashSet}, env, sync::Arc};
+use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
+use tokio::time::Instant;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
 use tokio::sync::broadcast;
@@ -31,6 +32,8 @@ pub struct Settings {
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
+    /// Stability runs finalize a nonempty candidate set after a quiet period.
+    pub selection_idle_timeout: Option<Duration>,
 }
 
 impl Settings {
@@ -46,7 +49,7 @@ impl Settings {
             .unwrap_or_else(|_| "2".to_owned()).parse::<usize>()
             .context("invalid DLMM_EXECUTION_ABOVE")?;
         ensure!(1 + below + above <= 6, "DLMM V10 supports at most six BinArrays");
-        Ok(Self { limit: 100, account_batch_size, below, above })
+        Ok(Self { limit: 100, account_batch_size, below, above, selection_idle_timeout: None })
     }
 }
 
@@ -618,8 +621,21 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut selected = Vec::with_capacity(settings.limit);
     let mut seen = HashSet::new();
     let mut observed = 0_u64;
+    let mut last_selected = Instant::now();
     loop {
-        match input.recv().await {
+        let event = if let Some(idle) = settings.selection_idle_timeout {
+            tokio::select! {
+                result = input.recv() => Some(result),
+                _ = tokio::time::sleep_until(last_selected + idle), if !selected.is_empty() => None,
+            }
+        } else {
+            Some(input.recv().await)
+        };
+        let Some(event) = event else {
+            println!("execution completion selection_quiet_timeout selected={} observed_pools={observed}",selected.len());
+            break;
+        };
+        match event {
             Ok(batch) => {
                 observed += batch.pools.len() as u64;
                 for pool in &batch.pools {
@@ -629,6 +645,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
                         && pool.tvl_usd.is_some_and(|tvl| tvl > 0.0)
                         && seen.insert(pool.address) {
                         selected.push(pool.clone());
+                        last_selected = Instant::now();
                     }
                     if selected.len() == settings.limit { break; }
                 }
