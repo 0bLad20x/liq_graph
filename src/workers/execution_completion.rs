@@ -240,8 +240,11 @@ async fn read(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>) ->
     let response = rpc.call(RpcOperation::Multiple {
         addresses, view: AccountView::Full, min_context_slot: min_slot,
     }).await?;
+    let provider = response.provider.clone();
     let RpcAnswer::Multiple { slot, accounts } = response.answer
         else { bail!("RPC returned unexpected answer to getMultipleAccounts"); };
+    println!("execution completion rpc method=getMultipleAccounts provider={provider} slot={slot} accounts={} present={}",
+        accounts.len(), accounts.iter().filter(|item|item.is_some()).count());
     ensure!(accounts.len() == expected.len(), "RPC result cardinality mismatch");
     ensure!(min_slot.is_none_or(|minimum| slot >= minimum), "RPC result below minContextSlot");
     for (expected, account) in expected.iter().zip(&accounts) {
@@ -518,6 +521,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
         results.len(), prepared, incomplete, retryable);
     let batch = Arc::new(CompletionResultBatch {source: "dlmm_execution_completion", results});
     output.send(batch).map_err(|_|anyhow!("completion results have no consumer"))?;
+    ensure!(prepared>0, "completion live test produced no validated execution manifest");
     Ok(())
 }
 
