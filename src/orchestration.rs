@@ -17,6 +17,7 @@ struct Cli {
     completion_limit: Option<usize>,
     persistence_write_live: bool,
     persistence_restore_live: bool,
+    stability_live: bool,
 }
 
 fn settings() -> Result<Cli> {
@@ -30,6 +31,7 @@ fn settings() -> Result<Cli> {
     let mut completion_limit = None;
     let mut persistence_write_live = false;
     let mut persistence_restore_live = false;
+    let mut stability_live = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,6 +42,7 @@ fn settings() -> Result<Cli> {
             "--graph-live" => { graph_live = true; once = true; },
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
+            "--stability-live" => stability_live = true,
             "--completion-limit" => {
                 let count: usize = args.next()
                     .context("--completion-limit requires a positive number")?
@@ -54,12 +57,15 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --stability-live, --graph-live or --completion-limit N"),
         }
     }
-    ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some())),
+    ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live)),
         "--rpc-live is an exclusive RPC transport check");
     ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
+    ensure!(!(stability_live && (completion_live || graph_live || persistence_write_live
+        || persistence_restore_live || rpc_live || jupiter_only || once)),
+        "--stability-live is continuous and cannot be combined with other live modes or --once");
     ensure!(!(persistence_write_live && (completion_live || graph_live || persistence_restore_live)),
         "--persistence-write-live is exclusive");
     ensure!(!(persistence_restore_live && (completion_live || graph_live || jupiter_only
@@ -70,8 +76,8 @@ fn settings() -> Result<Cli> {
     ensure!(!(persistence_write_live && jupiter_only), "--persistence-write-live cannot use Jupiter-only");
     ensure!(!(completion_live && jupiter_only),
         "--completion-live cannot be combined with --jupiter-only");
-    ensure!(completion_limit.is_none() || completion_live || graph_live || persistence_write_live,
-        "--completion-limit requires --completion-live or --graph-live");
+    ensure!(completion_limit.is_none() || completion_live || graph_live || persistence_write_live || stability_live,
+        "--completion-limit requires --completion-live, --graph-live, --persistence-write-live or --stability-live");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
@@ -85,6 +91,7 @@ fn settings() -> Result<Cli> {
         completion_limit,
         persistence_write_live,
         persistence_restore_live,
+        stability_live,
     })
 }
 
@@ -260,21 +267,25 @@ pub async fn run() -> Result<()> {
         println!("persistence restore-live complete restored_pools={restored} rpc_calls=0");
         return Ok(());
     }
-    if cli.completion_live || cli.graph_live || cli.persistence_write_live {
+    if cli.completion_live || cli.graph_live || cli.persistence_write_live || cli.stability_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
         let mut completion = execution_completion::Settings::from_env()?;
-        completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live || cli.persistence_write_live {5000} else {100});
-        let graph = if cli.graph_live || cli.persistence_write_live {
+        completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live || cli.persistence_write_live || cli.stability_live {5000} else {100});
+        let graph = if cli.graph_live || cli.persistence_write_live || cli.stability_live {
             Some(liquidity_graph::Settings::from_env()?)
         } else {None};
-        let (registry, writer) = if cli.persistence_write_live {
+        let (registry, writer) = if cli.persistence_write_live || cli.stability_live {
             let db = persistence::Persistence::connect().await?;
             let registry = pool_registry::PoolRegistry::default();
             let restored = registry.restore(db.restore().await?)?;
             println!("orchestration initial persistence restored_pools={restored}");
             (Some(registry), Some(db))
         } else {(None,None)};
+        if cli.stability_live {
+            println!("orchestration stability-live continuous_source=true pages={:?} one_time_completion_limit={} postgres=true graph=true",
+                cli.meteora.max_pages, completion.limit);
+        }
         spawn_meteora(&mut tasks, cli.meteora,
             Some((rpc.clone(), completion)), graph, registry, writer)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
