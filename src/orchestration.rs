@@ -6,12 +6,13 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{jupiter_search, meteora_dlmm, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{execution_completion, jupiter_search, meteora_dlmm, pool_registry, rpc_transport, source_diagnostic}};
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
     jupiter_only: bool,
     rpc_live: bool,
+    completion_live: bool,
 }
 
 fn settings() -> Result<Cli> {
@@ -20,12 +21,14 @@ fn settings() -> Result<Cli> {
     let mut max_pages = None;
     let mut jupiter_only = false;
     let mut rpc_live = false;
+    let mut completion_live = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => once = true,
             "--jupiter-only" => jupiter_only = true,
             "--rpc-live" => rpc_live = true,
+            "--completion-live" => { completion_live = true; once = true; },
             "--pages" => {
                 let count: u32 = args.next()
                     .context("--pages requires a positive number")?
@@ -38,6 +41,8 @@ fn settings() -> Result<Cli> {
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some())),
         "--rpc-live is an exclusive RPC transport check");
+    ensure!(!(completion_live && jupiter_only),
+        "--completion-live cannot be combined with --jupiter-only");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
@@ -46,6 +51,7 @@ fn settings() -> Result<Cli> {
         meteora: meteora_dlmm::Settings { once, max_pages },
         jupiter_only,
         rpc_live,
+        completion_live,
     })
 }
 
@@ -115,13 +121,23 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
     )))
 }
 
-fn spawn_meteora(tasks: &mut JoinSet<Result<()>>, settings: meteora_dlmm::Settings) -> Result<()> {
+fn spawn_meteora(
+    tasks: &mut JoinSet<Result<()>>,
+    settings: meteora_dlmm::Settings,
+    completion: Option<(rpc_transport::RpcHandle, execution_completion::Settings)>,
+) -> Result<()> {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     let registry_input = output.subscribe();
     let (registry_output, registry_observer) =
         broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
     let registry = pool_registry::PoolRegistry::default();
 
+    if let Some((rpc, config)) = completion {
+        let candidate_input = registry_output.subscribe();
+        let (completion_output, completion_observer) = broadcast::channel(4);
+        tasks.spawn(execution_completion::observe(completion_observer));
+        tasks.spawn(execution_completion::run(candidate_input, rpc, config, completion_output));
+    }
     tasks.spawn(source_diagnostic::run(input));
     tasks.spawn(pool_registry::observe_updates(registry_observer));
     tasks.spawn(pool_registry::run(registry_input, registry, registry_output));
@@ -159,6 +175,18 @@ pub async fn run() -> Result<()> {
         task.await??;
         return Ok(());
     }
+    if cli.completion_live {
+        let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+        let mut tasks = JoinSet::new();
+        spawn_meteora(&mut tasks, cli.meteora,
+            Some((rpc.clone(), execution_completion::Settings::from_env()?)))?;
+        // Completion owns the last handle. The HTTP transport terminates once it completes.
+        drop(rpc);
+        tasks.spawn(async move { rpc_task.await? });
+        while let Some(result) = tasks.join_next().await { result??; }
+        return Ok(());
+    }
+
     let rpc_handle = if !cli.meteora.once && rpc_transport::configured() {
         let (handle, task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         // Keep the transport available to future worker consumers.
@@ -177,7 +205,7 @@ pub async fn run() -> Result<()> {
 
     let mut tasks = JoinSet::new();
     if !cli.jupiter_only {
-        spawn_meteora(&mut tasks, cli.meteora)?;
+        spawn_meteora(&mut tasks, cli.meteora, None)?;
     }
 
     // Keep the provisional watch sender alive until a real input worker takes over.
