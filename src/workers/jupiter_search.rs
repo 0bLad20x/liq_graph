@@ -57,7 +57,7 @@ fn decode_batch(body: &[u8]) -> Result<(DataBatch, usize)> {
             .and_then(|value| value.parse::<Pubkey>().ok());
         match address {
             Some(address) if address != Pubkey::default() => records.push(DataRecord {
-                identity: RecordIdentity::Mint { address }, payload,
+                identity: RecordIdentity::Mint { address }, tvl_usd: None, payload,
             }),
             _ => rejected += 1,
         }

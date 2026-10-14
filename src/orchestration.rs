@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, persistence, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
+
+#[derive(Clone, Copy, Debug)]
+enum SourceSet { Dlmm, Raydium, Orca, DammV2, All }
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
@@ -18,6 +21,8 @@ struct Cli {
     persistence_write_live: bool,
     persistence_restore_live: bool,
     stability_live: bool,
+    rest_discovery_live: bool,
+    rest_source_only: Option<SourceSet>,
 }
 
 fn settings() -> Result<Cli> {
@@ -32,6 +37,8 @@ fn settings() -> Result<Cli> {
     let mut persistence_write_live = false;
     let mut persistence_restore_live = false;
     let mut stability_live = false;
+    let mut rest_discovery_live = false;
+    let mut rest_source_only = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -43,6 +50,10 @@ fn settings() -> Result<Cli> {
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
             "--stability-live" => stability_live = true,
+            "--rest-discovery-live" => { rest_discovery_live = true; once = true; },
+            "--raydium-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Raydium); once = true; },
+            "--orca-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Orca); once = true; },
+            "--damm-v2-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::DammV2); once = true; },
             "--completion-limit" => {
                 let count: usize = args.next()
                     .context("--completion-limit requires a positive number")?
@@ -57,11 +68,15 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --stability-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
         }
     }
-    ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live)),
+    ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live || rest_discovery_live)),
         "--rpc-live is an exclusive RPC transport check");
+    ensure!(!((rest_discovery_live || rest_source_only.is_some()) && (completion_live || graph_live || persistence_write_live
+        || persistence_restore_live || stability_live || rpc_live || jupiter_only || completion_limit.is_some()
+        || (rest_discovery_live && rest_source_only.is_some()))),
+        "--rest-discovery-live is an API-only checkpoint with optional --pages");
     ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
     ensure!(!(stability_live && (completion_live || graph_live || persistence_write_live
         || persistence_restore_live || rpc_live || jupiter_only || once)),
@@ -92,6 +107,8 @@ fn settings() -> Result<Cli> {
         persistence_write_live,
         persistence_restore_live,
         stability_live,
+        rest_discovery_live,
+        rest_source_only,
     })
 }
 
@@ -161,18 +178,28 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
     )))
 }
 
-fn spawn_meteora(
+fn spawn_sources(
     tasks: &mut JoinSet<Result<()>>,
     settings: meteora_dlmm::Settings,
     completion: Option<(rpc_transport::RpcHandle, execution_completion::Settings)>,
     graph: Option<liquidity_graph::Settings>,
     initial_registry: Option<pool_registry::PoolRegistry>,
     persist: Option<persistence::Persistence>,
+    source_set: SourceSet,
+    strict_lag: bool,
 ) -> Result<()> {
-    let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
+    let source_capacity: usize = env::var("REST_BROADCAST_CAPACITY")
+        .unwrap_or_else(|_| "256".into()).parse().context("invalid REST_BROADCAST_CAPACITY")?;
+    let registry_capacity: usize = env::var("REGISTRY_BROADCAST_CAPACITY")
+        .unwrap_or_else(|_| "256".into()).parse().context("invalid REGISTRY_BROADCAST_CAPACITY")?;
+    ensure!((32..=65536).contains(&source_capacity) && (32..=65536).contains(&registry_capacity),
+        "REST/REGISTRY broadcast capacities must be 32..=65536");
+    println!("orchestration rest_sources={source_set:?} source_broadcast_capacity={} registry_broadcast_capacity={} fail_on_lag={strict_lag}",
+        source_capacity, registry_capacity);
+    let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(source_capacity);
     let registry_input = output.subscribe();
     let (registry_output, registry_observer) =
-        broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
+        broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(registry_capacity);
     let registry = initial_registry.unwrap_or_default();
     let completion_live = completion.is_some();
     let persistence_input = persist.as_ref().map(|_| registry_output.subscribe());
@@ -194,8 +221,8 @@ fn spawn_meteora(
         tasks.spawn(execution_completion::run(candidate_input, rpc, config, completion_output));
         Some(receiver)
     } else { None };
-    tasks.spawn(source_diagnostic::run(input));
-    tasks.spawn(pool_registry::observe_updates(registry_observer, completion_live));
+    tasks.spawn(source_diagnostic::run(input, strict_lag));
+    tasks.spawn(pool_registry::observe_updates(registry_observer, completion_live, strict_lag));
     // Seed restored, historically validated pool records before any fresh source.
     // All recipients are already subscribed; the SQL writer ignores Source batches.
     let restored = registry.snapshot();
@@ -212,8 +239,28 @@ fn spawn_meteora(
     if let Some(writer) = persist {
         tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
     }
-    tasks.spawn(pool_registry::run(registry_input, completion_input, registry, registry_output));
-    tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
+    tasks.spawn(pool_registry::run(registry_input, completion_input, registry, registry_output, strict_lag));
+    if matches!(source_set, SourceSet::Raydium | SourceSet::All) {
+        let rps: u32 = env::var("RAYDIUM_API_RPS")
+            .unwrap_or_else(|_| "10".into()).parse().context("invalid RAYDIUM_API_RPS")?;
+        tasks.spawn(raydium::run(core::http_client()?, output.clone(), raydium::Settings {
+            once: settings.once, max_pages: settings.max_pages, rps,
+        }));
+    }
+    if matches!(source_set, SourceSet::Orca | SourceSet::All) {
+        let rps: u32 = env::var("ORCA_API_RPS")
+            .unwrap_or_else(|_| "10".into()).parse().context("invalid ORCA_API_RPS")?;
+        tasks.spawn(orca::run(core::http_client()?, output.clone(), orca::Settings {
+            once: settings.once, max_pages: settings.max_pages, rps,
+        }));
+    }
+    if matches!(source_set, SourceSet::DammV2 | SourceSet::All) {
+        tasks.spawn(meteora_damm_v2::run(core::http_client()?, output.clone(),
+            meteora_damm_v2::Settings { once: settings.once, max_pages: settings.max_pages }));
+    }
+    if matches!(source_set, SourceSet::Dlmm | SourceSet::All) {
+        tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
+    }
     Ok(())
 }
 
@@ -223,7 +270,7 @@ fn spawn_jupiter(
     mints: Arc<[Pubkey]>,
 ) -> watch::Sender<Arc<[Pubkey]>> {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
-    tasks.spawn(source_diagnostic::run(input));
+    tasks.spawn(source_diagnostic::run(input, false));
 
     let (input_tx, input_rx) = watch::channel(mints);
     // Independent client: the shared HTTP client applies Meteora's 20-second limit.
@@ -293,8 +340,8 @@ pub async fn run() -> Result<()> {
             println!("orchestration stability-live continuous_source=true pages={:?} one_time_completion_limit={} postgres=true graph=true",
                 cli.meteora.max_pages, completion.limit);
         }
-        spawn_meteora(&mut tasks, cli.meteora,
-            Some((rpc.clone(), completion)), graph, registry, writer)?;
+        spawn_sources(&mut tasks, cli.meteora,
+            Some((rpc.clone(), completion)), graph, registry, writer, SourceSet::Dlmm, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
         tasks.spawn(async move { rpc_task.await? });
@@ -320,7 +367,13 @@ pub async fn run() -> Result<()> {
 
     let mut tasks = JoinSet::new();
     if !cli.jupiter_only {
-        spawn_meteora(&mut tasks, cli.meteora, None, None, None, None)?;
+        let source_set = cli.rest_source_only.unwrap_or(if cli.rest_discovery_live || !cli.meteora.once {
+            SourceSet::All
+        } else { SourceSet::Dlmm });
+        let fail_on_lag = cli.rest_discovery_live || cli.rest_source_only.is_some()
+            || env::var("REST_FAIL_ON_LAG").ok().as_deref() == Some("true");
+        spawn_sources(&mut tasks, cli.meteora, None, None, None, None,
+            source_set, fail_on_lag)?;
     }
 
     // Keep the provisional watch sender alive until a real input worker takes over.
