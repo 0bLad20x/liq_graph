@@ -543,11 +543,15 @@ async fn ws_session(
                     if update.is_err(){return Ok(());}
                     desired=targets.borrow().iter().copied().collect();
                 }
-                incoming=timeout(Duration::from_millis(timeout_ms),ws.next())=>{
+                _=sleep(Duration::from_millis(timeout_ms)), if !pending.is_empty()=>{
+                    emit(&events,WsEvent::Gap{provider:name.clone(),reason:"subscribe_ack_timeout"});
+                    break 'connected;
+                }
+                incoming=ws.next()=>{
                     let message=match incoming {
-                        Ok(Some(Ok(Message::Text(text))))=>text,
-                        Ok(Some(Ok(Message::Ping(_))))|Ok(Some(Ok(Message::Pong(_))))=>continue,
-                        Ok(Some(Ok(_)))=>continue,
+                        Some(Ok(Message::Text(text)))=>text,
+                        Some(Ok(Message::Ping(_)))|Some(Ok(Message::Pong(_)))=>continue,
+                        Some(Ok(_))=>continue,
                         _=>break 'connected,
                     };
                     let value:Value=match serde_json::from_str(&message) {
