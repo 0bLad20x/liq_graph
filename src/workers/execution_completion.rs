@@ -289,6 +289,133 @@ async fn read(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>) ->
     Ok(ReadBatch { slot, accounts })
 }
 
+
+#[derive(Clone)]
+enum MintObservation {
+    Verified(MintProof),
+    Invalid(String),
+    Unavailable(String),
+}
+
+/// Mint account ownership proves SPL vs Token-2022 independently of LbPair flags.
+fn decode_mint(account: &AccountData) -> Result<MintProof> {
+    let spl: Pubkey = SPL_TOKEN.parse()?;
+    let token_2022: Pubkey = TOKEN_2022.parse()?;
+    ensure!(account.view == AccountView::Full, "mint account must be a full RPC read");
+    let is_token_2022 = if account.owner == spl { false }
+        else if account.owner == token_2022 { true }
+        else { bail!("Mint has unexpected token program owner {}", account.owner); };
+    let data = &account.bytes;
+    ensure!(data.len() >= 82 && data[45] == 1, "Mint base layout or initialized flag invalid");
+    let mut extensions = Vec::new();
+    if is_token_2022 && data.len() > 82 {
+        ensure!(data[82] == 1, "Token-2022 account type is not Mint");
+        let mut offset = 83;
+        while offset < data.len() {
+            let trailing = &data[offset..];
+            if trailing.iter().all(|byte| *byte == 0) { break; }
+            ensure!(trailing.len() >= 4, "truncated Token-2022 Mint extension header");
+            let kind = u16::from_le_bytes(trailing[0..2].try_into()?);
+            let size = usize::from(u16::from_le_bytes(trailing[2..4].try_into()?));
+            if kind == 0 && size == 0 {
+                ensure!(trailing[4..].iter().all(|byte| *byte == 0),
+                    "nonzero data after Token-2022 Mint TLV terminator");
+                break;
+            }
+            ensure!(kind != 0 && size <= trailing.len() - 4,
+                "invalid Token-2022 Mint extension type or size");
+            extensions.push(kind);
+            offset += 4 + size;
+        }
+    } else if !is_token_2022 {
+        ensure!(data.len() == 82, "SPL Mint account has unexpected length");
+    }
+    extensions.sort_unstable();
+    ensure!(!extensions.windows(2).any(|v|v[0] == v[1]),
+        "duplicate Token-2022 Mint extension");
+    // Public V10 documentation rejects transfer hooks and confidential transfers.
+    // NonTransferable mints cannot participate in a swap.
+    let unsupported = extensions.iter().copied()
+        .filter(|kind| matches!(kind, 4 | 9 | 14 | 16 | 24))
+        .collect();
+    Ok(MintProof { address: account.address, token_2022: is_token_2022,
+        extensions, unsupported })
+}
+
+fn mint_failure(pending: PendingMintValidation, status: CompletionStatus,
+    reason: impl Into<String>) -> CompletionResult {
+    CompletionResult { pool: pending.pool, status, validated_slot: Some(pending.slot),
+        manifest: None, reason: Some(reason.into()),
+        inventory: Some(Arc::new(pending.validated.inventory)), mints: None }
+}
+
+async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
+    pending: Vec<PendingMintValidation>, results: &mut Vec<CompletionResult>) {
+    if pending.is_empty() { return; }
+    let mut unique = HashSet::new();
+    let mut addresses = Vec::new();
+    let mut minimum_slot = 0_u64;
+    for item in &pending {
+        minimum_slot = minimum_slot.max(item.slot);
+        for mint in [item.validated.layout.mint_a, item.validated.layout.mint_b] {
+            if unique.insert(mint) { addresses.push(mint); }
+        }
+    }
+    let mut observed: HashMap<Pubkey, MintObservation> = HashMap::new();
+    for page in addresses.chunks(account_limit) {
+        match read(rpc, page.to_vec(), Some(minimum_slot)).await {
+            Ok(batch) => {
+                for (key, account) in page.iter().zip(batch.accounts) {
+                    let observation = match account {
+                        Some(a) => match decode_mint(&a) {
+                            Ok(proof) => MintObservation::Verified(proof),
+                            Err(error) => MintObservation::Invalid(error.to_string()),
+                        },
+                        None => MintObservation::Unavailable("Mint account missing".to_owned()),
+                    };
+                    observed.insert(*key, observation);
+                }
+            }
+            Err(error) => {
+                for mint in page {
+                    observed.insert(*mint, MintObservation::Unavailable(format!(
+                        "Mint RPC read failed: {error:#}")));
+                }
+            }
+        }
+    }
+    for item in pending {
+        let layout = &item.validated.layout;
+        let check = (|| -> std::result::Result<[MintProof; 2], (CompletionStatus, String)> {
+            let mut proofs = Vec::new();
+            for (key, expected_2022) in [(layout.mint_a, layout.token_2022_a),
+                (layout.mint_b, layout.token_2022_b)] {
+                match observed.get(&key) {
+                    Some(MintObservation::Verified(proof)) => {
+                        if proof.token_2022 != expected_2022 {
+                            return Err((CompletionStatus::Incomplete, format!(
+                                "mint {key} Token-2022 owner differs from LbPair flag expected={expected_2022} actual={}",
+                                proof.token_2022)));
+                        }
+                        proofs.push(proof.clone());
+                    }
+                    Some(MintObservation::Invalid(reason)) =>
+                        return Err((CompletionStatus::Incomplete, format!("mint {key}: {reason}"))),
+                    Some(MintObservation::Unavailable(reason)) =>
+                        return Err((CompletionStatus::Retryable, format!("mint {key}: {reason}"))),
+                    None => return Err((CompletionStatus::Retryable,
+                        format!("mint {key} RPC response missing"))),
+                }
+            }
+            Ok([proofs.remove(0), proofs.remove(0)])
+        })();
+        match check {
+            Ok(mints) => results.push(prepared(item.pool, item.slot, item.validated, mints)),
+            Err((status, reason)) => results.push(mint_failure(item, status, reason)),
+        }
+    }
+}
+
 fn retryable(pool: Pubkey, reason: impl Into<String>) -> CompletionResult {
     CompletionResult { pool, status: CompletionStatus::Retryable, validated_slot: None,
         manifest: None, reason: Some(reason.into()), inventory: None, mints: None }
@@ -373,6 +500,7 @@ async fn process(rpc: &RpcHandle, candidates: &[PoolState], settings: Settings)
     };
     // Initial LbPairs share one RPC context per bounded batch.
     let mut plans = Vec::new();
+    let mut validated_for_mints = Vec::new();
     for group in candidates.chunks(settings.account_batch_size) {
         let keys: Vec<_> = group.iter().map(|pool| pool.address).collect();
         let first = match read(rpc, keys, None).await {
@@ -392,17 +520,10 @@ async fn process(rpc: &RpcHandle, candidates: &[PoolState], settings: Settings)
             };
             match decode_pool(&account, pool, &owner) {
                 Ok(layout) => {
-                    let center = layout.active_id.div_euclid(70);
-                    let initial_indices = bitmap_indices(&layout, None);
-                    let needs_extension = match initial_indices {
-                        Ok(indices) => select_indices(&indices, center, settings.below, settings.above).len()
-                            < 1 + settings.below + settings.above,
-                        Err(_) => true,
-                    };
-                    if needs_extension {
-                        wanted_extensions.push((initial.len(),
-                            pda(pool.address, b"bitmap", None, &owner)));
-                    }
+                    // Read the extension for every pool: the inventory must cover all initialized
+                    // arrays, even when the requested execution window is already satisfied.
+                    wanted_extensions.push((initial.len(),
+                        pda(pool.address, b"bitmap", None, &owner)));
                     initial.push((pool.clone(), layout, None::<AccountData>));
                 }
                 Err(err) => results.push(retryable(pool.address, format!("LbPair decode: {err:#}"))),
@@ -482,12 +603,16 @@ async fn process(rpc: &RpcHandle, candidates: &[PoolState], settings: Settings)
             offset += count;
             let checked = validate(plan, accounts, batch.slot, &owner);
             match checked {
-                Ok(manifest) => results.push(prepared(plan.candidate.address, batch.slot, manifest)),
+                Ok(validated) => validated_for_mints.push(PendingMintValidation {
+                    pool: plan.candidate.address, slot: batch.slot, validated,
+                }),
                 Err(err) => results.push(retryable(plan.candidate.address,
                     format!("DLMM validation: {err:#}"))),
             }
         }
     }
+    complete_mint_verification(rpc, settings.account_batch_size,
+        validated_for_mints, &mut results).await;
     results
 }
 
