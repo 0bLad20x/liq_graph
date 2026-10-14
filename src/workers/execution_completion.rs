@@ -55,6 +55,7 @@ pub struct BinArrayRef {
 
 #[derive(Clone, Debug)]
 pub struct BinArrayInventory {
+    pub registry_tvl_usd: Option<f64>,
     pub active_id: i32,
     pub active_array_index: i32,
     pub internal_initialized: usize,
@@ -652,6 +653,7 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
         }
     }
     let inventory = BinArrayInventory {
+        registry_tvl_usd: plan.candidate.tvl_usd,
         active_id: latest.active_id,
         active_array_index: latest.active_id.div_euclid(70),
         internal_initialized: latest.bitmap.iter().map(|byte| byte.count_ones() as usize).sum(),
@@ -728,8 +730,8 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                 for result in &batch.results {
                     results += 1;
                     if let Some(inventory) = &result.inventory {
-                        println!("execution inventory pool={} active_bin={} active_array={} internal_bitmap_bits={} extension_bitmap_bits={} bitmap_extension_present={} initialized={} selected={:?} validated={:?} initialized_addresses={:?}",
-                            result.pool, inventory.active_id, inventory.active_array_index,
+                        println!("execution inventory pool={} registry_tvl_usd={:?} active_bin={} active_array={} internal_bitmap_bits={} extension_bitmap_bits={} bitmap_extension_present={} initialized={} selected={:?} validated={:?} initialized_addresses={:?}",
+                            result.pool, inventory.registry_tvl_usd, inventory.active_id, inventory.active_array_index,
                             inventory.internal_initialized, inventory.extension_initialized,
                             inventory.extension_present, inventory.initialized.len(),
                             inventory.selected_indices, inventory.validated_indices,
