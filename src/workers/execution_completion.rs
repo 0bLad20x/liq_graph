@@ -1,7 +1,7 @@
 //! DLMM execution completion: registry candidate -> RPC account observations -> V10 manifest.
 //! No persistence, no writes to Pool Registry, and no hidden RPC clients.
 
-use std::{collections::HashSet, env, sync::Arc};
+use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
 use tokio::sync::broadcast;
@@ -16,6 +16,8 @@ use crate::{
 
 const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const MEMO: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const POOL_DISC: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
 const ARRAY_DISC: [u8; 8] = [92, 142, 92, 220, 5, 148, 70, 181];
 const BITMAP_DISC: [u8; 8] = [80, 111, 124, 113, 55, 237, 18, 5];
@@ -46,12 +48,42 @@ pub struct ExecutionManifest {
 }
 
 #[derive(Clone, Debug)]
+pub struct BinArrayRef {
+    pub index: i32,
+    pub address: Pubkey,
+}
+
+#[derive(Clone, Debug)]
+pub struct BinArrayInventory {
+    pub active_id: i32,
+    pub active_array_index: i32,
+    pub internal_initialized: usize,
+    pub extension_initialized: usize,
+    pub extension_present: bool,
+    /// The complete initialized array-address inventory represented by the fetched bitmaps.
+    pub initialized: Arc<[BinArrayRef]>,
+    pub selected_indices: Vec<i32>,
+    pub validated_indices: Vec<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MintProof {
+    pub address: Pubkey,
+    pub token_2022: bool,
+    /// Verified Token-2022 Mint TLV extension type identifiers.
+    pub extensions: Vec<u16>,
+    pub unsupported: Vec<u16>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CompletionResult {
     pub pool: Pubkey,
     pub status: CompletionStatus,
     pub validated_slot: Option<u64>,
     pub manifest: Option<Arc<ExecutionManifest>>,
     pub reason: Option<String>,
+    pub inventory: Option<Arc<BinArrayInventory>>,
+    pub mints: Option<[MintProof; 2]>,
 }
 
 #[derive(Debug)]
@@ -259,18 +291,37 @@ async fn read(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>) ->
 
 fn retryable(pool: Pubkey, reason: impl Into<String>) -> CompletionResult {
     CompletionResult { pool, status: CompletionStatus::Retryable, validated_slot: None,
-        manifest: None, reason: Some(reason.into()) }
+        manifest: None, reason: Some(reason.into()), inventory: None, mints: None }
 }
 
-fn prepared(pool: Pubkey, slot: u64, manifest: Option<ExecutionManifest>) -> CompletionResult {
-    let status = if manifest.is_some() { CompletionStatus::Prepared }
-        else { CompletionStatus::Incomplete };
-    CompletionResult { pool, status, validated_slot: Some(slot),
-        manifest: manifest.map(Arc::new),
-        reason: if status == CompletionStatus::Incomplete {
-            Some("no bitmap-initialized BinArrays in execution window".to_owned())
-        } else { None },
+fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]) -> CompletionResult {
+    let unsupported: Vec<String> = mints.iter().filter(|mint| !mint.unsupported.is_empty())
+        .map(|mint| format!("{}:{:?}", mint.address, mint.unsupported)).collect();
+    let reason = if !unsupported.is_empty() {
+        Some(format!("V10 unsupported Token-2022 mint extensions: {}", unsupported.join(", ")))
+    } else if validated.manifest.is_none() {
+        Some(format!("no bitmap-initialized BinArrays in execution window; internal={} extension={} selected={} validated={}",
+            validated.inventory.internal_initialized, validated.inventory.extension_initialized,
+            validated.inventory.selected_indices.len(), validated.inventory.validated_indices.len()))
+    } else { None };
+    let status = if reason.is_some() { CompletionStatus::Incomplete } else { CompletionStatus::Prepared };
+    CompletionResult {
+        pool, status, validated_slot: Some(slot),
+        manifest: if status == CompletionStatus::Prepared { validated.manifest.map(Arc::new) } else { None },
+        reason, inventory: Some(Arc::new(validated.inventory)), mints: Some(mints),
     }
+}
+
+struct Validated {
+    layout: PoolLayout,
+    inventory: BinArrayInventory,
+    manifest: Option<ExecutionManifest>,
+}
+
+struct PendingMintValidation {
+    pool: Pubkey,
+    slot: u64,
+    validated: Validated,
 }
 
 struct Plan {
@@ -441,7 +492,7 @@ async fn process(rpc: &RpcHandle, candidates: &[PoolState], settings: Settings)
 }
 
 fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
-    owner: &Pubkey) -> Result<Option<ExecutionManifest>> {
+    owner: &Pubkey) -> Result<Validated> {
     ensure!(accounts.len() == plan.addresses.len(), "DLMM validation cardinality mismatch");
     ensure!(slot >= plan.first_slot, "DLMM final context slot is stale");
     let current = accounts[0].as_ref().context("LbPair missing on final read")?;
@@ -459,22 +510,39 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
             "planning bitmap changed or disappeared before validation");
     }
 
+    let all_indices = bitmap_indices(&latest, bitmap)?;
     let mut arrays = Vec::new();
+    let mut validated_indices = Vec::new();
     for (i, index) in plan.indices.iter().copied().enumerate() {
         let initialized = is_initialized(&latest, bitmap, index)?;
         match (initialized, accounts.get(i + 2).and_then(Option::as_ref)) {
             (true, Some(account)) => {
                 validate_array(account, latest.address, index, owner)?;
                 arrays.push(account.address);
+                validated_indices.push(index);
             }
             (true, None) => bail!("initialized BinArray index {index} missing"),
             (false, Some(account)) => validate_array(account, latest.address, index, owner)?,
             (false, None) => (),
         }
     }
-    if arrays.is_empty() {return Ok(None);}
-    let bitmap_key = bitmap.map(|b| b.address);
-    Ok(Some(manifest(&latest, slot, &arrays, bitmap_key, *owner)?))
+    let inventory = BinArrayInventory {
+        active_id: latest.active_id,
+        active_array_index: latest.active_id.div_euclid(70),
+        internal_initialized: latest.bitmap.iter().map(|byte| byte.count_ones() as usize).sum(),
+        extension_initialized: bitmap.map_or(0, |b|
+            b.bytes[40..].iter().map(|byte| byte.count_ones() as usize).sum()),
+        extension_present: bitmap.is_some(),
+        initialized: Arc::from(all_indices.iter().copied().map(|index| BinArrayRef {
+            index, address: pda(latest.address, b"bin_array", Some(index), owner),
+        }).collect::<Vec<_>>()),
+        selected_indices: plan.indices.clone(),
+        validated_indices,
+    };
+    let manifest = if arrays.is_empty() { None } else {
+        Some(manifest(&latest, slot, &arrays, bitmap.map(|b| b.address), *owner)?)
+    };
+    Ok(Validated {layout: latest, inventory, manifest})
 }
 
 /// Standalone consumer of Registry's typed change stream. Never reads private Registry state.
