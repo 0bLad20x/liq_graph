@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{jupiter_search, meteora_dlmm, source_diagnostic}};
+use crate::{core, workers::{jupiter_search, meteora_dlmm, pool_registry, source_diagnostic}};
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
@@ -111,7 +111,14 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
 
 fn spawn_meteora(tasks: &mut JoinSet<Result<()>>, settings: meteora_dlmm::Settings) -> Result<()> {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
+    let registry_input = output.subscribe();
+    let (registry_output, registry_observer) =
+        broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
+    let registry = pool_registry::PoolRegistry::default();
+
     tasks.spawn(source_diagnostic::run(input));
+    tasks.spawn(pool_registry::observe_updates(registry_observer));
+    tasks.spawn(pool_registry::run(registry_input, registry, registry_output));
     tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
     Ok(())
 }
