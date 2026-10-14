@@ -3,7 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use solana_pubkey::Pubkey;
@@ -21,8 +21,6 @@ const PAGE_SIZE: u32 = 1000;
 const MAX_IN_FLIGHT: usize = 8;
 const MIN_REQUEST_SPACING: Duration = Duration::from_millis(34);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-const MAX_ATTEMPTS: u32 = 5;
-const RESTART_DELAY: Duration = Duration::from_secs(30);
 
 pub struct Settings {
     pub once: bool,
@@ -71,7 +69,7 @@ async fn fetch_with_retry(
     gate: Arc<Mutex<Instant>>,
     page: u32,
 ) -> Result<Page> {
-    for attempt in 1..=MAX_ATTEMPTS {
+    loop {
         let mut next = gate.lock().await;
         sleep_until(*next).await;
         *next = Instant::now() + MIN_REQUEST_SPACING;
@@ -79,25 +77,20 @@ async fn fetch_with_retry(
 
         match fetch_page(&client, page).await {
             Ok(result) => return Ok(result),
-            Err(error) if attempt == MAX_ATTEMPTS => {
-                return Err(error).with_context(|| format!(
-                    "Meteora page {page} failed after {MAX_ATTEMPTS} attempts"
-                ));
-            }
             Err(error) => {
-                eprintln!("meteora page={page} retry={attempt} error={error:#}");
+                eprintln!("meteora page={page} retry error={error:#}");
                 sleep(RETRY_DELAY).await;
             }
         }
     }
-    bail!("Meteora retry loop ended unexpectedly")
 }
 
-/// Broadcast never waits for a consumer. A slow consumer may lag and lose records.
-fn publish(records: Vec<Box<RawValue>>, output: &broadcast::Sender<SourceRecord>) -> Result<(usize, usize)> {
-    let count = records.len();
-    let mut without_subscribers = 0;
-
+/// One broadcast per API page. Consumers receive a shared immutable batch.
+fn publish(
+    records: Vec<Box<RawValue>>,
+    output: &broadcast::Sender<Arc<Vec<SourceRecord>>>,
+) -> Result<(usize, usize)> {
+    let mut batch = Vec::with_capacity(records.len());
     for raw in records {
         let pool: PoolAddress<'_> = serde_json::from_str(raw.get())
             .context("Meteora pool has no readable address")?;
@@ -105,22 +98,21 @@ fn publish(records: Vec<Box<RawValue>>, output: &broadcast::Sender<SourceRecord>
             .context("Meteora pool address is invalid")?;
         ensure!(address != Pubkey::default(), "Meteora pool address is zero");
 
-        let message = SourceRecord {
+        batch.push(SourceRecord {
             source: SOURCE,
             kind: RecordKind::Pool,
             address,
             payload: Arc::from(raw.get().as_bytes()),
-        };
-        if output.send(message).is_err() {
-            without_subscribers += 1;
-        }
+        });
     }
+    let count = batch.len();
+    let without_subscribers = usize::from(output.send(Arc::new(batch)).is_err());
     Ok((count, without_subscribers))
 }
 
 pub async fn run(
     client: reqwest::Client,
-    output: broadcast::Sender<SourceRecord>,
+    output: broadcast::Sender<Arc<Vec<SourceRecord>>>,
     settings: Settings,
 ) -> Result<()> {
     let gate = Arc::new(Mutex::new(Instant::now()));
@@ -157,12 +149,11 @@ pub async fn run(
         }
 
         eprintln!(
-            "meteora source pages={scanned}/{total_pages} records={records} without_subscribers={without_subscribers} elapsed_ms={}",
+            "meteora source pages={scanned}/{total_pages} records={records} unconsumed_batches={without_subscribers} elapsed_ms={}",
             started.elapsed().as_millis()
         );
         if settings.once {
             return Ok(());
         }
-        sleep(RESTART_DELAY).await;
     }
 }
