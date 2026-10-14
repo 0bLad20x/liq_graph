@@ -1,0 +1,384 @@
+//! V10 liquidity graph: typed Registry updates -> immutable group catalog and inverted indices.
+//! No RPC, database, protocol-account interpretation, signal producer, or transaction building.
+
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    hint::black_box,
+    mem::size_of,
+    sync::Arc,
+    time::Instant,
+};
+
+use anyhow::{Context, Result, ensure};
+use solana_pubkey::Pubkey;
+use tokio::sync::{broadcast, watch};
+
+use crate::workers::pool_registry::{CompletionState, PoolState, PoolUpdateBatch};
+
+const WSOL: &str = "So11111111111111111111111111111111111111112";
+const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const V10_MAX_DECLARATIONS: usize = 16;
+
+type Pair = (Pubkey, Pubkey);
+
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
+    /// None means no economic TVL cutoff; readiness is always mandatory.
+    pub min_tvl_usd: Option<f64>,
+}
+
+impl Settings {
+    pub fn from_env() -> Result<Self> {
+        let min_tvl_usd = env::var("GRAPH_MIN_TVL_USD")
+            .ok()
+            .map(|value| value.parse::<f64>().context("invalid GRAPH_MIN_TVL_USD"))
+            .transpose()?;
+        if let Some(value) = min_tvl_usd {
+            ensure!(value.is_finite() && value >= 0.0, "GRAPH_MIN_TVL_USD must be nonnegative and finite");
+        }
+        Ok(Self { min_tvl_usd })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GroupKind { Direct, Bridge }
+
+/// V10-compatible role template, NOT a packed instruction. Pools in each role are
+/// alternatives and can exceed the 16-declaration instruction cap. The eventual
+/// execution adapter must pack a valid subset, maximum four groups / 16 declarations.
+#[derive(Clone, Debug)]
+pub struct Group {
+    pub settlement: Pubkey,
+    pub target: Pubkey,
+    pub bridge: Option<Pubkey>,
+    pub intermediate: Option<Pubkey>,
+    pub conversion: Option<Pubkey>,
+    pub direct_s: Arc<[Pubkey]>,
+    /// Only applicable to direct-only groups using Q/S conversion.
+    pub direct_q: Arc<[Pubkey]>,
+    /// B/S without conversion, B/Q when conversion is present.
+    pub bridge_pools: Arc<[Pubkey]>,
+    pub kind: GroupKind,
+    /// Number of ordered, distinct-pool trade paths represented by this role template.
+    pub route_options: u64,
+}
+
+impl Group {
+    fn declarations(&self) -> usize {
+        self.direct_s.len() + self.direct_q.len() + self.bridge_pools.len()
+            + usize::from(self.intermediate.is_some())
+            + usize::from(self.conversion.is_some())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreparedPool {
+    address: Pubkey,
+    a: Pubkey,
+    b: Pubkey,
+    tvl_usd: Option<f64>,
+    slot: u64,
+}
+
+fn eligible(pool: &PoolState, min_tvl_usd: Option<f64>) -> Option<PreparedPool> {
+    let (Some(a), Some(b), Some(slot), Some(manifest)) =
+        (pool.mint_a, pool.mint_b, pool.completion_validated_slot,
+         pool.execution_manifest.as_ref()) else { return None };
+    if pool.completion_state != CompletionState::Prepared || a == b
+        || a == Pubkey::default() || b == Pubkey::default()
+        || manifest.pool != pool.address || manifest.mint_a != a
+        || manifest.mint_b != b || manifest.validated_slot != slot
+        || manifest.base_a.is_empty() || manifest.base_b.is_empty() {
+        return None;
+    }
+    if let Some(threshold) = min_tvl_usd {
+        if !pool.tvl_usd.is_some_and(|v| v.is_finite() && v >= threshold) {
+            return None;
+        }
+    }
+    Some(PreparedPool { address: pool.address, a, b, tvl_usd: pool.tvl_usd, slot })
+}
+
+fn pair(a: Pubkey, b: Pubkey) -> Pair {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+fn pools_for(pairs: &HashMap<Pair, Arc<[Pubkey]>>, a: Pubkey, b: Pubkey) -> Arc<[Pubkey]> {
+    pairs.get(&pair(a, b)).cloned().unwrap_or_else(|| Arc::from([]))
+}
+
+fn route_count(direct: usize, bridge: usize) -> u64 {
+    2_u64.saturating_mul(direct as u64).saturating_mul(bridge as u64)
+}
+
+/// A generation owns every index; IDs must never cross generation boundaries.
+#[derive(Debug, Default)]
+pub struct GraphSnapshot {
+    pub generation: u64,
+    pub qualified_pools: usize,
+    pub mint_pairs: usize,
+    pub groups: Vec<Group>,
+    pub token_index: HashMap<Pubkey, Vec<u32>>,
+    pub pool_index: HashMap<Pubkey, Vec<u32>>,
+    pub route_options: u64,
+    pub role_pool_refs: usize,
+    pub approx_index_bytes: usize,
+}
+
+impl GraphSnapshot {
+    pub fn for_token(&self, mint: Pubkey) -> &[u32] {
+        self.token_index.get(&mint).map_or(&[], Vec::as_slice)
+    }
+    pub fn for_pool(&self, pool: Pubkey) -> &[u32] {
+        self.pool_index.get(&pool).map_or(&[], Vec::as_slice)
+    }
+    pub fn group(&self, id: u32) -> Option<&Group> {
+        self.groups.get(id as usize)
+    }
+}
+
+fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<GraphSnapshot> {
+    let mut edge_count = 0_usize;
+    let mut pairs: HashMap<Pair, Vec<Pubkey>> = HashMap::new();
+    for p in pools {
+        pairs.entry(pair(p.a, p.b)).or_default().push(p.address);
+        edge_count += 1;
+    }
+    let mut adjacency: HashMap<Pubkey, HashSet<Pubkey>> = HashMap::new();
+    let pair_map: HashMap<Pair, Arc<[Pubkey]>> = pairs.into_iter().map(|((a,b),mut list)| {
+        list.sort_unstable();
+        adjacency.entry(a).or_default().insert(b);
+        adjacency.entry(b).or_default().insert(a);
+        ((a,b), Arc::from(list))
+    }).collect();
+
+    let wsol: Pubkey = WSOL.parse()?;
+    let usdc: Pubkey = USDC.parse()?;
+    let settlements = [(wsol, usdc), (usdc, wsol)];
+    let mut groups: Vec<Group> = Vec::new();
+
+    for (s, q) in settlements {
+        let mut targets: Vec<_> = adjacency.get(&s).into_iter()
+            .flat_map(|neighbors| neighbors.iter().copied()).collect();
+        targets.sort_unstable();
+        for t in targets {
+            if t == s { continue; }
+            let direct_s = pools_for(&pair_map, t, s);
+            if direct_s.len() >= 2 {
+                let n = direct_s.len() as u64;
+                groups.push(Group {
+                    settlement:s, target:t, bridge:None, intermediate:None, conversion:None,
+                    direct_s:direct_s.clone(), direct_q:Arc::from([]),
+                    bridge_pools:Arc::from([]), kind:GroupKind::Direct,
+                    route_options:n.saturating_mul(n-1),
+                });
+            }
+
+            // Direct-only with Q/S conversion: one or more T/S and T/Q candidates.
+            // Distinct pool pairs guarantee no same pool reused on any trade path.
+            if t != q {
+                let direct_q = pools_for(&pair_map, t, q);
+                if !direct_q.is_empty() {
+                    let conversions = pools_for(&pair_map, q, s);
+                    for conversion in conversions.iter().copied() {
+                        groups.push(Group {
+                            settlement:s, target:t, bridge:None, intermediate:None,
+                            conversion:Some(conversion), direct_s:direct_s.clone(),
+                            direct_q:direct_q.clone(), bridge_pools:Arc::from([]),
+                            kind:GroupKind::Direct,
+                            route_options: route_count(direct_s.len(), direct_q.len())
+                                .saturating_add((direct_s.len() as u64)
+                                    .saturating_mul(direct_s.len().saturating_sub(1) as u64)),
+                        });
+                    }
+                }
+            }
+
+            // Bridge groups have exactly one T/B intermediate pool per group.
+            let mut bridges: Vec<_> = adjacency.get(&t).into_iter()
+                .flat_map(|neighbors| neighbors.iter().copied())
+                .filter(|b| *b != s && *b != t).collect();
+            bridges.sort_unstable();
+            for b in bridges {
+                let intermediate = pools_for(&pair_map, t, b);
+                let return_s = pools_for(&pair_map, b, s);
+                if !return_s.is_empty() {
+                    for middle in intermediate.iter().copied() {
+                        groups.push(Group {
+                            settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
+                            conversion:None, direct_s:direct_s.clone(), direct_q:Arc::from([]),
+                            bridge_pools:return_s.clone(), kind:GroupKind::Bridge,
+                            route_options:route_count(direct_s.len(), return_s.len()),
+                        });
+                    }
+                }
+                // With Q/S conversion, both T and B must differ from Q.
+                if t != q && b != q {
+                    let return_q = pools_for(&pair_map, b, q);
+                    if return_q.is_empty() { continue; }
+                    let conversions = pools_for(&pair_map, q, s);
+                    for middle in intermediate.iter().copied() {
+                        for conversion in conversions.iter().copied() {
+                            groups.push(Group {
+                                settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
+                                conversion:Some(conversion), direct_s:direct_s.clone(),
+                                direct_q:Arc::from([]), bridge_pools:return_q.clone(),
+                                kind:GroupKind::Bridge,
+                                route_options:route_count(direct_s.len(), return_q.len()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    groups.sort_unstable_by_key(|g| {
+        (g.settlement, g.target, g.kind, g.bridge, g.intermediate, g.conversion)
+    });
+    ensure!(groups.len() <= u32::MAX as usize, "V10 group count exceeds u32 index capacity");
+
+    let mut token_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
+    let mut pool_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
+    let mut routes = 0_u64;
+    let mut refs = 0_usize;
+    for (index, g) in groups.iter().enumerate() {
+        let id = index as u32;
+        let mut tokens = vec![g.settlement, g.target];
+        if let Some(b) = g.bridge { tokens.push(b); }
+        if g.conversion.is_some() { tokens.push(if g.settlement == wsol { usdc } else { wsol }); }
+        tokens.sort_unstable();
+        tokens.dedup();
+        for mint in tokens { token_index.entry(mint).or_default().push(id); }
+        for address in g.direct_s.iter().chain(g.direct_q.iter())
+            .chain(g.bridge_pools.iter()).copied()
+            .chain(g.intermediate).chain(g.conversion) {
+            pool_index.entry(address).or_default().push(id);
+            refs += 1;
+        }
+        routes = routes.saturating_add(g.route_options);
+    }
+    // Each role list contains unique pools, and repeated role group references are intentional.
+    let index_items: usize = token_index.values().map(Vec::len).sum::<usize>()
+        + pool_index.values().map(Vec::len).sum::<usize>();
+    let approx = edge_count * size_of::<PreparedPool>()
+        + groups.len() * size_of::<Group>()
+        + refs * size_of::<Pubkey>()
+        + index_items * size_of::<u32>();
+    Ok(GraphSnapshot { generation, qualified_pools:edge_count,
+        mint_pairs:pair_map.len(), groups, token_index, pool_index,
+        route_options:routes, role_pool_refs:refs, approx_index_bytes:approx })
+}
+
+fn probe(snapshot: &GraphSnapshot) {
+    let mut samples: Vec<(bool,Pubkey)> = snapshot.token_index.keys()
+        .copied().take(32).map(|k|(true,k)).collect();
+    samples.extend(snapshot.pool_index.keys().copied().take(32).map(|k|(false,k)));
+    if samples.is_empty() {
+        println!("liquidity graph lookup skipped=no_qualified_v10_groups");
+        return;
+    }
+    let mut ns = Vec::with_capacity(4096);
+    let mut matched = 0_usize;
+    // This is a live-data measurement, not a synthetic test suite.
+    for i in 0..4096 {
+        let (token,key) = samples[i % samples.len()];
+        let started = Instant::now();
+        let ids = if token { snapshot.for_token(key) } else { snapshot.for_pool(key) };
+        matched += black_box(ids.len());
+        ns.push(started.elapsed().as_nanos() as u64);
+    }
+    ns.sort_unstable();
+    let pct = |numer:usize| ns[((ns.len()-1)*numer)/100];
+    println!("liquidity graph lookup generation={} samples={} matches={} p50_ns={} p95_ns={} p99_ns={} max_ns={}",
+        snapshot.generation,ns.len(),matched,pct(50),pct(95),pct(99),ns[ns.len()-1]);
+}
+
+/// A single owner consumes Registry changes. Publishing an Arc replaces the
+/// complete immutable generation atomically; no signal can read a partial catalog.
+pub async fn run(
+    mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
+    output: watch::Sender<Arc<GraphSnapshot>>,
+    settings: Settings,
+) -> Result<()> {
+    let mut prepared: HashMap<Pubkey, PreparedPool> = HashMap::new();
+    let mut changed_batches = 0_u64;
+    let mut observed = 0_usize;
+    let mut generation = 0_u64;
+    loop {
+        match input.recv().await {
+            Ok(batch) => {
+                observed += batch.pools.len();
+                let mut changes = 0_usize;
+                for pool in &batch.pools {
+                    let candidate = eligible(pool, settings.min_tvl_usd);
+                    match candidate {
+                        Some(p) => {
+                            if prepared.get(&p.address) != Some(&p) {
+                                prepared.insert(p.address, p);
+                                changes += 1;
+                            }
+                        }
+                        None => {
+                            if prepared.remove(&pool.address).is_some() { changes += 1; }
+                        }
+                    }
+                }
+                if changes == 0 { continue; }
+                generation = generation.checked_add(1).context("graph generation overflow")?;
+                let started = Instant::now();
+                let graph = Arc::new(build(prepared.values().copied(), generation)?);
+                let elapsed = started.elapsed();
+                let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
+                let bridge = graph.groups.len() - direct;
+                let oversized = graph.groups.iter()
+                    .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
+                println!("liquidity graph rebuild generation={} source={} changed_pools={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
+                    generation, batch.source, changes, graph.qualified_pools, graph.mint_pairs,
+                    graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
+                    oversized, graph.approx_index_bytes, elapsed.as_micros());
+                output.send_replace(graph);
+                changed_batches += 1;
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) =>
+                anyhow::bail!("liquidity graph lost {skipped} Registry update batches"),
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    let final_graph = output.borrow().clone();
+    println!("liquidity graph complete observed_pool_updates={} changed_batches={} generation={} prepared={} groups={}",
+        observed, changed_batches, final_graph.generation,
+        final_graph.qualified_pools,final_graph.groups.len());
+
+    // Evaluate economic thresholds on the identical, actually prepared pool set.
+    // Don't assert that a threshold predicts profit.
+    if settings.min_tvl_usd.is_none() && !prepared.is_empty() {
+        for threshold in [10.0_f64,100.0,1000.0] {
+            let started = Instant::now();
+            let graph = build(prepared.values().copied().filter(|p|
+                p.tvl_usd.is_some_and(|v|v>=threshold)), generation)?;
+            println!("liquidity graph scenario min_tvl_usd={} qualified={} groups={} trade_paths={} approx_index_bytes={} build_us={}",
+                threshold,graph.qualified_pools,graph.groups.len(),graph.route_options,
+                graph.approx_index_bytes,started.elapsed().as_micros());
+        }
+    }
+    Ok(())
+}
+
+/// Live consumer proves that the immutable RAM generation reaches a real reader.
+pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<()> {
+    let mut observed = 0_u64;
+    while input.changed().await.is_ok() {
+        let snapshot = input.borrow_and_update().clone();
+        observed += 1;
+        probe(&snapshot);
+        if let Some(group) = snapshot.groups.first() {
+            println!("liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={}",
+                snapshot.generation,snapshot.groups.len(),group.kind,group.settlement,group.target,
+                group.bridge,group.intermediate,group.conversion,group.direct_s.len(),
+                group.direct_q.len(),group.bridge_pools.len(),group.route_options);
+        }
+    }
+    println!("liquidity graph consumer complete generations={observed}");
+    Ok(())
+}
