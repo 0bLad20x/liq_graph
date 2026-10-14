@@ -110,7 +110,7 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
 }
 
 fn spawn_meteora(tasks: &mut JoinSet<Result<()>>, settings: meteora_dlmm::Settings) -> Result<()> {
-    let (output, input) = broadcast::channel::<core::SourceBatch>(32);
+    let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     tasks.spawn(source_diagnostic::run(input));
     tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
     Ok(())
@@ -121,7 +121,7 @@ fn spawn_jupiter(
     settings: jupiter_search::Settings,
     mints: Arc<[Pubkey]>,
 ) -> watch::Sender<Arc<[Pubkey]>> {
-    let (output, input) = broadcast::channel::<core::SourceBatch>(32);
+    let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     tasks.spawn(source_diagnostic::run(input));
 
     let (input_tx, input_rx) = watch::channel(mints);

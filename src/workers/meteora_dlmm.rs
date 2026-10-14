@@ -1,18 +1,19 @@
-//! Meteora DLMM API source: fetch, validate pagination, broadcast unchanged HTTP bytes.
-//! No pool decoding, individual allocations, normalization, or deduplication.
+//! Meteora DLMM API source: fetch, paginate, decode once and broadcast complete pool records.
+//! No market-state deduplication, selection, persistence or consumer-specific processing.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use bytes::Bytes;
-use serde::{Deserialize, de::IgnoredAny};
+use serde::Deserialize;
+use serde_json::Value;
+use solana_pubkey::Pubkey;
 use tokio::{
     sync::{Mutex, broadcast},
     task::JoinSet,
     time::{Instant, sleep, sleep_until},
 };
 
-use crate::core::{RecordKind, SourceBatch};
+use crate::core::{DataBatch, DataRecord, RecordIdentity, Venue, now_unix_ms};
 
 const URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SOURCE: &str = "meteora_dlmm_api";
@@ -30,13 +31,74 @@ pub struct Settings {
 struct PageEnvelope {
     current_page: u32,
     pages: u32,
-    data: Vec<IgnoredAny>,
+    data: Vec<Value>,
 }
 
 struct Page {
     pages: u32,
-    records: usize,
-    body: Bytes,
+    rejected: usize,
+    batch: DataBatch,
+}
+
+fn optional_mint(pool: &Value, pointer: &str) -> Option<Pubkey> {
+    pool.pointer(pointer)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+
+fn decode_pool(payload: Value) -> Result<DataRecord> {
+    let address: Pubkey = payload.pointer("/address")
+        .and_then(Value::as_str)
+        .context("DLMM pool missing address")?
+        .parse()
+        .context("invalid DLMM pool address")?;
+    ensure!(address != Pubkey::default(), "zero DLMM pool address");
+    let mint_a = optional_mint(&payload, "/token_x/address");
+    let mint_b = optional_mint(&payload, "/token_y/address");
+    Ok(DataRecord {
+        identity: RecordIdentity::Pool {
+            address, venue: Venue::MeteoraDlmm, mint_a, mint_b,
+        },
+        payload,
+    })
+}
+
+fn decode_page(body: &[u8], page: u32) -> Result<Page> {
+    let envelope: PageEnvelope = serde_json::from_slice(body)
+        .with_context(|| format!("invalid Meteora page {page} JSON envelope"))?;
+    ensure!(envelope.current_page == page, "Meteora page number mismatch");
+    ensure!(
+        envelope.pages >= page || (page == 1 && envelope.pages == 0 && envelope.data.is_empty()),
+        "Meteora page count inconsistent"
+    );
+    ensure!(
+        !envelope.data.is_empty() || (page == 1 && envelope.pages == 0),
+        "Meteora page unexpectedly empty"
+    );
+    ensure!(envelope.data.len() <= PAGE_SIZE as usize, "Meteora page size exceeded");
+
+    let mut records = Vec::with_capacity(envelope.data.len());
+    let mut rejected = 0_usize;
+    for pool in envelope.data {
+        match decode_pool(pool) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                rejected += 1;
+                eprintln!("meteora page={page} rejected_pool error={error:#}");
+            }
+        }
+    }
+    ensure!(!records.is_empty() || envelope.pages == 0,
+        "Meteora page contained no identifiable pools");
+    Ok(Page {
+        pages: envelope.pages.max(1),
+        rejected,
+        batch: DataBatch {
+            source: SOURCE,
+            received_at_ms: now_unix_ms()?,
+            records,
+        },
+    })
 }
 
 async fn fetch_page(client: &reqwest::Client, page: u32) -> Result<Page> {
@@ -49,23 +111,7 @@ async fn fetch_page(client: &reqwest::Client, page: u32) -> Result<Page> {
         .send().await?
         .error_for_status()?;
     let body = response.bytes().await?;
-    let envelope: PageEnvelope = serde_json::from_slice(&body)
-        .with_context(|| format!("invalid Meteora page {page} JSON envelope"))?;
-    ensure!(envelope.current_page == page, "Meteora page number mismatch");
-    ensure!(
-        envelope.pages >= page || (page == 1 && envelope.pages == 0 && envelope.data.is_empty()),
-        "Meteora page count inconsistent"
-    );
-    ensure!(
-        !envelope.data.is_empty() || (page == 1 && envelope.pages == 0),
-        "Meteora page unexpectedly empty"
-    );
-    ensure!(envelope.data.len() <= PAGE_SIZE as usize, "Meteora page size exceeded");
-    Ok(Page {
-        pages: envelope.pages.max(1),
-        records: envelope.data.len(),
-        body,
-    })
+    decode_page(&body, page)
 }
 
 /// One request-start limiter shared by concurrent pages and retries.
@@ -90,18 +136,14 @@ async fn fetch_with_retry(
     }
 }
 
-/// A batch is one whole API response; broadcast never waits for a receiver.
-fn publish(output: &broadcast::Sender<SourceBatch>, body: Bytes) -> bool {
-    output.send(SourceBatch {
-        source: SOURCE,
-        kind: RecordKind::Pool,
-        body,
-    }).is_ok()
+/// One decoded response is one broadcast message.
+fn publish(output: &broadcast::Sender<Arc<DataBatch>>, batch: DataBatch) -> bool {
+    output.send(Arc::new(batch)).is_ok()
 }
 
 pub async fn run(
     client: reqwest::Client,
-    output: broadcast::Sender<SourceBatch>,
+    output: broadcast::Sender<Arc<DataBatch>>,
     settings: Settings,
 ) -> Result<()> {
     let gate = Arc::new(Mutex::new(Instant::now()));
@@ -111,8 +153,9 @@ pub async fn run(
         let first = fetch_with_retry(client.clone(), gate.clone(), 1).await;
         let total_pages = first.pages;
         let pages = settings.max_pages.unwrap_or(total_pages).min(total_pages);
-        let mut records = first.records;
-        let mut unconsumed_batches = usize::from(!publish(&output, first.body));
+        let mut records = first.batch.records.len();
+        let mut rejected = first.rejected;
+        let mut unconsumed_batches = usize::from(!publish(&output, first.batch));
         let mut scanned = 1_u32;
 
         let mut pending = JoinSet::new();
@@ -128,14 +171,15 @@ pub async fn run(
             }
             if let Some(task) = pending.join_next().await {
                 let page = task.context("Meteora page task stopped unexpectedly")?;
-                records += page.records;
-                unconsumed_batches += usize::from(!publish(&output, page.body));
+                records += page.batch.records.len();
+                rejected += page.rejected;
+                unconsumed_batches += usize::from(!publish(&output, page.batch));
                 scanned += 1;
             }
         }
 
         eprintln!(
-            "meteora source pages={scanned}/{total_pages} records={records} unconsumed_batches={unconsumed_batches} elapsed_ms={}",
+            "meteora source pages={scanned}/{total_pages} decoded_pools={records} rejected_pools={rejected} unconsumed_batches={unconsumed_batches} elapsed_ms={}",
             started.elapsed().as_millis()
         );
         if settings.once {

@@ -1,9 +1,10 @@
-//! Jupiter Search: rotate a typed mint input and publish unmodified API responses.
+//! Jupiter Search: rotate a typed mint input, decode once, publish complete token records.
 //! All scheduling and request state belongs to this worker.
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+use serde_json::Value;
 use reqwest::Client;
 use solana_pubkey::Pubkey;
 use tokio::{
@@ -12,7 +13,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-use crate::core::{RecordKind, SourceBatch};
+use crate::core::{DataBatch, DataRecord, RecordIdentity, now_unix_ms};
 
 const SOURCE: &str = "jupiter_search";
 
@@ -31,7 +32,8 @@ struct Lane {
 }
 
 enum RequestOutcome {
-    Success(bytes::Bytes),
+    Success { batch: DataBatch, rejected: usize },
+    DecodeError(anyhow::Error),
     RateLimited(Option<String>),
     HttpError(reqwest::StatusCode),
     TransportError(reqwest::Error),
@@ -44,11 +46,34 @@ struct Completion {
     outcome: RequestOutcome,
 }
 
+fn decode_batch(body: &[u8]) -> Result<(DataBatch, usize)> {
+    let tokens: Vec<Value> = serde_json::from_slice(body)
+        .context("invalid Jupiter Search JSON token array")?;
+    let mut records = Vec::with_capacity(tokens.len());
+    let mut rejected = 0_usize;
+    for payload in tokens {
+        let address = payload.get("id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<Pubkey>().ok());
+        match address {
+            Some(address) if address != Pubkey::default() => records.push(DataRecord {
+                identity: RecordIdentity::Mint { address }, payload,
+            }),
+            _ => rejected += 1,
+        }
+    }
+    Ok((DataBatch {
+        source: SOURCE,
+        received_at_ms: now_unix_ms()?,
+        records,
+    }, rejected))
+}
+
 pub async fn run(
     client: Client,
     settings: Settings,
     mut input: watch::Receiver<Arc<[Pubkey]>>,
-    output: broadcast::Sender<SourceBatch>,
+    output: broadcast::Sender<Arc<DataBatch>>,
 ) -> Result<()> {
     ensure!(!settings.url.trim().is_empty(), "Jupiter Search URL missing");
     ensure!(!settings.api_keys.is_empty(), "Jupiter Search API keys missing");
@@ -130,7 +155,10 @@ pub async fn run(
                                 RequestOutcome::HttpError(status)
                             } else {
                                 match response.bytes().await {
-                                    Ok(body) => RequestOutcome::Success(body),
+                                    Ok(body) => match decode_batch(&body) {
+                                        Ok((batch, rejected)) => RequestOutcome::Success { batch, rejected },
+                                        Err(error) => RequestOutcome::DecodeError(error),
+                                    },
                                     Err(error) => RequestOutcome::BodyError(error),
                                 }
                             }
@@ -171,6 +199,10 @@ pub async fn run(
                         "jupiter source lane={} body_error={error}",
                         completion.lane
                     ),
+                    RequestOutcome::DecodeError(error) => eprintln!(
+                        "jupiter source lane={} decode_error={error:#}",
+                        completion.lane
+                    ),
                     RequestOutcome::RateLimited(retry_after) => eprintln!(
                         "jupiter source lane={} rate_limited retry_after={}",
                         completion.lane, retry_after.as_deref().unwrap_or("unspecified")
@@ -179,17 +211,13 @@ pub async fn run(
                         "jupiter source lane={} http_status={status}",
                         completion.lane
                     ),
-                    RequestOutcome::Success(body) => {
-                        let bytes = body.len();
-                        let delivered = output.send(SourceBatch {
-                            source: SOURCE,
-                            kind: RecordKind::Mint,
-                            body,
-                        }).is_ok();
+                    RequestOutcome::Success { batch, rejected } => {
+                        let records = batch.records.len();
+                        let delivered = output.send(Arc::new(batch)).is_ok();
                         published += 1;
                         eprintln!(
-                            "jupiter source lane={} requested={} bytes={} published={} subscriber={delivered}",
-                            completion.lane, completion.requested, bytes, published
+                            "jupiter source lane={} requested={} decoded_mints={} rejected_mints={} published={} subscriber={delivered}",
+                            completion.lane, completion.requested, records, rejected, published
                         );
                     }
                 }
