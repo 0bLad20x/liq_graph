@@ -78,7 +78,6 @@ struct PreparedPool {
     a: Pubkey,
     b: Pubkey,
     tvl_usd: Option<f64>,
-    slot: u64,
 }
 
 fn eligible(pool: &PoolState, min_tvl_usd: Option<f64>) -> Option<PreparedPool> {
@@ -97,7 +96,7 @@ fn eligible(pool: &PoolState, min_tvl_usd: Option<f64>) -> Option<PreparedPool> 
             return None;
         }
     }
-    Some(PreparedPool { address: pool.address, a, b, tvl_usd: pool.tvl_usd, slot })
+    Some(PreparedPool { address: pool.address, a, b, tvl_usd: pool.tvl_usd })
 }
 
 fn pair(a: Pubkey, b: Pubkey) -> Pair {
@@ -331,10 +330,12 @@ pub async fn run(
                     let candidate = eligible(pool, settings.min_tvl_usd);
                     match candidate {
                         Some(p) => {
-                            if prepared.get(&p.address) != Some(&p) {
-                                prepared.insert(p.address, p);
-                                changes += 1;
-                            }
+                            // A TVL or manifest-slot refresh inside the same eligible class
+                            // must not rebuild unchanged topology and group roles.
+                            let same_edge = prepared.get(&p.address)
+                                .is_some_and(|old| old.a == p.a && old.b == p.b);
+                            prepared.insert(p.address, p);
+                            if !same_edge { changes += 1; }
                         }
                         None => {
                             if prepared.remove(&pool.address).is_some() { changes += 1; }
