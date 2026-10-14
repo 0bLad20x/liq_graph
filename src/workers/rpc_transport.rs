@@ -3,7 +3,7 @@
 //! No venue/account decoding beyond JSON-RPC and base64 transport framing.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::Duration,
