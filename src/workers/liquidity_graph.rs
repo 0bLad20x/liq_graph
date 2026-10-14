@@ -282,20 +282,33 @@ fn probe(snapshot: &GraphSnapshot) {
         println!("liquidity graph lookup skipped=no_qualified_v10_groups");
         return;
     }
-    let mut ns = Vec::with_capacity(4096);
+    let mut lookup_ns = Vec::with_capacity(4096);
+    let mut resolve_ns = Vec::with_capacity(4096);
     let mut matched = 0_usize;
-    // This is a live-data measurement, not a synthetic test suite.
+    // Real indexed addresses, including fetching up to four referenced templates.
+    // This is NOT the future 16-pool V10 instruction-packing benchmark.
     for i in 0..4096 {
         let (token,key) = samples[i % samples.len()];
         let started = Instant::now();
         let ids = if token { snapshot.for_token(key) } else { snapshot.for_pool(key) };
-        matched += black_box(ids.len());
-        ns.push(started.elapsed().as_nanos() as u64);
+        let looked_up = started.elapsed();
+        let resolved = ids.iter().take(4)
+            .filter_map(|id| snapshot.group(*id))
+            .map(|group| group.declarations())
+            .sum::<usize>();
+        matched += black_box(resolved);
+        lookup_ns.push(looked_up.as_nanos() as u64);
+        resolve_ns.push(started.elapsed().as_nanos() as u64);
     }
-    ns.sort_unstable();
-    let pct = |numer:usize| ns[((ns.len()-1)*numer)/100];
-    println!("liquidity graph lookup generation={} samples={} matches={} p50_ns={} p95_ns={} p99_ns={} max_ns={}",
-        snapshot.generation,ns.len(),matched,pct(50),pct(95),pct(99),ns[ns.len()-1]);
+    lookup_ns.sort_unstable();
+    resolve_ns.sort_unstable();
+    let percentile = |samples: &[u64], numer:usize| samples[((samples.len()-1)*numer)/100];
+    println!("liquidity graph lookup generation={} samples={} resolved_pool_refs={} lookup_p50_ns={} lookup_p95_ns={} lookup_p99_ns={} lookup_max_ns={} resolve4_p50_ns={} resolve4_p95_ns={} resolve4_p99_ns={} resolve4_max_ns={}",
+        snapshot.generation,lookup_ns.len(),matched,
+        percentile(&lookup_ns,50),percentile(&lookup_ns,95),
+        percentile(&lookup_ns,99),lookup_ns[lookup_ns.len()-1],
+        percentile(&resolve_ns,50),percentile(&resolve_ns,95),
+        percentile(&resolve_ns,99),resolve_ns[resolve_ns.len()-1]);
 }
 
 /// A single owner consumes Registry changes. Publishing an Arc replaces the
@@ -377,10 +390,12 @@ pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<(
         observed += 1;
         probe(&snapshot);
         if let Some(group) = snapshot.groups.first() {
-            println!("liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={}",
+            println!("liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={} direct_pool_samples={:?} bridge_pool_samples={:?}",
                 snapshot.generation,snapshot.groups.len(),group.kind,group.settlement,group.target,
                 group.bridge,group.intermediate,group.conversion,group.direct_s.len(),
-                group.direct_q.len(),group.bridge_pools.len(),group.route_options);
+                group.direct_q.len(),group.bridge_pools.len(),group.route_options,
+                group.direct_s.iter().take(3).collect::<Vec<_>>(),
+                group.bridge_pools.iter().take(3).collect::<Vec<_>>());
         }
     }
     println!("liquidity graph consumer complete generations={observed}");
