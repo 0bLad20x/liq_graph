@@ -14,6 +14,15 @@
 8. **CORE-ÄNDERUNG:** Nur bei tatsächlich benötigter neuer generischer Fähigkeit oder gemeinsamem Datenvertrag. Keine neuen Crates.
 9. **GRUNDSATZ:** Ein neuer Worker erweitert das System, ohne bestehende Worker oder deren Implementierungen ändern zu müssen.
 
+
+## GIT- UND LOCKFILE-VERTRAG V1.0
+
+1. **BRANCH-ÜBERGABE:** Ein Feature-Branch darf erst zum lokalen Test übergeben werden, wenn alle für den Build benötigten Änderungen committed sind. Bei Dependency-Änderungen müssen `Cargo.toml` **und** das passend generierte `Cargo.lock` gemeinsam im Branch vorliegen. Keine manuell zusammengesetzten oder ungeprüften Lockfiles.
+2. **BUILD AUF DEM RICHTIGEN BRANCH:** Vor einem Build-/Live-Test-Nachweis sind Branch, HEAD und Working-Tree-Status ausdrücklich zu prüfen (`git branch --show-current`, `git rev-parse --short HEAD`, `git status --short`). Ein `cargo build --locked` auf `main` beweist **nichts** über einen nicht ausgecheckten Feature-Branch. Niemals einen solchen Build als Branch-Abnahme werten.
+3. **LOKALE SYNCHRONISIERUNG:** Bei einem durch lokale Änderungen blockierten Checkout **sofort stoppen und die Ursache beheben**; nicht wiederholt `git stash`, `git switch` und `cargo build` vorschlagen. Erhaltenwerte Änderungen zuerst identifizieren und einmalig sichern. Ist ausschließlich ein bereits gesichertes/entbehrliches `Cargo.lock` betroffen, darf die anschließende Branch-Umschaltung gezielt mit `git switch --discard-changes` erfolgen. Andere Nutzerdaten und untracked Logs bleiben unangetastet. Kein pauschales `git reset --hard`, kein `git clean`.
+4. **LOCKFILE-HYGIENE:** Vor Übergabe `git diff -- Cargo.lock` und den Checkout-Zustand prüfen; versehentliche Änderungen oder LF/CRLF-Drift nicht als Feature-Änderung ausgeben. Nur durch tatsächliche Dependency-Änderungen nötige Lockfile-Anpassungen committen. Nach dem Build prüfen, dass keine unbeabsichtigten Änderungen zurückgeblieben sind.
+5. **FEHLERBEHEBUNG STATT WIEDERHOLUNG:** Scheitert Checkout oder `cargo build --locked`, keinen weiteren Testlauf als Lösung empfehlen. Erst die konkrete Ursache und einen einmaligen, ausführbaren Behebungsweg liefern. Keine Merge- oder Abnahmebehauptung ohne die im TESTVERTRAG geforderten Nachweise.
+
 ## TESTVERTRAG V1.1
 
 1. **BUILD:** `cargo build --locked` muss erfolgreich sein. Compilerfehler beheben, Warnings prüfen. Ein Build ist **kein** Funktionsnachweis.
