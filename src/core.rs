@@ -7,6 +7,7 @@ use solana_pubkey::Pubkey;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordKind {
     Pool,
+    #[allow(dead_code)] // Defined for mint-producing sources; CP1 emits pools only.
     Mint,
 }
 
