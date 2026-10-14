@@ -12,18 +12,19 @@ use serde_json::Value;
 use solana_pubkey::Pubkey;
 use tokio::sync::broadcast;
 
-use crate::core::{DataBatch, RecordIdentity, Venue};
+use crate::core::{
+    now_unix_ms, BinArrayInventory, CompletionResultBatch, CompletionStatus, DataBatch,
+    ExecutionManifest, MintProof, RecordIdentity, Venue,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Completion results are connected in a later checkpoint.
 pub enum CompletionState {
     Unknown,
     Prepared,
     Incomplete,
 }
 
-/// One current pool observation; protocol-specific execution manifests are added
-/// only when an actual completion contract exists.
+/// One current pool observation, including accepted execution-completion results.
 #[derive(Clone, Debug)]
 pub struct PoolState {
     pub address: Pubkey,
@@ -36,6 +37,11 @@ pub struct PoolState {
     pub last_changed_ms: u64,
     pub tvl_usd: Option<f64>,
     pub completion_state: CompletionState,
+    pub completion_validated_slot: Option<u64>,
+    pub execution_manifest: Option<Arc<ExecutionManifest>>,
+    pub execution_inventory: Option<Arc<BinArrayInventory>>,
+    pub mint_proofs: Option<[MintProof; 2]>,
+    pub completion_reason: Option<String>,
 }
 
 /// Changed records only; last_seen-only refreshes remain accessible in snapshots.
@@ -89,6 +95,11 @@ impl PoolRegistry {
                         last_changed_ms: batch.received_at_ms,
                         tvl_usd: observed_tvl,
                         completion_state: CompletionState::Unknown,
+                        completion_validated_slot: None,
+                        execution_manifest: None,
+                        execution_inventory: None,
+                        mint_proofs: None,
+                        completion_reason: None,
                     };
                     updates.push(state.clone());
                     entries.insert(*address, state);
@@ -147,6 +158,93 @@ impl PoolRegistry {
         stats.updates = updates;
         stats
     }
+
+    // Only the Registry worker calls this method. Completion is a typed input, never
+    // an external writer into the Registry's private RAM state.
+    fn apply_completion(&self, batch: &CompletionResultBatch, changed_at_ms: u64)
+        -> CompletionStats {
+        let mut stats = CompletionStats::default();
+        let mut entries = self.entries.write().expect("pool registry lock poisoned");
+        for result in &batch.results {
+            stats.received += 1;
+            let Some(pool) = entries.get_mut(&result.pool) else {
+                stats.missing_pool += 1;
+                continue;
+            };
+            let accepted_slot = pool.completion_validated_slot;
+            if result.validated_slot.is_some_and(|slot|
+                accepted_slot.is_some_and(|previous| slot <= previous)) {
+                stats.stale += 1;
+                continue;
+            }
+            if result.status == CompletionStatus::Retryable {
+                // Transient RPC/validation failures must not overwrite previously
+                // validated manifests or turn an Unknown pool into a terminal state.
+                stats.retryable += 1;
+                if pool.completion_state == CompletionState::Unknown {
+                    pool.completion_reason = result.reason.clone();
+                    pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
+                    stats.updates.push(pool.clone());
+                    stats.applied += 1;
+                }
+                continue;
+            }
+
+            let Some(slot) = result.validated_slot else {
+                stats.invalid += 1;
+                continue;
+            };
+            if result.status == CompletionStatus::Prepared {
+                let Some(manifest) = result.manifest.as_ref() else {
+                    stats.invalid += 1;
+                    continue;
+                };
+                if manifest.pool != result.pool || manifest.validated_slot != slot
+                    || pool.mint_a != Some(manifest.mint_a)
+                    || pool.mint_b != Some(manifest.mint_b)
+                    || result.inventory.is_none() || result.mints.is_none() {
+                    stats.invalid += 1;
+                    continue;
+                }
+            } else if result.manifest.is_some() {
+                stats.invalid += 1;
+                continue;
+            }
+
+            pool.completion_state = match result.status {
+                CompletionStatus::Prepared => CompletionState::Prepared,
+                CompletionStatus::Incomplete => CompletionState::Incomplete,
+                CompletionStatus::Retryable => unreachable!("handled above"),
+            };
+            pool.completion_validated_slot = Some(slot);
+            pool.execution_manifest = result.manifest.clone();
+            pool.execution_inventory = result.inventory.clone();
+            pool.mint_proofs = result.mints.clone();
+            pool.completion_reason = result.reason.clone();
+            pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
+            stats.applied += 1;
+            match result.status {
+                CompletionStatus::Prepared => stats.prepared += 1,
+                CompletionStatus::Incomplete => stats.incomplete += 1,
+                CompletionStatus::Retryable => (),
+            }
+            stats.updates.push(pool.clone());
+        }
+        stats
+    }
+}
+
+#[derive(Default)]
+struct CompletionStats {
+    received: usize,
+    applied: usize,
+    prepared: usize,
+    incomplete: usize,
+    retryable: usize,
+    stale: usize,
+    invalid: usize,
+    missing_pool: usize,
+    updates: Vec<PoolState>,
 }
 
 #[derive(Default)]
@@ -170,10 +268,11 @@ fn tvl_usd(payload: &Value) -> Option<f64> {
     (parsed.is_finite() && parsed >= 0.0).then_some(parsed)
 }
 
-/// Consume every source observation; only semantic pool-state changes are emitted.
-/// A lagged broadcast receiver is observable but cannot reconstruct missing pages.
+/// Consume API observations and completion results through one Registry writer.
+/// Keep running until both streams close: completion may finish after the API source.
 pub async fn run(
     mut input: broadcast::Receiver<Arc<DataBatch>>,
+    mut completion: Option<broadcast::Receiver<Arc<CompletionResultBatch>>>,
     registry: PoolRegistry,
     output: broadcast::Sender<Arc<PoolUpdateBatch>>,
 ) -> Result<()> {
@@ -185,49 +284,88 @@ pub async fn run(
     let mut stale = 0_u64;
     let mut conflicts = 0_u64;
     let mut lagged = 0_u64;
+    let mut completion_received = 0_usize;
+    let mut completion_applied = 0_usize;
+    let mut completion_prepared = 0_usize;
+    let mut completion_incomplete = 0_usize;
+    let mut completion_retryable = 0_usize;
+    let mut completion_rejected = 0_usize;
+    let mut source_open = true;
+    let mut completion_open = completion.is_some();
 
-    loop {
-        match input.recv().await {
-            Ok(batch) => {
-                batches += 1;
-                input_records += batch.records.len() as u64;
-                let stats = registry.apply(&batch);
-                inserted += stats.inserted as u64;
-                changed += stats.changed as u64;
-                unchanged += stats.unchanged as u64;
-                stale += stats.stale as u64;
-                conflicts += stats.conflicts as u64;
-                let updates = stats.updates.len();
-                if updates > 0 {
-                    let delivered = output.send(Arc::new(PoolUpdateBatch {
-                        source: batch.source,
-                        received_at_ms: batch.received_at_ms,
-                        pools: stats.updates,
-                    })).is_ok();
-                    if !delivered {
-                        eprintln!("pool registry update_broadcast_no_subscribers");
+    while source_open || completion_open {
+        tokio::select! {
+            event = input.recv(), if source_open => match event {
+                Ok(batch) => {
+                    batches += 1;
+                    input_records += batch.records.len() as u64;
+                    let stats = registry.apply(&batch);
+                    inserted += stats.inserted as u64;
+                    changed += stats.changed as u64;
+                    unchanged += stats.unchanged as u64;
+                    stale += stats.stale as u64;
+                    conflicts += stats.conflicts as u64;
+                    let updates = stats.updates.len();
+                    if updates > 0 {
+                        if output.send(Arc::new(PoolUpdateBatch {
+                            source: batch.source,
+                            received_at_ms: batch.received_at_ms,
+                            pools: stats.updates,
+                        })).is_err() {
+                            eprintln!("pool registry update_broadcast_no_subscribers");
+                        }
+                    }
+                    if batches == 1 || batches % 25 == 0 {
+                        println!(
+                            "pool registry batches={batches} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
+                            stats.total, stats.ignored_mints,
+                        );
                     }
                 }
-                if batches == 1 || batches % 25 == 0 {
-                    println!(
-                        "pool registry batches={batches} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
-                        stats.total, stats.ignored_mints,
-                    );
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    lagged += skipped;
+                    eprintln!("pool registry source_lagged missed_batches={skipped}");
                 }
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                lagged += skipped;
-                eprintln!("pool registry source_lagged missed_batches={skipped}");
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => source_open = false,
+            },
+            event = async {
+                completion.as_mut().expect("completion receiver exists").recv().await
+            }, if completion_open => match event {
+                Ok(batch) => {
+                    let stats = registry.apply_completion(&batch, now_unix_ms()?);
+                    completion_received += stats.received;
+                    completion_applied += stats.applied;
+                    completion_prepared += stats.prepared;
+                    completion_incomplete += stats.incomplete;
+                    completion_retryable += stats.retryable;
+                    completion_rejected += stats.invalid + stats.stale + stats.missing_pool;
+                    let updated = stats.updates.len();
+                    println!("pool registry completion source={} received={} applied={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
+                        batch.source, stats.received, stats.applied, stats.prepared, stats.incomplete,
+                        stats.retryable, stats.stale, stats.invalid, stats.missing_pool, updated);
+                    if updated > 0 && output.send(Arc::new(PoolUpdateBatch {
+                        source: batch.source,
+                        received_at_ms: now_unix_ms()?,
+                        pools: stats.updates,
+                    })).is_err() {
+                        eprintln!("pool registry completion_broadcast_no_subscribers");
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) =>
+                    anyhow::bail!("pool registry completion_lagged missed_batches={skipped}"),
+                Err(broadcast::error::RecvError::Closed) => completion_open = false,
+            },
         }
     }
 
-    // One full snapshot at the end of a bounded --once live run.
     let snapshot = registry.snapshot();
     let with_tvl = snapshot.iter().filter(|p| p.tvl_usd.is_some()).count();
+    let prepared = snapshot.iter().filter(|p| p.completion_state == CompletionState::Prepared).count();
+    let incomplete = snapshot.iter().filter(|p| p.completion_state == CompletionState::Incomplete).count();
+    let manifests = snapshot.iter().filter(|p| p.execution_manifest.is_some()).count();
+    let inventories = snapshot.iter().filter(|p| p.execution_inventory.is_some()).count();
     println!(
-        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged}",
+        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
         snapshot.len(),
     );
     Ok(())
