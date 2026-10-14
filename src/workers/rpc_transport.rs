@@ -476,13 +476,17 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                     let provider=&eligible[(cursor+offset)%eligible.len()];
                     if !provider.eligible(operation.bit()) {continue;}
                     match provider.request(&operation,&params).await {
-                        Ok(value)=>{
-                            let answer=interpret(operation,value)?;
-                            return Ok(RpcResponse {
+                        Ok(value)=>match interpret(operation.clone(),value) {
+                            Ok(answer)=>return Ok(RpcResponse {
                                 provider:provider.cfg.name.clone(),
                                 received_at_ms:now_unix_ms()?,
                                 answer,
-                            });
+                            }),
+                            Err(error)=>{
+                                eprintln!("rpc provider={} method={} response_validation_error={error:#}",
+                                    provider.cfg.name,operation.method());
+                                error=Some(error);
+                            }
                         },
                         Err(err)=>{
                             eprintln!("rpc provider={} method={} error={err:#}",provider.cfg.name,operation.method());
@@ -622,12 +626,24 @@ async fn ws_session(
                         emit(&events,WsEvent::Gap{provider:name.clone(),reason:"unknown_subscription"});
                         continue;
                     };
-                    let slot=value.pointer("/params/result/context/slot").and_then(Value::as_u64)
-                        .context("WS notification missing slot")?;
-                    let item=value.pointer("/params/result/value").context("WS notification missing value")?;
-                    let payload=decode_account(address,item,AccountView::Full)?;
-                    emit(&events,WsEvent::Account{provider:name.clone(),address,slot,
-                        received_at_ms:now_unix_ms()?,value:payload});
+                    let decoded=(||->Result<(u64,Option<AccountData>)> {
+                        let slot=value.pointer("/params/result/context/slot").and_then(Value::as_u64)
+                            .context("WS notification missing slot")?;
+                        let item=value.pointer("/params/result/value")
+                            .context("WS notification missing value")?;
+                        Ok((slot,decode_account(address,item,AccountView::Full)?))
+                    })();
+                    match decoded {
+                        Ok((slot,payload))=>emit(&events,WsEvent::Account{
+                            provider:name.clone(),address,slot,
+                            received_at_ms:now_unix_ms()?,value:payload,
+                        }),
+                        Err(error)=>{
+                            eprintln!("rpc websocket provider={name} decode_error={error:#}");
+                            emit(&events,WsEvent::Gap{provider:name.clone(),reason:"malformed_account_notification"});
+                            break 'connected;
+                        }
+                    }
                 }
             }
         }
