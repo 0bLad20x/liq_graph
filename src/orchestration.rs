@@ -36,7 +36,7 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only or --rpc-live"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live or --completion-live"),
         }
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some())),
