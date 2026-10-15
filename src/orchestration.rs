@@ -20,6 +20,7 @@ struct Cli {
     completion_limit: Option<usize>,
     persistence_write_live: bool,
     persistence_restore_live: bool,
+    persistence_v2_live: bool,
     stability_live: bool,
     rest_discovery_live: bool,
     rest_source_only: Option<SourceSet>,
@@ -36,6 +37,7 @@ fn settings() -> Result<Cli> {
     let mut completion_limit = None;
     let mut persistence_write_live = false;
     let mut persistence_restore_live = false;
+    let mut persistence_v2_live = false;
     let mut stability_live = false;
     let mut rest_discovery_live = false;
     let mut rest_source_only = None;
@@ -49,6 +51,7 @@ fn settings() -> Result<Cli> {
             "--graph-live" => { graph_live = true; once = true; },
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
+            "--persistence-v2-live" => { persistence_v2_live = true; once = true; },
             "--stability-live" => stability_live = true,
             "--rest-discovery-live" => { rest_discovery_live = true; once = true; },
             "--raydium-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Raydium); once = true; },
@@ -68,7 +71,7 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
         }
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live || rest_discovery_live)),
@@ -77,6 +80,11 @@ fn settings() -> Result<Cli> {
         || persistence_restore_live || stability_live || rpc_live || jupiter_only || completion_limit.is_some()
         || (rest_discovery_live && rest_source_only.is_some()))),
         "--rest-discovery-live is an API-only checkpoint with optional --pages");
+    ensure!(!(persistence_v2_live && (persistence_write_live || persistence_restore_live
+        || completion_live || graph_live || stability_live || rest_discovery_live
+        || rest_source_only.is_some() || rpc_live || jupiter_only
+        || completion_limit.is_some())),
+        "--persistence-v2-live is an exclusive REST+PostgreSQL checkpoint");
     ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
     ensure!(!(stability_live && (completion_live || graph_live || persistence_write_live
         || persistence_restore_live || rpc_live || jupiter_only || once)),
@@ -106,6 +114,7 @@ fn settings() -> Result<Cli> {
         completion_limit,
         persistence_write_live,
         persistence_restore_live,
+        persistence_v2_live,
         stability_live,
         rest_discovery_live,
         rest_source_only,
@@ -233,6 +242,7 @@ fn spawn_sources(
             source: "persistence_restore",
             received_at_ms: 0,
             pools: restored,
+            persist_identity: Vec::new(),
         })).map_err(|_|anyhow::anyhow!("no registry bootstrap subscriber"))?;
         println!("orchestration bootstrap seeded_pools={count}");
     }
@@ -294,11 +304,23 @@ pub async fn run() -> Result<()> {
         task.await??;
         return Ok(());
     }
+    if cli.persistence_v2_live {
+        let database=persistence::Persistence::connect().await?;
+        let registry=pool_registry::PoolRegistry::default();
+        let restored=registry.restore(database.restore().await?)?;
+        println!("orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
+        let mut tasks=JoinSet::new();
+        spawn_sources(&mut tasks,cli.meteora,None,None,
+            Some(registry),Some(database),SourceSet::All,true)?;
+        while let Some(result)=tasks.join_next().await {result??;}
+        println!("orchestration persistence-v2-live complete rpc_calls=0");
+        return Ok(());
+    }
     if cli.persistence_restore_live {
         let database = persistence::Persistence::connect().await?;
         let registry = pool_registry::PoolRegistry::default();
         let restored = registry.restore(database.restore().await?)?;
-        ensure!(restored > 0, "persistence restore-live requires stored completion records");
+        ensure!(restored > 0, "persistence restore-live requires stored pools");
         let graph_settings = liquidity_graph::Settings::from_env()?;
         ensure!(graph_settings.min_tvl_usd.is_none(),
             "restore-live cannot use GRAPH_MIN_TVL_USD without a fresh TVL source");
@@ -312,6 +334,7 @@ pub async fn run() -> Result<()> {
             source:"persistence_restore",
             received_at_ms:0,
             pools:registry.snapshot(),
+            persist_identity: Vec::new(),
         })).map_err(|_|anyhow::anyhow!("no graph bootstrap receiver"))?;
         drop(updates);
         while let Some(result)=tasks.join_next().await {result??;}
