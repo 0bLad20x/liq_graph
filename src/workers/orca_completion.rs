@@ -27,6 +27,9 @@ const DYNAMIC_MIN_LEN: usize = 8 + 4 + 32 + 16 + 88;
 const DYNAMIC_MAX_LEN: usize = 8 + 4 + 32 + 16 + 88 * 113;
 const ORACLE_LEN: usize = 8 + 32 + 8 + 34 + 44 + 128;
 const POOLS_PER_BATCH: usize = 8; // second pass <= 11 addresses per pool
+const PARALLEL_BATCHES: usize = 16;
+const MIN_TVL_USD: f64 = 500.0;
+const ARRAY_RADIUS: i32 = 2;
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
@@ -39,18 +42,15 @@ pub struct Settings {
 }
 impl Settings {
     pub fn from_env() -> Result<Self> {
-        let parse = |key: &str, default: &str| -> Result<String> {
-            Ok(env::var(key).unwrap_or_else(|_| default.to_owned()))
-        };
-        let account_batch_size = parse("RPC_ACCOUNT_BATCH_SIZE","100")?.parse::<usize>()?;
-        let parallel_batches = parse("ORCA_COMPLETION_PARALLEL_BATCHES","16")?.parse::<usize>()?;
-        let min_tvl_usd = parse("ORCA_COMPLETION_MIN_TVL_USD","500")?.parse::<f64>()?;
-        let radius = parse("ORCA_COMPLETION_ARRAY_RADIUS","2")?.parse::<i32>()?;
-        ensure!((11..=100).contains(&account_batch_size), "Orca RPC batch size must be 11..=100");
-        ensure!((1..=64).contains(&parallel_batches), "Orca parallel batches must be 1..=64");
-        ensure!(min_tvl_usd.is_finite() && min_tvl_usd >= 0.0, "invalid Orca minimum TVL");
-        ensure!((0..=2).contains(&radius), "Orca V10 tick array radius must be 0..=2");
-        Ok(Self { limit:0, account_batch_size, parallel_batches, min_tvl_usd, radius })
+        // Same RPC_ACCOUNT_BATCH_SIZE as DLMM/DAMM v2. The RPC client and its
+        // provider configuration remain exclusively owned by rpc_transport.
+        let account_batch_size = env::var("RPC_ACCOUNT_BATCH_SIZE")
+            .unwrap_or_else(|_| "100".to_owned()).parse::<usize>()
+            .context("invalid RPC_ACCOUNT_BATCH_SIZE")?;
+        ensure!((11..=100).contains(&account_batch_size),
+            "Orca requires RPC_ACCOUNT_BATCH_SIZE in 11..=100 for its coherent account snapshot");
+        Ok(Self { limit:0, account_batch_size, parallel_batches:PARALLEL_BATCHES,
+            min_tvl_usd:MIN_TVL_USD, radius:ARRAY_RADIUS })
     }
     fn pools_per_batch(self) -> usize {
         POOLS_PER_BATCH.min(self.account_batch_size / 11)
@@ -215,7 +215,7 @@ fn make_manifest(l:Layout,slot:u64,arrays_a:&[Pubkey],arrays_b:&[Pubkey],
     };
     ExecutionManifest {
         pool:l.pool,mint_a:l.mint_a,mint_b:l.mint_b,validated_slot:slot,
-        // base_a = A->B: ticks traverse downward; base_b = B->A: upward.
+        // base_a = B->A: upward; base_b = A->B: downward.
         base_a:direction(l.mint_a,true,arrays_a),base_b:direction(l.mint_b,false,arrays_b),
     }
 }
@@ -283,8 +283,10 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     down.reverse();
     let up=selected.iter().copied().filter(|start|*start>=center)
         .collect::<Vec<_>>();
-    let arrays_a=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
-    let arrays_b=up.iter().map(|start|present[start].0).collect::<Vec<_>>();
+    // V10 `base_a` uses mint A as the *output/base*, hence swaps B->A
+    // and traverses upward; `base_b` swaps A->B and traverses downward.
+    let arrays_a=up.iter().map(|start|present[start].0).collect::<Vec<_>>();
+    let arrays_b=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let mints=[mint_a,mint_b];
     let ev=Arc::new(CompletionEvidence{
         kind:"orca_whirlpool_tick_arrays".into(),version:1,
@@ -296,8 +298,8 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             "selected":selected.iter().map(|start|json!({
                 "start":start,"address":present[start].0.to_string(),"layout":present[start].1
             })).collect::<Vec<_>>(),
-            "base_a_start_ticks":down,
-            "base_b_start_ticks":up,
+            "base_a_start_ticks":up,
+            "base_b_start_ticks":down,
             "token_program_a":a.owner.to_string(),"token_program_b":b.owner.to_string()
         }))
     });
