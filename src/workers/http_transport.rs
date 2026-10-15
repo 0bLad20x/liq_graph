@@ -128,6 +128,7 @@ pub struct Settings {
     pub list_file: Option<String>,
     pub public_discovery: bool,
     pub host_rps_overrides: HashMap<String, u32>,
+    /// Budget per configured proxy IP and destination host; not necessarily egress IP.
     pub request_rps_per_route: u32,
     pub retry_attempts: usize,
 }
@@ -155,7 +156,10 @@ impl Settings {
         let queue_capacity = from_env("HTTP_TRANSPORT_QUEUE_CAPACITY", 512_usize)?;
         let probe_rps = from_env("HTTP_PROXY_PROBE_RPS", 20_u32)?;
         let request_rps_per_host = from_env("HTTP_TRANSPORT_HOST_RPS", 5_u32)?;
-        let request_rps_per_route = from_env("HTTP_TRANSPORT_ROUTE_RPS", 5_u32)?;
+        let route_rps_legacy = from_env("HTTP_TRANSPORT_ROUTE_RPS", 5_u32)?;
+        // Address-based cap: two different ports at the same proxy address
+        // must not each receive their own independent request budget.
+        let request_rps_per_route = from_env("HTTP_TRANSPORT_PROXY_IP_RPS", route_rps_legacy)?;
         let retry_attempts = from_env("HTTP_TRANSPORT_RETRY_ATTEMPTS", 3_usize)?;
         for value in [refresh, tcp, handshake, probe, healthy, retry] {
             ensure!(value > 0, "HTTP transport intervals must be positive");
@@ -755,8 +759,9 @@ async fn host_limit_at(shared: &Shared, host: &str, rps: u32) {
 async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
     let host_rps = shared.settings.host_rps_overrides.get(host)
         .copied().unwrap_or(shared.settings.request_rps_per_host);
-    // Route caps remain independent. Host cap can be explicitly disabled with 0
-    // only where an endpoint's actual entitlement permits per-route allocation.
+    // Destination limits and proxy-address limits are separate. Identical proxy IPs
+    // on different ports share one address budget. The configured address may not
+    // equal the actual egress IP of a public proxy.
     let mut host_gates = shared.host_gates.lock().await;
     let mut route_gates = shared.route_gates.lock().await;
     let now = Instant::now();
@@ -787,7 +792,7 @@ async fn respect_backoff(shared: &Shared, host: &str, route_id: &str) {
     }
 }
 
-async fn choose_route(shared: &Shared, host: &str, excluded: &HashSet<String>) -> Result<(String, Client)> {
+async fn choose_route(shared: &Shared, host: &str, excluded: &HashSet<String>) -> Result<(String, String, Client)> {
     let snapshot = Arc::clone(&*shared.snapshots.borrow());
     ensure!(!snapshot.is_empty(), "no verified proxy routes; direct fallback forbidden");
     let start = shared.selection.fetch_add(1, Ordering::Relaxed) % snapshot.len();
@@ -800,7 +805,7 @@ async fn choose_route(shared: &Shared, host: &str, excluded: &HashSet<String>) -
         if let Some(route) = state.get(id) {
             if route.verified.is_some_and(|at| at.elapsed() < shared.settings.healthy_for) {
                 if let Some(client) = &route.client {
-                    return Ok((id.clone(), client.clone()));
+                    return Ok((id.clone(), route.candidate.host.clone(), client.clone()));
                 }
             }
         }
@@ -859,8 +864,8 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
     let mut previous_route = None::<String>;
     let mut last_error = None;
     for attempt in 0..max_attempts {
-        let (route_id, client) = match request.policy {
-            RoutePolicy::DirectOnly => ("direct".to_owned(), shared.direct_client.clone()),
+        let (route_id, proxy_ip, client) = match request.policy {
+            RoutePolicy::DirectOnly => ("direct".to_owned(), "direct".to_owned(), shared.direct_client.clone()),
             RoutePolicy::ProxyOnly => match choose_route(shared, &host, &excluded).await {
                 Ok(value) => value,
                 Err(error) if attempt == 0 => return Err(error),
@@ -879,8 +884,8 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             stats.attempts += 1;
             stats.routes_used.insert(route_id.clone());
         }
-        pace_request(shared, &host, &route_id).await;
-        respect_backoff(shared, &host, &route_id).await;
+        pace_request(shared, &host, &proxy_ip).await;
+        respect_backoff(shared, &host, &proxy_ip).await;
         let started = Instant::now();
         let mut builder = client.request(request.method.clone(), request.url.clone())
             .headers(request.headers.clone())
