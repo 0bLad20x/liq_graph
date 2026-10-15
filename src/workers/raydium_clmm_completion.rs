@@ -230,6 +230,30 @@ fn validate_array(account:&AccountData,l:Layout,start:i32,program:Pubkey)->Resul
     ensure!(count<=60,"Raydium CLMM initialized TickArray count exceeds 60");
     Ok(count>0)
 }
+// Raydium CLMM's pool bitmap has 1024 bits centered on tick-array index 0.
+// Outside that range, bitmap-extension pages hold 512 bits per side/page.
+fn array_initialized(pool:&AccountData,extension:&AccountData,start:i32,width:i32)->Result<bool>{
+    let index=start.div_euclid(width);
+    let (data,offset,bit)=if (-512..512).contains(&index) {
+        let bit=usize::try_from(index+512)?;
+        (pool.bytes.as_ref(),904+8*(bit/64),bit%64)
+    }else{
+        let boundary=512*width;
+        let absolute=start.abs();
+        let mut page=absolute/boundary-1;
+        if start<0 && absolute%boundary==0 {page-=1;}
+        ensure!((0..14).contains(&page),
+            "Raydium CLMM bitmap extension page outside range");
+        let within=absolute%boundary;
+        let local=if start<0 && within!=0 {512-within/width}else{within/width};
+        let local=usize::try_from(local)?;
+        let base=8+32+if start<0 {14*64}else{0};
+        let offset=base+usize::try_from(page)?*64+8*(local/64);
+        (extension.bytes.as_ref(),offset,local%64)
+    };
+    Ok((u64_at(data,offset)? & (1_u64<<bit))!=0)
+}
+
 fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
     -> impl std::future::Future<Output=Result<(u64,Vec<Option<AccountData>>)>> + '_ {
     async move {
@@ -322,13 +346,25 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let center=l.tick_current.div_euclid(width)*width;
     let mut present=HashMap::<i32,Pubkey>::new();
     for (start,address) in arrays(l,owner) {
-        if let Some(account)=get(address) {
-            match validate_array(account,l,start,owner){
-                Ok(true)=>{present.insert(start,address);},
-                Ok(false)=>{},
-                Err(e)=>return incomplete(pool.address,slot,
-                    format!("Raydium CLMM TickArray start={start}: {e:#}")),
+        let initialized=match array_initialized(parent,bitmap,start,width){
+            Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
+                format!("Raydium CLMM bitmap start={start}: {e:#}")),
+        };
+        match get(address) {
+            Some(account)=>{
+                let contains=match validate_array(account,l,start,owner){
+                    Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
+                        format!("Raydium CLMM TickArray start={start}: {e:#}")),
+                };
+                if contains!=initialized {
+                    return incomplete(pool.address,slot,
+                        format!("Raydium CLMM TickArray count/bitmap disagreement at {start}"));
+                }
+                if initialized {present.insert(start,address);}
             }
+            None if initialized =>return incomplete(pool.address,slot,
+                format!("Raydium CLMM initialized TickArray missing at {start}")),
+            None=>{}
         }
     }
     // Supply first initialized array and further initialized arrays in traversal
