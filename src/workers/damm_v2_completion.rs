@@ -198,7 +198,7 @@ fn manifest(layout: PoolLayout, slot: u64, program: Pubkey) -> ExecutionManifest
         let (x_vault, base_vault) = if reverse {
             (layout.vault_b, layout.vault_a)
         } else { (layout.vault_a, layout.vault_b) };
-        Arc::from(vec![
+        Arc::<[AccountMeta]>::from(vec![
             ro(program), ro(base_mint), ro(event), ro(authority),
             rw(layout.address), rw(x_vault), rw(base_vault),
         ])
@@ -298,8 +298,8 @@ async fn process(rpc: &RpcHandle, pools: Vec<PoolState>, settings: Settings)
     }
     if !pending.is_empty() {
         // One final coherent slot validates parent state, both vaults and mint programs.
-        ensure!(addresses.len()<=settings.account_batch_size,"DAMM v2 final account batch exceeds configured limit")
-            .expect("pools_per_batch bounds final account count");
+        assert!(addresses.len() <= settings.account_batch_size,
+            "DAMM v2 final account batch exceeds configured limit");
         match read(rpc,addresses.clone(),Some(first.slot)).await {
             Ok(final_read)=>{
                 let lookup: HashMap<Pubkey, Option<AccountData>> =
