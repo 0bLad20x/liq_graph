@@ -252,12 +252,8 @@ impl PoolRegistry {
                 stats.missing_pool += 1;
                 continue;
             };
-            let accepted_slot = pool.completion_validated_slot;
-            if result.validated_slot.is_some_and(|slot|
-                accepted_slot.is_some_and(|previous| slot <= previous)) {
-                stats.stale += 1;
-                continue;
-            }
+            // Retryable does not advance a validated slot. Account for the
+            // accepted no-op before checking stale terminal completion proofs.
             if result.status == CompletionStatus::Retryable {
                 // Transient RPC/validation failures must not overwrite previously
                 // validated manifests or turn an Unknown pool into a terminal state.
@@ -273,6 +269,13 @@ impl PoolRegistry {
                     // no-op, not a rejected completion result.
                     stats.preserved_retryable += 1;
                 }
+                continue;
+            }
+
+            let accepted_slot = pool.completion_validated_slot;
+            if result.validated_slot.is_some_and(|slot|
+                accepted_slot.is_some_and(|previous| slot <= previous)) {
+                stats.stale += 1;
                 continue;
             }
 
