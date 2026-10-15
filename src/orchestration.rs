@@ -61,7 +61,7 @@ fn settings() -> Result<Cli> {
                 let count: usize = args.next()
                     .context("--completion-limit requires a positive number")?
                     .parse().context("invalid --completion-limit value")?;
-                ensure!((1..=5000).contains(&count), "--completion-limit must be 1..=5000");
+                ensure!(count <= 5000, "--completion-limit must be 0 (unbounded) or 1..=5000");
                 completion_limit = Some(count);
             }
             "--pages" => {
@@ -211,6 +211,7 @@ fn spawn_sources(
         broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(registry_capacity);
     let registry = initial_registry.unwrap_or_default();
     let completion_live = completion.is_some();
+    let (source_done_tx,source_done_rx) = watch::channel(false);
     let persistence_input = persist.as_ref().map(|_| registry_output.subscribe());
     if let Some(settings) = graph {
         let (tx, rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
@@ -220,14 +221,14 @@ fn spawn_sources(
 
     let completion_input = if let Some((rpc, config)) = completion {
         let candidate_input = registry_output.subscribe();
-        let (completion_output, completion_observer) = broadcast::channel(4);
+        let (completion_output, completion_observer) = broadcast::channel(256);
         let receiver = completion_output.subscribe();
-        // The finite live modes retain the strict, verbose manifest proof.
-        // Continuous diagnostics use the worker's bounded summary instead.
-        if config.selection_idle_timeout.is_none() {
+        // Verbose proof only for finite runs. Continuous work stays bounded.
+        if config.limit > 0 {
             tasks.spawn(execution_completion::observe(completion_observer));
         }
-        tasks.spawn(execution_completion::run(candidate_input, rpc, config, completion_output));
+        tasks.spawn(execution_completion::run(candidate_input, source_done_rx,
+            rpc, config, completion_output));
         Some(receiver)
     } else { None };
     tasks.spawn(source_diagnostic::run(input, strict_lag));
@@ -249,7 +250,8 @@ fn spawn_sources(
     if let Some(writer) = persist {
         tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
     }
-    tasks.spawn(pool_registry::run(registry_input, completion_input, registry, registry_output, strict_lag));
+    tasks.spawn(pool_registry::run(registry_input, completion_input, registry,
+        registry_output, source_done_tx, strict_lag));
     if matches!(source_set, SourceSet::Raydium | SourceSet::All) {
         let rps: u32 = env::var("RAYDIUM_API_RPS")
             .unwrap_or_else(|_| "10".into()).parse().context("invalid RAYDIUM_API_RPS")?;
@@ -345,10 +347,13 @@ pub async fn run() -> Result<()> {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
         let mut completion = execution_completion::Settings::from_env()?;
-        completion.limit = cli.completion_limit.unwrap_or(if cli.graph_live || cli.persistence_write_live || cli.stability_live {5000} else {100});
-        if cli.stability_live {
-            completion.selection_idle_timeout = Some(Duration::from_secs(60));
-        }
+        // Continuous stability mode has no arbitrary pool-count cap.
+        // Zero can also be requested explicitly for finite whole-universe scans.
+        completion.limit = cli.completion_limit.unwrap_or(
+            if cli.stability_live {0}
+            else if cli.graph_live || cli.persistence_write_live {5000}
+            else {100});
+
         let graph = if cli.graph_live || cli.persistence_write_live || cli.stability_live {
             Some(liquidity_graph::Settings::from_env()?)
         } else {None};
@@ -360,7 +365,7 @@ pub async fn run() -> Result<()> {
             (Some(registry), Some(db))
         } else {(None,None)};
         if cli.stability_live {
-            println!("orchestration stability-live continuous_source=true pages={:?} one_time_completion_limit={} postgres=true graph=true",
+            println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) min_tvl_usd=1000 postgres=true graph=true",
                 cli.meteora.max_pages, completion.limit);
         }
         spawn_sources(&mut tasks, cli.meteora,

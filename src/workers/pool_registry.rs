@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast,watch};
 
 use crate::core::{
     now_unix_ms, BinArrayInventory, CompletionResultBatch, CompletionStatus, DataBatch,
@@ -349,6 +349,7 @@ pub async fn run(
     mut completion: Option<broadcast::Receiver<Arc<CompletionResultBatch>>>,
     registry: PoolRegistry,
     output: broadcast::Sender<Arc<PoolUpdateBatch>>,
+    source_done: watch::Sender<bool>,
     fail_on_lag: bool,
 ) -> Result<()> {
     let mut batches = 0_u64;
@@ -414,7 +415,12 @@ pub async fn run(
                     eprintln!("pool registry source_lagged missed_batches={skipped}");
                     if fail_on_lag { anyhow::bail!("REST broadcast overflow: Registry lost {skipped} source batches"); }
                 }
-                Err(broadcast::error::RecvError::Closed) => source_open = false,
+                Err(broadcast::error::RecvError::Closed) => {
+                    source_open = false;
+                    // All Source updates have been forwarded. Completion may still
+                    // produce results; this lifecycle signal breaks the channel cycle.
+                    source_done.send_replace(true);
+                },
             },
             event = async {
                 completion.as_mut().expect("completion receiver exists").recv().await
