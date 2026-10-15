@@ -71,6 +71,13 @@ impl Group {
             + usize::from(self.intermediate.is_some())
             + usize::from(self.conversion.is_some())
     }
+
+    /// Pool order is not group identity: only typed roles and their mint context
+    /// distinguish V10 group templates. Alternatives are kept in sorted role lists.
+    fn identity(&self) -> (Pubkey, Pubkey, GroupKind, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>) {
+        (self.settlement, self.target, self.kind,
+            self.bridge, self.intermediate, self.conversion)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,6 +119,72 @@ fn route_count(direct: usize, bridge: usize) -> u64 {
     2_u64.saturating_mul(direct as u64).saturating_mul(bridge as u64)
 }
 
+/// Validate every published template against the mint roles required by the public
+/// V10 instruction contract. This validates topology, NOT a packed instruction:
+/// a template may retain more than 16 pool alternatives for later selection.
+fn validate_v10_group(group: &Group, pairs: &HashMap<Pair, Arc<[Pubkey]>>,
+    wsol: Pubkey, usdc: Pubkey) -> Result<()> {
+    let s = group.settlement;
+    ensure!(s == wsol || s == usdc, "V10 group has unsupported settlement {s}");
+    let q = if s == wsol { usdc } else { wsol };
+    let t = group.target;
+    ensure!(t != s && t != Pubkey::default(), "V10 group target equals settlement or zero");
+    ensure!(!group.direct_s.is_empty()
+        && group.direct_s.as_ref() == pools_for(pairs, t, s).as_ref(),
+        "V10 group missing or incorrect settlement-quoted direct pools");
+    for list in [&group.direct_s, &group.direct_q, &group.bridge_pools] {
+        ensure!(list.windows(2).all(|p| p[0] < p[1]),
+            "V10 group pool alternatives are not canonical and distinct");
+    }
+    if let Some(conversion) = group.conversion {
+        ensure!(conversion != Pubkey::default()
+            && pools_for(pairs, q, s).binary_search(&conversion).is_ok(),
+            "V10 group conversion does not pair WSOL and USDC");
+        ensure!(t != q, "V10 group target equals conversion quote");
+    }
+    match group.kind {
+        GroupKind::Direct => {
+            ensure!(group.bridge.is_none() && group.intermediate.is_none()
+                && group.bridge_pools.is_empty(),
+                "V10 direct template contains a triangle role");
+            let direct_q = if group.conversion.is_some() {
+                pools_for(pairs, t, q)
+            } else { Arc::from([]) };
+            ensure!(group.direct_q.as_ref() == direct_q.as_ref()
+                && group.direct_s.len() + group.direct_q.len() >= 2,
+                "V10 direct template requires at least two correctly quoted pools");
+            let expected_routes = if group.conversion.is_some() {
+                route_count(group.direct_s.len(), group.direct_q.len())
+            } else {
+                let n = group.direct_s.len() as u64;
+                n.saturating_mul(n - 1)
+            };
+            ensure!(expected_routes > 0 && group.route_options == expected_routes,
+                "V10 direct template has no valid 2/3-swap choices");
+        }
+        GroupKind::Bridge => {
+            let b = group.bridge.context("V10 triangle missing bridge mint")?;
+            let middle = group.intermediate.context("V10 triangle missing intermediate pool")?;
+            ensure!(b != s && b != t && b != Pubkey::default()
+                && group.direct_q.is_empty() && !group.bridge_pools.is_empty(),
+                "V10 triangle has invalid bridge mint or pool roles");
+            if group.conversion.is_some() {
+                ensure!(b != q, "V10 triangle bridge equals conversion quote");
+            }
+            ensure!(pools_for(pairs, t, b).binary_search(&middle).is_ok(),
+                "V10 triangle intermediate does not pair target and bridge");
+            let bridge_quote = if group.conversion.is_some() { q } else { s };
+            ensure!(group.bridge_pools.as_ref()
+                == pools_for(pairs, b, bridge_quote).as_ref(),
+                "V10 triangle bridge pools do not pair bridge and quote");
+            let expected_routes = route_count(group.direct_s.len(), group.bridge_pools.len());
+            ensure!(expected_routes > 0 && group.route_options == expected_routes,
+                "V10 triangle requires an intermediate, a direct and a bridge choice");
+        }
+    }
+    Ok(())
+}
+
 /// A generation owns every index; IDs must never cross generation boundaries.
 #[derive(Debug, Default)]
 pub struct GraphSnapshot {
@@ -141,7 +214,10 @@ impl GraphSnapshot {
 fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<GraphSnapshot> {
     let mut edge_count = 0_usize;
     let mut pairs: HashMap<Pair, Vec<Pubkey>> = HashMap::new();
+    let mut known_pools = HashSet::new();
     for p in pools {
+        ensure!(known_pools.insert(p.address),
+            "V10 graph received duplicate Prepared pool address {}", p.address);
         pairs.entry(pair(p.a, p.b)).or_default().push(p.address);
         edge_count += 1;
     }
@@ -179,7 +255,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
             // Distinct pool pairs guarantee no same pool reused on any trade path.
             if t != q {
                 let direct_q = pools_for(&pair_map, t, q);
-                if !direct_q.is_empty() {
+                if !direct_s.is_empty() && !direct_q.is_empty() {
                     let conversions = pools_for(&pair_map, q, s);
                     for conversion in conversions.iter().copied() {
                         groups.push(Group {
@@ -201,7 +277,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
             for b in bridges {
                 let intermediate = pools_for(&pair_map, t, b);
                 let return_s = pools_for(&pair_map, b, s);
-                if !return_s.is_empty() {
+                if !direct_s.is_empty() && !return_s.is_empty() {
                     for middle in intermediate.iter().copied() {
                         groups.push(Group {
                             settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
@@ -212,7 +288,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
                     }
                 }
                 // With Q/S conversion, both T and B must differ from Q.
-                if t != q && b != q {
+                if t != q && b != q && !direct_s.is_empty() {
                     let return_q = pools_for(&pair_map, b, q);
                     if return_q.is_empty() { continue; }
                     let conversions = pools_for(&pair_map, q, s);
@@ -231,10 +307,36 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
             }
         }
     }
-    groups.sort_unstable_by_key(|g| {
-        (g.settlement, g.target, g.kind, g.bridge, g.intermediate, g.conversion)
+    // Canonical identity is independent of alternative-pool input order.
+    // The sorted role lists were built from each unique mint-pair set.
+    groups.sort_unstable_by_key(Group::identity);
+    let before_dedup = groups.len();
+    groups.dedup_by(|a, b| {
+        a.identity() == b.identity()
+            && a.direct_s == b.direct_s
+            && a.direct_q == b.direct_q
+            && a.bridge_pools == b.bridge_pools
     });
+    ensure!(groups.windows(2).all(|w| w[0].identity() != w[1].identity()),
+        "V10 group identity collision with different pool alternatives");
     ensure!(groups.len() <= u32::MAX as usize, "V10 group count exceeds u32 index capacity");
+
+    let mut direct_2 = 0_usize;
+    let mut direct_3 = 0_usize;
+    let mut triangle_3 = 0_usize;
+    let mut triangle_4 = 0_usize;
+    for g in &groups {
+        validate_v10_group(g, &pair_map, wsol, usdc)?;
+        match (g.kind, g.conversion.is_some()) {
+            (GroupKind::Direct, false) => direct_2 += 1,
+            (GroupKind::Direct, true) => direct_3 += 1,
+            (GroupKind::Bridge, false) => triangle_3 += 1,
+            (GroupKind::Bridge, true) => triangle_4 += 1,
+        }
+    }
+    println!("liquidity graph v10 validated generation={} groups={} direct_2={} direct_3={} triangle_3={} triangle_4={} canonical_duplicates_removed={} invalid_groups=0",
+        generation, groups.len(), direct_2, direct_3, triangle_3, triangle_4,
+        before_dedup - groups.len());
 
     let mut token_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
     let mut pool_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
