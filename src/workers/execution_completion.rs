@@ -619,7 +619,7 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
 
 /// This is a worker-local attempt scheduler, not an economic signal engine.
 /// It uses only fresh Registry TVL; historic SQL observations never qualify a pool.
-const MIN_COMPLETION_TVL_USD: f64 = 1_000.0;
+const MIN_COMPLETION_TVL_USD: f64 = 500.0;
 const POOLS_PER_WORK_BATCH: usize = 16;
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
