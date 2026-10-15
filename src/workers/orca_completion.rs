@@ -25,7 +25,7 @@ const ORACLE_DISC: [u8;8] = [139,194,131,179,140,179,229,244];
 const FIXED_LEN: usize = 8 + 4 + 88 * 113 + 32;
 const DYNAMIC_MIN_LEN: usize = 8 + 4 + 32 + 16 + 88;
 const DYNAMIC_MAX_LEN: usize = 8 + 4 + 32 + 16 + 88 * 113;
-const ORACLE_LEN: usize = 8 + 32 + 8 + 36 + 44 + 128;
+const ORACLE_LEN: usize = 8 + 32 + 8 + 34 + 44 + 128;
 const POOLS_PER_BATCH: usize = 8; // second pass <= 11 addresses per pool
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
@@ -122,7 +122,8 @@ fn validate_array(account:&AccountData, pool:Pubkey, start:i32, owner:Pubkey) ->
             if tag==1 {pos+=112;}
             ensure!(pos<=b.len(),"truncated Orca dynamic initialized tick");
         }
-        ensure!(pos==b.len(),"unexpected Orca dynamic TickArray trailing data");
+        ensure!(b[pos..].iter().all(|v| *v==0),
+            "unexpected Orca dynamic TickArray trailing bytes");
         Ok("dynamic")
     } else { bail!("Orca TickArray discriminator invalid") }
 }
