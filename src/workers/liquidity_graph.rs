@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, watch};
 
-use crate::workers::pool_registry::{CompletionState, PoolState, PoolUpdateBatch};
+use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";

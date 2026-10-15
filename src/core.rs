@@ -1,4 +1,4 @@
-//! Shared source contracts and generic HTTP infrastructure.
+//! Shared worker contracts and generic HTTP infrastructure.
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::Result;
@@ -82,24 +82,12 @@ pub struct ExecutionManifest {
     pub base_b: Arc<[AccountMeta]>,
 }
 
+/// Versioned protocol evidence; consumers do not interpret the schema.
 #[derive(Clone, Debug)]
-pub struct BinArrayRef {
-    pub index: i32,
-    pub address: Pubkey,
-}
-
-#[derive(Clone, Debug)]
-pub struct BinArrayInventory {
-    pub registry_tvl_usd: Option<f64>,
-    pub active_id: i32,
-    pub active_array_index: i32,
-    pub internal_initialized: usize,
-    pub extension_initialized: usize,
-    pub extension_present: bool,
-    /// The complete initialized array-address inventory represented by the fetched bitmaps.
-    pub initialized: Arc<[BinArrayRef]>,
-    pub selected_indices: Vec<i32>,
-    pub validated_indices: Vec<i32>,
+pub struct CompletionEvidence {
+    pub kind: String,
+    pub version: u32,
+    pub payload: Arc<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +106,7 @@ pub struct CompletionResult {
     pub validated_slot: Option<u64>,
     pub manifest: Option<Arc<ExecutionManifest>>,
     pub reason: Option<String>,
-    pub inventory: Option<Arc<BinArrayInventory>>,
+    pub evidence: Option<Arc<CompletionEvidence>>,
     pub mints: Option<[MintProof; 2]>,
 }
 
@@ -126,5 +114,55 @@ pub struct CompletionResult {
 pub struct CompletionResultBatch {
     pub source: &'static str,
     pub results: Vec<CompletionResult>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionState {
+    Unknown,
+    Prepared,
+    Incomplete,
+}
+
+/// One current pool observation, including accepted execution-completion results.
+#[derive(Clone, Debug)]
+pub struct PoolState {
+    pub address: Pubkey,
+    pub venue: Venue,
+    pub mint_a: Option<Pubkey>,
+    pub mint_b: Option<Pubkey>,
+    pub source: &'static str,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub last_changed_ms: u64,
+    pub tvl_usd: Option<f64>,
+    /// Durable, validated protocol configuration, not arbitrary REST JSON.
+    pub pool_config: Option<Arc<Value>>,
+    /// Historical persisted observation; never treat as a fresh live quote.
+    pub last_observation: Option<Arc<Value>>,
+    pub completion_state: CompletionState,
+    pub completion_validated_slot: Option<u64>,
+    pub execution_manifest: Option<Arc<ExecutionManifest>>,
+    pub completion_evidence: Option<Arc<CompletionEvidence>>,
+    pub mint_proofs: Option<[MintProof; 2]>,
+    pub completion_reason: Option<String>,
+}
+
+/// Distinguish source observations from completed execution metadata without
+/// interpreting worker-specific source names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolUpdateKind {
+    Source,
+    Completion,
+}
+
+/// Changed records only; last_seen-only refreshes remain accessible in snapshots.
+#[derive(Debug)]
+pub struct PoolUpdateBatch {
+    pub kind: PoolUpdateKind,
+    pub source: &'static str,
+    pub received_at_ms: u64,
+    pub pools: Vec<PoolState>,
+    /// Identity/configuration changes only. Excludes TVL-only updates.
+    pub persist_identity: Vec<Pubkey>,
 }
 

@@ -9,12 +9,12 @@ use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
-    core::{AccountMeta, BinArrayInventory, BinArrayRef, ExecutionManifest, MintProof, Venue},
-    workers::pool_registry::{CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
+    core::{AccountMeta, CompletionEvidence, ExecutionManifest, MintProof, Venue,
+        CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
 };
 
 const TABLE: &str = "public.liq_graph_pool_cache";
-const DESCRIPTOR_VERSION: i32 = 1;
+const DESCRIPTOR_VERSION: i32 = 2;
 const PLANNER_VERSION: i32 = 1;
 const BATCH_SIZE: usize = 512;
 const WRITE_INTERVAL: Duration = Duration::from_secs(1);
@@ -126,7 +126,7 @@ const UPSERT_COMPLETION: &str = r#"
 INSERT INTO public.liq_graph_pool_cache AS existing
 (pool_address,venue,mint_a,mint_b,status,validated_slot,
  descriptor_version,planner_version,descriptor,pool_config,last_observation)
-SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,1,1,d.descriptor::jsonb,
+SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,2,1,d.descriptor::jsonb,
        d.config::jsonb,d.observation::jsonb
 FROM UNNEST($1::bytea[],$2::smallint[],$3::bytea[],$4::bytea[],
             $5::smallint[],$6::bigint[],$7::text[],$8::text[],$9::text[])
@@ -201,25 +201,6 @@ fn array<'a>(value: &'a Value, name: &str) -> Result<&'a [Value]> {
         .with_context(||format!("missing array {name}"))?)
 }
 
-fn int(value: &Value, name: &str) -> Result<i32> {
-    let number = value.get(name).and_then(Value::as_i64)
-        .with_context(||format!("missing integer {name}"))?;
-    Ok(i32::try_from(number).context("stored signed integer overflow")?)
-}
-
-fn usize_value(value: &Value, name: &str) -> Result<usize> {
-    let number = value.get(name).and_then(Value::as_u64)
-        .with_context(||format!("missing unsigned integer {name}"))?;
-    Ok(usize::try_from(number).context("stored unsigned integer overflow")?)
-}
-
-fn index_array(value: &Value, name: &str) -> Result<Vec<i32>> {
-    array(value, name)?.iter().map(|v| {
-        i32::try_from(v.as_i64().context("invalid signed BinArray index")?)
-            .context("BinArray index overflow")
-    }).collect()
-}
-
 fn encode_accounts(accounts: &[AccountMeta]) -> Value {
     Value::Array(accounts.iter().map(|a|
         json!({"address":a.address.to_string(),"writable":a.writable})).collect())
@@ -242,17 +223,8 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
     }));
     ensure!(pool.completion_state != CompletionState::Prepared || manifest.is_some(),
         "Prepared pool lacks manifest");
-    let inventory = pool.execution_inventory.as_ref().map(|i| json!({
-        "active_id":i.active_id,
-        "active_array_index":i.active_array_index,
-        "internal_initialized":i.internal_initialized,
-        "extension_initialized":i.extension_initialized,
-        "extension_present":i.extension_present,
-        "initialized":i.initialized.iter().map(|v| json!({
-            "index":v.index, "address":v.address.to_string()
-        })).collect::<Vec<_>>(),
-        "selected_indices":i.selected_indices,
-        "validated_indices":i.validated_indices
+    let evidence = pool.completion_evidence.as_ref().map(|e| json!({
+        "kind": e.kind, "version": e.version, "payload": e.payload.as_ref()
     }));
     let mints = pool.mint_proofs.as_ref().map(|proofs| proofs.iter().map(|m| json!({
         "address":m.address.to_string(), "token_2022":m.token_2022,
@@ -261,7 +233,7 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
     let payload = json!({
         "validated_slot":slot,
         "manifest":manifest,
-        "inventory":inventory,
+        "evidence":evidence,
         "mints":mints,
         "reason":pool.completion_reason,
     });
@@ -269,8 +241,9 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
 }
 
 fn decode_descriptor(
-    address: Pubkey, a: Pubkey, b: Pubkey, status: CompletionState, slot: u64, payload: &Value
-) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<BinArrayInventory>>,
+    address: Pubkey, a: Pubkey, b: Pubkey, status: CompletionState, slot: u64,
+    descriptor_version: i32, payload: &Value
+) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
              Option<[MintProof;2]>, Option<String>)> {
     ensure!(payload.get("validated_slot").and_then(Value::as_u64)==Some(slot),
         "persisted validated_slot / descriptor mismatch");
@@ -282,24 +255,30 @@ fn decode_descriptor(
             base_b:decode_accounts(value,"base_b")?,
         }))
     } else { None };
-    let inventory = if let Some(v) = payload.get("inventory").filter(|v|!v.is_null()) {
-        let initialized = array(v,"initialized")?.iter().map(|entry| Ok(BinArrayRef {
-            index:int(entry,"index")?,
-            address:json_key(entry.get("address").context("BinArray address missing")?)?,
-        })).collect::<Result<Vec<_>>>()?;
-        Some(Arc::new(BinArrayInventory {
-            registry_tvl_usd:None, // Live TVL must never be restored as fresh.
-            active_id:int(v,"active_id")?,
-            active_array_index:int(v,"active_array_index")?,
-            internal_initialized:usize_value(v,"internal_initialized")?,
-            extension_initialized:usize_value(v,"extension_initialized")?,
-            extension_present:v.get("extension_present").and_then(Value::as_bool)
-                .context("extension_present missing")?,
-            initialized:Arc::from(initialized),
-            selected_indices:index_array(v,"selected_indices")?,
-            validated_indices:index_array(v,"validated_indices")?,
-        }))
-    } else {None};
+    // Read historic V1 DLMM payloads as opaque evidence; no BinArray decoder.
+    let evidence = if descriptor_version == 1 {
+        payload.get("inventory").filter(|v| !v.is_null()).map(|v| {
+            ensure!(v.is_object(), "legacy DLMM inventory must be an object");
+            Ok(Arc::new(CompletionEvidence {
+                kind: "meteora_dlmm_bin_arrays".to_owned(),
+                version: 1,
+                payload: Arc::new(v.clone()),
+            }))
+        }).transpose()?
+    } else {
+        payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
+            let kind = v.get("kind").and_then(Value::as_str)
+                .filter(|v| !v.is_empty()).context("completion evidence kind missing")?;
+            let version = u32::try_from(v.get("version").and_then(Value::as_u64)
+                .context("completion evidence version missing")?)?;
+            ensure!(version > 0, "invalid completion evidence version");
+            let data = v.get("payload").context("completion evidence payload missing")?;
+            ensure!(data.is_object(), "completion evidence payload must be an object");
+            Ok(Arc::new(CompletionEvidence {
+                kind: kind.to_owned(), version, payload: Arc::new(data.clone()),
+            }))
+        }).transpose()?
+    };
     let mints = if let Some(v) = payload.get("mints").filter(|v|!v.is_null()) {
         let raw = v.as_array().context("invalid stored mint proofs")?;
         ensure!(raw.len()==2, "expected two persisted mint proofs");
@@ -326,12 +305,12 @@ fn decode_descriptor(
     ensure!((status==CompletionState::Prepared)==manifest.is_some(),
         "stored Prepared status and manifest disagree");
     if status==CompletionState::Prepared {
-        ensure!(inventory.is_some() && mints.is_some(), "Prepared missing RPC proof");
+        ensure!(evidence.is_some() && mints.is_some(), "Prepared missing protocol evidence and mint proof");
     }
     let reason = payload.get("reason").filter(|v|!v.is_null())
         .map(|v|v.as_str().context("invalid persisted reason").map(str::to_owned))
         .transpose()?;
-    Ok((manifest, inventory, mints, reason))
+    Ok((manifest, evidence, mints, reason))
 }
 
 #[derive(Clone, Copy)]
@@ -435,10 +414,10 @@ impl Persistence {
                     .map(|v|u64::try_from(v).context("negative persisted slot")).transpose()?;
                 let version:i32=row.get("descriptor_version");
                 let planner:i32=row.get("planner_version");
-                ensure!(version==DESCRIPTOR_VERSION && planner==PLANNER_VERSION,
+                ensure!((1..=DESCRIPTOR_VERSION).contains(&version) && planner==PLANNER_VERSION,
                     "unsupported persisted descriptor/planner version pool={address}");
                 let raw_descriptor:Option<String>=row.get("payload");
-                let (manifest,inventory,mints,reason)=match (status,slot,raw_descriptor) {
+                let (manifest,evidence,mints,reason)=match (status,slot,raw_descriptor) {
                     (CompletionState::Unknown,None,None) => {
                         unknown+=1; (None,None,None,None)
                     }
@@ -447,7 +426,7 @@ impl Persistence {
                         let b=b.context("completed pool mint B missing")?;
                         let payload:Value=serde_json::from_str(&raw)
                             .with_context(||format!("decode descriptor pool={address}"))?;
-                        let decoded=decode_descriptor(address,a,b,status,slot,&payload)
+                        let decoded=decode_descriptor(address,a,b,status,slot,version,&payload)
                             .with_context(||format!("restore pool={address}"))?;
                         if status==CompletionState::Prepared{prepared+=1;}else{incomplete+=1;}
                         decoded
@@ -474,7 +453,7 @@ impl Persistence {
                     first_seen_ms,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
                     pool_config,last_observation,
                     completion_state:status,completion_validated_slot:slot,
-                    execution_manifest:manifest,execution_inventory:inventory,
+                    execution_manifest:manifest,completion_evidence:evidence,
                     mint_proofs:mints,completion_reason:reason,
                 });
                 after=Some(raw_address);

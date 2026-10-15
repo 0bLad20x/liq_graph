@@ -5,15 +5,14 @@ use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
+use serde_json::json;
 use tokio::{sync::{broadcast,watch}, task::JoinSet};
 
 use crate::{
-    core::{Venue, AccountMeta, ExecutionManifest, BinArrayRef, BinArrayInventory,
-        MintProof, CompletionStatus, CompletionResult, CompletionResultBatch},
-    workers::{
-        pool_registry::{CompletionState, PoolState, PoolUpdateBatch},
-        rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
-    },
+    core::{Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
+        CompletionStatus, CompletionResult, CompletionResultBatch,
+        CompletionState, PoolState, PoolUpdateBatch},
+    workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
@@ -25,6 +24,47 @@ const ARRAY_DISC: [u8; 8] = [92, 142, 92, 220, 5, 148, 70, 181];
 const BITMAP_DISC: [u8; 8] = [80, 111, 124, 113, 55, 237, 18, 5];
 const ARRAY_BYTES: usize = 56 + 70 * 144;
 const BITMAP_BYTES: usize = 40 + 2 * 12 * 64;
+
+// This DLMM-only account inventory never crosses the shared contract boundary.
+#[derive(Clone, Debug)]
+struct BinArrayRef {
+    pub index: i32,
+    pub address: Pubkey,
+}
+
+#[derive(Clone, Debug)]
+struct BinArrayInventory {
+    pub registry_tvl_usd: Option<f64>,
+    pub active_id: i32,
+    pub active_array_index: i32,
+    pub internal_initialized: usize,
+    pub extension_initialized: usize,
+    pub extension_present: bool,
+    /// The complete initialized array-address inventory represented by the fetched bitmaps.
+    pub initialized: Arc<[BinArrayRef]>,
+    pub selected_indices: Vec<i32>,
+    pub validated_indices: Vec<i32>,
+}
+
+fn evidence(inventory: BinArrayInventory) -> Arc<CompletionEvidence> {
+    Arc::new(CompletionEvidence {
+        kind: "meteora_dlmm_bin_arrays".to_owned(),
+        version: 1,
+        payload: Arc::new(json!({
+            "registry_tvl_usd": inventory.registry_tvl_usd,
+            "active_id": inventory.active_id,
+            "active_array_index": inventory.active_array_index,
+            "internal_initialized": inventory.internal_initialized,
+            "extension_initialized": inventory.extension_initialized,
+            "extension_present": inventory.extension_present,
+            "initialized": inventory.initialized.iter().map(|a| json!({
+                "index": a.index, "address": a.address.to_string()
+            })).collect::<Vec<_>>(),
+            "selected_indices": inventory.selected_indices,
+            "validated_indices": inventory.validated_indices,
+        })),
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -292,7 +332,7 @@ fn mint_failure(pending: PendingMintValidation, status: CompletionStatus,
     reason: impl Into<String>) -> CompletionResult {
     CompletionResult { pool: pending.pool, status, validated_slot: Some(pending.slot),
         manifest: None, reason: Some(reason.into()),
-        inventory: Some(Arc::new(pending.validated.inventory)), mints: None }
+        evidence: Some(evidence(pending.validated.inventory)), mints: None }
 }
 
 async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
@@ -364,7 +404,7 @@ async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
 
 fn retryable(pool: Pubkey, reason: impl Into<String>) -> CompletionResult {
     CompletionResult { pool, status: CompletionStatus::Retryable, validated_slot: None,
-        manifest: None, reason: Some(reason.into()), inventory: None, mints: None }
+        manifest: None, reason: Some(reason.into()), evidence: None, mints: None }
 }
 
 fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]) -> CompletionResult {
@@ -381,7 +421,7 @@ fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]
     CompletionResult {
         pool, status, validated_slot: Some(slot),
         manifest: if status == CompletionStatus::Prepared { validated.manifest.map(Arc::new) } else { None },
-        reason, inventory: Some(Arc::new(validated.inventory)), mints: Some(mints),
+        reason, evidence: Some(evidence(validated.inventory)), mints: Some(mints),
     }
 }
 
@@ -854,14 +894,9 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                 batches += 1;
                 for result in &batch.results {
                     results += 1;
-                    if let Some(inventory) = &result.inventory {
-                        println!("execution inventory pool={} registry_tvl_usd={:?} active_bin={} active_array={} internal_bitmap_bits={} extension_bitmap_bits={} bitmap_extension_present={} initialized={} selected={:?} validated={:?} initialized_addresses={:?}",
-                            result.pool, inventory.registry_tvl_usd, inventory.active_id, inventory.active_array_index,
-                            inventory.internal_initialized, inventory.extension_initialized,
-                            inventory.extension_present, inventory.initialized.len(),
-                            inventory.selected_indices, inventory.validated_indices,
-                            inventory.initialized.iter().map(|a| format!("{}:{}", a.index, a.address))
-                                .collect::<Vec<_>>());
+                    if let Some(evidence) = &result.evidence {
+                        println!("execution evidence pool={} kind={} version={} payload={}",
+                            result.pool, evidence.kind, evidence.version, evidence.payload);
                     }
                     if let Some(mints) = &result.mints {
                         for mint in mints {
