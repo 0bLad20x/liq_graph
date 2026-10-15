@@ -6,16 +6,23 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
-enum SourceSet { Dlmm, Raydium, Orca, DammV2, All }
+enum SourceSet { Dlmm, DlmmDammV2, Raydium, Orca, DammV2, All }
+
+struct CompletionConfig {
+    rpc: rpc_transport::RpcHandle,
+    dlmm: Option<execution_completion::Settings>,
+    damm_v2: Option<damm_v2_completion::Settings>,
+}
 
 struct Cli {
     meteora: meteora_dlmm::Settings,
     jupiter_only: bool,
     rpc_live: bool,
     completion_live: bool,
+    damm_v2_completion_live: bool,
     graph_live: bool,
     completion_limit: Option<usize>,
     persistence_write_live: bool,
@@ -33,6 +40,7 @@ fn settings() -> Result<Cli> {
     let mut jupiter_only = false;
     let mut rpc_live = false;
     let mut completion_live = false;
+    let mut damm_v2_completion_live = false;
     let mut graph_live = false;
     let mut completion_limit = None;
     let mut persistence_write_live = false;
@@ -48,6 +56,7 @@ fn settings() -> Result<Cli> {
             "--jupiter-only" => jupiter_only = true,
             "--rpc-live" => rpc_live = true,
             "--completion-live" => { completion_live = true; once = true; },
+            "--damm-v2-completion-live" => { damm_v2_completion_live = true; once = true; },
             "--graph-live" => { graph_live = true; once = true; },
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
@@ -71,7 +80,7 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --damm-v2-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
         }
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live || rest_discovery_live)),
@@ -81,11 +90,15 @@ fn settings() -> Result<Cli> {
         || (rest_discovery_live && rest_source_only.is_some()))),
         "--rest-discovery-live is an API-only checkpoint with optional --pages");
     ensure!(!(persistence_v2_live && (persistence_write_live || persistence_restore_live
-        || completion_live || graph_live || stability_live || rest_discovery_live
+        || completion_live || damm_v2_completion_live || graph_live || stability_live || rest_discovery_live
         || rest_source_only.is_some() || rpc_live || jupiter_only
         || completion_limit.is_some())),
         "--persistence-v2-live is an exclusive REST+PostgreSQL checkpoint");
     ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
+    ensure!(!(damm_v2_completion_live && (graph_live || persistence_write_live
+        || persistence_restore_live || persistence_v2_live || stability_live || rpc_live
+        || rest_discovery_live || rest_source_only.is_some() || jupiter_only)),
+        "--damm-v2-completion-live is an integrated RPC/Registry/PostgreSQL/Graph mode; only --completion-live may be combined to enable both DEXes");
     ensure!(!(stability_live && (completion_live || graph_live || persistence_write_live
         || persistence_restore_live || rpc_live || jupiter_only || once)),
         "--stability-live is continuous and cannot be combined with other live modes or --once");
@@ -99,8 +112,9 @@ fn settings() -> Result<Cli> {
     ensure!(!(persistence_write_live && jupiter_only), "--persistence-write-live cannot use Jupiter-only");
     ensure!(!(completion_live && jupiter_only),
         "--completion-live cannot be combined with --jupiter-only");
-    ensure!(completion_limit.is_none() || completion_live || graph_live || persistence_write_live || stability_live,
-        "--completion-limit requires --completion-live, --graph-live, --persistence-write-live or --stability-live");
+    ensure!(completion_limit.is_none() || completion_live || damm_v2_completion_live
+        || graph_live || persistence_write_live || stability_live,
+        "--completion-limit requires a Completion/Graph/Persistence/Stability live mode");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
@@ -110,6 +124,7 @@ fn settings() -> Result<Cli> {
         jupiter_only,
         rpc_live,
         completion_live,
+        damm_v2_completion_live,
         graph_live,
         completion_limit,
         persistence_write_live,
@@ -190,7 +205,7 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
 fn spawn_sources(
     tasks: &mut JoinSet<Result<()>>,
     settings: meteora_dlmm::Settings,
-    completion: Option<(rpc_transport::RpcHandle, execution_completion::Settings)>,
+    completion: Option<CompletionConfig>,
     graph: Option<liquidity_graph::Settings>,
     initial_registry: Option<pool_registry::PoolRegistry>,
     persist: Option<persistence::Persistence>,
@@ -219,16 +234,24 @@ fn spawn_sources(
         tasks.spawn(liquidity_graph::run(registry_output.subscribe(), tx, settings));
     }
 
-    let completion_input = if let Some((rpc, config)) = completion {
-        let candidate_input = registry_output.subscribe();
-        let (completion_output, completion_observer) = broadcast::channel(256);
+    let completion_input = if let Some(config) = completion {
+        let (completion_output, _) =
+            broadcast::channel::<Arc<core::CompletionResultBatch>>(256);
         let receiver = completion_output.subscribe();
-        // Verbose proof only for finite runs. Continuous work stays bounded.
-        if config.limit > 0 {
-            tasks.spawn(execution_completion::observe(completion_observer));
+        if let Some(dlmm) = config.dlmm {
+            // Verbose DLMM proof only in its original bounded standalone mode.
+            if config.damm_v2.is_none() && dlmm.limit > 0 {
+                tasks.spawn(execution_completion::observe(completion_output.subscribe()));
+            }
+            tasks.spawn(execution_completion::run(registry_output.subscribe(),
+                source_done_rx.clone(), config.rpc.clone(), dlmm, completion_output.clone()));
         }
-        tasks.spawn(execution_completion::run(candidate_input, source_done_rx,
-            rpc, config, completion_output));
+        if let Some(damm_v2) = config.damm_v2 {
+            tasks.spawn(damm_v2_completion::run(registry_output.subscribe(),
+                source_done_rx, config.rpc, damm_v2, completion_output.clone()));
+        }
+        // Registry closes only after every completion producer has finished.
+        drop(completion_output);
         Some(receiver)
     } else { None };
     tasks.spawn(source_diagnostic::run(input, strict_lag));
@@ -266,11 +289,11 @@ fn spawn_sources(
             once: settings.once, max_pages: settings.max_pages, rps,
         }));
     }
-    if matches!(source_set, SourceSet::DammV2 | SourceSet::All) {
+    if matches!(source_set, SourceSet::DammV2 | SourceSet::DlmmDammV2 | SourceSet::All) {
         tasks.spawn(meteora_damm_v2::run(core::http_client()?, output.clone(),
             meteora_damm_v2::Settings { once: settings.once, max_pages: settings.max_pages }));
     }
-    if matches!(source_set, SourceSet::Dlmm | SourceSet::All) {
+    if matches!(source_set, SourceSet::Dlmm | SourceSet::DlmmDammV2 | SourceSet::All) {
         tasks.spawn(meteora_dlmm::run(core::http_client()?, output, settings));
     }
     Ok(())
@@ -343,7 +366,8 @@ pub async fn run() -> Result<()> {
         println!("persistence restore-live complete restored_pools={restored} rpc_calls=0");
         return Ok(());
     }
-    if cli.completion_live || cli.graph_live || cli.persistence_write_live || cli.stability_live {
+    if cli.completion_live || cli.damm_v2_completion_live
+        || cli.graph_live || cli.persistence_write_live || cli.stability_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
         let mut completion = execution_completion::Settings::from_env()?;
@@ -354,10 +378,12 @@ pub async fn run() -> Result<()> {
             else if cli.graph_live || cli.persistence_write_live {5000}
             else {100});
 
-        let graph = if cli.graph_live || cli.persistence_write_live || cli.stability_live {
+        let graph = if cli.graph_live || cli.persistence_write_live
+            || cli.stability_live || cli.damm_v2_completion_live {
             Some(liquidity_graph::Settings::from_env()?)
         } else {None};
-        let (registry, writer) = if cli.persistence_write_live || cli.stability_live {
+        let (registry, writer) = if cli.persistence_write_live
+            || cli.stability_live || cli.damm_v2_completion_live {
             let db = persistence::Persistence::connect().await?;
             let registry = pool_registry::PoolRegistry::default();
             let restored = registry.restore(db.restore().await?)?;
@@ -368,8 +394,20 @@ pub async fn run() -> Result<()> {
             println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
                 cli.meteora.max_pages, completion.limit);
         }
+        let source_set = if cli.damm_v2_completion_live {
+            if cli.completion_live { SourceSet::DlmmDammV2 } else { SourceSet::DammV2 }
+        } else { SourceSet::Dlmm };
+        let damm_v2 = if cli.damm_v2_completion_live {
+            let mut settings = damm_v2_completion::Settings::from_env()?;
+            settings.limit = completion.limit;
+            Some(settings)
+        } else { None };
+        let dlmm = if !cli.damm_v2_completion_live || cli.completion_live {
+            Some(completion)
+        } else { None };
         spawn_sources(&mut tasks, cli.meteora,
-            Some((rpc.clone(), completion)), graph, registry, writer, SourceSet::Dlmm, false)?;
+            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2}),
+            graph, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
         tasks.spawn(async move { rpc_task.await? });
