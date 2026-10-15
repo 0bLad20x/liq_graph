@@ -134,7 +134,7 @@ fn settings() -> Result<Cli> {
     ensure!(!(completion_live && jupiter_only),
         "--completion-live cannot be combined with --jupiter-only");
     ensure!(completion_limit.is_none() || completion_live || damm_v2_completion_live
-        || orca_completion_live || raydium_amm_v4_completion_live || raydium_amm_v4_completion_live
+        || orca_completion_live || raydium_amm_v4_completion_live
         || graph_live || persistence_write_live || stability_live,
         "--completion-limit requires a Completion/Graph/Persistence/Stability live mode");
     ensure!(
