@@ -450,9 +450,8 @@ async fn fetch_inventory(shared: &Shared) -> Result<(HashMap<String, Candidate>,
             let result = async {
                 let response = client.get(&url).timeout(Duration::from_secs(20)).send().await?;
                 ensure!(response.status().is_success(), "source HTTP {}", response.status());
-                ensure!(response.content_length().is_none_or(|n| n <= MAX_SOURCE_BYTES as u64), "source too large");
-                let bytes = response.bytes().await?;
-                ensure!(bytes.len() <= MAX_SOURCE_BYTES, "source too large");
+                let bytes = read_capped(response, MAX_SOURCE_BYTES).await
+                    .context("proxy source response too large or truncated")?;
                 Ok::<_, anyhow::Error>(String::from_utf8(bytes.to_vec())?)
             }.await;
             (name, kind, url, result)
@@ -576,10 +575,8 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
                 let response = client.get(shared.settings.verify_url.clone())
                     .timeout(shared.settings.probe_timeout).send().await?;
                 ensure!(response.status().is_success(), "verify HTTP {}", response.status());
-                ensure!(response.content_length().is_none_or(|n| n <= 1024),
-                    "verify response exceeds 1 KiB");
-                let body = response.bytes().await?;
-                ensure!(body.len() <= 1024, "verify response exceeds 1 KiB");
+                let _body = read_capped(response, 1024).await
+                    .context("proxy verify response too large or truncated")?;
                 Ok::<_, anyhow::Error>((client, started.elapsed().as_millis() as u64))
             }.await;
             (candidate, outcome)
@@ -773,12 +770,12 @@ async fn quarantine(shared: &Shared, route_id: &str) {
     publish(shared).await;
 }
 
-async fn read_bounded(mut response: reqwest::Response) -> Result<Bytes> {
-    ensure!(response.content_length().is_none_or(|n| n <= MAX_RESPONSE_BYTES as u64),
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Bytes> {
+    ensure!(response.content_length().is_none_or(|n| n <= cap as u64),
         "HTTP response exceeds size cap");
     let mut body = BytesMut::new();
     while let Some(chunk) = response.chunk().await.context("HTTP response body")? {
-        ensure!(chunk.len() <= MAX_RESPONSE_BYTES.saturating_sub(body.len()),
+        ensure!(chunk.len() <= cap.saturating_sub(body.len()),
             "HTTP response exceeds size cap");
         body.extend_from_slice(&chunk);
     }
@@ -798,7 +795,7 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             .iter().any(|key| request.headers.contains_key(*key)),
             "authentication headers cannot be forwarded through public proxies");
     }
-    let idempotent = matches!(request.method, Method::GET | Method::HEAD);
+    let idempotent = request.method == Method::GET || request.method == Method::HEAD;
     let max_attempts = if idempotent { shared.settings.retry_attempts } else { 1 };
     let mut excluded = HashSet::new();
     let mut previous_route = None::<String>;
@@ -860,7 +857,7 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             shared.stats.lock().expect("HTTP stats lock poisoned").http_5xx += 1;
         }
 
-        let body = match read_bounded(response).await {
+        let body = match read_capped(response, MAX_RESPONSE_BYTES).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 shared.stats.lock().expect("HTTP stats lock poisoned").other_errors += 1;
