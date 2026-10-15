@@ -28,12 +28,12 @@ const BITMAP_BYTES: usize = 40 + 2 * 12 * 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
+    /// Zero means continuous/unbounded; positive limits cap finite live runs.
     pub limit: usize,
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
     pub parallel_batches: usize,
-    /// Zero means continuous/unbounded; finite tests may set a positive attempt cap.
 }
 
 impl Settings {
