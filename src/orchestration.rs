@@ -354,16 +354,6 @@ pub async fn run() -> Result<()> {
         );
 
         let started = std::time::Instant::now();
-        let jobs = stream::iter(0..calls).map(|_| {
-            let handle = handle.clone();
-            let target = target.clone();
-            async move {
-                let request = http_transport::HttpRequest::get(
-                    &target, http_transport::RoutePolicy::ProxyOnly)?;
-                handle.call(request).await
-            }
-        }).buffer_unordered(parallel);
-        tokio::pin!(jobs);
         let mut ok = 0usize;
         let mut failed = 0usize;
         let mut status_429 = 0usize;
@@ -372,7 +362,18 @@ pub async fn run() -> Result<()> {
         let mut latencies = Vec::with_capacity(calls);
         let mut bytes = 0usize;
         let mut sample = None;
-        while let Some(result) = jobs.next().await {
+        {
+            let jobs = stream::iter(0..calls).map(|_| {
+                let handle = handle.clone();
+                let target = target.clone();
+                async move {
+                    let request = http_transport::HttpRequest::get(
+                        &target, http_transport::RoutePolicy::ProxyOnly)?;
+                    handle.call(request).await
+                }
+            }).buffer_unordered(parallel);
+            tokio::pin!(jobs);
+            while let Some(result) = jobs.next().await {
             match result {
                 Ok(response) => {
                     routes_used.insert(response.route_id.clone());
@@ -395,6 +396,7 @@ pub async fn run() -> Result<()> {
                     if failed <= 3 { eprintln!("http_transport live request_error={error:#}"); }
                 }
             }
+        }
         }
         latencies.sort_unstable();
         let p50 = latencies.get(latencies.len().saturating_sub(1) * 50 / 100)
