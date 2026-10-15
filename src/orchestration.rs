@@ -336,7 +336,11 @@ pub async fn run() -> Result<()> {
                 updates.changed().await.context("HTTP working set publisher closed")?;
             }
         }).await.context("no verified proxy within 900 seconds")??;
-        println!("http_transport live working_set={} fastest_ms={}", selected.len(), selected[0].latency_ms);
+        println!(
+            "http_transport live working_set={} fastest_ms={} protocol={} sources={} current_working={}",
+            selected.len(), selected[0].latency_ms, selected[0].protocol,
+            selected[0].sources.join(","), handle.working_set().len()
+        );
         let request = http_transport::HttpRequest::get(&target, http_transport::RoutePolicy::ProxyOnly)?;
         let response = handle.call(request).await?;
         ensure!(response.status == reqwest::StatusCode::OK,

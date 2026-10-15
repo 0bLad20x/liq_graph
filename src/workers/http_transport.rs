@@ -31,6 +31,8 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutePolicy {
     ProxyOnly,
+    // Public route-policy option; no direct-request consumer is wired yet.
+    #[allow(dead_code)]
     DirectOnly,
 }
 
