@@ -5,7 +5,7 @@ use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
-use tokio::{sync::broadcast, task::JoinSet};
+use tokio::{sync::{broadcast,watch}, task::JoinSet};
 
 use crate::{
     core::{Venue, AccountMeta, ExecutionManifest, BinArrayRef, BinArrayInventory,
@@ -28,13 +28,12 @@ const BITMAP_BYTES: usize = 40 + 2 * 12 * 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
+    /// Zero means continuous/unbounded; positive limits cap finite live runs.
     pub limit: usize,
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
     pub parallel_batches: usize,
-    /// Stability runs finalize a nonempty candidate set after a quiet period.
-    pub selection_idle_timeout: Option<Duration>,
 }
 
 impl Settings {
@@ -55,8 +54,7 @@ impl Settings {
             .context("invalid DLMM_COMPLETION_PARALLEL_BATCHES")?;
         ensure!((1..=64).contains(&parallel_batches),
             "DLMM_COMPLETION_PARALLEL_BATCHES must be 1..=64");
-        Ok(Self { limit: 100, account_batch_size, below, above,
-            parallel_batches, selection_idle_timeout: None })
+        Ok(Self { limit: 100, account_batch_size, below, above, parallel_batches })
     }
 }
 
@@ -619,92 +617,230 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
     Ok(Validated {layout: latest, inventory, manifest})
 }
 
-/// Standalone consumer of Registry's typed change stream. Never reads private Registry state.
+/// This is a worker-local attempt scheduler, not an economic signal engine.
+/// It uses only fresh Registry TVL; historic SQL observations never qualify a pool.
+const MIN_COMPLETION_TVL_USD: f64 = 500.0;
+const POOLS_PER_WORK_BATCH: usize = 16;
+const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct CandidateScheduler {
+    /// Latest qualifying Registry state. Keyed for deduplication and TVL reprioritization.
+    candidates: HashMap<Pubkey, PoolState>,
+    /// 1 = first completion attempt finished/started; 2 = one delayed technical retry.
+    attempts: HashMap<Pubkey, u8>,
+    /// Only transient validation/RPC failures may enter the third priority tier.
+    retry_after: HashMap<Pubkey, Instant>,
+}
+
+impl CandidateScheduler {
+    fn update(&mut self, pool: &PoolState) {
+        if pool.venue != Venue::MeteoraDlmm { return; }
+        if pool.completion_state == CompletionState::Prepared {
+            self.candidates.remove(&pool.address);
+            self.retry_after.remove(&pool.address);
+        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
+            || !pool.tvl_usd.is_some_and(|v| v.is_finite() && v > MIN_COMPLETION_TVL_USD)
+        {
+            // TVL is only a temporary eligibility filter. Keep the attempt and
+            // transient retry history if the pool later re-enters the threshold.
+            self.candidates.remove(&pool.address);
+        } else {
+            self.candidates.insert(pool.address, pool.clone());
+        }
+    }
+
+    fn repeatable_incomplete(pool: &PoolState) -> bool {
+        // Re-reading cannot cure a verified V10-incompatible mint.
+        !pool.completion_reason.as_deref().is_some_and(|reason|
+            reason.contains("V10 unsupported Token-2022 mint extensions")
+            || reason.contains("Token-2022 owner differs from LbPair flag"))
+    }
+
+    fn tier(&self, pool: &PoolState, now: Instant) -> Option<u8> {
+        match self.attempts.get(&pool.address).copied() {
+            None => match pool.completion_state {
+                CompletionState::Unknown => Some(1),
+                CompletionState::Incomplete if Self::repeatable_incomplete(pool) => Some(2),
+                _ => None,
+            },
+            Some(1) if self.retry_after.get(&pool.address).is_some_and(|due| *due <= now) =>
+                Some(3),
+            _ => None,
+        }
+    }
+
+    /// Always consume currently known tier-1 before tier-2, and tier-2 before tier-3.
+    /// Within a tier, highest current TVL wins (never an inferred profit metric).
+    fn next(&self, capacity: usize, now: Instant) -> (u8, Vec<PoolState>) {
+        let mut tier=0;
+        let mut sorted=Vec::new();
+        for pool in self.candidates.values() {
+            let Some(available)=self.tier(pool,now) else {continue;};
+            if tier==0 || available < tier {
+                tier=available;
+                sorted.clear();
+            }
+            if available==tier {sorted.push(pool.clone());}
+        }
+        sorted.sort_unstable_by(|a,b|{
+            b.tvl_usd.unwrap_or_default().total_cmp(&a.tvl_usd.unwrap_or_default())
+                .then_with(||a.address.to_bytes().cmp(&b.address.to_bytes()))
+        });
+        sorted.truncate(capacity);
+        (tier,sorted)
+    }
+
+    fn pending_retry(&self) -> bool {
+        self.retry_after.iter().any(|(address,_)|
+            self.candidates.contains_key(address)
+            && self.attempts.get(address)==Some(&1))
+    }
+
+    fn classify(&self) -> (usize,usize,usize,usize) {
+        let mut unknown=0; let mut incomplete=0; let mut retryable=0; let mut blocked=0;
+        for pool in self.candidates.values() {
+            if self.attempts.get(&pool.address)==Some(&1)
+                && self.retry_after.contains_key(&pool.address) {
+                retryable+=1;
+            } else if !self.attempts.contains_key(&pool.address) {
+                match pool.completion_state {
+                    CompletionState::Unknown => unknown+=1,
+                    CompletionState::Incomplete if Self::repeatable_incomplete(pool) => incomplete+=1,
+                    CompletionState::Incomplete => blocked+=1,
+                    CompletionState::Prepared => (),
+                }
+            }
+        }
+        (unknown,incomplete,retryable,blocked)
+    }
+}
+
+/// Standalone DLMM consumer. First attempts are never interrupted by retry loops.
+/// Each finished partition is published immediately; no 5,000-pool accumulation.
 pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
+    source_done: watch::Receiver<bool>,
     rpc: RpcHandle, settings: Settings,
     output: broadcast::Sender<Arc<CompletionResultBatch>>) -> Result<()> {
-    ensure!(settings.limit > 0 && settings.account_batch_size > 0,
+    ensure!(settings.account_batch_size > 0 && settings.parallel_batches > 0,
         "invalid Completion settings");
-    let mut selected = Vec::with_capacity(settings.limit);
-    let mut seen = HashSet::new();
-    let mut observed = 0_u64;
-    let mut last_selected = Instant::now();
-    loop {
-        let event = if let Some(idle) = settings.selection_idle_timeout {
-            tokio::select! {
-                result = input.recv() => Some(result),
-                _ = tokio::time::sleep_until(last_selected + idle), if !selected.is_empty() => None,
-            }
-        } else {
-            Some(input.recv().await)
-        };
-        let Some(event) = event else {
-            println!("execution completion selection_quiet_timeout selected={} observed_pools={observed}",selected.len());
-            break;
-        };
-        match event {
-            Ok(batch) => {
-                observed += batch.pools.len() as u64;
-                for pool in &batch.pools {
-                    if pool.venue == Venue::MeteoraDlmm
-                        && pool.completion_state == CompletionState::Unknown
-                        && pool.mint_a.is_some() && pool.mint_b.is_some()
-                        && pool.tvl_usd.is_some_and(|tvl| tvl > 0.0)
-                        && seen.insert(pool.address) {
-                        selected.push(pool.clone());
-                        last_selected = Instant::now();
-                    }
-                    if selected.len() == settings.limit { break; }
-                }
-                if selected.len() == settings.limit { break; }
-            }
-            Err(broadcast::error::RecvError::Lagged(count)) =>
-                bail!("execution completion missed {count} Registry batches"),
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
-    println!("execution completion selection observed_pools={observed} selected_unknown={} max={}",
-        selected.len(), settings.limit);
-    ensure!(!selected.is_empty(), "no unknown DLMM pools with positive TVL observed");
+    let mut scheduler=CandidateScheduler::default();
+    let mut tasks=JoinSet::new();
+    let mut source_open=true;
+    let mut observed=0_u64;
+    let mut unique_dlmm_seen=HashSet::new();
+    let mut total_attempts=0_usize;
+    let mut initial_attempts=0_usize;
+    let mut repeated_attempts=0_usize;
+    let mut prepared_count=0_usize;
+    let mut incomplete_count=0_usize;
+    let mut retryable_count=0_usize;
+    let started=Instant::now();
+    let mut pulse=tokio::time::interval(Duration::from_secs(5));
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    println!("dlmm completion started min_tvl_usd={} limit={} (0=unbounded) parallel={} pools_per_batch={} retry_cooldown_s={}",
+        MIN_COMPLETION_TVL_USD,settings.limit,settings.parallel_batches,
+        POOLS_PER_WORK_BATCH,RETRY_COOLDOWN.as_secs());
 
-    // Independent pool partitions can be completed concurrently. Each partition
-    // retains the existing per-pool multi-slot revalidation and 100-account RPC limit.
-    // The single shared RpcHandle enforces per-provider request limits and failover.
-    let started = Instant::now();
-    let total_batches = selected.len().div_ceil(settings.account_batch_size);
-    let mut partitions = selected.chunks(settings.account_batch_size);
-    let mut tasks = JoinSet::new();
-    let mut results = Vec::with_capacity(selected.len());
-    for _ in 0..settings.parallel_batches {
-        let Some(partition) = partitions.next() else { break; };
-        let rpc = rpc.clone();
-        let pools = partition.to_vec();
-        tasks.spawn(async move { process(&rpc, &pools, settings).await });
-    }
-    let mut finished = 0_usize;
-    while let Some(joined) = tasks.join_next().await {
-        results.extend(joined.context("DLMM parallel completion batch failed")?);
-        finished += 1;
-        if finished % 10 == 0 || finished == total_batches {
-            println!("execution completion progress batches={finished}/{total_batches} pools={} elapsed_ms={}",
-                results.len(), started.elapsed().as_millis());
+    loop {
+        // Limit launch concurrency and provide enough headroom for the single Registry writer.
+        while tasks.len()<settings.parallel_batches
+            && (settings.limit==0 || total_attempts<settings.limit) {
+            let capacity=if settings.limit==0 {POOLS_PER_WORK_BATCH}
+                else {POOLS_PER_WORK_BATCH.min(settings.limit-total_attempts)};
+            if capacity==0 {break;}
+            let (tier,selected)=scheduler.next(capacity,Instant::now());
+            if selected.is_empty(){break;}
+            for pool in &selected {
+                let prior=scheduler.attempts.get(&pool.address).copied().unwrap_or(0);
+                scheduler.attempts.insert(pool.address,prior+1);
+                scheduler.retry_after.remove(&pool.address);
+            }
+            total_attempts+=selected.len();
+            if tier==3 {repeated_attempts+=selected.len();}
+            else {initial_attempts+=selected.len();}
+            let rpc=rpc.clone();
+            tasks.spawn(async move {
+                let result=process(&rpc,&selected,settings).await;
+                (tier,selected,result)
+            });
         }
-        if let Some(partition) = partitions.next() {
-            let rpc = rpc.clone();
-            let pools = partition.to_vec();
-            tasks.spawn(async move { process(&rpc, &pools, settings).await });
+
+        let limit_reached=settings.limit>0 && total_attempts>=settings.limit;
+        // The Registry cannot close its broadcast while the Completion producer
+        // is still alive. Use its independent source-drained signal instead.
+        let discovery_finished = !source_open || *source_done.borrow();
+        if tasks.is_empty() && (limit_reached || (discovery_finished
+            && input.len()==0 && !scheduler.pending_retry()
+            && scheduler.next(1,Instant::now()).1.is_empty())) {
+            break;
+        }
+
+        tokio::select! {
+            event=input.recv(),if source_open => match event {
+                Ok(batch)=>{
+                    observed+=batch.pools.len() as u64;
+                    for pool in &batch.pools {
+                        if pool.venue==Venue::MeteoraDlmm {
+                            unique_dlmm_seen.insert(pool.address);
+                        }
+                        scheduler.update(pool);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) =>
+                    bail!("DLMM completion lost {n} Registry update batches"),
+                Err(broadcast::error::RecvError::Closed)=>source_open=false,
+            },
+            result=tasks.join_next(),if !tasks.is_empty()=>{
+                let (tier,selected,results)=result.context("missing completion partition")?
+                    .context("DLMM completion partition panicked")?;
+                ensure!(results.len()==selected.len(),
+                    "DLMM completion partition lost pool results");
+                let mut prep=0_usize;let mut inc=0_usize;let mut retry=0_usize;
+                let mut missing_arrays=0_usize;let mut unsupported_mints=0_usize;
+                for result in &results {
+                    if let Some(reason)=result.reason.as_deref() {
+                        if reason.contains("no bitmap-initialized BinArrays") {missing_arrays+=1;}
+                        if reason.contains("V10 unsupported Token-2022 mint extensions") {unsupported_mints+=1;}
+                    }
+                    match result.status {
+                        CompletionStatus::Prepared=>{
+                            prep+=1; scheduler.candidates.remove(&result.pool);
+                            scheduler.retry_after.remove(&result.pool);
+                        }
+                        CompletionStatus::Incomplete=>{inc+=1;}
+                        CompletionStatus::Retryable=>{
+                            retry+=1;
+                            if scheduler.attempts.get(&result.pool)==Some(&1)
+                                && scheduler.candidates.contains_key(&result.pool) {
+                                scheduler.retry_after.insert(result.pool,Instant::now()+RETRY_COOLDOWN);
+                            }
+                        }
+                    }
+                }
+                prepared_count+=prep;incomplete_count+=inc;retryable_count+=retry;
+                println!("dlmm completion batch tier={} attempts={} prepared={} incomplete={} retryable={} missing_arrays={} unsupported_mints={} total_attempts={} first_attempts={} retries={} elapsed_ms={}",
+                    tier,results.len(),prep,inc,retry,missing_arrays,unsupported_mints,
+                    total_attempts,initial_attempts,repeated_attempts,started.elapsed().as_millis());
+                // Small, fully evaluated batches flow to Registry/Persistence/Graph at once.
+                output.send(Arc::new(CompletionResultBatch {
+                    source:"dlmm_execution_completion",results
+                })).map_err(|_|anyhow!("DLMM completion results have no consumer"))?;
+            },
+            _=pulse.tick()=>{
+                let (unknown,incomplete,retryable,blocked)=scheduler.classify();
+                println!("dlmm completion backlog distinct_dlmm_seen={} eligible_unknown={} eligible_incomplete={} cooldown_retryable={} blocked_incompatible={} candidates_in_ram={} active_batches={} first_attempts={} retries={} prepared={} incomplete={} retryable={} observed_updates={}",
+                    unique_dlmm_seen.len(),unknown,incomplete,retryable,blocked,scheduler.candidates.len(),tasks.len(),
+                    initial_attempts,repeated_attempts,prepared_count,incomplete_count,retryable_count,observed);
+            }
         }
     }
-    results.sort_by_key(|result| result.pool.to_bytes());
-    ensure!(results.len() == selected.len(), "completion output count != selected pool count");
-    let prepared = results.iter().filter(|r| r.status == CompletionStatus::Prepared).count();
-    let incomplete = results.iter().filter(|r| r.status == CompletionStatus::Incomplete).count();
-    let retryable = results.iter().filter(|r| r.status == CompletionStatus::Retryable).count();
-    println!("execution completion complete selected={} prepared={} incomplete={} retryable={} batches={} parallel={} elapsed_ms={}",
-        results.len(), prepared, incomplete, retryable, total_batches,
-        settings.parallel_batches, started.elapsed().as_millis());
-    let batch = Arc::new(CompletionResultBatch {source: "dlmm_execution_completion", results});
-    output.send(batch).map_err(|_|anyhow!("completion results have no consumer"))?;
+
+    let (unknown,incomplete,retryable,blocked)=scheduler.classify();
+    println!("dlmm completion complete min_tvl_usd={} distinct_dlmm_seen={} observed_updates={} first_attempts={} retries={} prepared={} incomplete={} retryable={} eligible_unknown_left={} eligible_incomplete_left={} eligible_retryable_left={} blocked_incompatible={} elapsed_ms={}",
+        MIN_COMPLETION_TVL_USD,unique_dlmm_seen.len(),observed,initial_attempts,repeated_attempts,
+        prepared_count,incomplete_count,retryable_count,unknown,incomplete,retryable,
+        blocked,started.elapsed().as_millis());
     Ok(())
 }
 
@@ -761,7 +897,6 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    ensure!(batches > 0, "completion consumer received no batch");
-    ensure!(manifests > 0, "completion live test produced no validated execution manifest");
+    println!("execution completion consumer complete batches={batches} results={results} validated_manifests={manifests}");
     Ok(())
 }

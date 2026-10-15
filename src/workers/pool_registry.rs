@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast,watch};
 
 use crate::core::{
     now_unix_ms, BinArrayInventory, CompletionResultBatch, CompletionStatus, DataBatch,
@@ -252,12 +252,8 @@ impl PoolRegistry {
                 stats.missing_pool += 1;
                 continue;
             };
-            let accepted_slot = pool.completion_validated_slot;
-            if result.validated_slot.is_some_and(|slot|
-                accepted_slot.is_some_and(|previous| slot <= previous)) {
-                stats.stale += 1;
-                continue;
-            }
+            // Retryable does not advance a validated slot. Account for the
+            // accepted no-op before checking stale terminal completion proofs.
             if result.status == CompletionStatus::Retryable {
                 // Transient RPC/validation failures must not overwrite previously
                 // validated manifests or turn an Unknown pool into a terminal state.
@@ -267,7 +263,19 @@ impl PoolRegistry {
                     pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
                     stats.updates.push(pool.clone());
                     stats.applied += 1;
+                } else {
+                    // Transient failure during a repeat check must not erase an
+                    // existing Incomplete/Prepared proof. This is an accepted
+                    // no-op, not a rejected completion result.
+                    stats.preserved_retryable += 1;
                 }
+                continue;
+            }
+
+            let accepted_slot = pool.completion_validated_slot;
+            if result.validated_slot.is_some_and(|slot|
+                accepted_slot.is_some_and(|previous| slot <= previous)) {
+                stats.stale += 1;
                 continue;
             }
 
@@ -292,11 +300,26 @@ impl PoolRegistry {
                 continue;
             }
 
-            pool.completion_state = match result.status {
+            let next_state = match result.status {
                 CompletionStatus::Prepared => CompletionState::Prepared,
                 CompletionStatus::Incomplete => CompletionState::Incomplete,
                 CompletionStatus::Retryable => unreachable!("handled above"),
             };
+            // Net transitions, not result counts: e.g. Incomplete -> Prepared
+            // increases Prepared while decreasing Incomplete.
+            match pool.completion_state {
+                CompletionState::Prepared => stats.prepared_delta -= 1,
+                CompletionState::Incomplete => stats.incomplete_delta -= 1,
+                CompletionState::Unknown => (),
+            }
+            match next_state {
+                CompletionState::Prepared => stats.prepared_delta += 1,
+                CompletionState::Incomplete => stats.incomplete_delta += 1,
+                CompletionState::Unknown => (),
+            }
+            if pool.execution_manifest.is_some() { stats.manifest_delta -= 1; }
+            if result.manifest.is_some() { stats.manifest_delta += 1; }
+            pool.completion_state = next_state;
             pool.completion_validated_slot = Some(slot);
             pool.execution_manifest = result.manifest.clone();
             pool.execution_inventory = result.inventory.clone();
@@ -322,6 +345,11 @@ struct CompletionStats {
     prepared: usize,
     incomplete: usize,
     retryable: usize,
+    preserved_retryable: usize,
+    /// Signed net count changes after accepted terminal state transitions.
+    prepared_delta: i64,
+    incomplete_delta: i64,
+    manifest_delta: i64,
     stale: usize,
     invalid: usize,
     missing_pool: usize,
@@ -349,6 +377,7 @@ pub async fn run(
     mut completion: Option<broadcast::Receiver<Arc<CompletionResultBatch>>>,
     registry: PoolRegistry,
     output: broadcast::Sender<Arc<PoolUpdateBatch>>,
+    source_done: watch::Sender<bool>,
     fail_on_lag: bool,
 ) -> Result<()> {
     let mut batches = 0_u64;
@@ -365,7 +394,11 @@ pub async fn run(
     let mut completion_prepared = 0_usize;
     let mut completion_incomplete = 0_usize;
     let mut completion_retryable = 0_usize;
+    let mut completion_preserved_retryable = 0_usize;
     let mut completion_rejected = 0_usize;
+    let mut prepared_delta = 0_i64;
+    let mut incomplete_delta = 0_i64;
+    let mut manifest_delta = 0_i64;
     let mut source_open = true;
     let mut completion_open = completion.is_some();
     let require_completion = completion_open;
@@ -414,7 +447,12 @@ pub async fn run(
                     eprintln!("pool registry source_lagged missed_batches={skipped}");
                     if fail_on_lag { anyhow::bail!("REST broadcast overflow: Registry lost {skipped} source batches"); }
                 }
-                Err(broadcast::error::RecvError::Closed) => source_open = false,
+                Err(broadcast::error::RecvError::Closed) => {
+                    source_open = false;
+                    // All Source updates have been forwarded. Completion may still
+                    // produce results; this lifecycle signal breaks the channel cycle.
+                    source_done.send_replace(true);
+                },
             },
             event = async {
                 completion.as_mut().expect("completion receiver exists").recv().await
@@ -426,11 +464,16 @@ pub async fn run(
                     completion_prepared += stats.prepared;
                     completion_incomplete += stats.incomplete;
                     completion_retryable += stats.retryable;
+                    completion_preserved_retryable += stats.preserved_retryable;
                     completion_rejected += stats.invalid + stats.stale + stats.missing_pool;
+                    prepared_delta += stats.prepared_delta;
+                    incomplete_delta += stats.incomplete_delta;
+                    manifest_delta += stats.manifest_delta;
                     let updated = stats.updates.len();
-                    println!("pool registry completion source={} received={} applied={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
-                        batch.source, stats.received, stats.applied, stats.prepared, stats.incomplete,
-                        stats.retryable, stats.stale, stats.invalid, stats.missing_pool, updated);
+                    println!("pool registry completion source={} received={} applied={} preserved_retryable={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
+                        batch.source, stats.received, stats.applied, stats.preserved_retryable,
+                        stats.prepared, stats.incomplete, stats.retryable, stats.stale, stats.invalid,
+                        stats.missing_pool, updated);
                     if updated > 0 && output.send(Arc::new(PoolUpdateBatch {
                         kind: PoolUpdateKind::Completion,
                         source: batch.source,
@@ -455,17 +498,24 @@ pub async fn run(
     let manifests = snapshot.iter().filter(|p| p.execution_manifest.is_some()).count();
     let inventories = snapshot.iter().filter(|p| p.execution_inventory.is_some()).count();
     println!(
-        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
+        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
         snapshot.len(),
     );
     if require_completion {
-        anyhow::ensure!(completion_received > 0 && completion_applied == completion_received
+        // A completed discovery pass with no new eligible candidates is valid.
+        // An accepted transient no-op preserves a validated older state and
+        // counts towards accounted results without pretending it was applied.
+        anyhow::ensure!(completion_applied + completion_preserved_retryable == completion_received
             && completion_rejected == 0,
             "registry completion live test did not accept all results");
-        anyhow::ensure!(manifests == bootstrap_manifests + completion_prepared
-            && prepared == bootstrap_prepared + completion_prepared
-            && incomplete == bootstrap_incomplete + completion_incomplete,
-            "registry RAM completion snapshot does not match restored and accepted results");
+        let expected_prepared = i64::try_from(bootstrap_prepared)? + prepared_delta;
+        let expected_incomplete = i64::try_from(bootstrap_incomplete)? + incomplete_delta;
+        let expected_manifests = i64::try_from(bootstrap_manifests)? + manifest_delta;
+        println!("pool registry completion status_net prepared={prepared_delta:+} incomplete={incomplete_delta:+} manifests={manifest_delta:+} expected_prepared={expected_prepared} expected_incomplete={expected_incomplete} expected_manifests={expected_manifests}");
+        anyhow::ensure!(i64::try_from(prepared)? == expected_prepared
+            && i64::try_from(incomplete)? == expected_incomplete
+            && i64::try_from(manifests)? == expected_manifests,
+            "registry RAM completion snapshot does not match restored and accepted net transitions");
     }
     let mut source_counts = by_source.into_iter().collect::<Vec<_>>();
     source_counts.sort_by_key(|(source,_)|*source);
@@ -551,8 +601,7 @@ pub async fn observe_updates(
         "pool registry consumer complete received_batches={batches} pool_updates={pool_updates} lagged_batches={lagged} completion_batches={completion_batches} completion_pools={completion_pools} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_inventories={completion_with_inventory}"
     );
     if require_completion {
-        anyhow::ensure!(completion_batches > 0 && completion_prepared > 0,
-            "registry completion live proof missing prepared output");
+        // No new qualified pools, or only Incomplete results, are valid outcomes.
         anyhow::ensure!(completion_pools == completion_prepared + completion_incomplete
             + completion_retryable, "registry completion consumer received invalid state updates");
         anyhow::ensure!(completion_with_inventory >= completion_prepared + completion_incomplete,
