@@ -338,6 +338,7 @@ pub async fn run() -> Result<()> {
         ensure!((1..=2000).contains(&calls), "HTTP live requests must be 1..=2000");
         ensure!((1..=512).contains(&parallel), "HTTP live parallel must be 1..=512");
         let (handle, task) = http_transport::spawn(config)?;
+        let route_updates = handle.subscribe_routes();
         let mut cycles = handle.subscribe_cycles();
         tokio::time::timeout(Duration::from_secs(900), async {
             loop {
@@ -348,9 +349,11 @@ pub async fn run() -> Result<()> {
         let verified = handle.working_set();
         ensure!(!verified.is_empty(), "HTTP discovery finished with no verified proxies");
         println!(
-            "http_transport live working_set={} fastest_ms={} protocol={} sources={}",
+            "http_transport live working_set={} fastest_ms={} protocol={} sources={} oldest_verified_age_ms={} published_routes={}",
             verified.len(), verified[0].latency_ms, verified[0].protocol,
-            verified[0].sources.join(",")
+            verified[0].sources.join(","),
+            verified.iter().map(|route| route.verified_age_ms).max().unwrap_or(0),
+            route_updates.borrow().len()
         );
 
         let started = std::time::Instant::now();
