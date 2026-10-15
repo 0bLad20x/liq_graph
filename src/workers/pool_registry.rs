@@ -267,6 +267,11 @@ impl PoolRegistry {
                     pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
                     stats.updates.push(pool.clone());
                     stats.applied += 1;
+                } else {
+                    // Transient failure during a repeat check must not erase an
+                    // existing Incomplete/Prepared proof. This is an accepted
+                    // no-op, not a rejected completion result.
+                    stats.preserved_retryable += 1;
                 }
                 continue;
             }
@@ -337,6 +342,7 @@ struct CompletionStats {
     prepared: usize,
     incomplete: usize,
     retryable: usize,
+    preserved_retryable: usize,
     /// Signed net count changes after accepted terminal state transitions.
     prepared_delta: i64,
     incomplete_delta: i64,
@@ -385,6 +391,7 @@ pub async fn run(
     let mut completion_prepared = 0_usize;
     let mut completion_incomplete = 0_usize;
     let mut completion_retryable = 0_usize;
+    let mut completion_preserved_retryable = 0_usize;
     let mut completion_rejected = 0_usize;
     let mut prepared_delta = 0_i64;
     let mut incomplete_delta = 0_i64;
@@ -454,14 +461,16 @@ pub async fn run(
                     completion_prepared += stats.prepared;
                     completion_incomplete += stats.incomplete;
                     completion_retryable += stats.retryable;
+                    completion_preserved_retryable += stats.preserved_retryable;
                     completion_rejected += stats.invalid + stats.stale + stats.missing_pool;
                     prepared_delta += stats.prepared_delta;
                     incomplete_delta += stats.incomplete_delta;
                     manifest_delta += stats.manifest_delta;
                     let updated = stats.updates.len();
-                    println!("pool registry completion source={} received={} applied={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
-                        batch.source, stats.received, stats.applied, stats.prepared, stats.incomplete,
-                        stats.retryable, stats.stale, stats.invalid, stats.missing_pool, updated);
+                    println!("pool registry completion source={} received={} applied={} preserved_retryable={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
+                        batch.source, stats.received, stats.applied, stats.preserved_retryable,
+                        stats.prepared, stats.incomplete, stats.retryable, stats.stale, stats.invalid,
+                        stats.missing_pool, updated);
                     if updated > 0 && output.send(Arc::new(PoolUpdateBatch {
                         kind: PoolUpdateKind::Completion,
                         source: batch.source,
@@ -486,13 +495,14 @@ pub async fn run(
     let manifests = snapshot.iter().filter(|p| p.execution_manifest.is_some()).count();
     let inventories = snapshot.iter().filter(|p| p.execution_inventory.is_some()).count();
     println!(
-        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
+        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
         snapshot.len(),
     );
     if require_completion {
         // A completed discovery pass with no new eligible candidates is valid.
-        // Once there are results, retain the strict accepted/rejected accounting.
-        anyhow::ensure!(completion_applied == completion_received
+        // An accepted transient no-op preserves a validated older state and
+        // counts towards accounted results without pretending it was applied.
+        anyhow::ensure!(completion_applied + completion_preserved_retryable == completion_received
             && completion_rejected == 0,
             "registry completion live test did not accept all results");
         let expected_prepared = i64::try_from(bootstrap_prepared)? + prepared_delta;
