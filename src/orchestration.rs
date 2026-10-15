@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{damm_v2_completion, execution_completion, graph_mint_watch, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, Orca, DammV2, All }
@@ -200,11 +200,7 @@ fn spawn_sources(
     if let Some(settings) = graph {
         let (tx, rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
         tasks.spawn(liquidity_graph::observe(rx.clone()));
-        if let Some(jupiter_settings) = jupiter {
-            // Typed graph snapshot -> mint watchlist -> existing Jupiter Search worker.
-            // The watchlist is derived in its own worker, never inside orchestration.
-            let _input_sender = spawn_jupiter(tasks, jupiter_settings, rx.clone());
-        }
+        spawn_watch_catalog(tasks, rx, jupiter);
         tasks.spawn(liquidity_graph::run(registry_output.subscribe(), tx, settings));
     } else {
         ensure!(jupiter.is_none(), "Jupiter Search requires a liquidity graph");
@@ -275,19 +271,32 @@ fn spawn_sources(
     Ok(())
 }
 
+// One catalog per graph generation; Jupiter receives only plain Mint addresses.
+fn spawn_watch_catalog(
+    tasks: &mut JoinSet<Result<()>>,
+    graph: watch::Receiver<Arc<liquidity_graph::GraphSnapshot>>,
+    jupiter: Option<jupiter_search::Settings>,
+) {
+    let (catalog_tx, catalog_rx) =
+        watch::channel(Arc::new(graph_watch_catalog::WatchCatalog::empty()));
+    tasks.spawn(graph_watch_catalog::observe(catalog_rx));
+    let mint_output = jupiter.map(|settings| {
+        let (mint_tx, mint_rx) = watch::channel::<Arc<[Pubkey]>>(Arc::from([]));
+        spawn_jupiter(tasks, settings, mint_rx);
+        mint_tx
+    });
+    tasks.spawn(graph_watch_catalog::run(graph, catalog_tx, mint_output));
+}
+
 fn spawn_jupiter(
     tasks: &mut JoinSet<Result<()>>,
     settings: jupiter_search::Settings,
-    graph: watch::Receiver<Arc<liquidity_graph::GraphSnapshot>>,
-) -> watch::Sender<Arc<[Pubkey]>> {
+    mints: watch::Receiver<Arc<[Pubkey]>>,
+) {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     tasks.spawn(source_diagnostic::run(input, false));
-
-    let (mint_tx, mint_rx) = watch::channel::<Arc<[Pubkey]>>(Arc::from([]));
-    tasks.spawn(graph_mint_watch::run(graph, mint_tx.clone()));
     // Independent client: the shared HTTP client applies Meteora's 20-second limit.
-    tasks.spawn(jupiter_search::run(reqwest::Client::new(), settings, mint_rx, output));
-    mint_tx
+    tasks.spawn(jupiter_search::run(reqwest::Client::new(), settings, mints, output));
 }
 
 pub async fn run() -> Result<()> {
@@ -321,7 +330,7 @@ pub async fn run() -> Result<()> {
             watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
         let mut tasks = JoinSet::new();
         tasks.spawn(liquidity_graph::observe(graph_rx.clone()));
-        let _mint_sender = spawn_jupiter(&mut tasks, jupiter, graph_rx);
+        spawn_watch_catalog(&mut tasks, graph_rx, Some(jupiter));
         tasks.spawn(liquidity_graph::run(graph_input, graph_tx, graph_settings));
         updates.send(Arc::new(core::PoolUpdateBatch {
             kind: core::PoolUpdateKind::Source,
@@ -333,7 +342,7 @@ pub async fn run() -> Result<()> {
         drop(updates);
         println!("orchestration jupiter-graph-live restored_pools={restored} source=persistence_restore");
         // Jupiter Search runs continuously against the restored graph's mint set.
-        // Retaining _mint_sender keeps this set available after the one-shot restore.
+        // The catalog producer retains the Jupiter mint sender during streaming.
         while let Some(result) = tasks.join_next().await { result??; }
         return Ok(());
     }
@@ -360,7 +369,8 @@ pub async fn run() -> Result<()> {
         let (updates, receiver) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
         let (graph_tx, graph_rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
         let mut tasks = JoinSet::new();
-        tasks.spawn(liquidity_graph::observe(graph_rx));
+        tasks.spawn(liquidity_graph::observe(graph_rx.clone()));
+        spawn_watch_catalog(&mut tasks, graph_rx, None);
         tasks.spawn(liquidity_graph::run(receiver,graph_tx,graph_settings));
         updates.send(Arc::new(core::PoolUpdateBatch {
             kind: core::PoolUpdateKind::Source,
