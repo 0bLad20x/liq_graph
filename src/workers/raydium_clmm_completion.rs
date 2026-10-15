@@ -112,7 +112,7 @@ fn decode_pool(account:&AccountData,expected:&PoolState,program:Pubkey)->Result<
         "Raydium CLMM on-chain mints/vaults differ from Registry or invalid");
     // CLMM pool address supports both legacy and permissioned pool seed_index.
     let seed_index=&d[391..393];
-    let seeds:Vec<&[u8]>=if seed_index==[0,0] {
+    let seeds:Vec<&[u8]>=if seed_index.iter().all(|v|*v==0) {
         vec![b"pool",config.as_ref(),mints[0].as_ref(),mints[1].as_ref()]
     } else {
         vec![b"pool",config.as_ref(),mints[0].as_ref(),mints[1].as_ref(),seed_index]
