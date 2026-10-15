@@ -1,5 +1,5 @@
 //! Raydium CPMM execution completion: Registry candidates -> coherent RPC -> V10 manifests.
-//! Owns AMM v4 binary decoding, SPL mint/vault validation, scheduling and evidence.
+//! Owns CPMM binary decoding, token-program/mint/vault checks, scheduling and evidence.
 //! No direct DB, REST parsing, graph mutations or provider-specific RPC code.
 use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
 
@@ -110,7 +110,7 @@ fn decode_pool(account:&AccountData,expected:&PoolState,program:Pubkey)->Result<
     let token_2022:Pubkey=TOKEN_2022.parse()?;
     ensure!(programs.iter().all(|p|*p==spl||*p==token_2022),
         "Raydium CPMM pool has unsupported token program");
-    let (authority,expected_bump)=Pubkey::find_program_address(
+    let (_,expected_bump)=Pubkey::find_program_address(
         &[b"vault_and_lp_mint_auth_seed"],&program);
     ensure!(auth_bump==expected_bump,"Raydium CPMM pool authority bump mismatch");
     for i in 0..2 {
@@ -121,7 +121,6 @@ fn decode_pool(account:&AccountData,expected:&PoolState,program:Pubkey)->Result<
     let oracle_pda=Pubkey::find_program_address(
         &[b"observation",account.address.as_ref()],&program).0;
     ensure!(observation==oracle_pda,"Raydium CPMM observation PDA mismatch");
-    let _=authority; // validated against auth_bump, used again in the manifest.
     Ok(PoolLayout{address:account.address,config,observation,mints,vaults,programs,
         decimals,auth_bump,status,open_time})
 }
@@ -409,7 +408,6 @@ impl Scheduler {
                 CompletionState::Unknown=>Some(1),
                 CompletionState::Incomplete if !pool.completion_reason.as_deref()
                     .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(2),
-                _=>None,
                 _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),
