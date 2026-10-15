@@ -1,12 +1,12 @@
 //! Resource provisioning, channel connections, and worker lifecycle only.
 
-use std::{collections::HashSet, env, fs, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{damm_v2_completion, execution_completion, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, execution_completion, graph_mint_watch, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, Orca, DammV2, All }
@@ -136,29 +136,7 @@ fn settings() -> Result<Cli> {
     })
 }
 
-// Temporary startup input for local tests; replaced by a real watch-input producer.
-fn load_mints(path: &str) -> Result<Arc<[Pubkey]>> {
-    let raw_file = fs::read_to_string(path)
-        .with_context(|| format!("read Jupiter mint input {path}"))?;
-    let mut mints = Vec::new();
-    let mut seen = HashSet::new();
-    for (line, raw) in raw_file.lines().enumerate() {
-        let raw = raw.trim();
-        if raw.is_empty() || raw.starts_with('#') {
-            continue;
-        }
-        let mint: Pubkey = raw.parse()
-            .with_context(|| format!("{path}: invalid mint on line {}", line + 1))?;
-        ensure!(mint != Pubkey::default(), "{path}: zero mint on line {}", line + 1);
-        if seen.insert(mint) {
-            mints.push(mint);
-        }
-    }
-    ensure!(!mints.is_empty(), "{path}: no mint addresses");
-    Ok(Arc::from(mints))
-}
-
-fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)>> {
+fn jupiter_settings() -> Result<Option<jupiter_search::Settings>> {
     let keys = env::var("JUPITER_SEARCH_API_KEYS").unwrap_or_default();
     let mut seen = HashSet::new();
     let api_keys = keys.split(|ch| ch == ',' || ch == '\n')
@@ -168,13 +146,6 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     if api_keys.is_empty() {
-        return Ok(None);
-    }
-
-    let path = env::var("JUPITER_MINTS_FILE")
-        .unwrap_or_else(|_| "jupiter_mints.txt".to_owned());
-    if !Path::new(&path).is_file() {
-        eprintln!("jupiter source not started: mint input file missing: {path}");
         return Ok(None);
     }
 
@@ -193,13 +164,10 @@ fn jupiter_settings() -> Result<Option<(jupiter_search::Settings, Arc<[Pubkey]>)
     let url = env::var("JUPITER_SEARCH_URL")
         .unwrap_or_else(|_| "https://api.jup.ag/tokens/v2/search".to_owned());
 
-    Ok(Some((
-        jupiter_search::Settings {
-            url, api_keys, calls_per_minute_per_key, batch_size,
-            timeout: Duration::from_secs(timeout),
-        },
-        load_mints(&path)?,
-    )))
+    Ok(Some(jupiter_search::Settings {
+        url, api_keys, calls_per_minute_per_key, batch_size,
+        timeout: Duration::from_secs(timeout),
+    }))
 }
 
 fn spawn_sources(
@@ -207,6 +175,7 @@ fn spawn_sources(
     settings: meteora_dlmm::Settings,
     completion: Option<CompletionConfig>,
     graph: Option<liquidity_graph::Settings>,
+    jupiter: Option<jupiter_search::Settings>,
     initial_registry: Option<pool_registry::PoolRegistry>,
     persist: Option<persistence::Persistence>,
     source_set: SourceSet,
@@ -230,8 +199,15 @@ fn spawn_sources(
     let persistence_input = persist.as_ref().map(|_| registry_output.subscribe());
     if let Some(settings) = graph {
         let (tx, rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
-        tasks.spawn(liquidity_graph::observe(rx));
+        tasks.spawn(liquidity_graph::observe(rx.clone()));
+        if let Some(jupiter_settings) = jupiter {
+            // Typed graph snapshot -> mint watchlist -> existing Jupiter Search worker.
+            // The watchlist is derived in its own worker, never inside orchestration.
+            let _input_sender = spawn_jupiter(tasks, jupiter_settings, rx.clone());
+        }
         tasks.spawn(liquidity_graph::run(registry_output.subscribe(), tx, settings));
+    } else {
+        ensure!(jupiter.is_none(), "Jupiter Search requires a liquidity graph");
     }
 
     let completion_input = if let Some(config) = completion {
@@ -302,15 +278,16 @@ fn spawn_sources(
 fn spawn_jupiter(
     tasks: &mut JoinSet<Result<()>>,
     settings: jupiter_search::Settings,
-    mints: Arc<[Pubkey]>,
+    graph: watch::Receiver<Arc<liquidity_graph::GraphSnapshot>>,
 ) -> watch::Sender<Arc<[Pubkey]>> {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     tasks.spawn(source_diagnostic::run(input, false));
 
-    let (input_tx, input_rx) = watch::channel(mints);
+    let (mint_tx, mint_rx) = watch::channel::<Arc<[Pubkey]>>(Arc::from([]));
+    tasks.spawn(graph_mint_watch::run(graph, mint_tx.clone()));
     // Independent client: the shared HTTP client applies Meteora's 20-second limit.
-    tasks.spawn(jupiter_search::run(reqwest::Client::new(), settings, input_rx, output));
-    input_tx
+    tasks.spawn(jupiter_search::run(reqwest::Client::new(), settings, mint_rx, output));
+    mint_tx
 }
 
 pub async fn run() -> Result<()> {
@@ -329,13 +306,44 @@ pub async fn run() -> Result<()> {
         task.await??;
         return Ok(());
     }
+    if cli.jupiter_only {
+        let jupiter = jupiter_settings()?
+            .context("--jupiter-only requires JUPITER_SEARCH_API_KEYS")?;
+        let database = persistence::Persistence::connect().await?;
+        let registry = pool_registry::PoolRegistry::default();
+        let restored = registry.restore(database.restore().await?)?;
+        ensure!(restored > 0, "--jupiter-only requires persisted pools for graph bootstrap");
+        let graph_settings = liquidity_graph::Settings::from_env()?;
+        ensure!(graph_settings.min_tvl_usd.is_none(),
+            "--jupiter-only restore cannot use GRAPH_MIN_TVL_USD without fresh TVL");
+        let (updates, graph_input) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
+        let (graph_tx, graph_rx) =
+            watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(liquidity_graph::observe(graph_rx.clone()));
+        let _mint_sender = spawn_jupiter(&mut tasks, jupiter, graph_rx);
+        tasks.spawn(liquidity_graph::run(graph_input, graph_tx, graph_settings));
+        updates.send(Arc::new(core::PoolUpdateBatch {
+            kind: core::PoolUpdateKind::Source,
+            source: "persistence_restore",
+            received_at_ms: 0,
+            pools: registry.snapshot(),
+            persist_identity: Vec::new(),
+        })).map_err(|_| anyhow::anyhow!("no Jupiter graph bootstrap subscriber"))?;
+        drop(updates);
+        println!("orchestration jupiter-graph-live restored_pools={restored} source=persistence_restore");
+        // Jupiter Search runs continuously against the restored graph's mint set.
+        // Retaining _mint_sender keeps this set available after the one-shot restore.
+        while let Some(result) = tasks.join_next().await { result??; }
+        return Ok(());
+    }
     if cli.persistence_v2_live {
         let database=persistence::Persistence::connect().await?;
         let registry=pool_registry::PoolRegistry::default();
         let restored=registry.restore(database.restore().await?)?;
         println!("orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
         let mut tasks=JoinSet::new();
-        spawn_sources(&mut tasks,cli.meteora,None,None,
+        spawn_sources(&mut tasks,cli.meteora,None,None,None,
             Some(registry),Some(database),SourceSet::All,true)?;
         while let Some(result)=tasks.join_next().await {result??;}
         println!("orchestration persistence-v2-live complete rpc_calls=0");
@@ -405,9 +413,10 @@ pub async fn run() -> Result<()> {
         let dlmm = if !cli.damm_v2_completion_live || cli.completion_live {
             Some(completion)
         } else { None };
+        let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
         spawn_sources(&mut tasks, cli.meteora,
             Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2}),
-            graph, registry, writer, source_set, false)?;
+            graph, jupiter, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
         tasks.spawn(async move { rpc_task.await? });
@@ -421,30 +430,25 @@ pub async fn run() -> Result<()> {
         // A standalone RPC worker is deliberately idle without explicit requests.
         Some((handle, task))
     } else { None };
-    let jupiter = if cli.meteora.once && !cli.jupiter_only {
-        None
-    } else {
-        jupiter_settings()?
-    };
-    ensure!(
-        !cli.jupiter_only || jupiter.is_some(),
-        "Jupiter Search needs API keys and a mint input file"
-    );
+    let jupiter = if cli.meteora.once { None } else { jupiter_settings()? };
+    let (registry, graph) = if jupiter.is_some() {
+        // Reuse validated completion state; new REST discoveries still require
+        // their own completion before they can enter the graph watchlist.
+        let database = persistence::Persistence::connect().await?;
+        let registry = pool_registry::PoolRegistry::default();
+        let restored = registry.restore(database.restore().await?)?;
+        println!("orchestration Jupiter graph bootstrap restored_pools={restored}");
+        (Some(registry), Some(liquidity_graph::Settings::from_env()?))
+    } else { (None, None) };
 
     let mut tasks = JoinSet::new();
-    if !cli.jupiter_only {
-        let source_set = cli.rest_source_only.unwrap_or(if cli.rest_discovery_live || !cli.meteora.once {
-            SourceSet::All
-        } else { SourceSet::Dlmm });
-        let fail_on_lag = cli.rest_discovery_live || cli.rest_source_only.is_some()
-            || env::var("REST_FAIL_ON_LAG").ok().as_deref() == Some("true");
-        spawn_sources(&mut tasks, cli.meteora, None, None, None, None,
-            source_set, fail_on_lag)?;
-    }
-
-    // Keep the provisional watch sender alive until a real input worker takes over.
-    let _jupiter_input = jupiter
-        .map(|(settings, mints)| spawn_jupiter(&mut tasks, settings, mints));
+    let source_set = cli.rest_source_only.unwrap_or(if cli.rest_discovery_live || !cli.meteora.once {
+        SourceSet::All
+    } else { SourceSet::Dlmm });
+    let fail_on_lag = cli.rest_discovery_live || cli.rest_source_only.is_some()
+        || env::var("REST_FAIL_ON_LAG").ok().as_deref() == Some("true");
+    spawn_sources(&mut tasks, cli.meteora, None, graph, jupiter, registry, None,
+        source_set, fail_on_lag)?;
 
     let _rpc_handle = if let Some((handle, task)) = rpc_handle {
         tasks.spawn(async move {task.await?});
