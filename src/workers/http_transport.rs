@@ -277,6 +277,14 @@ struct Shared {
 }
 
 pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)> {
+    println!(
+        "http_transport config refresh_s={} verify_url={} public_discovery={} configured_file={} probe_rps={} host_default_rps={} route_rps={} host_overrides={} in_flight={} queue={} retries={}",
+        settings.refresh.as_secs(), settings.verify_url,
+        settings.public_discovery, settings.list_file.is_some(), settings.probe_rps,
+        settings.request_rps_per_host, settings.request_rps_per_route,
+        settings.host_rps_overrides.len(), settings.request_parallel,
+        settings.queue_capacity, settings.retry_attempts
+    );
     let (calls, receiver) = mpsc::channel(settings.queue_capacity);
     let (snapshots, route_reader) = watch::channel(Arc::new(Vec::new()));
     let (cycles, cycle_reader) = watch::channel(0_u64);
