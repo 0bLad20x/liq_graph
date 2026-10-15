@@ -140,14 +140,12 @@ impl WatchCatalog {
 #[derive(Default)]
 struct MintAccumulator {
     contexts: BTreeSet<MintContext>,
-    groups: BTreeSet<u32>,
 }
 
 #[derive(Default)]
 struct PoolAccumulator {
     pair: Option<MintPair>,
     contexts: BTreeSet<PoolContext>,
-    groups: BTreeSet<u32>,
 }
 
 #[derive(Default)]
@@ -165,11 +163,9 @@ fn mint_role(
     address: Pubkey,
     kind: RouteKind,
     role: MintRole,
-    group_id: u32,
 ) {
     let entry = mints.entry(address).or_default();
     entry.contexts.insert(MintContext { kind, role });
-    entry.groups.insert(group_id);
 }
 
 fn pool_role(
@@ -179,7 +175,6 @@ fn pool_role(
     b: Pubkey,
     kind: RouteKind,
     role: PoolRole,
-    group_id: u32,
 ) -> Result<()> {
     let expected = pair(a, b);
     let entry = pools.entry(address).or_default();
@@ -189,7 +184,6 @@ fn pool_role(
         None => entry.pair = Some(expected),
     }
     entry.contexts.insert(PoolContext { kind, role });
-    entry.groups.insert(group_id);
     Ok(())
 }
 
@@ -199,42 +193,41 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
     let mut mint_state = BTreeMap::<Pubkey, MintAccumulator>::new();
     let mut pool_state = BTreeMap::<Pubkey, PoolAccumulator>::new();
 
-    for (index, group) in graph.groups.iter().enumerate() {
-        let id = u32::try_from(index).context("catalog group ID overflow")?;
+    for group in &graph.groups {
         let kind = RouteKind::of(group);
         let settlement = group.settlement;
         ensure!(settlement == wsol || settlement == usdc,
             "catalog has non-WSOL/USDC settlement");
         let quote = if settlement == wsol { usdc } else { wsol };
         let target = group.target;
-        mint_role(&mut mint_state, settlement, kind, MintRole::Settlement, id);
-        mint_role(&mut mint_state, target, kind, MintRole::Target, id);
+        mint_role(&mut mint_state, settlement, kind, MintRole::Settlement);
+        mint_role(&mut mint_state, target, kind, MintRole::Target);
         if group.conversion.is_some() {
-            mint_role(&mut mint_state, quote, kind, MintRole::ConversionQuote, id);
+            mint_role(&mut mint_state, quote, kind, MintRole::ConversionQuote);
         }
 
         for &address in group.direct_s.iter() {
             pool_role(&mut pool_state, address, target, settlement,
-                kind, PoolRole::DirectSettlement, id)?;
+                kind, PoolRole::DirectSettlement)?;
         }
         for &address in group.direct_q.iter() {
             pool_role(&mut pool_state, address, target, quote,
-                kind, PoolRole::DirectQuote, id)?;
+                kind, PoolRole::DirectQuote)?;
         }
         if let Some(bridge) = group.bridge {
-            mint_role(&mut mint_state, bridge, kind, MintRole::Bridge, id);
+            mint_role(&mut mint_state, bridge, kind, MintRole::Bridge);
             let middle = group.intermediate.context("bridge group without intermediate pool")?;
             pool_role(&mut pool_state, middle, target, bridge,
-                kind, PoolRole::Intermediate, id)?;
+                kind, PoolRole::Intermediate)?;
             let return_quote = if group.conversion.is_some() { quote } else { settlement };
             for &address in group.bridge_pools.iter() {
                 pool_role(&mut pool_state, address, bridge, return_quote,
-                    kind, PoolRole::BridgeReturn, id)?;
+                    kind, PoolRole::BridgeReturn)?;
             }
         }
         if let Some(conversion) = group.conversion {
             pool_role(&mut pool_state, conversion, settlement, quote,
-                kind, PoolRole::Conversion, id)?;
+                kind, PoolRole::Conversion)?;
         }
     }
 
@@ -254,7 +247,7 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
     let mints: Vec<MintWatch> = mint_state.into_iter().map(|(address, state)| MintWatch {
         address,
         contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
-        group_ids: Arc::from(state.groups.into_iter().collect::<Vec<_>>()),
+        group_ids: Arc::from(graph.for_token(address)),
     }).collect();
     let pools: Vec<PoolWatch> = pool_state.into_iter().map(|(address, state)| {
         let (mint_a, mint_b) = state.pair.expect("catalog pool pair established");
@@ -262,7 +255,7 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         PoolWatch {
             address, mint_a, mint_b,
             contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
-            group_ids: Arc::from(state.groups.into_iter().collect::<Vec<_>>()),
+            group_ids: Arc::from(graph.for_pool(address)),
             pair_pool_count,
         }
     }).collect();
