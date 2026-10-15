@@ -358,6 +358,7 @@ pub async fn run() -> Result<()> {
         let mut failed = 0usize;
         let mut status_429 = 0usize;
         let mut other_status = 0usize;
+        let mut invalid_payload = 0usize;
         let mut routes_used = HashSet::new();
         let mut latencies = Vec::with_capacity(calls);
         let mut bytes = 0usize;
@@ -379,11 +380,21 @@ pub async fn run() -> Result<()> {
                     routes_used.insert(response.route_id.clone());
                     latencies.push(response.elapsed_ms);
                     if response.status.is_success() {
-                        ok += 1;
-                        bytes += response.body.len();
-                        if sample.is_none() {
-                            sample = Some(format!("route={} status={} bytes={}",
-                                response.route_id, response.status, response.body.len()));
+                        match http_transport::validate_live_payload(&target, &response.body) {
+                            Ok(()) => {
+                                ok += 1;
+                                bytes += response.body.len();
+                                if sample.is_none() {
+                                    sample = Some(format!("route={} status={} bytes={}",
+                                        response.route_id, response.status, response.body.len()));
+                                }
+                            }
+                            Err(error) => {
+                                invalid_payload += 1;
+                                if invalid_payload <= 3 {
+                                    eprintln!("http_transport live invalid_payload={error:#}");
+                                }
+                            }
                         }
                     } else if response.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         status_429 += 1;
@@ -405,8 +416,8 @@ pub async fn run() -> Result<()> {
             .copied().unwrap_or(0);
         let elapsed = started.elapsed().as_secs_f64();
         println!(
-            "http_transport live benchmark requests={} success={} errors={} http_429={} other_http={} distinct_routes={} bytes={} elapsed_s={:.2} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={}",
-            calls, ok, failed, status_429, other_status, routes_used.len(),
+            "http_transport live benchmark requests={} success={} errors={} http_429={} other_http={} invalid_payload={} distinct_routes={} bytes={} elapsed_s={:.2} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={}",
+            calls, ok, failed, status_429, other_status, invalid_payload, routes_used.len(),
             bytes, elapsed, calls as f64 / elapsed.max(0.001), p50, p95
         );
         ensure!(ok > 0, "HTTP proxy transport did not produce a successful response");
