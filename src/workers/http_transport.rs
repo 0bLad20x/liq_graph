@@ -153,7 +153,7 @@ impl Settings {
         let probe_parallel = from_env("HTTP_PROXY_PROBE_PARALLEL", 100_usize)?;
         let request_parallel = from_env("HTTP_TRANSPORT_MAX_IN_FLIGHT", 128_usize)?;
         let queue_capacity = from_env("HTTP_TRANSPORT_QUEUE_CAPACITY", 512_usize)?;
-        let probe_rps = from_env("HTTP_PROXY_PROBE_RPS", 5_u32)?;
+        let probe_rps = from_env("HTTP_PROXY_PROBE_RPS", 20_u32)?;
         let request_rps_per_host = from_env("HTTP_TRANSPORT_HOST_RPS", 5_u32)?;
         let request_rps_per_route = from_env("HTTP_TRANSPORT_ROUTE_RPS", 5_u32)?;
         let retry_attempts = from_env("HTTP_TRANSPORT_RETRY_ATTEMPTS", 3_usize)?;
@@ -428,7 +428,7 @@ fn csv_entries(map: &mut HashMap<String, Candidate>, source: &str, text: &str) -
 #[derive(Clone, Copy)]
 enum SourceKind { Json, Csv, Txt(&'static str) }
 
-async fn fetch_inventory(shared: &Shared) -> Result<HashMap<String, Candidate>> {
+async fn fetch_inventory(shared: &Shared) -> Result<(HashMap<String, Candidate>, bool)> {
     let sources: Vec<(&str, SourceKind, String)> = vec![
         ("monosans", SourceKind::Json, "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies.json".into()),
         ("proxifly", SourceKind::Txt("http"), "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt".into()),
@@ -437,8 +437,9 @@ async fn fetch_inventory(shared: &Shared) -> Result<HashMap<String, Candidate>> 
         ("speedx", SourceKind::Txt("socks4"), "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt".into()),
         ("speedx", SourceKind::Txt("socks5"), "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt".into()),
     ];
-    let mut jobs: Vec<(String, SourceKind, String)> = sources.into_iter()
-        .map(|(name, kind, url)| (name.to_owned(), kind, url)).collect();
+    let mut jobs: Vec<(String, SourceKind, String)> = if shared.settings.public_discovery {
+        sources.into_iter().map(|(name, kind, url)| (name.to_owned(), kind, url)).collect()
+    } else { Vec::new() };
     for url in &shared.settings.extra_txt_urls {
         jobs.push(("extra".to_owned(), SourceKind::Txt("http"), url.as_str().to_owned()));
     }
@@ -458,6 +459,11 @@ async fn fetch_inventory(shared: &Shared) -> Result<HashMap<String, Candidate>> 
     }).buffer_unordered(8);
     tokio::pin!(calls);
     let mut map = HashMap::new();
+    if let Some(path) = &shared.settings.list_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("read configured HTTP proxy list {path}"))?;
+        txt_entries(&mut map, "configured", &content, "http");
+    }
     let mut failures = 0;
     while let Some((name, kind, url, result)) = calls.next().await {
         match result {
@@ -478,9 +484,11 @@ async fn fetch_inventory(shared: &Shared) -> Result<HashMap<String, Candidate>> 
             }
         }
     }
-    ensure!(failures == 0, "{failures} proxy sources failed; existing registry retained");
+    if failures != 0 {
+        eprintln!("http_transport discovery partial_source_failures={failures} preserving_previous_routes=true");
+    }
     ensure!(!map.is_empty(), "proxy discovery returned empty inventory");
-    Ok(map)
+    Ok((map, failures == 0))
 }
 
 async fn discovery_loop(shared: Arc<Shared>) {
@@ -495,12 +503,13 @@ async fn discovery_loop(shared: Arc<Shared>) {
 }
 
 async fn refresh(shared: &Arc<Shared>) -> Result<()> {
-    let found = fetch_inventory(shared).await?;
+    let (found, complete) = fetch_inventory(shared).await?;
     let inventory_count = found.len();
     let now = Instant::now();
     let due = {
         let mut state = shared.inventory.lock().await;
-        state.retain(|id, _| found.contains_key(id));
+        // One unavailable source must not evict its previously verified routes.
+        if complete { state.retain(|id, _| found.contains_key(id)); }
         for (id, candidate) in found {
             if let Some(route) = state.get_mut(&id) {
                 route.candidate.sources = candidate.sources;
@@ -534,8 +543,8 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
     mark_failures(shared, dead).await;
     println!("http_transport inventory={inventory_count} due={tcp_total} tcp_open={}", open.len());
 
-    let host = shared.settings.probe_url.host_str().context("missing probe host")?.to_owned();
-    let port = shared.settings.probe_url.port_or_known_default().unwrap_or(443);
+    let host = shared.settings.verify_url.host_str().context("missing verify host")?.to_owned();
+    let port = shared.settings.verify_url.port_or_known_default().unwrap_or(443);
     let probes = stream::iter(open).map(|candidate| {
         let host = host.clone();
         let deadline = shared.settings.handshake_timeout;
@@ -552,7 +561,7 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
         if fine { candidates.push(candidate); } else { invalid.push(candidate.id); }
     }
     mark_failures(shared, invalid).await;
-    println!("http_transport handshake_ok={} dex_probe_queue={}", candidates.len(), candidates.len());
+    println!("http_transport handshake_ok={} verify_queue={}", candidates.len(), candidates.len());
 
     // Every actual DEX request is globally paced. Handshakes are not charged to this gate.
     let verify = stream::iter(candidates).map(|candidate| {
@@ -560,23 +569,16 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
         async move {
             let outcome = async {
                 let client = proxy_client(&candidate)?;
-                let host = shared.settings.probe_url.host_str().context("missing probe hostname")?;
+                let host = shared.settings.verify_url.host_str().context("missing verify hostname")?;
                 host_limit_at(&shared, host, shared.settings.probe_rps).await;
                 let started = Instant::now();
-                let response = client.get(shared.settings.probe_url.clone())
+                let response = client.get(shared.settings.verify_url.clone())
                     .timeout(shared.settings.probe_timeout).send().await?;
-                ensure!(response.status() == StatusCode::OK, "probe status {}", response.status());
-                ensure!(response.content_length().is_none_or(|n| n <= MAX_RESPONSE_BYTES as u64), "probe response too large");
-                let value: Value = response.json().await?;
-                let mint = shared.settings.probe_url.path_segments()
-                    .and_then(|mut x| x.next_back()).context("probe URL without mint")?.to_owned();
-                let valid = value.as_array().is_some_and(|pairs| pairs.iter().any(|p| {
-                    p.get("chainId").and_then(Value::as_str) == Some("solana")
-                        && ["baseToken", "quoteToken"].iter().any(|key| {
-                            p.get(*key).and_then(|v| v.get("address")).and_then(Value::as_str) == Some(mint.as_str())
-                        })
-                }));
-                ensure!(valid, "probe response has no matching Solana pool");
+                ensure!(response.status().is_success(), "verify HTTP {}", response.status());
+                ensure!(response.content_length().is_none_or(|n| n <= 1024),
+                    "verify response exceeds 1 KiB");
+                let body = response.bytes().await?;
+                ensure!(body.len() <= 1024, "verify response exceeds 1 KiB");
                 Ok::<_, anyhow::Error>((client, started.elapsed().as_millis() as u64))
             }.await;
             (candidate, outcome)
@@ -607,11 +609,12 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
         drop(state);
         if tested % 100 == 0 {
             publish(shared).await;
-            println!("http_transport dex_tested={tested} dex_ok={ok}");
+            println!("http_transport verify_tested={tested} verify_ok={ok}");
         }
     }
     publish(shared).await;
-    println!("http_transport cycle_complete dex_tested={tested} dex_ok={ok} working={}", shared.snapshots.borrow().len());
+    println!("http_transport cycle_complete verified_tested={tested} verified_ok={ok} working={}", shared.snapshots.borrow().len());
+    shared.cycles.send_modify(|cycle| *cycle += 1);
     Ok(())
 }
 
