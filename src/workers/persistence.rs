@@ -201,25 +201,6 @@ fn array<'a>(value: &'a Value, name: &str) -> Result<&'a [Value]> {
         .with_context(||format!("missing array {name}"))?)
 }
 
-fn int(value: &Value, name: &str) -> Result<i32> {
-    let number = value.get(name).and_then(Value::as_i64)
-        .with_context(||format!("missing integer {name}"))?;
-    Ok(i32::try_from(number).context("stored signed integer overflow")?)
-}
-
-fn usize_value(value: &Value, name: &str) -> Result<usize> {
-    let number = value.get(name).and_then(Value::as_u64)
-        .with_context(||format!("missing unsigned integer {name}"))?;
-    Ok(usize::try_from(number).context("stored unsigned integer overflow")?)
-}
-
-fn index_array(value: &Value, name: &str) -> Result<Vec<i32>> {
-    array(value, name)?.iter().map(|v| {
-        i32::try_from(v.as_i64().context("invalid signed BinArray index")?)
-            .context("BinArray index overflow")
-    }).collect()
-}
-
 fn encode_accounts(accounts: &[AccountMeta]) -> Value {
     Value::Array(accounts.iter().map(|a|
         json!({"address":a.address.to_string(),"writable":a.writable})).collect())
