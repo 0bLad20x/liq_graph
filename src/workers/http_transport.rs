@@ -310,6 +310,7 @@ async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<
         })
     };
     while let Some(call) = receiver.recv().await {
+        shared.stats.lock().expect("HTTP stats lock poisoned").submitted += 1;
         let permit = capacity.clone().acquire_owned().await
             .context("HTTP transport semaphore closed")?;
         let shared = shared.clone();
@@ -720,77 +721,176 @@ async fn host_limit_at(shared: &Shared, host: &str, rps: u32) {
     sleep_until(at).await;
 }
 
+async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
+    let host_rps = shared.settings.host_rps_overrides.get(host)
+        .copied().unwrap_or(shared.settings.request_rps_per_host);
+    // Both limits apply. Adding proxy routes does not implicitly enlarge the
+    // provider's configured quota; route-level capacity is a separate limit.
+    let mut host_gates = shared.host_gates.lock().await;
+    let mut route_gates = shared.route_gates.lock().await;
+    let now = Instant::now();
+    let host_due = host_gates.get(host).copied().unwrap_or(now);
+    let route_key = (host.to_owned(), route_id.to_owned());
+    let route_due = route_gates.get(&route_key).copied().unwrap_or(now);
+    let at = now.max(host_due).max(route_due);
+    host_gates.insert(host.to_owned(),
+        at + Duration::from_secs_f64(1.0 / f64::from(host_rps)));
+    route_gates.insert(route_key,
+        at + Duration::from_secs_f64(1.0 / f64::from(shared.settings.request_rps_per_route)));
+    drop(route_gates);
+    drop(host_gates);
+    sleep_until(at).await;
+}
+
+async fn choose_route(shared: &Shared, excluded: &HashSet<String>) -> Result<(String, Client)> {
+    let snapshot = Arc::clone(&*shared.snapshots.borrow());
+    ensure!(!snapshot.is_empty(), "no verified proxy routes; direct fallback forbidden");
+    let start = shared.selection.fetch_add(1, Ordering::Relaxed) % snapshot.len();
+    let state = shared.inventory.lock().await;
+    for offset in 0..snapshot.len() {
+        let id = &snapshot[(start + offset) % snapshot.len()].id;
+        if excluded.contains(id) { continue; }
+        if let Some(route) = state.get(id) {
+            if route.verified.is_some_and(|at| at.elapsed() < shared.settings.healthy_for) {
+                if let Some(client) = &route.client {
+                    return Ok((id.clone(), client.clone()));
+                }
+            }
+        }
+    }
+    bail!("no verified untried proxy routes; direct fallback forbidden");
+}
+
+async fn quarantine(shared: &Shared, route_id: &str) {
+    if route_id == "direct" { return; }
+    let mut state = shared.inventory.lock().await;
+    if let Some(route) = state.get_mut(route_id) {
+        route.client = None;
+        route.verified = None;
+        route.next_check = Instant::now() + shared.settings.retry_failure_after;
+    }
+    drop(state);
+    publish(shared).await;
+}
+
+async fn read_bounded(mut response: reqwest::Response) -> Result<Bytes> {
+    ensure!(response.content_length().is_none_or(|n| n <= MAX_RESPONSE_BYTES as u64),
+        "HTTP response exceeds size cap");
+    let mut body = BytesMut::new();
+    while let Some(chunk) = response.chunk().await.context("HTTP response body")? {
+        ensure!(chunk.len() <= MAX_RESPONSE_BYTES.saturating_sub(body.len()),
+            "HTTP response exceeds size cap");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
 async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> {
     ensure!(matches!(request.url.scheme(), "http" | "https"), "HTTP request requires http(s) URL");
-    ensure!(request.url.username().is_empty() && request.url.password().is_none(), "credentials in request URL forbidden");
+    ensure!(request.url.username().is_empty() && request.url.password().is_none(),
+        "credentials in request URL forbidden");
     ensure!(!request.timeout.is_zero(), "request timeout must be positive");
-    let host = request.url.host_str().context("request URL missing host")?.to_owned();
-    let (route_id, client) = match request.policy {
-        RoutePolicy::DirectOnly => ("direct".to_owned(), shared.direct_client.clone()),
-        RoutePolicy::ProxyOnly => {
-            let snapshot = Arc::clone(&*shared.snapshots.borrow());
-            let routes: Vec<_> = snapshot.iter()
-                .filter(|r| r.verified_age_ms < shared.settings.healthy_for.as_millis() as u64)
-                .take(64).collect();
-            ensure!(!routes.is_empty(), "no verified proxy routes; direct fallback forbidden");
-            let start = shared.selection.fetch_add(1, Ordering::Relaxed) % routes.len();
-            let state = shared.inventory.lock().await;
-            let selected = (0..routes.len()).find_map(|offset| {
-                let id = &routes[(start + offset) % routes.len()].id;
-                let route = state.get(id)?;
-                if !route.verified.is_some_and(|at| at.elapsed() < shared.settings.healthy_for) {
-                    return None;
-                }
-                Some((id.to_owned(), route.client.clone()?))
-            }).context("no currently verified proxy; direct fallback forbidden")?;
-            selected
-        }
-    };
-    host_limit_at(shared, &host, shared.settings.request_rps_per_host).await;
-    let started = Instant::now();
-    let mut builder = client.request(request.method, request.url)
-        .headers(request.headers)
-        .timeout(request.timeout);
-    if let Some(body) = request.body { builder = builder.body(body); }
-    let reply = builder.send().await;
-    let response = match reply {
-        Ok(response) => response,
-        Err(error) => {
-            if route_id != "direct" && (error.is_connect() || error.is_timeout()) {
-                let mut state = shared.inventory.lock().await;
-                if let Some(route) = state.get_mut(&route_id) {
-                    route.client = None;
-                    route.verified = None;
-                    route.next_check = Instant::now() + shared.settings.retry_failure_after;
-                }
-                drop(state);
-                publish(shared).await;
+    let host = request.url.host_str().context("request URL missing host")?.to_ascii_lowercase();
+
+    // Public proxies are untrusted; never forward authentication material.
+    if request.policy == RoutePolicy::ProxyOnly {
+        ensure!(!["authorization", "proxy-authorization", "cookie", "x-api-key"]
+            .iter().any(|key| request.headers.contains_key(*key)),
+            "authentication headers cannot be forwarded through public proxies");
+    }
+    let idempotent = matches!(request.method, Method::GET | Method::HEAD);
+    let max_attempts = if idempotent { shared.settings.retry_attempts } else { 1 };
+    let mut excluded = HashSet::new();
+    let mut previous_route = None::<String>;
+    let mut last_error = None;
+    for attempt in 0..max_attempts {
+        let (route_id, client) = match request.policy {
+            RoutePolicy::DirectOnly => ("direct".to_owned(), shared.direct_client.clone()),
+            RoutePolicy::ProxyOnly => match choose_route(shared, &excluded).await {
+                Ok(value) => value,
+                Err(error) if attempt == 0 => return Err(error),
+                Err(_) => break,
+            },
+        };
+        if attempt > 0 {
+            if previous_route.as_deref() != Some(&route_id) {
+                shared.stats.lock().expect("HTTP stats lock poisoned").failovers += 1;
             }
-            return Err(anyhow!("HTTP transport route={route_id}: {}", error.without_url()));
         }
-    };
-    let status = response.status();
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        let retry = response.headers().get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5).clamp(1, 3600);
-        let mut gates = shared.host_gates.lock().await;
-        let t = Instant::now() + Duration::from_secs(retry);
-        let entry = gates.entry(host).or_insert(t);
-        if *entry < t { *entry = t; }
-    }
-    ensure!(response.content_length().is_none_or(|n| n <= MAX_RESPONSE_BYTES as u64), "response exceeds size cap");
-    let body = response.bytes().await.context("HTTP response body")?;
-    ensure!(body.len() <= MAX_RESPONSE_BYTES, "response exceeds size cap");
-    if route_id != "direct" && status != StatusCode::TOO_MANY_REQUESTS {
-        let mut state = shared.inventory.lock().await;
-        if let Some(route) = state.get_mut(&route_id) {
-            route.verified = Some(Instant::now());
-            route.latency_ms = started.elapsed().as_millis() as u64;
-            route.next_check = Instant::now() + shared.settings.refresh;
+        previous_route = Some(route_id.clone());
+        excluded.insert(route_id.clone());
+        {
+            let mut stats = shared.stats.lock().expect("HTTP stats lock poisoned");
+            stats.attempts += 1;
+            stats.routes_used.insert(route_id.clone());
         }
+        pace_request(shared, &host, &route_id).await;
+        let started = Instant::now();
+        let mut builder = client.request(request.method.clone(), request.url.clone())
+            .headers(request.headers.clone())
+            .timeout(request.timeout);
+        if let Some(body) = &request.body { builder = builder.body(body.clone()); }
+
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                shared.stats.lock().expect("HTTP stats lock poisoned").transport_errors += 1;
+                last_error = Some(anyhow!("HTTP route={route_id} transport: {}", error.without_url()));
+                if route_id != "direct" && (error.is_connect() || error.is_timeout()) {
+                    quarantine(shared, &route_id).await;
+                }
+                if !idempotent { break; }
+                continue;
+            }
+        };
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            shared.stats.lock().expect("HTTP stats lock poisoned").http_429 += 1;
+            let retry = response.headers().get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5).clamp(1, 3600);
+            let mut gates = shared.host_gates.lock().await;
+            let deadline = Instant::now() + Duration::from_secs(retry);
+            let at = gates.entry(host.clone()).or_insert(deadline);
+            *at = (*at).max(deadline);
+            drop(gates);
+        } else if status == StatusCode::FORBIDDEN {
+            shared.stats.lock().expect("HTTP stats lock poisoned").http_403 += 1;
+        } else if status.is_server_error() {
+            shared.stats.lock().expect("HTTP stats lock poisoned").http_5xx += 1;
+        }
+
+        let body = match read_bounded(response).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                shared.stats.lock().expect("HTTP stats lock poisoned").other_errors += 1;
+                last_error = Some(error.context(format!("HTTP route={route_id} response body")));
+                quarantine(shared, &route_id).await;
+                if !idempotent { break; }
+                continue;
+            }
+        };
+        if status.is_success() && route_id != "direct" {
+            let mut state = shared.inventory.lock().await;
+            if let Some(route) = state.get_mut(&route_id) {
+                route.verified = Some(Instant::now());
+                route.latency_ms = started.elapsed().as_millis() as u64;
+                route.next_check = Instant::now() + shared.settings.refresh;
+            }
+        }
+        if matches!(status, StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT | StatusCode::FORBIDDEN)
+        {
+            quarantine(shared, &route_id).await;
+            if idempotent && attempt + 1 < max_attempts {
+                last_error = Some(anyhow!("HTTP route={route_id} status={status}"));
+                continue;
+            }
+        }
+        // HTTP statuses, including 429, are returned to the caller for its policy.
+        return Ok(HttpResponse {
+            status, body, route_id, elapsed_ms: started.elapsed().as_millis() as u64,
+        });
     }
-    Ok(HttpResponse {
-        status, body, route_id, elapsed_ms: started.elapsed().as_millis() as u64,
-    })
+    Err(last_error.unwrap_or_else(|| anyhow!("HTTP transport retries exhausted")))
 }
