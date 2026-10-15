@@ -282,7 +282,9 @@ fn spawn_watch_catalog(
     tasks.spawn(graph_watch_catalog::observe(catalog_rx));
     let mint_output = jupiter.map(|settings| {
         let (mint_tx, mint_rx) = watch::channel::<Arc<[Pubkey]>>(Arc::from([]));
-        spawn_jupiter(tasks, settings, mint_rx);
+        // Jupiter is continuous even if the one-shot graph restore completes.
+        // Keep one sender alive for the lifetime of the Jupiter task.
+        spawn_jupiter(tasks, settings, mint_rx, mint_tx.clone());
         mint_tx
     });
     tasks.spawn(graph_watch_catalog::run(graph, catalog_tx, mint_output));
@@ -292,11 +294,16 @@ fn spawn_jupiter(
     tasks: &mut JoinSet<Result<()>>,
     settings: jupiter_search::Settings,
     mints: watch::Receiver<Arc<[Pubkey]>>,
+    keepalive: watch::Sender<Arc<[Pubkey]>>,
 ) {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
     tasks.spawn(source_diagnostic::run(input, false));
-    // Independent client: the shared HTTP client applies Meteora's 20-second limit.
-    tasks.spawn(jupiter_search::run(reqwest::Client::new(), settings, mints, output));
+    // Jupiter must outlive a finite graph restore. Its own task retains the
+    // watch sender without requiring the catalog producer to stay running.
+    tasks.spawn(async move {
+        let _mint_sender = keepalive;
+        jupiter_search::run(reqwest::Client::new(), settings, mints, output).await
+    });
 }
 
 pub async fn run() -> Result<()> {
