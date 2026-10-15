@@ -530,12 +530,13 @@ pub async fn run() -> Result<()> {
         || cli.orca_completion_live || cli.graph_live || cli.persistence_write_live || cli.stability_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
-        let mut completion = execution_completion::Settings::from_env()?;
-        // Continuous stability mode has no arbitrary pool-count cap.
-        // Zero can also be requested explicitly for finite whole-universe scans.
-        completion.limit = cli.completion_limit.unwrap_or(
+        // Protocol completion workers share the RPC transport configuration;
+        // only instantiate a protocol's settings if that worker actually runs.
+        // Zero allows a whole-universe scan in finite/continuous modes.
+        let completion_limit = cli.completion_limit.unwrap_or(
             if cli.stability_live {0}
             else if cli.graph_live || cli.persistence_write_live {5000}
+            else if cli.orca_completion_live {200}
             else {100});
 
         let graph = if cli.graph_live || cli.persistence_write_live
@@ -554,7 +555,7 @@ pub async fn run() -> Result<()> {
         } else {(None,None)};
         if cli.stability_live {
             println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
-                cli.meteora.max_pages, completion.limit);
+                cli.meteora.max_pages, completion_limit);
         }
         let source_set = if cli.orca_completion_live {
             SourceSet::Orca
@@ -563,16 +564,18 @@ pub async fn run() -> Result<()> {
         } else { SourceSet::Dlmm };
         let damm_v2 = if cli.damm_v2_completion_live {
             let mut settings = damm_v2_completion::Settings::from_env()?;
-            settings.limit = completion.limit;
+            settings.limit = completion_limit;
             Some(settings)
         } else { None };
-        let dlmm = if cli.orca_completion_live {None}
-            else if !cli.damm_v2_completion_live || cli.completion_live {
-                Some(completion)
-            } else {None};
+        let dlmm = if !cli.orca_completion_live
+            && (!cli.damm_v2_completion_live || cli.completion_live) {
+            let mut settings = execution_completion::Settings::from_env()?;
+            settings.limit = completion_limit;
+            Some(settings)
+        } else {None};
         let orca = if cli.orca_completion_live {
             let mut settings = orca_completion::Settings::from_env()?;
-            settings.limit = cli.completion_limit.unwrap_or(200);
+            settings.limit = completion_limit;
             Some(settings)
         } else {None};
         let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
