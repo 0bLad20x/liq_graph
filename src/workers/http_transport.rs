@@ -269,6 +269,7 @@ struct Shared {
     selection: AtomicUsize,
     host_gates: Mutex<HashMap<String, Instant>>,
     route_gates: Mutex<HashMap<(String, String), Instant>>,
+    host_route_cooldowns: Mutex<HashMap<(String, String), Instant>>,
     stats: StdMutex<TransportStats>,
     direct_client: Client,
 }
@@ -288,6 +289,7 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
         selection: AtomicUsize::new(0),
         host_gates: Mutex::new(HashMap::new()),
         route_gates: Mutex::new(HashMap::new()),
+        host_route_cooldowns: Mutex::new(HashMap::new()),
         stats: StdMutex::new(TransportStats::default()),
         direct_client,
     });
@@ -503,6 +505,7 @@ async fn discovery_loop(shared: Arc<Shared>) {
 }
 
 async fn refresh(shared: &Arc<Shared>) -> Result<()> {
+    shared.host_route_cooldowns.lock().await.retain(|_, until| *until > Instant::now());
     let (found, complete) = fetch_inventory(shared).await?;
     let inventory_count = found.len();
     let now = Instant::now();
@@ -739,14 +742,16 @@ async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
     sleep_until(at).await;
 }
 
-async fn choose_route(shared: &Shared, excluded: &HashSet<String>) -> Result<(String, Client)> {
+async fn choose_route(shared: &Shared, host: &str, excluded: &HashSet<String>) -> Result<(String, Client)> {
     let snapshot = Arc::clone(&*shared.snapshots.borrow());
     ensure!(!snapshot.is_empty(), "no verified proxy routes; direct fallback forbidden");
     let start = shared.selection.fetch_add(1, Ordering::Relaxed) % snapshot.len();
+    let blocked = shared.host_route_cooldowns.lock().await;
     let state = shared.inventory.lock().await;
     for offset in 0..snapshot.len() {
         let id = &snapshot[(start + offset) % snapshot.len()].id;
-        if excluded.contains(id) { continue; }
+        if excluded.contains(id) || blocked.get(&(host.to_owned(), id.clone()))
+            .is_some_and(|until| *until > Instant::now()) { continue; }
         if let Some(route) = state.get(id) {
             if route.verified.is_some_and(|at| at.elapsed() < shared.settings.healthy_for) {
                 if let Some(client) = &route.client {
@@ -756,6 +761,14 @@ async fn choose_route(shared: &Shared, excluded: &HashSet<String>) -> Result<(St
         }
     }
     bail!("no verified untried proxy routes; direct fallback forbidden");
+}
+
+async fn cooldown_host_route(shared: &Shared, host: &str, route_id: &str) {
+    if route_id == "direct" { return; }
+    shared.host_route_cooldowns.lock().await.insert(
+        (host.to_owned(), route_id.to_owned()),
+        Instant::now() + shared.settings.retry_failure_after,
+    );
 }
 
 async fn quarantine(shared: &Shared, route_id: &str) {
@@ -803,7 +816,7 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
     for attempt in 0..max_attempts {
         let (route_id, client) = match request.policy {
             RoutePolicy::DirectOnly => ("direct".to_owned(), shared.direct_client.clone()),
-            RoutePolicy::ProxyOnly => match choose_route(shared, &excluded).await {
+            RoutePolicy::ProxyOnly => match choose_route(shared, &host, &excluded).await {
                 Ok(value) => value,
                 Err(error) if attempt == 0 => return Err(error),
                 Err(_) => break,
@@ -878,7 +891,7 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
         if matches!(status, StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT | StatusCode::FORBIDDEN)
         {
-            quarantine(shared, &route_id).await;
+            cooldown_host_route(shared, &host, &route_id).await;
             if idempotent && attempt + 1 < max_attempts {
                 last_error = Some(anyhow!("HTTP route={route_id} status={status}"));
                 continue;
