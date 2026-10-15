@@ -9,6 +9,7 @@ pub mod damm_v2_completion;
 pub mod orca_completion;
 pub mod raydium_amm_v4_completion;
 pub mod raydium_cpmm_completion;
+pub mod raydium_clmm_completion;
 
 pub mod liquidity_graph;
 pub mod graph_watch_catalog;
