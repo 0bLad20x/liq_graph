@@ -195,8 +195,10 @@ fn validate_config(account:&AccountData,layout:PoolLayout,program:Pubkey)->Resul
 fn validate_observation(account:&AccountData,layout:PoolLayout,program:Pubkey)->Result<()>{
     ensure!(account.owner==program && account.address==layout.observation
         && account.bytes.len()==OBS_LEN && account.bytes[..8]==OBS_DISC
-        && account.bytes[8]==1 && key(&account.bytes,11)?==layout.address,
+        && matches!(account.bytes[8],0|1)
+        && key(&account.bytes,11)?==layout.address,
         "Raydium CPMM Observation account owner/state/pool identity invalid");
+    // New observation accounts stay uninitialized until the first executed swap.
     let index=u16::from_le_bytes(account.bytes[9..11].try_into()?);
     ensure!(index<100,"Raydium CPMM observation index invalid");
     Ok(())
