@@ -340,13 +340,25 @@ pub async fn observe(mut input: watch::Receiver<Arc<WatchCatalog>>) -> Result<()
         if let Some(pool) = bridge4_pools.first() {
             let selected = catalog.for_pool(pool.address)
                 .context("catalog consumer lookup missing published pool")?;
-            let group = selected.group_ids.first()
-                .and_then(|&id| catalog.graph.group(id))
+            let group_id = *selected.group_ids.first()
+                .context("catalog consumer pool without group references")?;
+            let group = catalog.graph.group(group_id)
                 .context("catalog consumer group reference invalid")?;
-            println!("graph watch catalog sample generation={} pool={} mint_a={} mint_b={} pair_pool_count={} group_refs={} group_settlement={} group_target={}",
+            let mint = catalog.for_mint(selected.mint_a)
+                .context("catalog consumer missing indexed mint")?;
+            let pair = catalog.for_pair(selected.mint_a, selected.mint_b)
+                .context("catalog consumer missing indexed mint pair")?;
+            ensure!(mint.group_ids.binary_search(&group_id).is_ok(),
+                "catalog indexed mint missing referencing group");
+            ensure!(pair.pools.binary_search(&selected.address).is_ok(),
+                "catalog indexed pair missing referencing pool");
+            ensure!(selected.contexts.iter().all(|ctx| pair.contexts.contains(ctx)),
+                "catalog pair missing a referenced pool context");
+            println!("graph watch catalog sample generation={} pool={} mint_a={} mint_b={} pair_pool_count={} group_refs={} group_settlement={} group_target={} mint_contexts={:?} mint_group_refs={} pair_contexts={:?} pair_pools={}",
                 catalog.generation, selected.address, selected.mint_a, selected.mint_b,
                 selected.pair_pool_count, selected.group_ids.len(),
-                group.settlement, group.target);
+                group.settlement, group.target, mint.contexts,
+                mint.group_ids.len(), pair.contexts, pair.pools.len());
         }
     }
     Ok(())
