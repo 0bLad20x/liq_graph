@@ -1090,6 +1090,6 @@ pub async fn live_diagnostic() -> Result<()> {
     println!("http_transport live PASS {}", sample.unwrap_or_default());
     drop(cycles);
     drop(handle);
-        task.await??;
+    task.await??;
     Ok(())
 }
