@@ -365,7 +365,7 @@ pub async fn run() -> Result<()> {
             (Some(registry), Some(db))
         } else {(None,None)};
         if cli.stability_live {
-            println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) min_tvl_usd=1000 postgres=true graph=true",
+            println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
                 cli.meteora.max_pages, completion.limit);
         }
         spawn_sources(&mut tasks, cli.meteora,
