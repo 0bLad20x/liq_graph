@@ -289,7 +289,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let arrays_b=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let mints=[mint_a,mint_b];
     let ev=Arc::new(CompletionEvidence{
-        kind:"orca_whirlpool_tick_arrays".into(),version:1,
+        kind:"orca_whirlpool_tick_arrays".into(),version:2,
         payload:Arc::new(json!({
             "program":owner.to_string(),"oracle":oracle.to_string(),
             "oracle_initialized":oracle_present,"tick_spacing":layout.tick_spacing,
@@ -363,6 +363,16 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 }
 
 
+// Version 1 persisted the Orca TickArray directions reversed. Such a proof
+// cannot remain Prepared merely because it was restored from PostgreSQL.
+// Revalidate it with the V10-correct direction mapping and publish evidence v2.
+fn needs_direction_upgrade(pool: &PoolState) -> bool {
+    pool.venue == Venue::OrcaWhirlpool
+        && pool.completion_state == CompletionState::Prepared
+        && pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind == "orca_whirlpool_tick_arrays" && e.version == 1)
+}
+
 #[derive(Default)]
 struct Scheduler {
     candidates:HashMap<Pubkey,PoolState>,
@@ -372,7 +382,10 @@ struct Scheduler {
 impl Scheduler {
     fn update(&mut self,pool:&PoolState,min_tvl:f64) {
         if pool.venue!=Venue::OrcaWhirlpool {return;}
-        if pool.completion_state==CompletionState::Prepared {
+        if needs_direction_upgrade(pool) {
+            // Old Prepared manifests must be rechecked even without fresh REST TVL.
+            self.candidates.insert(pool.address,pool.clone());
+        } else if pool.completion_state==CompletionState::Prepared {
             self.candidates.remove(&pool.address);
             self.retry_after.remove(&pool.address);
         } else if pool.mint_a.is_none() || pool.mint_b.is_none()
@@ -385,11 +398,12 @@ impl Scheduler {
     fn eligible(&self,pool:&PoolState,now:Instant)->Option<u8> {
         match self.attempts.get(&pool.address).copied() {
             None=>match pool.completion_state {
-                CompletionState::Unknown=>Some(1),
-                CompletionState::Incomplete=>Some(2),
+                CompletionState::Prepared if needs_direction_upgrade(pool)=>Some(1),
+                CompletionState::Unknown=>Some(2),
+                CompletionState::Incomplete=>Some(3),
                 CompletionState::Prepared=>None,
             },
-            Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),
+            Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(4),
             _=>None,
         }
     }
@@ -412,13 +426,14 @@ impl Scheduler {
             self.candidates.contains_key(pool) && self.attempts.get(pool)==Some(&1))
     }
     fn counts(&self,now:Instant)->(usize,usize,usize) {
-        let mut unknown=0;let mut incomplete=0;let mut retry=0;
+        let mut upgrade=0;let mut unknown=0;let mut incomplete=0;let mut retry=0;
         for pool in self.candidates.values() {
             match self.eligible(pool,now) {
-                Some(1)=>unknown+=1,Some(2)=>incomplete+=1,Some(3)=>retry+=1,_=>(),
+                Some(1)=>upgrade+=1,Some(2)=>unknown+=1,Some(3)=>incomplete+=1,
+                Some(4)=>retry+=1,_=>(),
             }
         }
-        (unknown,incomplete,retry)
+        (upgrade,unknown,incomplete,retry)
     }
 }
 pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
@@ -454,7 +469,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                 scheduler.retry_after.remove(&pool.address);
             }
             attempts+=selected.len();
-            if tier==3 {retries+=selected.len();}
+            if tier==4 {retries+=selected.len();}
             let rpc=rpc.clone();
             tasks.spawn(async move {(tier,process(&rpc,selected,settings).await)});
         }
@@ -519,14 +534,14 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     .map_err(|_|anyhow!("Orca completion has no Registry consumer"))?;
             },
             _=pulse.tick()=>{
-                let (a,b,c)=scheduler.counts(Instant::now());
-                println!("orca completion backlog seen={} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
+                let (upgrade,a,b,c)=scheduler.counts(Instant::now());
+                println!("orca completion backlog seen={} direction_upgrade={upgrade} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
                     seen.len(),scheduler.candidates.len(),tasks.len());
             }
         }
     }
-    let (a,b,c)=scheduler.counts(Instant::now());
-    println!("orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
+    let (upgrade,a,b,c)=scheduler.counts(Instant::now());
+    println!("orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_direction_upgrade={upgrade} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }
