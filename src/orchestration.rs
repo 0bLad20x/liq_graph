@@ -3,10 +3,11 @@
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::{stream, StreamExt};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{damm_v2_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, http_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, Orca, DammV2, All }
@@ -21,6 +22,7 @@ struct Cli {
     meteora: meteora_dlmm::Settings,
     jupiter_only: bool,
     rpc_live: bool,
+    http_transport_live: bool,
     completion_live: bool,
     damm_v2_completion_live: bool,
     graph_live: bool,
@@ -39,6 +41,7 @@ fn settings() -> Result<Cli> {
     let mut max_pages = None;
     let mut jupiter_only = false;
     let mut rpc_live = false;
+    let mut http_transport_live = false;
     let mut completion_live = false;
     let mut damm_v2_completion_live = false;
     let mut graph_live = false;
@@ -55,6 +58,7 @@ fn settings() -> Result<Cli> {
             "--once" => once = true,
             "--jupiter-only" => jupiter_only = true,
             "--rpc-live" => rpc_live = true,
+            "--http-transport-live" => http_transport_live = true,
             "--completion-live" => { completion_live = true; once = true; },
             "--damm-v2-completion-live" => { damm_v2_completion_live = true; once = true; },
             "--graph-live" => { graph_live = true; once = true; },
@@ -80,7 +84,7 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --completion-live, --damm-v2-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --http-transport-live, --completion-live, --damm-v2-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
         }
     }
     ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live || rest_discovery_live)),
@@ -119,10 +123,17 @@ fn settings() -> Result<Cli> {
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
     );
+    ensure!(!http_transport_live || (!rpc_live && !jupiter_only && !once
+        && max_pages.is_none() && completion_limit.is_none() && !completion_live
+        && !damm_v2_completion_live && !graph_live && !persistence_write_live
+        && !persistence_restore_live && !persistence_v2_live && !stability_live
+        && !rest_discovery_live && rest_source_only.is_none()),
+        "--http-transport-live must be used alone");
     Ok(Cli {
         meteora: meteora_dlmm::Settings { once, max_pages },
         jupiter_only,
         rpc_live,
+        http_transport_live,
         completion_live,
         damm_v2_completion_live,
         graph_live,
@@ -314,6 +325,114 @@ pub async fn run() -> Result<()> {
     }
 
     let cli = settings()?;
+    if cli.http_transport_live {
+        let config = http_transport::Settings::from_env()?;
+        ensure!(config.public_discovery || config.list_file.is_some()
+            || !config.extra_txt_urls.is_empty(),
+            "HTTP proxy live mode requires a configured proxy source");
+        let target = env::var("HTTP_TRANSPORT_LIVE_URL")
+            .unwrap_or_else(|_| config.probe_url.to_string());
+        let calls: usize = env::var("HTTP_TRANSPORT_LIVE_REQUESTS")
+            .unwrap_or_else(|_| "100".into()).parse()
+            .context("invalid HTTP_TRANSPORT_LIVE_REQUESTS")?;
+        let parallel: usize = env::var("HTTP_TRANSPORT_LIVE_PARALLEL")
+            .unwrap_or_else(|_| "32".into()).parse()
+            .context("invalid HTTP_TRANSPORT_LIVE_PARALLEL")?;
+        ensure!((1..=2000).contains(&calls), "HTTP live requests must be 1..=2000");
+        ensure!((1..=512).contains(&parallel), "HTTP live parallel must be 1..=512");
+        let (handle, task) = http_transport::spawn(config)?;
+        let route_updates = handle.subscribe_routes();
+        let mut cycles = handle.subscribe_cycles();
+        tokio::time::timeout(Duration::from_secs(900), async {
+            loop {
+                if *cycles.borrow_and_update() > 0 { break Ok::<_, anyhow::Error>(()); }
+                cycles.changed().await.context("HTTP discovery cycle publisher closed")?;
+            }
+        }).await.context("HTTP proxy discovery did not finish within 900 seconds")??;
+        let verified = handle.working_set();
+        ensure!(!verified.is_empty(), "HTTP discovery finished with no verified proxies");
+        println!(
+            "http_transport live working_set={} fastest_ms={} protocol={} sources={} oldest_verified_age_ms={} published_routes={}",
+            verified.len(), verified[0].latency_ms, verified[0].protocol,
+            verified[0].sources.join(","),
+            verified.iter().map(|route| route.verified_age_ms).max().unwrap_or(0),
+            route_updates.borrow().len()
+        );
+
+        let started = std::time::Instant::now();
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        let mut status_429 = 0usize;
+        let mut other_status = 0usize;
+        let mut invalid_payload = 0usize;
+        let mut routes_used = HashSet::new();
+        let mut latencies = Vec::with_capacity(calls);
+        let mut bytes = 0usize;
+        let mut sample = None;
+        {
+            let jobs = stream::iter(0..calls).map(|_| {
+                let handle = handle.clone();
+                let target = target.clone();
+                async move {
+                    let request = http_transport::HttpRequest::get(
+                        &target, http_transport::RoutePolicy::ProxyOnly)?;
+                    handle.call(request).await
+                }
+            }).buffer_unordered(parallel);
+            tokio::pin!(jobs);
+            while let Some(result) = jobs.next().await {
+            match result {
+                Ok(response) => {
+                    routes_used.insert(response.route_id.clone());
+                    latencies.push(response.elapsed_ms);
+                    if response.status.is_success() {
+                        match http_transport::validate_live_payload(&target, &response.body) {
+                            Ok(()) => {
+                                ok += 1;
+                                bytes += response.body.len();
+                                if sample.is_none() {
+                                    sample = Some(format!("route={} status={} bytes={}",
+                                        response.route_id, response.status, response.body.len()));
+                                }
+                            }
+                            Err(error) => {
+                                invalid_payload += 1;
+                                if invalid_payload <= 3 {
+                                    eprintln!("http_transport live invalid_payload={error:#}");
+                                }
+                            }
+                        }
+                    } else if response.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        status_429 += 1;
+                    } else {
+                        other_status += 1;
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    if failed <= 3 { eprintln!("http_transport live request_error={error:#}"); }
+                }
+            }
+        }
+        }
+        latencies.sort_unstable();
+        let p50 = latencies.get(latencies.len().saturating_sub(1) * 50 / 100)
+            .copied().unwrap_or(0);
+        let p95 = latencies.get(latencies.len().saturating_sub(1) * 95 / 100)
+            .copied().unwrap_or(0);
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "http_transport live benchmark requests={} success={} errors={} http_429={} other_http={} invalid_payload={} distinct_routes={} bytes={} elapsed_s={:.2} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={}",
+            calls, ok, failed, status_429, other_status, invalid_payload, routes_used.len(),
+            bytes, elapsed, calls as f64 / elapsed.max(0.001), p50, p95
+        );
+        ensure!(ok > 0, "HTTP proxy transport did not produce a successful response");
+        println!("http_transport live PASS {}", sample.unwrap_or_default());
+        drop(cycles);
+        drop(handle);
+        task.await??;
+        return Ok(());
+    }
     if cli.rpc_live {
         let config = rpc_transport::settings_from_env()?;
         let (handle, task) = rpc_transport::spawn(config)?;
