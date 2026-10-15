@@ -172,6 +172,7 @@ fn read(rpc:&RpcHandle, addresses:Vec<Pubkey>, min_slot:Option<u64>)
     -> impl std::future::Future<Output=Result<(u64,Vec<Option<AccountData>>)>> + '_ {
     async move {
         let count=addresses.len();
+        let expected=addresses.clone();
         let result=rpc.call(RpcOperation::Multiple {
             addresses,view:AccountView::Full,min_context_slot:min_slot
         }).await?;
@@ -179,9 +180,11 @@ fn read(rpc:&RpcHandle, addresses:Vec<Pubkey>, min_slot:Option<u64>)
             else {bail!("unexpected Orca RPC Multiple answer")};
         ensure!(accounts.len()==count && min_slot.is_none_or(|v|slot>=v),
             "Orca RPC cardinality or slot mismatch");
-        ensure!(accounts.iter().flatten().all(|a|
-            a.view==AccountView::Full && a.original_len==Some(a.bytes.len())),
-            "Orca RPC did not return full accounts");
+        ensure!(accounts.iter().zip(&expected).all(|(a,expected)|
+            a.as_ref().is_none_or(|item| item.address==*expected
+                && item.view==AccountView::Full
+                && item.original_len==Some(item.bytes.len()))),
+            "Orca RPC address or full-account identity mismatch");
         Ok((slot,accounts))
     }
 }
