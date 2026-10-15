@@ -199,12 +199,13 @@ fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
 fn incomplete(pool:Pubkey,slot:u64,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Incomplete,Some(slot),Some(reason.into()),None,None,None)
 }
-fn make_manifest(l:Layout,slot:u64,arrays:&[Pubkey],owner:Pubkey)->ExecutionManifest {
+fn make_manifest(l:Layout,slot:u64,arrays_a:&[Pubkey],arrays_b:&[Pubkey],
+    owner:Pubkey)->ExecutionManifest {
     let ro=|address|AccountMeta{address,writable:false};
     let rw=|address|AccountMeta{address,writable:true};
     let memo:Pubkey=MEMO.parse().expect("known Memo program ID");
     let oracle=Pubkey::find_program_address(&[b"oracle",l.pool.as_ref()],&owner).0;
-    let direction=|base:Pubkey,reverse:bool|{
+    let direction=|base:Pubkey,reverse:bool,arrays:&[Pubkey]|{
         let (x_vault,base_vault)=if reverse {(l.vault_b,l.vault_a)}
             else {(l.vault_a,l.vault_b)};
         let mut accounts=vec![ro(owner),ro(base),ro(memo),rw(l.pool),
@@ -214,7 +215,8 @@ fn make_manifest(l:Layout,slot:u64,arrays:&[Pubkey],owner:Pubkey)->ExecutionMani
     };
     ExecutionManifest {
         pool:l.pool,mint_a:l.mint_a,mint_b:l.mint_b,validated_slot:slot,
-        base_a:direction(l.mint_a,true),base_b:direction(l.mint_b,false),
+        // base_a = A->B: ticks traverse downward; base_b = B->A: upward.
+        base_a:direction(l.mint_a,true,arrays_a),base_b:direction(l.mint_b,false,arrays_b),
     }
 }
 fn finish(pool:&PoolState,initial:Layout,slot:u64,
@@ -274,7 +276,15 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
         }
     }
     selected.sort_unstable();
-    let arrays=selected.iter().map(|i|present[i].0).collect::<Vec<_>>();
+    // The V10 builder preserves array order, and Whirlpool swaps consume arrays
+    // starting at the active array, then in the actual swap direction.
+    let mut down=selected.iter().copied().filter(|start|*start<=center)
+        .collect::<Vec<_>>();
+    down.reverse();
+    let up=selected.iter().copied().filter(|start|*start>=center)
+        .collect::<Vec<_>>();
+    let arrays_a=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
+    let arrays_b=up.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let mints=[mint_a,mint_b];
     let ev=Arc::new(CompletionEvidence{
         kind:"orca_whirlpool_tick_arrays".into(),version:1,
@@ -286,6 +296,8 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             "selected":selected.iter().map(|start|json!({
                 "start":start,"address":present[start].0.to_string(),"layout":present[start].1
             })).collect::<Vec<_>>(),
+            "base_a_start_ticks":down,
+            "base_b_start_ticks":up,
             "token_program_a":a.owner.to_string(),"token_program_b":b.owner.to_string()
         }))
     });
@@ -294,7 +306,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             Some(format!("V10 unsupported Token-2022 mint extensions: {:?} {:?}",
                 mints[0].unsupported,mints[1].unsupported)),Some(ev),Some(mints),None);
     }
-    let manifest=make_manifest(layout,slot,&arrays,owner);
+    let manifest=make_manifest(layout,slot,&arrays_a,&arrays_b,owner);
     result(pool.address,CompletionStatus::Prepared,Some(slot),None,
         Some(ev),Some(mints),Some(Arc::new(manifest)))
 }
