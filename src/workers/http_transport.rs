@@ -768,14 +768,17 @@ async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
     let host_due = if host_rps == 0 { now }
         else { host_gates.get(host).copied().unwrap_or(now) };
     let route_key = (host.to_owned(), route_id.to_owned());
-    let route_due = route_gates.get(&route_key).copied().unwrap_or(now);
+    let route_due = if route_id == "direct" { now }
+        else { route_gates.get(&route_key).copied().unwrap_or(now) };
     let at = now.max(host_due).max(route_due);
     if host_rps > 0 {
         host_gates.insert(host.to_owned(),
             at + Duration::from_secs_f64(1.0 / f64::from(host_rps)));
     }
-    route_gates.insert(route_key,
-        at + Duration::from_secs_f64(1.0 / f64::from(shared.settings.request_rps_per_route)));
+    if route_id != "direct" {
+        route_gates.insert(route_key,
+            at + Duration::from_secs_f64(1.0 / f64::from(shared.settings.request_rps_per_route)));
+    }
     drop(route_gates);
     drop(host_gates);
     sleep_until(at).await;
@@ -912,7 +915,10 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
                 .and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(5).clamp(1, 3600);
             let deadline = Instant::now() + Duration::from_secs(retry);
-            shared.host_backoffs.lock().await.insert(host.clone(), deadline);
+            let mut backoffs = shared.host_backoffs.lock().await;
+            let previous = backoffs.entry(host.clone()).or_insert(deadline);
+            *previous = (*previous).max(deadline);
+            drop(backoffs);
             let mut gates = shared.host_gates.lock().await;
             let at = gates.entry(host.clone()).or_insert(deadline);
             *at = (*at).max(deadline);
