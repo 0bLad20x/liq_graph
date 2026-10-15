@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{damm_v2_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, http_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, Orca, DammV2, All }
@@ -21,6 +21,7 @@ struct Cli {
     meteora: meteora_dlmm::Settings,
     jupiter_only: bool,
     rpc_live: bool,
+    http_transport_live: bool,
     completion_live: bool,
     damm_v2_completion_live: bool,
     graph_live: bool,
@@ -39,6 +40,7 @@ fn settings() -> Result<Cli> {
     let mut max_pages = None;
     let mut jupiter_only = false;
     let mut rpc_live = false;
+    let mut http_transport_live = false;
     let mut completion_live = false;
     let mut damm_v2_completion_live = false;
     let mut graph_live = false;
@@ -55,6 +57,7 @@ fn settings() -> Result<Cli> {
             "--once" => once = true,
             "--jupiter-only" => jupiter_only = true,
             "--rpc-live" => rpc_live = true,
+            "--http-transport-live" => http_transport_live = true,
             "--completion-live" => { completion_live = true; once = true; },
             "--damm-v2-completion-live" => { damm_v2_completion_live = true; once = true; },
             "--graph-live" => { graph_live = true; once = true; },
@@ -119,10 +122,17 @@ fn settings() -> Result<Cli> {
         !(jupiter_only && (once || max_pages.is_some())),
         "--jupiter-only cannot be combined with --once or --pages"
     );
+    ensure!(!http_transport_live || (!rpc_live && !jupiter_only && !once
+        && max_pages.is_none() && completion_limit.is_none() && !completion_live
+        && !damm_v2_completion_live && !graph_live && !persistence_write_live
+        && !persistence_restore_live && !persistence_v2_live && !stability_live
+        && !rest_discovery_live && rest_source_only.is_none()),
+        "--http-transport-live must be used alone");
     Ok(Cli {
         meteora: meteora_dlmm::Settings { once, max_pages },
         jupiter_only,
         rpc_live,
+        http_transport_live,
         completion_live,
         damm_v2_completion_live,
         graph_live,
@@ -314,6 +324,34 @@ pub async fn run() -> Result<()> {
     }
 
     let cli = settings()?;
+    if cli.http_transport_live {
+        let config = http_transport::Settings::from_env()?;
+        let target = config.probe_url.to_string();
+        let (handle, task) = http_transport::spawn(config)?;
+        let mut updates = handle.subscribe_routes();
+        let selected = tokio::time::timeout(Duration::from_secs(900), async {
+            loop {
+                let routes = updates.borrow_and_update().clone();
+                if !routes.is_empty() { return Ok::<_, anyhow::Error>(routes); }
+                updates.changed().await.context("HTTP working set publisher closed")?;
+            }
+        }).await.context("no verified proxy within 900 seconds")??;
+        println!("http_transport live working_set={} fastest_ms={}", selected.len(), selected[0].latency_ms);
+        let request = http_transport::HttpRequest::get(&target, http_transport::RoutePolicy::ProxyOnly)?;
+        let response = handle.call(request).await?;
+        ensure!(response.status == reqwest::StatusCode::OK,
+            "HTTP transport probe returned {}", response.status);
+        let data: serde_json::Value = serde_json::from_slice(&response.body)?;
+        ensure!(data.as_array().is_some_and(|pairs| pairs.iter().any(|p| {
+            p.get("chainId").and_then(serde_json::Value::as_str) == Some("solana")
+        })), "HTTP transport returned invalid DEX-Screener pool data");
+        println!("http_transport live PASS status={} route={} elapsed_ms={} payload_bytes={}",
+            response.status, response.route_id, response.elapsed_ms, response.body.len());
+        drop(updates);
+        drop(handle);
+        task.await??;
+        return Ok(());
+    }
     if cli.rpc_live {
         let config = rpc_transport::settings_from_env()?;
         let (handle, task) = rpc_transport::spawn(config)?;
