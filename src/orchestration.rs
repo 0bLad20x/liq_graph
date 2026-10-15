@@ -3,6 +3,7 @@
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::{stream, StreamExt};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
@@ -326,32 +327,89 @@ pub async fn run() -> Result<()> {
     let cli = settings()?;
     if cli.http_transport_live {
         let config = http_transport::Settings::from_env()?;
-        let target = config.probe_url.to_string();
+        let target = env::var("HTTP_TRANSPORT_LIVE_URL")
+            .unwrap_or_else(|_| config.probe_url.to_string());
+        let calls: usize = env::var("HTTP_TRANSPORT_LIVE_REQUESTS")
+            .unwrap_or_else(|_| "100".into()).parse()
+            .context("invalid HTTP_TRANSPORT_LIVE_REQUESTS")?;
+        let parallel: usize = env::var("HTTP_TRANSPORT_LIVE_PARALLEL")
+            .unwrap_or_else(|_| "32".into()).parse()
+            .context("invalid HTTP_TRANSPORT_LIVE_PARALLEL")?;
+        ensure!((1..=2000).contains(&calls), "HTTP live requests must be 1..=2000");
+        ensure!((1..=512).contains(&parallel), "HTTP live parallel must be 1..=512");
         let (handle, task) = http_transport::spawn(config)?;
-        let mut updates = handle.subscribe_routes();
-        let selected = tokio::time::timeout(Duration::from_secs(900), async {
+        let mut cycles = handle.subscribe_cycles();
+        tokio::time::timeout(Duration::from_secs(900), async {
             loop {
-                let routes = updates.borrow_and_update().clone();
-                if !routes.is_empty() { return Ok::<_, anyhow::Error>(routes); }
-                updates.changed().await.context("HTTP working set publisher closed")?;
+                if *cycles.borrow_and_update() > 0 { break Ok::<_, anyhow::Error>(()); }
+                cycles.changed().await.context("HTTP discovery cycle publisher closed")?;
             }
-        }).await.context("no verified proxy within 900 seconds")??;
+        }).await.context("HTTP proxy discovery did not finish within 900 seconds")??;
+        let verified = handle.working_set();
+        ensure!(!verified.is_empty(), "HTTP discovery finished with no verified proxies");
         println!(
-            "http_transport live working_set={} fastest_ms={} protocol={} sources={} current_working={}",
-            selected.len(), selected[0].latency_ms, selected[0].protocol,
-            selected[0].sources.join(","), handle.working_set().len()
+            "http_transport live working_set={} fastest_ms={} protocol={} sources={}",
+            verified.len(), verified[0].latency_ms, verified[0].protocol,
+            verified[0].sources.join(",")
         );
-        let request = http_transport::HttpRequest::get(&target, http_transport::RoutePolicy::ProxyOnly)?;
-        let response = handle.call(request).await?;
-        ensure!(response.status == reqwest::StatusCode::OK,
-            "HTTP transport probe returned {}", response.status);
-        let data: serde_json::Value = serde_json::from_slice(&response.body)?;
-        ensure!(data.as_array().is_some_and(|pairs| pairs.iter().any(|p| {
-            p.get("chainId").and_then(serde_json::Value::as_str) == Some("solana")
-        })), "HTTP transport returned invalid DEX-Screener pool data");
-        println!("http_transport live PASS status={} route={} elapsed_ms={} payload_bytes={}",
-            response.status, response.route_id, response.elapsed_ms, response.body.len());
-        drop(updates);
+
+        let started = std::time::Instant::now();
+        let jobs = stream::iter(0..calls).map(|_| {
+            let handle = handle.clone();
+            let target = target.clone();
+            async move {
+                let request = http_transport::HttpRequest::get(
+                    &target, http_transport::RoutePolicy::ProxyOnly)?;
+                handle.call(request).await
+            }
+        }).buffer_unordered(parallel);
+        tokio::pin!(jobs);
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        let mut status_429 = 0usize;
+        let mut other_status = 0usize;
+        let mut routes_used = HashSet::new();
+        let mut latencies = Vec::with_capacity(calls);
+        let mut bytes = 0usize;
+        let mut sample = None;
+        while let Some(result) = jobs.next().await {
+            match result {
+                Ok(response) => {
+                    routes_used.insert(response.route_id.clone());
+                    latencies.push(response.elapsed_ms);
+                    if response.status.is_success() {
+                        ok += 1;
+                        bytes += response.body.len();
+                        if sample.is_none() {
+                            sample = Some(format!("route={} status={} bytes={}",
+                                response.route_id, response.status, response.body.len()));
+                        }
+                    } else if response.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        status_429 += 1;
+                    } else {
+                        other_status += 1;
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    if failed <= 3 { eprintln!("http_transport live request_error={error:#}"); }
+                }
+            }
+        }
+        latencies.sort_unstable();
+        let p50 = latencies.get(latencies.len().saturating_sub(1) * 50 / 100)
+            .copied().unwrap_or(0);
+        let p95 = latencies.get(latencies.len().saturating_sub(1) * 95 / 100)
+            .copied().unwrap_or(0);
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "http_transport live benchmark requests={} success={} errors={} http_429={} other_http={} distinct_routes={} bytes={} elapsed_s={:.2} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={}",
+            calls, ok, failed, status_429, other_status, routes_used.len(),
+            bytes, elapsed, calls as f64 / elapsed.max(0.001), p50, p95
+        );
+        ensure!(ok > 0, "HTTP proxy transport did not produce a successful response");
+        println!("http_transport live PASS {}", sample.unwrap_or_default());
+        drop(cycles);
         drop(handle);
         task.await??;
         return Ok(());
