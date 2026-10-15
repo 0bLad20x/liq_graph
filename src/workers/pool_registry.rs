@@ -13,59 +13,9 @@ use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast,watch};
 
 use crate::core::{
-    now_unix_ms, BinArrayInventory, CompletionResultBatch, CompletionStatus, DataBatch,
-    ExecutionManifest, MintProof, RecordIdentity, Venue,
+    now_unix_ms, CompletionResultBatch, CompletionStatus, DataBatch, RecordIdentity,
+    CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompletionState {
-    Unknown,
-    Prepared,
-    Incomplete,
-}
-
-/// One current pool observation, including accepted execution-completion results.
-#[derive(Clone, Debug)]
-pub struct PoolState {
-    pub address: Pubkey,
-    pub venue: Venue,
-    pub mint_a: Option<Pubkey>,
-    pub mint_b: Option<Pubkey>,
-    pub source: &'static str,
-    pub first_seen_ms: u64,
-    pub last_seen_ms: u64,
-    pub last_changed_ms: u64,
-    pub tvl_usd: Option<f64>,
-    /// Durable, validated protocol configuration, not arbitrary REST JSON.
-    pub pool_config: Option<Arc<Value>>,
-    /// Historical persisted observation; never treat as a fresh live quote.
-    pub last_observation: Option<Arc<Value>>,
-    pub completion_state: CompletionState,
-    pub completion_validated_slot: Option<u64>,
-    pub execution_manifest: Option<Arc<ExecutionManifest>>,
-    pub execution_inventory: Option<Arc<BinArrayInventory>>,
-    pub mint_proofs: Option<[MintProof; 2]>,
-    pub completion_reason: Option<String>,
-}
-
-/// Distinguish source observations from completed execution metadata without
-/// interpreting worker-specific source names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PoolUpdateKind {
-    Source,
-    Completion,
-}
-
-/// Changed records only; last_seen-only refreshes remain accessible in snapshots.
-#[derive(Debug)]
-pub struct PoolUpdateBatch {
-    pub kind: PoolUpdateKind,
-    pub source: &'static str,
-    pub received_at_ms: u64,
-    pub pools: Vec<PoolState>,
-    /// Identity/configuration changes only. Excludes TVL-only updates.
-    pub persist_identity: Vec<Pubkey>,
-}
 
 /// The write owner is the registry worker. Consumers can only request typed snapshots.
 #[derive(Clone, Default)]
@@ -104,7 +54,7 @@ impl PoolRegistry {
                 CompletionState::Unknown => {
                     ensure!(pool.completion_validated_slot.is_none()
                         && pool.execution_manifest.is_none()
-                        && pool.execution_inventory.is_none()
+                        && pool.completion_evidence.is_none()
                         && pool.mint_proofs.is_none(),
                         "restored Unknown pool has execution proof");
                 }
@@ -114,13 +64,17 @@ impl PoolRegistry {
                     else { anyhow::bail!("restored Prepared pool missing identity or proof"); };
                     ensure!(m.pool == pool.address && m.mint_a == a && m.mint_b == b
                         && m.validated_slot == slot && !m.base_a.is_empty() && !m.base_b.is_empty()
-                        && pool.execution_inventory.is_some() && pool.mint_proofs.is_some(),
-                        "invalid restored manifest identity, slot or RPC evidence");
+                        && pool.completion_evidence.as_ref().is_some_and(|e|
+                        !e.kind.is_empty() && e.version > 0 && e.payload.is_object())
+                    && pool.mint_proofs.is_some(),
+                        "invalid restored manifest identity, slot or protocol evidence");
                 }
                 CompletionState::Incomplete => {
                     ensure!(a.is_some() && b.is_some()
                         && pool.completion_validated_slot.is_some()
-                        && pool.execution_manifest.is_none(),
+                        && pool.execution_manifest.is_none()
+                        && pool.completion_evidence.as_ref().is_none_or(|e|
+                            !e.kind.is_empty() && e.version > 0 && e.payload.is_object()),
                         "invalid restored Incomplete pool");
                 }
             }
@@ -166,7 +120,7 @@ impl PoolRegistry {
                         completion_state: CompletionState::Unknown,
                         completion_validated_slot: None,
                         execution_manifest: None,
-                        execution_inventory: None,
+                        completion_evidence: None,
                         mint_proofs: None,
                         completion_reason: None,
                     };
@@ -291,11 +245,16 @@ impl PoolRegistry {
                 if manifest.pool != result.pool || manifest.validated_slot != slot
                     || pool.mint_a != Some(manifest.mint_a)
                     || pool.mint_b != Some(manifest.mint_b)
-                    || result.inventory.is_none() || result.mints.is_none() {
+                    || result.evidence.is_none() || result.mints.is_none() {
                     stats.invalid += 1;
                     continue;
                 }
             } else if result.manifest.is_some() {
+                stats.invalid += 1;
+                continue;
+            }
+            if result.evidence.as_ref().is_some_and(|e|
+                e.kind.is_empty() || e.version == 0 || !e.payload.is_object()) {
                 stats.invalid += 1;
                 continue;
             }
@@ -322,7 +281,7 @@ impl PoolRegistry {
             pool.completion_state = next_state;
             pool.completion_validated_slot = Some(slot);
             pool.execution_manifest = result.manifest.clone();
-            pool.execution_inventory = result.inventory.clone();
+            pool.completion_evidence = result.evidence.clone();
             pool.mint_proofs = result.mints.clone();
             pool.completion_reason = result.reason.clone();
             pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
@@ -496,9 +455,9 @@ pub async fn run(
     let prepared = snapshot.iter().filter(|p| p.completion_state == CompletionState::Prepared).count();
     let incomplete = snapshot.iter().filter(|p| p.completion_state == CompletionState::Incomplete).count();
     let manifests = snapshot.iter().filter(|p| p.execution_manifest.is_some()).count();
-    let inventories = snapshot.iter().filter(|p| p.execution_inventory.is_some()).count();
+    let evidences = snapshot.iter().filter(|p| p.completion_evidence.is_some()).count();
     println!(
-        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} inventories_in_ram={inventories}",
+        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",
         snapshot.len(),
     );
     if require_completion {
@@ -541,7 +500,7 @@ pub async fn observe_updates(
     let mut completion_prepared = 0_usize;
     let mut completion_incomplete = 0_usize;
     let mut completion_retryable = 0_usize;
-    let mut completion_with_inventory = 0_usize;
+    let mut completion_with_evidence = 0_usize;
     loop {
         match input.recv().await {
             Ok(batch) => {
@@ -561,14 +520,14 @@ pub async fn observe_updates(
                     let retryable = batch.pools.iter().filter(|p|
                         p.completion_state == CompletionState::Unknown
                         && p.execution_manifest.is_none()).count();
-                    let with_inventory = batch.pools.iter()
-                        .filter(|p|p.execution_inventory.is_some()).count();
+                    let with_evidence = batch.pools.iter()
+                        .filter(|p|p.completion_evidence.is_some()).count();
                     completion_prepared += prepared;
                     completion_incomplete += incomplete;
                     completion_retryable += retryable;
-                    completion_with_inventory += with_inventory;
-                    println!("pool registry completion consumer source={} received={} prepared={} incomplete={} retryable={} inventories={} manifests={} sample_pool={} sample_slot={:?}",
-                        batch.source, batch.pools.len(), prepared, incomplete, retryable, with_inventory,
+                    completion_with_evidence += with_evidence;
+                    println!("pool registry completion consumer source={} received={} prepared={} incomplete={} retryable={} evidences={} manifests={} sample_pool={} sample_slot={:?}",
+                        batch.source, batch.pools.len(), prepared, incomplete, retryable, with_evidence,
                         batch.pools.iter().filter(|p|p.execution_manifest.is_some()).count(),
                         batch.pools.first().map_or(Pubkey::default(), |p|p.address),
                         batch.pools.first().and_then(|p|p.completion_validated_slot));
@@ -598,14 +557,14 @@ pub async fn observe_updates(
         }
     }
     println!(
-        "pool registry consumer complete received_batches={batches} pool_updates={pool_updates} lagged_batches={lagged} completion_batches={completion_batches} completion_pools={completion_pools} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_inventories={completion_with_inventory}"
+        "pool registry consumer complete received_batches={batches} pool_updates={pool_updates} lagged_batches={lagged} completion_batches={completion_batches} completion_pools={completion_pools} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_evidences={completion_with_evidence}"
     );
     if require_completion {
         // No new qualified pools, or only Incomplete results, are valid outcomes.
         anyhow::ensure!(completion_pools == completion_prepared + completion_incomplete
             + completion_retryable, "registry completion consumer received invalid state updates");
-        anyhow::ensure!(completion_with_inventory >= completion_prepared + completion_incomplete,
-            "registry completion consumer missing execution inventory for terminal results");
+        anyhow::ensure!(completion_with_evidence >= completion_prepared,
+            "registry completion consumer missing protocol evidence for Prepared results");
     }
     Ok(())
 }

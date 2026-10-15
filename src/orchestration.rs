@@ -208,7 +208,7 @@ fn spawn_sources(
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(source_capacity);
     let registry_input = output.subscribe();
     let (registry_output, registry_observer) =
-        broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(registry_capacity);
+        broadcast::channel::<Arc<core::PoolUpdateBatch>>(registry_capacity);
     let registry = initial_registry.unwrap_or_default();
     let completion_live = completion.is_some();
     let (source_done_tx,source_done_rx) = watch::channel(false);
@@ -238,8 +238,8 @@ fn spawn_sources(
     let restored = registry.snapshot();
     if !restored.is_empty() {
         let count = restored.len();
-        registry_output.send(Arc::new(pool_registry::PoolUpdateBatch {
-            kind: pool_registry::PoolUpdateKind::Source,
+        registry_output.send(Arc::new(core::PoolUpdateBatch {
+            kind: core::PoolUpdateKind::Source,
             source: "persistence_restore",
             received_at_ms: 0,
             pools: restored,
@@ -326,13 +326,13 @@ pub async fn run() -> Result<()> {
         let graph_settings = liquidity_graph::Settings::from_env()?;
         ensure!(graph_settings.min_tvl_usd.is_none(),
             "restore-live cannot use GRAPH_MIN_TVL_USD without a fresh TVL source");
-        let (updates, receiver) = broadcast::channel::<Arc<pool_registry::PoolUpdateBatch>>(32);
+        let (updates, receiver) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
         let (graph_tx, graph_rx) = watch::channel(Arc::new(liquidity_graph::GraphSnapshot::default()));
         let mut tasks = JoinSet::new();
         tasks.spawn(liquidity_graph::observe(graph_rx));
         tasks.spawn(liquidity_graph::run(receiver,graph_tx,graph_settings));
-        updates.send(Arc::new(pool_registry::PoolUpdateBatch {
-            kind: pool_registry::PoolUpdateKind::Source,
+        updates.send(Arc::new(core::PoolUpdateBatch {
+            kind: core::PoolUpdateKind::Source,
             source:"persistence_restore",
             received_at_ms:0,
             pools:registry.snapshot(),
