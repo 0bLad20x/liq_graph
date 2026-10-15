@@ -327,6 +327,9 @@ pub async fn run() -> Result<()> {
     let cli = settings()?;
     if cli.http_transport_live {
         let config = http_transport::Settings::from_env()?;
+        ensure!(config.public_discovery || config.list_file.is_some()
+            || !config.extra_txt_urls.is_empty(),
+            "HTTP proxy live mode requires a configured proxy source");
         let target = env::var("HTTP_TRANSPORT_LIVE_URL")
             .unwrap_or_else(|_| config.probe_url.to_string());
         let calls: usize = env::var("HTTP_TRANSPORT_LIVE_REQUESTS")
