@@ -80,12 +80,14 @@ pub struct RouteSnapshot {
 pub struct HttpHandle {
     calls: mpsc::Sender<Call>,
     routes: watch::Receiver<Arc<Vec<RouteSnapshot>>>,
+    cycles: watch::Receiver<u64>,
 }
 
 impl HttpHandle {
     pub async fn call(&self, request: HttpRequest) -> Result<HttpResponse> {
         let (reply, result) = oneshot::channel();
-        self.calls.send(Call { request, reply }).await.context("HTTP transport stopped")?;
+        self.calls.send(Call { request, reply, queued_at: Instant::now() })
+            .await.context("HTTP transport stopped")?;
         result.await.context("HTTP transport dropped request")?
     }
     pub fn working_set(&self) -> Arc<Vec<RouteSnapshot>> {
@@ -94,11 +96,15 @@ impl HttpHandle {
     pub fn subscribe_routes(&self) -> watch::Receiver<Arc<Vec<RouteSnapshot>>> {
         self.routes.clone()
     }
+    pub fn subscribe_cycles(&self) -> watch::Receiver<u64> {
+        self.cycles.clone()
+    }
 }
 
 struct Call {
     request: HttpRequest,
     reply: oneshot::Sender<Result<HttpResponse>>,
+    queued_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -221,19 +227,56 @@ struct Route {
     next_check: Instant,
 }
 
+#[derive(Default)]
+struct TransportStats {
+    submitted: u64, completed: u64, succeeded: u64,
+    attempts: u64, failovers: u64, http_429: u64, http_403: u64,
+    http_5xx: u64, transport_errors: u64, other_errors: u64,
+    routes_used: HashSet<String>,
+    latency_ms: VecDeque<u64>, queue_ms: VecDeque<u64>,
+}
+
+fn percentile(values: &VecDeque<u64>, p: usize) -> u64 {
+    if values.is_empty() { return 0; }
+    let mut sorted = values.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    sorted[((sorted.len()-1)*p)/100]
+}
+
+fn sample(values: &mut VecDeque<u64>, ms: u64) {
+    if values.len() >= 4096 { values.pop_front(); }
+    values.push_back(ms);
+}
+
+fn report_stats(shared: &Shared) {
+    let stats = shared.stats.lock().expect("HTTP stats lock poisoned");
+    println!(
+        "http_transport stats submitted={} completed={} ok={} failed={} attempts={} failovers={} http_429={} http_403={} http_5xx={} transport_errors={} other_errors={} distinct_routes={} latency_p50_ms={} latency_p95_ms={} queue_p95_ms={}",
+        stats.submitted, stats.completed, stats.succeeded,
+        stats.completed.saturating_sub(stats.succeeded), stats.attempts, stats.failovers,
+        stats.http_429, stats.http_403, stats.http_5xx, stats.transport_errors,
+        stats.other_errors, stats.routes_used.len(),
+        percentile(&stats.latency_ms, 50), percentile(&stats.latency_ms, 95),
+        percentile(&stats.queue_ms, 95)
+    );
+}
+
 struct Shared {
     settings: Settings,
     inventory: Mutex<HashMap<String, Route>>,
     snapshots: watch::Sender<Arc<Vec<RouteSnapshot>>>,
+    cycles: watch::Sender<u64>,
     selection: AtomicUsize,
-    // Limit requests by target host, not by public proxy address.
     host_gates: Mutex<HashMap<String, Instant>>,
+    route_gates: Mutex<HashMap<(String, String), Instant>>,
+    stats: StdMutex<TransportStats>,
     direct_client: Client,
 }
 
 pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)> {
     let (calls, receiver) = mpsc::channel(settings.queue_capacity);
     let (snapshots, route_reader) = watch::channel(Arc::new(Vec::new()));
+    let (cycles, cycle_reader) = watch::channel(0_u64);
     let direct_client = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(30))
@@ -241,13 +284,15 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
     let shared = Arc::new(Shared {
         settings: settings.clone(),
         inventory: Mutex::new(HashMap::new()),
-        snapshots,
+        snapshots, cycles,
         selection: AtomicUsize::new(0),
         host_gates: Mutex::new(HashMap::new()),
+        route_gates: Mutex::new(HashMap::new()),
+        stats: StdMutex::new(TransportStats::default()),
         direct_client,
     });
     let task = tokio::spawn(run(shared, receiver));
-    Ok((HttpHandle { calls, routes: route_reader }, task))
+    Ok((HttpHandle { calls, routes: route_reader, cycles: cycle_reader }, task))
 }
 
 async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<()> {
@@ -256,17 +301,37 @@ async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<
         tokio::spawn(async move { discovery_loop(shared).await })
     };
     let capacity = Arc::new(Semaphore::new(shared.settings.request_parallel));
-    while let Some(call) = receiver.recv().await {
-        let permit = capacity.clone().acquire_owned().await.context("HTTP transport semaphore closed")?;
+    let reporter = {
         let shared = shared.clone();
         tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.tick().await;
+            loop { tick.tick().await; report_stats(&shared); }
+        })
+    };
+    while let Some(call) = receiver.recv().await {
+        let permit = capacity.clone().acquire_owned().await
+            .context("HTTP transport semaphore closed")?;
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let queued_ms = call.queued_at.elapsed().as_millis() as u64;
+            let started = Instant::now();
             let result = execute(&shared, call.request).await;
+            {
+                let mut stats = shared.stats.lock().expect("HTTP stats lock poisoned");
+                stats.completed += 1;
+                if result.as_ref().is_ok_and(|v| v.status.is_success()) { stats.succeeded += 1; }
+                sample(&mut stats.latency_ms, started.elapsed().as_millis() as u64);
+                sample(&mut stats.queue_ms, queued_ms);
+            }
             let _ = call.reply.send(result);
             drop(permit);
         });
     }
     discover.abort();
     let _ = discover.await;
+    reporter.abort();
+    report_stats(&shared);
     Ok(())
 }
 
