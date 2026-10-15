@@ -425,7 +425,7 @@ impl Scheduler {
         self.retry_after.iter().any(|(pool,_)|
             self.candidates.contains_key(pool) && self.attempts.get(pool)==Some(&1))
     }
-    fn counts(&self,now:Instant)->(usize,usize,usize) {
+    fn counts(&self,now:Instant)->(usize,usize,usize,usize) {
         let mut upgrade=0;let mut unknown=0;let mut incomplete=0;let mut retry=0;
         for pool in self.candidates.values() {
             match self.eligible(pool,now) {
