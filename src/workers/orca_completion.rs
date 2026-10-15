@@ -26,7 +26,7 @@ const FIXED_LEN: usize = 8 + 4 + 88 * 113 + 32;
 const DYNAMIC_MIN_LEN: usize = 8 + 4 + 32 + 16 + 88;
 const DYNAMIC_MAX_LEN: usize = 8 + 4 + 32 + 16 + 88 * 113;
 const ORACLE_LEN: usize = 8 + 32 + 8 + 34 + 44 + 128;
-const POOLS_PER_BATCH: usize = 8; // second pass <= 11 addresses per pool
+const POOLS_PER_BATCH: usize = 8; // second pass <= 12 addresses per pool
 const PARALLEL_BATCHES: usize = 16;
 const MIN_TVL_USD: f64 = 500.0;
 const ARRAY_RADIUS: i32 = 2;
@@ -47,13 +47,13 @@ impl Settings {
         let account_batch_size = env::var("RPC_ACCOUNT_BATCH_SIZE")
             .unwrap_or_else(|_| "100".to_owned()).parse::<usize>()
             .context("invalid RPC_ACCOUNT_BATCH_SIZE")?;
-        ensure!((11..=100).contains(&account_batch_size),
-            "Orca requires RPC_ACCOUNT_BATCH_SIZE in 11..=100 for its coherent account snapshot");
+        ensure!((12..=100).contains(&account_batch_size),
+            "Orca requires RPC_ACCOUNT_BATCH_SIZE in 12..=100 for its coherent account snapshot");
         Ok(Self { limit:0, account_batch_size, parallel_batches:PARALLEL_BATCHES,
             min_tvl_usd:MIN_TVL_USD, radius:ARRAY_RADIUS })
     }
     fn pools_per_batch(self) -> usize {
-        POOLS_PER_BATCH.min(self.account_batch_size / 11)
+        POOLS_PER_BATCH.min(self.account_batch_size / 12)
     }
 }
 
@@ -91,7 +91,11 @@ fn decode_pool(account: &AccountData, expected: &PoolState, owner: Pubkey) -> Re
 fn array_addresses(layout: Layout, owner: Pubkey, radius: i32) -> Vec<(i32,Pubkey)> {
     let width = layout.tick_spacing * 88;
     let center = layout.tick_current.div_euclid(width);
-    (-radius..=radius).filter_map(|delta| {
+    // B->A starts in the next array if the next initializable tick crosses its boundary.
+    // Fetch one extra upper neighbor so both directions can supply up to three arrays.
+    let shifted = layout.tick_current + layout.tick_spacing >= (center + 1) * width;
+    let upper_radius = if shifted { radius + 1 } else { radius };
+    (-radius..=upper_radius).filter_map(|delta| {
         let index = center + delta;
         let start = index * width;
         // Orca uses a possibly out-of-range array beginning at the minimum tick.
@@ -157,7 +161,7 @@ fn validate_vault(account:&AccountData,mint:Pubkey,token_program:Pubkey,pool:Pub
     ensure!(account.owner==token_program && account.bytes.len()>=165,
         "Orca vault token program or account length invalid");
     ensure!(key(&account.bytes,0)?==mint && key(&account.bytes,32)?==pool
-        && matches!(account.bytes[108],1|2),"Orca vault mint, authority or state invalid");
+        && account.bytes[108]==1,"Orca vault mint, authority or state invalid");
     Ok(())
 }
 fn validate_oracle(oracle:Option<&AccountData>,pool:Pubkey,owner:Pubkey)->Result<bool> {
@@ -263,33 +267,31 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             }
         }
     }
+    // Match Orca sparse_swap::get_start_tick_indexes for both directions.
+    // A->B starts at center; B->A starts one array higher at the upper boundary.
+    let shifted = layout.tick_current + layout.tick_spacing >= center + width;
+    let up_center = if shifted { center + width } else { center };
     if !present.contains_key(&center) {
-        return incomplete(pool.address,slot,"Orca current TickArray not initialized");
+        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized");
     }
-    // No holes in either traversal direction. Missing neighbors are not fabricated.
-    let mut selected=vec![center];
-    for direction in [-1,1] {
-        for distance in 1..=radius {
-            let start=center+direction*distance*width;
-            if !present.contains_key(&start) {break;}
-            selected.push(start);
-        }
+    if !present.contains_key(&up_center) {
+        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized");
     }
+    // Keep only consecutive initialized arrays starting at each direction's first array.
+    let down=(0..=radius).map(|distance|center-distance*width)
+        .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+    let up=(0..=radius).map(|distance|up_center+distance*width)
+        .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+    let mut selected=down.iter().chain(up.iter()).copied().collect::<Vec<_>>();
     selected.sort_unstable();
-    // The V10 builder preserves array order, and Whirlpool swaps consume arrays
-    // starting at the active array, then in the actual swap direction.
-    let mut down=selected.iter().copied().filter(|start|*start<=center)
-        .collect::<Vec<_>>();
-    down.reverse();
-    let up=selected.iter().copied().filter(|start|*start>=center)
-        .collect::<Vec<_>>();
+    selected.dedup();
     // V10 `base_a` uses mint A as the *output/base*, hence swaps B->A
     // and traverses upward; `base_b` swaps A->B and traverses downward.
     let arrays_a=up.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let arrays_b=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let mints=[mint_a,mint_b];
     let ev=Arc::new(CompletionEvidence{
-        kind:"orca_whirlpool_tick_arrays".into(),version:2,
+        kind:"orca_whirlpool_tick_arrays".into(),version:3,
         payload:Arc::new(json!({
             "program":owner.to_string(),"oracle":oracle.to_string(),
             "oracle_initialized":oracle_present,"tick_spacing":layout.tick_spacing,
@@ -363,14 +365,13 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 }
 
 
-// Version 1 persisted the Orca TickArray directions reversed. Such a proof
-// cannot remain Prepared merely because it was restored from PostgreSQL.
-// Revalidate it with the V10-correct direction mapping and publish evidence v2.
-fn needs_direction_upgrade(pool: &PoolState) -> bool {
+// Evidence v1 had reversed directions; v2 missed the B->A boundary shift
+// and accepted frozen vaults. Revalidate persisted Prepared v1/v2 proofs.
+fn needs_evidence_upgrade(pool: &PoolState) -> bool {
     pool.venue == Venue::OrcaWhirlpool
         && pool.completion_state == CompletionState::Prepared
         && pool.completion_evidence.as_ref().is_some_and(|e|
-            e.kind == "orca_whirlpool_tick_arrays" && e.version == 1)
+            e.kind == "orca_whirlpool_tick_arrays" && e.version < 3)
 }
 
 #[derive(Default)]
@@ -382,7 +383,7 @@ struct Scheduler {
 impl Scheduler {
     fn update(&mut self,pool:&PoolState,min_tvl:f64) {
         if pool.venue!=Venue::OrcaWhirlpool {return;}
-        if needs_direction_upgrade(pool) {
+        if needs_evidence_upgrade(pool) {
             // Old Prepared manifests must be rechecked even without fresh REST TVL.
             self.candidates.insert(pool.address,pool.clone());
         } else if pool.completion_state==CompletionState::Prepared {
@@ -398,9 +399,10 @@ impl Scheduler {
     fn eligible(&self,pool:&PoolState,now:Instant)->Option<u8> {
         match self.attempts.get(&pool.address).copied() {
             None=>match pool.completion_state {
-                CompletionState::Prepared if needs_direction_upgrade(pool)=>Some(1),
+                CompletionState::Prepared if needs_evidence_upgrade(pool)=>Some(1),
                 CompletionState::Unknown=>Some(2),
-                CompletionState::Incomplete=>Some(3),
+                CompletionState::Incomplete if !pool.completion_reason.as_deref()
+                    .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(3),
                 CompletionState::Prepared=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(4),
@@ -535,13 +537,13 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
             },
             _=pulse.tick()=>{
                 let (upgrade,a,b,c)=scheduler.counts(Instant::now());
-                println!("orca completion backlog seen={} direction_upgrade={upgrade} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
+                println!("orca completion backlog seen={} evidence_upgrade={upgrade} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
                     seen.len(),scheduler.candidates.len(),tasks.len());
             }
         }
     }
     let (upgrade,a,b,c)=scheduler.counts(Instant::now());
-    println!("orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_direction_upgrade={upgrade} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
+    println!("orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_evidence_upgrade={upgrade} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }
