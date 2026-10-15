@@ -3,16 +3,16 @@
 //! No DEX business decoding beyond a standalone health-test response validator.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     net::Ipv4Addr,
     str::FromStr,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{Arc, Mutex as StdMutex, atomic::{AtomicUsize, Ordering}},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, Method, Proxy, StatusCode, Url, header::HeaderMap};
 use serde_json::Value;
@@ -117,7 +117,13 @@ pub struct Settings {
     pub probe_rps: u32,
     pub request_rps_per_host: u32,
     pub probe_url: Url,
+    pub verify_url: Url,
     pub extra_txt_urls: Vec<Url>,
+    pub list_file: Option<String>,
+    pub public_discovery: bool,
+    pub host_rps_overrides: HashMap<String, u32>,
+    pub request_rps_per_route: u32,
+    pub retry_attempts: usize,
 }
 
 fn from_env<T: FromStr>(name: &str, default: T) -> Result<T>
@@ -143,15 +149,42 @@ impl Settings {
         let queue_capacity = from_env("HTTP_TRANSPORT_QUEUE_CAPACITY", 512_usize)?;
         let probe_rps = from_env("HTTP_PROXY_PROBE_RPS", 5_u32)?;
         let request_rps_per_host = from_env("HTTP_TRANSPORT_HOST_RPS", 5_u32)?;
+        let request_rps_per_route = from_env("HTTP_TRANSPORT_ROUTE_RPS", 5_u32)?;
+        let retry_attempts = from_env("HTTP_TRANSPORT_RETRY_ATTEMPTS", 3_usize)?;
         for value in [refresh, tcp, handshake, probe, healthy, retry] {
             ensure!(value > 0, "HTTP transport intervals must be positive");
         }
         for value in [tcp_parallel, handshake_parallel, probe_parallel, request_parallel, queue_capacity] {
             ensure!((1..=4096).contains(&value), "HTTP transport concurrency must be 1..=4096");
         }
-        ensure!(probe_rps > 0 && request_rps_per_host > 0, "HTTP transport RPS must be positive");
-        let probe_url = Url::parse(&env::var("HTTP_PROXY_PROBE_URL").unwrap_or_else(|_| DEX_PROBE.to_owned()))?;
-        ensure!(probe_url.scheme() == "https" && probe_url.host_str().is_some(), "probe URL must be https");
+        ensure!(probe_rps > 0 && request_rps_per_host > 0 && request_rps_per_route > 0,
+            "HTTP transport RPS must be positive");
+        ensure!((1..=5).contains(&retry_attempts), "HTTP transport retries must be 1..=5");
+        let probe_url = Url::parse(&env::var("HTTP_PROXY_PROBE_URL")
+            .unwrap_or_else(|_| DEX_PROBE.to_owned()))?;
+        let verify_url = Url::parse(&env::var("HTTP_PROXY_VERIFY_URL")
+            .unwrap_or_else(|_| "https://www.gstatic.com/generate_204".to_owned()))?;
+        ensure!([&probe_url, &verify_url].iter().all(|u| u.scheme() == "https" && u.host_str().is_some()),
+            "probe and verify URLs must be HTTPS");
+        let list_file = env::var("HTTP_PROXY_LIST_FILE").ok().filter(|s| !s.trim().is_empty());
+        let public_discovery = match env::var("HTTP_PROXY_PUBLIC_DISCOVERY").as_deref() {
+            Ok("false" | "0") => false,
+            Ok("true" | "1") | Err(_) => true,
+            _ => bail!("invalid HTTP_PROXY_PUBLIC_DISCOVERY"),
+        };
+        ensure!(public_discovery || list_file.is_some(), "configure at least one proxy source");
+        let mut host_rps_overrides = HashMap::new();
+        for rule in env::var("HTTP_TRANSPORT_HOST_RPS_OVERRIDES").unwrap_or_default()
+            .split(',').map(str::trim).filter(|s| !s.is_empty())
+        {
+            let (host, raw) = rule.rsplit_once(':')
+                .context("host RPS override must be host:rps")?;
+            let rps = raw.parse::<u32>().context("invalid host RPS override")?;
+            ensure!(rps > 0 && !host.is_empty() && !host.contains('/'),
+                "invalid HTTP transport host limit");
+            ensure!(host_rps_overrides.insert(host.to_ascii_lowercase(), rps).is_none(),
+                "duplicate HTTP transport host limit");
+        }
         let extra_txt_urls = env::var("HTTP_PROXY_EXTRA_TXT_URLS").unwrap_or_default()
             .split(',').map(str::trim).filter(|s| !s.is_empty())
             .map(Url::parse).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -164,7 +197,9 @@ impl Settings {
             healthy_for: Duration::from_secs(healthy),
             retry_failure_after: Duration::from_secs(retry),
             tcp_parallel, handshake_parallel, probe_parallel, request_parallel, queue_capacity,
-            probe_rps, request_rps_per_host, probe_url, extra_txt_urls,
+            probe_rps, request_rps_per_host, probe_url, verify_url, extra_txt_urls,
+            list_file, public_discovery, host_rps_overrides, request_rps_per_route,
+            retry_attempts,
         })
     }
 }
