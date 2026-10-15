@@ -248,14 +248,15 @@ fn sample(values: &mut VecDeque<u64>, ms: u64) {
     values.push_back(ms);
 }
 
-fn report_stats(shared: &Shared) {
+fn report_stats(shared: &Shared, throughput_rps: f64) {
     let stats = shared.stats.lock().expect("HTTP stats lock poisoned");
     println!(
-        "http_transport stats submitted={} completed={} ok={} failed={} attempts={} failovers={} http_429={} http_403={} http_5xx={} transport_errors={} other_errors={} distinct_routes={} latency_p50_ms={} latency_p95_ms={} queue_p95_ms={}",
+        "http_transport stats submitted={} completed={} ok={} failed={} attempts={} failovers={} http_429={} http_403={} http_5xx={} transport_errors={} other_errors={} distinct_routes={} working_routes={} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={} queue_p95_ms={}",
         stats.submitted, stats.completed, stats.succeeded,
         stats.completed.saturating_sub(stats.succeeded), stats.attempts, stats.failovers,
         stats.http_429, stats.http_403, stats.http_5xx, stats.transport_errors,
         stats.other_errors, stats.routes_used.len(),
+        shared.snapshots.borrow().len(), throughput_rps,
         percentile(&stats.latency_ms, 50), percentile(&stats.latency_ms, 95),
         percentile(&stats.queue_ms, 95)
     );
@@ -308,7 +309,13 @@ async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             tick.tick().await;
-            loop { tick.tick().await; report_stats(&shared); }
+            let mut previous = 0_u64;
+            loop {
+                tick.tick().await;
+                let completed = shared.stats.lock().expect("HTTP stats lock poisoned").completed;
+                report_stats(&shared, (completed.saturating_sub(previous)) as f64 / 10.0);
+                previous = completed;
+            }
         })
     };
     while let Some(call) = receiver.recv().await {
@@ -334,7 +341,7 @@ async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<
     discover.abort();
     let _ = discover.await;
     reporter.abort();
-    report_stats(&shared);
+    report_stats(&shared, 0.0);
     Ok(())
 }
 
@@ -903,4 +910,23 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
         });
     }
     Err(last_error.unwrap_or_else(|| anyhow!("HTTP transport retries exhausted")))
+}
+
+
+/// Standalone live-probe validator; the transport itself never decodes DEX payloads.
+/// Custom non-DEX test URLs are accepted based on HTTP status by the caller.
+pub fn validate_live_payload(url: &str, body: &Bytes) -> Result<()> {
+    if url.starts_with("https://api.dexscreener.com/token-pairs/v1/solana/") {
+        let expected = url.rsplit('/').next().context("DEX live probe mint missing")?;
+        let rows: Value = serde_json::from_slice(body).context("invalid live DEX JSON")?;
+        let matches = rows.as_array().is_some_and(|pairs| pairs.iter().any(|pair| {
+            pair.get("chainId").and_then(Value::as_str) == Some("solana")
+            && ["baseToken", "quoteToken"].iter().any(|key| {
+                pair.get(*key).and_then(|v| v.get("address"))
+                    .and_then(Value::as_str) == Some(expected)
+            })
+        }));
+        ensure!(matches, "live DEX payload lacks expected Solana mint");
+    }
+    Ok(())
 }
