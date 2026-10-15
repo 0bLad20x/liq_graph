@@ -866,8 +866,9 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             Ok(response) => response,
             Err(error) => {
                 shared.stats.lock().expect("HTTP stats lock poisoned").transport_errors += 1;
+                let route_failure = error.is_connect() || error.is_timeout();
                 last_error = Some(anyhow!("HTTP route={route_id} transport: {}", error.without_url()));
-                if route_id != "direct" && (error.is_connect() || error.is_timeout()) {
+                if route_id != "direct" && route_failure {
                     quarantine(shared, &route_id).await;
                 }
                 if !idempotent { break; }
