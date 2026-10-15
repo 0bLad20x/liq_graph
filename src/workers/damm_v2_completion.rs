@@ -298,8 +298,14 @@ async fn process(rpc: &RpcHandle, pools: Vec<PoolState>, settings: Settings)
     }
     if !pending.is_empty() {
         // One final coherent slot validates parent state, both vaults and mint programs.
-        assert!(addresses.len() <= settings.account_batch_size,
-            "DAMM v2 final account batch exceeds configured limit");
+        if addresses.len() > settings.account_batch_size {
+            for (i,_) in pending {
+                results[i]=Some(retry(pools[i].address,
+                    "DAMM v2 final RPC account set exceeds configured limit"));
+            }
+            return results.into_iter()
+                .map(|r|r.expect("each DAMM v2 pool has a result")).collect();
+        }
         match read(rpc,addresses.clone(),Some(first.slot)).await {
             Ok(final_read)=>{
                 let lookup: HashMap<Pubkey, Option<AccountData>> =
