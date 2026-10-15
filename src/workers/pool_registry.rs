@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::Result;
-use serde_json::Value;
 use solana_pubkey::Pubkey;
 use tokio::sync::broadcast;
 
@@ -125,7 +124,7 @@ impl PoolRegistry {
                 continue;
             }
 
-            let observed_tvl = tvl_usd(&record.payload);
+            let observed_tvl = record.tvl_usd;
             match entries.get_mut(address) {
                 None => {
                     let state = PoolState {
@@ -303,14 +302,6 @@ struct BatchStats {
     updates: Vec<PoolState>,
 }
 
-fn tvl_usd(payload: &Value) -> Option<f64> {
-    // Consume existing source fields; the original full payload remains on
-    // the source stream. Unknown or invalid TVL never replaces a known value.
-    let value = payload.get("tvl_usd").or_else(|| payload.get("tvl"))?;
-    let parsed = value.as_f64()
-        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))?;
-    (parsed.is_finite() && parsed >= 0.0).then_some(parsed)
-}
 
 /// Consume API observations and completion results through one Registry writer.
 /// Keep running until both streams close: completion may finish after the API source.
@@ -319,6 +310,7 @@ pub async fn run(
     mut completion: Option<broadcast::Receiver<Arc<CompletionResultBatch>>>,
     registry: PoolRegistry,
     output: broadcast::Sender<Arc<PoolUpdateBatch>>,
+    fail_on_lag: bool,
 ) -> Result<()> {
     let mut batches = 0_u64;
     let mut input_records = 0_u64;
@@ -328,6 +320,7 @@ pub async fn run(
     let mut stale = 0_u64;
     let mut conflicts = 0_u64;
     let mut lagged = 0_u64;
+    let mut by_source = HashMap::<&'static str, u64>::new();
     let mut completion_received = 0_usize;
     let mut completion_applied = 0_usize;
     let mut completion_prepared = 0_usize;
@@ -351,6 +344,7 @@ pub async fn run(
                 Ok(batch) => {
                     batches += 1;
                     input_records += batch.records.len() as u64;
+                    *by_source.entry(batch.source).or_default() += batch.records.len() as u64;
                     let stats = registry.apply(&batch);
                     inserted += stats.inserted as u64;
                     changed += stats.changed as u64;
@@ -370,14 +364,15 @@ pub async fn run(
                     }
                     if batches == 1 || batches % 25 == 0 {
                         println!(
-                            "pool registry batches={batches} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
-                            stats.total, stats.ignored_mints,
+                            "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
+                            batch.source, stats.total, stats.ignored_mints,
                         );
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     lagged += skipped;
                     eprintln!("pool registry source_lagged missed_batches={skipped}");
+                    if fail_on_lag { anyhow::bail!("REST broadcast overflow: Registry lost {skipped} source batches"); }
                 }
                 Err(broadcast::error::RecvError::Closed) => source_open = false,
             },
@@ -431,6 +426,13 @@ pub async fn run(
             && incomplete == bootstrap_incomplete + completion_incomplete,
             "registry RAM completion snapshot does not match restored and accepted results");
     }
+    let mut source_counts = by_source.into_iter().collect::<Vec<_>>();
+    source_counts.sort_by_key(|(source,_)|*source);
+    let mut venue_counts = HashMap::<String,usize>::new();
+    for pool in registry.snapshot() { *venue_counts.entry(format!("{:?}",pool.venue)).or_default() += 1; }
+    let mut venue_counts = venue_counts.into_iter().collect::<Vec<_>>();
+    venue_counts.sort_by(|a,b|a.0.cmp(&b.0));
+    println!("pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
     Ok(())
 }
 
@@ -438,6 +440,7 @@ pub async fn run(
 pub async fn observe_updates(
     mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     require_completion: bool,
+    fail_on_lag: bool,
 ) -> Result<()> {
     let mut batches = 0_u64;
     let mut pool_updates = 0_u64;
@@ -498,6 +501,7 @@ pub async fn observe_updates(
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 lagged += skipped;
                 eprintln!("pool registry consumer_lagged missed_batches={skipped}");
+                if fail_on_lag { anyhow::bail!("Registry broadcast overflow: observer lost {skipped} update batches"); }
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }

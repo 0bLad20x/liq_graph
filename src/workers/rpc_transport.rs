@@ -5,7 +5,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env,
-    sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
+    sync::{Arc, Mutex as StdMutex, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::Duration,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -456,17 +456,75 @@ fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
     }
 }
 
+#[derive(Clone, Default)]
+struct RpcCallStats {
+    calls:u64, succeeded:u64, total_ms:u128, max_ms:u128,
+    http_401:u64, http_403:u64, http_429:u64,
+    rpc_32602:u64, rpc_32016:u64, transport:u64, invalid_response:u64, other:u64,
+}
+
+type RpcStats = Arc<StdMutex<HashMap<(String, &'static str), RpcCallStats>>>;
+
+fn record_rpc(stats:&RpcStats, provider:&str, method:&'static str,
+    elapsed:Duration, failure:Option<&str>) {
+    let mut guard=stats.lock().expect("RPC statistics lock poisoned");
+    let item=guard.entry((provider.to_owned(),method)).or_default();
+    item.calls+=1;
+    let millis=elapsed.as_millis();
+    item.total_ms+=millis;
+    item.max_ms=item.max_ms.max(millis);
+    match failure {
+        None=>item.succeeded+=1,
+        Some(reason) if reason.contains("HTTP 401")=>item.http_401+=1,
+        Some(reason) if reason.contains("HTTP 403")=>item.http_403+=1,
+        Some(reason) if reason.contains("HTTP 429")=>item.http_429+=1,
+        Some(reason) if reason.contains("code=-32602")=>item.rpc_32602+=1,
+        Some(reason) if reason.contains("code=-32016")=>item.rpc_32016+=1,
+        Some(reason) if reason.contains("transport error")=>item.transport+=1,
+        Some("response_validation")=>item.invalid_response+=1,
+        Some(_)=>item.other+=1,
+    }
+}
+
+fn report_rpc(stats:&RpcStats) {
+    let mut rows=stats.lock().expect("RPC statistics lock poisoned").iter()
+        .map(|((provider,method),values)|(provider.clone(),*method,values.clone()))
+        .collect::<Vec<_>>();
+    rows.sort_unstable_by(|a,b|(&a.0,a.1).cmp(&(&b.0,b.1)));
+    for (provider,method,v) in rows {
+        let failed=v.calls-v.succeeded;
+        let success_pct=100.0*(v.succeeded as f64)/(v.calls as f64);
+        let avg_ms=v.total_ms/u128::from(v.calls);
+        println!("rpc stats provider={provider} method={method} calls={} ok={} failed={failed} ok_pct={success_pct:.1} avg_ms={avg_ms} max_ms={} http_401={} http_403={} http_429={} rpc_32602={} rpc_32016={} transport={} invalid_response={} other={}",
+            v.calls,v.succeeded,v.max_ms,v.http_401,v.http_403,v.http_429,
+            v.rpc_32602,v.rpc_32016,v.transport,v.invalid_response,v.other);
+    }
+}
+
 async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     let providers=settings.http.into_iter().map(HttpProvider::new)
         .map(|r|r.map(Arc::new)).collect::<Result<Vec<_>>>()?;
     let mut tasks=tokio::task::JoinSet::new();
     let next=Arc::new(AtomicUsize::new(0));
+    let stats:RpcStats=Arc::new(StdMutex::new(HashMap::new()));
+    let stats_interval:u64=var("RPC_STATS_INTERVAL_SECONDS",30)?;
+    ensure!((1..=3600).contains(&stats_interval), "RPC_STATS_INTERVAL_SECONDS must be 1..=3600");
+    let report_stats=stats.clone();
+    let reporter=tokio::spawn(async move {
+        let mut ticker=tokio::time::interval(Duration::from_secs(stats_interval));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            report_rpc(&report_stats);
+        }
+    });
     while let Some(Call{operation,reply})=rx.recv().await {
         // A semaphore inside each provider limits concurrency independently.
         let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(operation.bit()))
             .cloned().collect();
         let params=operation.params(&settings.commitment,settings.account_batch_size,settings.v2_page_limit);
         let cursor=next.fetch_add(1,Ordering::Relaxed);
+        let stats=stats.clone();
         tasks.spawn(async move {
             let answer=async {
                 let params=params?;
@@ -475,20 +533,27 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                 for offset in 0..eligible.len() {
                     let provider=&eligible[(cursor+offset)%eligible.len()];
                     if !provider.eligible(operation.bit()) {continue;}
+                    let started=Instant::now();
                     match provider.request(&operation,&params).await {
                         Ok(value)=>match interpret(operation.clone(),value) {
-                            Ok(answer)=>return Ok(RpcResponse {
-                                provider:provider.cfg.name.clone(),
-                                received_at_ms:now_unix_ms()?,
-                                answer,
-                            }),
+                            Ok(answer)=>{
+                                record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),None);
+                                return Ok(RpcResponse {
+                                    provider:provider.cfg.name.clone(),
+                                    received_at_ms:now_unix_ms()?,
+                                    answer,
+                                });
+                            }
                             Err(invalid)=>{
+                                record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),Some("response_validation"));
                                 eprintln!("rpc provider={} method={} response_validation_error={invalid:#}",
                                     provider.cfg.name,operation.method());
                                 error=Some(invalid);
                             }
                         },
                         Err(err)=>{
+                            let reason=format!("{err:#}");
+                            record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),Some(&reason));
                             eprintln!("rpc provider={} method={} error={err:#}",provider.cfg.name,operation.method());
                             error=Some(err);
                         }
@@ -503,6 +568,8 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
         }
     }
     while let Some(result)=tasks.join_next().await {result?;}
+    reporter.abort();
+    report_rpc(&stats);
     Ok(())
 }
 

@@ -9,6 +9,12 @@ use solana_pubkey::Pubkey;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Venue {
     MeteoraDlmm,
+    MeteoraDammV2,
+    RaydiumAmmV4,
+    RaydiumCpmm,
+    RaydiumClmm,
+    RaydiumStable,
+    OrcaWhirlpool,
 }
 
 /// An immutable decoded response, fan-out via Arc<DataBatch> without payload copies.
@@ -22,6 +28,8 @@ pub struct DataBatch {
 #[derive(Debug)]
 pub struct DataRecord {
     pub identity: RecordIdentity,
+    /// Source-normalized USD TVL. Never infer this from provider JSON in a consumer.
+    pub tvl_usd: Option<f64>,
     /// Complete source object: no filtering, flattening or consumer-specific projection.
     pub payload: Value,
 }

@@ -1,10 +1,11 @@
 //! DLMM execution completion: registry candidate -> RPC account observations -> V10 manifest.
 //! No persistence, no writes to Pool Registry, and no hidden RPC clients.
 
-use std::{collections::{HashMap, HashSet}, env, sync::Arc};
+use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
+use tokio::time::Instant;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
-use tokio::sync::broadcast;
+use tokio::{sync::broadcast, task::JoinSet};
 
 use crate::{
     core::{Venue, AccountMeta, ExecutionManifest, BinArrayRef, BinArrayInventory,
@@ -31,6 +32,9 @@ pub struct Settings {
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
+    pub parallel_batches: usize,
+    /// Stability runs finalize a nonempty candidate set after a quiet period.
+    pub selection_idle_timeout: Option<Duration>,
 }
 
 impl Settings {
@@ -46,7 +50,13 @@ impl Settings {
             .unwrap_or_else(|_| "2".to_owned()).parse::<usize>()
             .context("invalid DLMM_EXECUTION_ABOVE")?;
         ensure!(1 + below + above <= 6, "DLMM V10 supports at most six BinArrays");
-        Ok(Self { limit: 100, account_batch_size, below, above })
+        let parallel_batches = env::var("DLMM_COMPLETION_PARALLEL_BATCHES")
+            .unwrap_or_else(|_| "32".to_owned()).parse::<usize>()
+            .context("invalid DLMM_COMPLETION_PARALLEL_BATCHES")?;
+        ensure!((1..=64).contains(&parallel_batches),
+            "DLMM_COMPLETION_PARALLEL_BATCHES must be 1..=64");
+        Ok(Self { limit: 100, account_batch_size, below, above,
+            parallel_batches, selection_idle_timeout: None })
     }
 }
 
@@ -618,8 +628,21 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut selected = Vec::with_capacity(settings.limit);
     let mut seen = HashSet::new();
     let mut observed = 0_u64;
+    let mut last_selected = Instant::now();
     loop {
-        match input.recv().await {
+        let event = if let Some(idle) = settings.selection_idle_timeout {
+            tokio::select! {
+                result = input.recv() => Some(result),
+                _ = tokio::time::sleep_until(last_selected + idle), if !selected.is_empty() => None,
+            }
+        } else {
+            Some(input.recv().await)
+        };
+        let Some(event) = event else {
+            println!("execution completion selection_quiet_timeout selected={} observed_pools={observed}",selected.len());
+            break;
+        };
+        match event {
             Ok(batch) => {
                 observed += batch.pools.len() as u64;
                 for pool in &batch.pools {
@@ -629,6 +652,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
                         && pool.tvl_usd.is_some_and(|tvl| tvl > 0.0)
                         && seen.insert(pool.address) {
                         selected.push(pool.clone());
+                        last_selected = Instant::now();
                     }
                     if selected.len() == settings.limit { break; }
                 }
@@ -643,14 +667,42 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
         selected.len(), settings.limit);
     ensure!(!selected.is_empty(), "no unknown DLMM pools with positive TVL observed");
 
-    let mut results = process(&rpc, &selected, settings).await;
+    // Independent pool partitions can be completed concurrently. Each partition
+    // retains the existing per-pool multi-slot revalidation and 100-account RPC limit.
+    // The single shared RpcHandle enforces per-provider request limits and failover.
+    let started = Instant::now();
+    let total_batches = selected.len().div_ceil(settings.account_batch_size);
+    let mut partitions = selected.chunks(settings.account_batch_size);
+    let mut tasks = JoinSet::new();
+    let mut results = Vec::with_capacity(selected.len());
+    for _ in 0..settings.parallel_batches {
+        let Some(partition) = partitions.next() else { break; };
+        let rpc = rpc.clone();
+        let pools = partition.to_vec();
+        tasks.spawn(async move { process(&rpc, &pools, settings).await });
+    }
+    let mut finished = 0_usize;
+    while let Some(joined) = tasks.join_next().await {
+        results.extend(joined.context("DLMM parallel completion batch failed")?);
+        finished += 1;
+        if finished % 10 == 0 || finished == total_batches {
+            println!("execution completion progress batches={finished}/{total_batches} pools={} elapsed_ms={}",
+                results.len(), started.elapsed().as_millis());
+        }
+        if let Some(partition) = partitions.next() {
+            let rpc = rpc.clone();
+            let pools = partition.to_vec();
+            tasks.spawn(async move { process(&rpc, &pools, settings).await });
+        }
+    }
     results.sort_by_key(|result| result.pool.to_bytes());
     ensure!(results.len() == selected.len(), "completion output count != selected pool count");
     let prepared = results.iter().filter(|r| r.status == CompletionStatus::Prepared).count();
     let incomplete = results.iter().filter(|r| r.status == CompletionStatus::Incomplete).count();
     let retryable = results.iter().filter(|r| r.status == CompletionStatus::Retryable).count();
-    println!("execution completion complete selected={} prepared={} incomplete={} retryable={}",
-        results.len(), prepared, incomplete, retryable);
+    println!("execution completion complete selected={} prepared={} incomplete={} retryable={} batches={} parallel={} elapsed_ms={}",
+        results.len(), prepared, incomplete, retryable, total_batches,
+        settings.parallel_batches, started.elapsed().as_millis());
     let batch = Arc::new(CompletionResultBatch {source: "dlmm_execution_completion", results});
     output.send(batch).map_err(|_|anyhow!("completion results have no consumer"))?;
     Ok(())

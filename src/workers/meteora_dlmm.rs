@@ -59,6 +59,9 @@ fn decode_pool(payload: Value) -> Result<DataRecord> {
         identity: RecordIdentity::Pool {
             address, venue: Venue::MeteoraDlmm, mint_a, mint_b,
         },
+        tvl_usd: payload.get("tvl")
+            .and_then(|v| v.as_f64().or_else(||v.as_str()?.parse::<f64>().ok()))
+            .filter(|v|v.is_finite() && *v>=0.0),
         payload,
     })
 }
