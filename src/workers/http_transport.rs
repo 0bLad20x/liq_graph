@@ -163,13 +163,14 @@ impl Settings {
         for value in [tcp_parallel, handshake_parallel, probe_parallel, request_parallel, queue_capacity] {
             ensure!((1..=4096).contains(&value), "HTTP transport concurrency must be 1..=4096");
         }
-        ensure!(probe_rps > 0 && request_rps_per_host > 0 && request_rps_per_route > 0,
-            "HTTP transport RPS must be positive");
+        ensure!(probe_rps > 0 && request_rps_per_route > 0,
+            "HTTP transport probe and route RPS must be positive");
         ensure!((1..=5).contains(&retry_attempts), "HTTP transport retries must be 1..=5");
         let probe_url = Url::parse(&env::var("HTTP_PROXY_PROBE_URL")
             .unwrap_or_else(|_| DEX_PROBE.to_owned()))?;
+        // One real target probe, no unrelated Google connectivity prerequisite.
         let verify_url = Url::parse(&env::var("HTTP_PROXY_VERIFY_URL")
-            .unwrap_or_else(|_| "https://www.gstatic.com/generate_204".to_owned()))?;
+            .unwrap_or_else(|_| probe_url.to_string()))?;
         ensure!([&probe_url, &verify_url].iter().all(|u| u.scheme() == "https" && u.host_str().is_some()),
             "probe and verify URLs must be HTTPS");
         let list_file = env::var("HTTP_PROXY_LIST_FILE").ok().filter(|s| !s.trim().is_empty());
@@ -185,7 +186,7 @@ impl Settings {
             let (host, raw) = rule.rsplit_once(':')
                 .context("host RPS override must be host:rps")?;
             let rps = raw.parse::<u32>().context("invalid host RPS override")?;
-            ensure!(rps > 0 && !host.is_empty() && !host.contains('/'),
+            ensure!(!host.is_empty() && !host.contains('/'),
                 "invalid HTTP transport host limit");
             ensure!(host_rps_overrides.insert(host.to_ascii_lowercase(), rps).is_none(),
                 "duplicate HTTP transport host limit");
@@ -596,18 +597,20 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
                 // When a provider endpoint doubles as the probe, respect its
                 // production host budget instead of the generic health-test rate.
                 let provider_probe = shared.settings.probe_url.host_str() == Some(host);
-                let allowed_rps = if provider_probe {
-                    shared.settings.probe_rps.min(
-                        shared.settings.host_rps_overrides.get(host).copied()
-                            .unwrap_or(shared.settings.request_rps_per_host))
+                let host_rps = shared.settings.host_rps_overrides.get(host).copied()
+                    .unwrap_or(shared.settings.request_rps_per_host);
+                let allowed_rps = if provider_probe && host_rps > 0 {
+                    shared.settings.probe_rps.min(host_rps)
                 } else { shared.settings.probe_rps };
                 host_limit_at(&shared, host, allowed_rps).await;
                 let started = Instant::now();
                 let response = client.get(shared.settings.verify_url.clone())
                     .timeout(shared.settings.probe_timeout).send().await?;
                 ensure!(response.status().is_success(), "verify HTTP {}", response.status());
-                let _body = read_capped(response, 1024).await
+                let body = read_capped(response, MAX_RESPONSE_BYTES).await
                     .context("proxy verify response too large or truncated")?;
+                validate_live_payload(shared.settings.verify_url.as_str(), &body)
+                    .context("proxy did not return the expected target data")?;
                 Ok::<_, anyhow::Error>((client, started.elapsed().as_millis() as u64))
             }.await;
             (candidate, outcome)
@@ -752,17 +755,20 @@ async fn host_limit_at(shared: &Shared, host: &str, rps: u32) {
 async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
     let host_rps = shared.settings.host_rps_overrides.get(host)
         .copied().unwrap_or(shared.settings.request_rps_per_host);
-    // Both limits apply. Adding proxy routes does not implicitly enlarge the
-    // provider's configured quota; route-level capacity is a separate limit.
+    // Route caps remain independent. Host cap can be explicitly disabled with 0
+    // only where an endpoint's actual entitlement permits per-route allocation.
     let mut host_gates = shared.host_gates.lock().await;
     let mut route_gates = shared.route_gates.lock().await;
     let now = Instant::now();
-    let host_due = host_gates.get(host).copied().unwrap_or(now);
+    let host_due = if host_rps == 0 { now }
+        else { host_gates.get(host).copied().unwrap_or(now) };
     let route_key = (host.to_owned(), route_id.to_owned());
     let route_due = route_gates.get(&route_key).copied().unwrap_or(now);
     let at = now.max(host_due).max(route_due);
-    host_gates.insert(host.to_owned(),
-        at + Duration::from_secs_f64(1.0 / f64::from(host_rps)));
+    if host_rps > 0 {
+        host_gates.insert(host.to_owned(),
+            at + Duration::from_secs_f64(1.0 / f64::from(host_rps)));
+    }
     route_gates.insert(route_key,
         at + Duration::from_secs_f64(1.0 / f64::from(shared.settings.request_rps_per_route)));
     drop(route_gates);
