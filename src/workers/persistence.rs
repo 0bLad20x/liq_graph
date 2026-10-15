@@ -531,8 +531,9 @@ impl Persistence {
                     Ok(batch)=>{
                         match batch.kind {
                             PoolUpdateKind::Source=>{
-                                // Bootstrap records already exist in SQL. Never rewrite them.
-                                if batch.source=="persistence_restore" {continue;}
+                                // Source batches without explicit identity changes (including
+                                // restored bootstrap snapshots) never require SQL writes.
+                                if batch.persist_identity.is_empty() {continue;}
                                 let keys:HashSet<Pubkey>=batch.persist_identity.iter().copied().collect();
                                 for pool in &batch.pools {
                                     if keys.contains(&pool.address) {
