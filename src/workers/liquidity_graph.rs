@@ -407,6 +407,79 @@ fn probe(snapshot: &GraphSnapshot) {
         percentile(&resolve_ns,99),resolve_ns[resolve_ns.len()-1]);
 }
 
+/// Optional read-only inventory of exotic X/Y pools participating in V10 Triangle-4.
+/// Group templates can repeat the same X/Y pool across settlement directions and
+/// conversion choices; count distinct pool addresses and unordered mint pairs.
+fn report_bridge4_inventory(snapshot: &GraphSnapshot, full: bool) -> Result<()> {
+    const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+    let usdt: Pubkey = USDT.parse()?;
+    let mut by_pair: HashMap<Pair, (HashSet<Pubkey>, usize)> = HashMap::new();
+
+    for group in &snapshot.groups {
+        if group.kind != GroupKind::Bridge || group.conversion.is_none() {
+            continue;
+        }
+        let b = group.bridge.context("Triangle-4 missing bridge mint")?;
+        let middle = group.intermediate.context("Triangle-4 missing intermediate pool")?;
+        let entry = by_pair.entry(pair(group.target, b)).or_default();
+        entry.0.insert(middle);
+        entry.1 += 1;
+    }
+
+    let mut all_pools = HashSet::new();
+    let mut all_mints = HashSet::new();
+    let mut no_usdt_pools = HashSet::new();
+    let mut no_usdt_mints = HashSet::new();
+    let mut all_templates = 0_usize;
+    let mut no_usdt_templates = 0_usize;
+    let mut no_usdt_pairs = 0_usize;
+
+    for (&(a, b), (pools, templates)) in &by_pair {
+        all_templates += *templates;
+        all_mints.extend([a, b]);
+        all_pools.extend(pools.iter().copied());
+        if a != usdt && b != usdt {
+            no_usdt_pairs += 1;
+            no_usdt_templates += *templates;
+            no_usdt_mints.extend([a, b]);
+            no_usdt_pools.extend(pools.iter().copied());
+        }
+    }
+
+    println!("liquidity graph bridge4 inventory generation={} selection=all group_templates={} mint_pairs={} intermediate_pools={} mints={}",
+        snapshot.generation, all_templates, by_pair.len(), all_pools.len(), all_mints.len());
+    println!("liquidity graph bridge4 inventory generation={} selection=exclude_usdt group_templates={} mint_pairs={} intermediate_pools={} mints={}",
+        snapshot.generation, no_usdt_templates, no_usdt_pairs,
+        no_usdt_pools.len(), no_usdt_mints.len());
+
+    let mut ranked = by_pair.iter().collect::<Vec<_>>();
+    ranked.sort_unstable_by(|a, b| {
+        b.1.0.len().cmp(&a.1.0.len())
+            .then_with(|| b.1.1.cmp(&a.1.1))
+            .then_with(|| a.0.cmp(b.0))
+    });
+    for (rank, (mint_pair, stats)) in ranked.into_iter().take(15).enumerate() {
+        println!("liquidity graph bridge4 top_pair generation={} rank={} mint_a={} mint_b={} intermediate_pools={} group_templates={} contains_usdt={}",
+            snapshot.generation, rank + 1, mint_pair.0, mint_pair.1,
+            stats.0.len(), stats.1, mint_pair.0 == usdt || mint_pair.1 == usdt);
+    }
+
+    if full {
+        let mut rows = Vec::with_capacity(all_pools.len());
+        for (&mint_pair, (pools, _)) in &by_pair {
+            for &pool in pools {
+                rows.push((mint_pair, pool));
+            }
+        }
+        rows.sort_unstable();
+        for ((a, b), pool) in rows {
+            println!("liquidity graph bridge4 pool generation={} mint_a={} mint_b={} pool={} contains_usdt={}",
+                snapshot.generation, a, b, pool, a == usdt || b == usdt);
+        }
+    }
+    Ok(())
+}
+
 /// A single owner consumes Registry changes. Publishing an Arc replaces the
 /// complete immutable generation atomically; no signal can read a partial catalog.
 pub async fn run(
@@ -487,6 +560,10 @@ pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<(
         let snapshot = input.borrow_and_update().clone();
         observed += 1;
         probe(&snapshot);
+        let inventory = env::var("GRAPH_BRIDGE_INVENTORY").unwrap_or_default();
+        if inventory == "summary" || inventory == "full" {
+            report_bridge4_inventory(&snapshot, inventory == "full")?;
+        }
         if let Some(group) = snapshot.groups.first() {
             println!("liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={} direct_pool_samples={:?} bridge_pool_samples={:?}",
                 snapshot.generation,snapshot.groups.len(),group.kind,group.settlement,group.target,
