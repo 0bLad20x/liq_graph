@@ -269,6 +269,7 @@ struct Shared {
     cycles: watch::Sender<u64>,
     selection: AtomicUsize,
     host_gates: Mutex<HashMap<String, Instant>>,
+    host_backoffs: Mutex<HashMap<String, Instant>>,
     route_gates: Mutex<HashMap<(String, String), Instant>>,
     host_route_cooldowns: Mutex<HashMap<(String, String), Instant>>,
     stats: StdMutex<TransportStats>,
@@ -289,6 +290,7 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
         snapshots, cycles,
         selection: AtomicUsize::new(0),
         host_gates: Mutex::new(HashMap::new()),
+        host_backoffs: Mutex::new(HashMap::new()),
         route_gates: Mutex::new(HashMap::new()),
         host_route_cooldowns: Mutex::new(HashMap::new()),
         stats: StdMutex::new(TransportStats::default()),
@@ -749,6 +751,17 @@ async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
     sleep_until(at).await;
 }
 
+// Already scheduled requests must also observe a 429 received by another lane.
+// After a cooldown, reserve a fresh provider-rate slot to prevent a wake-up burst.
+async fn respect_backoff(shared: &Shared, host: &str, route_id: &str) {
+    loop {
+        let until = shared.host_backoffs.lock().await.get(host).copied();
+        let Some(until) = until.filter(|deadline| *deadline > Instant::now()) else { break; };
+        sleep_until(until).await;
+        pace_request(shared, host, route_id).await;
+    }
+}
+
 async fn choose_route(shared: &Shared, host: &str, excluded: &HashSet<String>) -> Result<(String, Client)> {
     let snapshot = Arc::clone(&*shared.snapshots.borrow());
     ensure!(!snapshot.is_empty(), "no verified proxy routes; direct fallback forbidden");
@@ -842,6 +855,7 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             stats.routes_used.insert(route_id.clone());
         }
         pace_request(shared, &host, &route_id).await;
+        respect_backoff(shared, &host, &route_id).await;
         let started = Instant::now();
         let mut builder = client.request(request.method.clone(), request.url.clone())
             .headers(request.headers.clone())
@@ -866,8 +880,9 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             let retry = response.headers().get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(5).clamp(1, 3600);
-            let mut gates = shared.host_gates.lock().await;
             let deadline = Instant::now() + Duration::from_secs(retry);
+            shared.host_backoffs.lock().await.insert(host.clone(), deadline);
+            let mut gates = shared.host_gates.lock().await;
             let at = gates.entry(host.clone()).or_insert(deadline);
             *at = (*at).max(deadline);
             drop(gates);
