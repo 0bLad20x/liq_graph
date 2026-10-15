@@ -6,6 +6,7 @@ pub mod rpc_transport;
 pub mod http_transport;
 pub mod execution_completion;
 pub mod damm_v2_completion;
+pub mod orca_completion;
 
 pub mod liquidity_graph;
 pub mod graph_watch_catalog;
