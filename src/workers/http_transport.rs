@@ -593,7 +593,15 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
             let outcome = async {
                 let client = proxy_client(&candidate)?;
                 let host = shared.settings.verify_url.host_str().context("missing verify hostname")?;
-                host_limit_at(&shared, host, shared.settings.probe_rps).await;
+                // When a provider endpoint doubles as the probe, respect its
+                // production host budget instead of the generic health-test rate.
+                let provider_probe = shared.settings.probe_url.host_str() == Some(host);
+                let allowed_rps = if provider_probe {
+                    shared.settings.probe_rps.min(
+                        shared.settings.host_rps_overrides.get(host).copied()
+                            .unwrap_or(shared.settings.request_rps_per_host))
+                } else { shared.settings.probe_rps };
+                host_limit_at(&shared, host, allowed_rps).await;
                 let started = Instant::now();
                 let response = client.get(shared.settings.verify_url.clone())
                     .timeout(shared.settings.probe_timeout).send().await?;
