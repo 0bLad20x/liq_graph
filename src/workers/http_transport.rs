@@ -1041,39 +1041,39 @@ pub async fn live_diagnostic() -> Result<()> {
         }).buffer_unordered(parallel);
         tokio::pin!(jobs);
         while let Some(result) = jobs.next().await {
-        match result {
-            Ok(response) => {
-                routes_used.insert(response.route_id.clone());
-                latencies.push(response.elapsed_ms);
-                if response.status.is_success() {
-                    match validate_live_payload(&target, &response.body) {
-                        Ok(()) => {
-                            ok += 1;
-                            bytes += response.body.len();
-                            if sample.is_none() {
-                                sample = Some(format!("route={} status={} bytes={}",
-                                    response.route_id, response.status, response.body.len()));
+            match result {
+                Ok(response) => {
+                    routes_used.insert(response.route_id.clone());
+                    latencies.push(response.elapsed_ms);
+                    if response.status.is_success() {
+                        match validate_live_payload(&target, &response.body) {
+                            Ok(()) => {
+                                ok += 1;
+                                bytes += response.body.len();
+                                if sample.is_none() {
+                                    sample = Some(format!("route={} status={} bytes={}",
+                                        response.route_id, response.status, response.body.len()));
+                                }
+                            }
+                            Err(error) => {
+                                invalid_payload += 1;
+                                if invalid_payload <= 3 {
+                                    eprintln!("http_transport live invalid_payload={error:#}");
+                                }
                             }
                         }
-                        Err(error) => {
-                            invalid_payload += 1;
-                            if invalid_payload <= 3 {
-                                eprintln!("http_transport live invalid_payload={error:#}");
-                            }
-                        }
+                    } else if response.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        status_429 += 1;
+                    } else {
+                        other_status += 1;
                     }
-                } else if response.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    status_429 += 1;
-                } else {
-                    other_status += 1;
+                }
+                Err(error) => {
+                    failed += 1;
+                    if failed <= 3 { eprintln!("http_transport live request_error={error:#}"); }
                 }
             }
-            Err(error) => {
-                failed += 1;
-                if failed <= 3 { eprintln!("http_transport live request_error={error:#}"); }
-            }
         }
-    }
     }
     latencies.sort_unstable();
     let p50 = latencies.get(latencies.len().saturating_sub(1) * 50 / 100)
