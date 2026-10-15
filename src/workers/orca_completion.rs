@@ -403,7 +403,7 @@ impl Scheduler {
                 CompletionState::Unknown=>Some(2),
                 CompletionState::Incomplete if !pool.completion_reason.as_deref()
                     .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(3),
-                CompletionState::Prepared=>None,
+                _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(4),
             _=>None,
