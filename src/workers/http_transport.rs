@@ -178,7 +178,6 @@ impl Settings {
             Ok("true" | "1") | Err(_) => true,
             _ => bail!("invalid HTTP_PROXY_PUBLIC_DISCOVERY"),
         };
-        ensure!(public_discovery || list_file.is_some(), "configure at least one proxy source");
         let mut host_rps_overrides = HashMap::new();
         for rule in env::var("HTTP_TRANSPORT_HOST_RPS_OVERRIDES").unwrap_or_default()
             .split(',').map(str::trim).filter(|s| !s.is_empty())
@@ -309,10 +308,12 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
 }
 
 async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<()> {
-    let discover = {
+    let discover = if shared.settings.public_discovery
+        || shared.settings.list_file.is_some() || !shared.settings.extra_txt_urls.is_empty()
+    {
         let shared = shared.clone();
-        tokio::spawn(async move { discovery_loop(shared).await })
-    };
+        Some(tokio::spawn(async move { discovery_loop(shared).await }))
+    } else { None };
     let capacity = Arc::new(Semaphore::new(shared.settings.request_parallel));
     let reporter = {
         let shared = shared.clone();
@@ -348,8 +349,10 @@ async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<
             drop(permit);
         });
     }
-    discover.abort();
-    let _ = discover.await;
+    if let Some(discover) = discover {
+        discover.abort();
+        let _ = discover.await;
+    }
     reporter.abort();
     report_stats(&shared, 0.0);
     Ok(())
