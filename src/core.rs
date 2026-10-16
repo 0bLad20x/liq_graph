@@ -1,4 +1,5 @@
 //! Shared worker contracts and generic HTTP infrastructure.
+pub mod logging;
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::Result;

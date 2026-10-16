@@ -29,7 +29,7 @@ fn enabled(key:&str)->Result<bool>{
 }
 fn critical<F>(tasks:&mut JoinSet<Result<()>>,name:&'static str,run:F)
 where F:Future<Output=Result<()>>+Send+'static {
-    println!("runtime worker={name} policy=fatal started=true");
+    crate::log_event!(Info,"runtime worker={name} policy=fatal started=true");
     tasks.spawn(async move {
         let started=Instant::now();
         // Join the inner task to preserve the worker name even if its future panics.
@@ -41,7 +41,7 @@ where F:Future<Output=Result<()>>+Send+'static {
             Err(error)=>Err(anyhow!("critical worker {name} panicked_or_cancelled={error}")),
         };
         if let Err(ref error)=result {
-            eprintln!("runtime fatal worker={name} elapsed_ms={} error={error:#}",
+            crate::log_event!(Error,"runtime fatal worker={name} elapsed_ms={} error={error:#}",
                 started.elapsed().as_millis());
         }
         result
@@ -50,7 +50,7 @@ where F:Future<Output=Result<()>>+Send+'static {
 async fn supervise<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     let mut failures=0_u32;
-    println!("runtime worker={name} policy=restart started=true");
+    crate::log_event!(Warn,"runtime worker={name} policy=restart started=true");
     loop {
         if *stop.borrow(){return Ok(());}
         let started=Instant::now();
@@ -62,14 +62,14 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
         let Some(finished)=finished else{return Ok(());};
         if *stop.borrow(){return Ok(());}
         match finished{
-            Ok(Ok(()))=>eprintln!("runtime worker={name} ended unexpectedly"),
-            Ok(Err(error))=>eprintln!("runtime worker={name} error={error:#}"),
-            Err(error)=>eprintln!("runtime worker={name} task_failure={error}"),
+            Ok(Ok(()))=>crate::log_event!(Warn,"runtime worker={name} ended unexpectedly"),
+            Ok(Err(error))=>crate::log_event!(Warn,"runtime worker={name} error={error:#}"),
+            Err(error)=>crate::log_event!(Warn,"runtime worker={name} task_failure={error}"),
         }
         if started.elapsed()>=Duration::from_secs(600){failures=0;}
         failures=failures.saturating_add(1);
         let pause=if failures>=6{300}else{1_u64<<failures.min(5)};
-        eprintln!("runtime worker={name} restart_in_s={pause} failures={failures}");
+        crate::log_event!(Warn,"runtime worker={name} restart_in_s={pause} failures={failures}");
         tokio::select!{
             _=tokio::time::sleep(Duration::from_secs(pause))=>{},
             _=stop.changed()=>return Ok(()),
@@ -78,7 +78,7 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
 }
 async fn once<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
-    println!("runtime worker={name} policy=once started=true");
+    crate::log_event!(Info,"runtime worker={name} policy=once started=true");
     for attempt in 1..=3 {
         let mut task=tokio::spawn(factory());
         let result=tokio::select!{
@@ -87,10 +87,10 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
         };
         match result{
             Ok(Ok(()))=>{
-                println!("runtime worker={name} complete=true attempts={attempt}");
+                crate::log_event!(Info,"runtime worker={name} complete=true attempts={attempt}");
                 let _=stop.changed().await;return Ok(());
             }
-            other=>eprintln!("runtime worker={name} attempt={attempt} error={other:?}"),
+            other=>crate::log_event!(Warn,"runtime worker={name} attempt={attempt} error={other:?}"),
         }
         if attempt<3 {
             tokio::select!{
@@ -99,7 +99,7 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
             }
         }
     }
-    eprintln!("runtime worker={name} degraded=true");
+    crate::log_event!(Warn,"runtime worker={name} degraded=true");
     let _=stop.changed().await;
     Ok(())
 }
@@ -171,7 +171,7 @@ pub async fn run()->Result<()>{
     }
     let registry=pool_registry::PoolRegistry::default();
     let count=registry.restore(restored)?;
-    println!("runtime bootstrap restored={count} prepared={} venues={} backpressure_unchanged=true",graph_boot.len(),boot.len());
+    crate::log_event!(Info,"runtime bootstrap restored={count} prepared={} venues={} backpressure_unchanged=true",graph_boot.len(),boot.len());
 
     let (stop_tx,stop_rx)=watch::channel(false);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(source_capacity);
@@ -281,7 +281,7 @@ pub async fn run()->Result<()>{
         confirmed.await.context("completion failed before startup readiness")?;
     }
     drop(completions);
-    println!("runtime ready=true workers_completion=10");
+    crate::log_event!(Info,"runtime ready=true workers_completion=10");
 
     // Keep REST source ownership and retry entirely outside the protocol workers.
     macro_rules! rest{
@@ -328,7 +328,7 @@ pub async fn run()->Result<()>{
             async move{discovery_pumpswap::run(client,tx,settings).await}
         }));
     }else{
-        println!("runtime worker=discovery.pumpswap_rolling enabled=false missing_rpc_v2_or_slot=true");
+        crate::log_event!(Info,"runtime worker=discovery.pumpswap_rolling enabled=false missing_rpc_v2_or_slot=true");
     }
     if full_scan{
         let settings=discovery_rpc_full::Settings::from_env()?;
@@ -357,7 +357,7 @@ pub async fn run()->Result<()>{
             }
         }
     });
-    println!("runtime running=true stop=q+Enter duration_seconds={duration}");
+    crate::log_event!(Info,"runtime running=true stop=q+Enter duration_seconds={duration}");
     let mut error=None;
     let reason=tokio::select!{
         _=async{
@@ -375,12 +375,12 @@ pub async fn run()->Result<()>{
                 None=>anyhow!("all runtime tasks exited"),
             };
             // Log before shutdown: drain errors previously hid the original failure.
-            eprintln!("runtime fatal error={cause:#}");
+            crate::log_event!(Error,"runtime fatal error={cause:#}");
             error=Some(cause);
             "fatal"
         }
     };
-    eprintln!("runtime shutdown reason={reason}");
+    crate::log_event!(Info,"runtime shutdown reason={reason}");
     stop_tx.send_replace(true);
     let drained=tokio::time::timeout(Duration::from_secs(30),async{
         while let Some(joined)=tasks.join_next().await{joined??;}
@@ -389,7 +389,7 @@ pub async fn run()->Result<()>{
     match drained{
         Ok(Ok(()))=>{},
         Ok(Err(drain_error))=>{
-            eprintln!("runtime shutdown drain_error={drain_error:#}");
+            crate::log_event!(Error,"runtime shutdown drain_error={drain_error:#}");
             if let Some(original)=error.take(){
                 return Err(original.context(format!("shutdown also failed: {drain_error:#}")));
             }
@@ -397,7 +397,7 @@ pub async fn run()->Result<()>{
         },
         Err(_)=>{
             tasks.abort_all();
-            eprintln!("runtime shutdown drain_timeout_s=30");
+            crate::log_event!(Warn,"runtime shutdown drain_timeout_s=30");
             if let Some(original)=error.take(){
                 return Err(original.context("shutdown drain exceeded 30 seconds"));
             }
@@ -405,6 +405,6 @@ pub async fn run()->Result<()>{
         }
     }
     if let Some(error)=error{return Err(error);}
-    println!("runtime shutdown complete=true");
+    crate::log_event!(Info,"runtime shutdown complete=true");
     Ok(())
 }

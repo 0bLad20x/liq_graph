@@ -336,7 +336,7 @@ fn spawn_sources(
         .unwrap_or_else(|_| "256".into()).parse().context("invalid REGISTRY_BROADCAST_CAPACITY")?;
     ensure!((32..=65536).contains(&source_capacity) && (32..=65536).contains(&registry_capacity),
         "REST/REGISTRY broadcast capacities must be 32..=65536");
-    println!("orchestration rest_sources={source_set:?} source_broadcast_capacity={} registry_broadcast_capacity={} fail_on_lag={strict_lag}",
+    crate::log_event!(Info,"orchestration rest_sources={source_set:?} source_broadcast_capacity={} registry_broadcast_capacity={} fail_on_lag={strict_lag}",
         source_capacity, registry_capacity);
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(source_capacity);
     let registry_input = output.subscribe();
@@ -421,7 +421,7 @@ fn spawn_sources(
             pools: restored,
             persist_identity: Vec::new(),
         })).map_err(|_|anyhow::anyhow!("no registry bootstrap subscriber"))?;
-        println!("orchestration bootstrap seeded_pools={count}");
+        crate::log_event!(Info,"orchestration bootstrap seeded_pools={count}");
     }
     if let Some(writer) = persist {
         tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
@@ -551,6 +551,7 @@ pub async fn run() -> Result<()> {
         Err(error) if error.not_found() => {}
         Err(error) => return Err(error).context("load .env"),
     }
+    core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.len() == 1 && args[0] == "--run" {
@@ -568,7 +569,7 @@ pub async fn run() -> Result<()> {
         let db = persistence::Persistence::connect().await?;
         let registry = pool_registry::PoolRegistry::default();
         let restored = registry.restore(db.restore().await?)?;
-        println!("rpc full scan initial restored_pools={restored}");
+        crate::log_event!(Info,"rpc full scan initial restored_pools={restored}");
         let (source, source_rx) = broadcast::channel::<Arc<core::DataBatch>>(256);
         let registry_rx = source.subscribe();
         let (updates, _) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(256);
@@ -590,7 +591,7 @@ pub async fn run() -> Result<()> {
         }
         downstream?;
         scanned?;
-        println!("rpc full scan live complete=true");
+        crate::log_event!(Info,"rpc full scan live complete=true");
         return Ok(());
     }
     if cli.pumpswap_discovery_live {
@@ -640,7 +641,7 @@ pub async fn run() -> Result<()> {
             persist_identity: Vec::new(),
         })).map_err(|_| anyhow::anyhow!("no Jupiter graph bootstrap subscriber"))?;
         drop(updates);
-        println!("orchestration jupiter-graph-live restored_pools={restored} source=persistence_restore");
+        crate::log_event!(Info,"orchestration jupiter-graph-live restored_pools={restored} source=persistence_restore");
         // Jupiter Search runs continuously against the restored graph's mint set.
         // The catalog producer retains the Jupiter mint sender during streaming.
         while let Some(result) = tasks.join_next().await { result??; }
@@ -650,12 +651,12 @@ pub async fn run() -> Result<()> {
         let database=persistence::Persistence::connect().await?;
         let registry=pool_registry::PoolRegistry::default();
         let restored=registry.restore(database.restore().await?)?;
-        println!("orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
+        crate::log_event!(Info,"orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
         let mut tasks=JoinSet::new();
         spawn_sources(&mut tasks,cli.meteora,None,None,None,
             Some(registry),Some(database),SourceSet::All,true)?;
         while let Some(result)=tasks.join_next().await {result??;}
-        println!("orchestration persistence-v2-live complete rpc_calls=0");
+        crate::log_event!(Info,"orchestration persistence-v2-live complete rpc_calls=0");
         return Ok(());
     }
     if cli.persistence_restore_live {
@@ -681,7 +682,7 @@ pub async fn run() -> Result<()> {
         })).map_err(|_|anyhow::anyhow!("no graph bootstrap receiver"))?;
         drop(updates);
         while let Some(result)=tasks.join_next().await {result??;}
-        println!("persistence restore-live complete restored_pools={restored} rpc_calls=0");
+        crate::log_event!(Info,"persistence restore-live complete restored_pools={restored} rpc_calls=0");
         return Ok(());
     }
     if cli.completion_live || cli.damm_v2_completion_live
@@ -729,11 +730,11 @@ pub async fn run() -> Result<()> {
             let registry = pool_registry::PoolRegistry::default();
             let restored_data = db.restore().await?;
             let restored = registry.restore(restored_data)?;
-            println!("orchestration initial persistence restored_pools={restored}");
+            crate::log_event!(Info,"orchestration initial persistence restored_pools={restored}");
             (Some(registry), Some(db))
         } else {(None,None)};
         if cli.stability_live {
-            println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
+            crate::log_event!(Info,"orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
                 cli.meteora.max_pages, completion_limit);
         }
         let source_set = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
@@ -830,7 +831,7 @@ pub async fn run() -> Result<()> {
         let database = persistence::Persistence::connect().await?;
         let registry = pool_registry::PoolRegistry::default();
         let restored = registry.restore(database.restore().await?)?;
-        println!("orchestration Jupiter graph bootstrap restored_pools={restored}");
+        crate::log_event!(Info,"orchestration Jupiter graph bootstrap restored_pools={restored}");
         (Some(registry), Some(graph_liquidity::Settings::from_env()?))
     } else { (None, None) };
 

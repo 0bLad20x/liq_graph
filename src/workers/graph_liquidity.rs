@@ -7,12 +7,12 @@ use std::{
     hint::black_box,
     mem::size_of,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
-use tokio::sync::{broadcast, watch};
+use tokio::{sync::{broadcast, watch}, time::{Instant as TokioInstant, sleep_until}};
 
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
 
@@ -334,7 +334,7 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
             (GroupKind::Bridge, true) => triangle_4 += 1,
         }
     }
-    println!("liquidity graph v10 validated generation={} groups={} direct_2={} direct_3={} triangle_3={} triangle_4={} canonical_duplicates_removed={} invalid_groups=0",
+    crate::log_event!(Debug,"validated generation={} groups={} direct_2={} direct_3={} triangle_3={} triangle_4={} canonical_duplicates_removed={} invalid_groups=0",
         generation, groups.len(), direct_2, direct_3, triangle_3, triangle_4,
         before_dedup - groups.len());
 
@@ -409,6 +409,12 @@ fn probe(snapshot: &GraphSnapshot) {
 
 /// A single owner consumes Registry changes. Publishing an Arc replaces the
 /// complete immutable generation atomically; no signal can read a partial catalog.
+const REBUILD_SPACING: Duration = Duration::from_secs(3);
+
+/// A single owner consumes every Registry update without waiting for a rebuild.
+/// At most one full rebuild runs at once; changed edges are coalesced for the
+/// next generation. An in-flight generation is immutable and can be superseded
+/// by a later one after another three-second interval.
 pub async fn run(
     mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     output: watch::Sender<Arc<GraphSnapshot>>,
@@ -418,65 +424,83 @@ pub async fn run(
     let mut changed_batches = 0_u64;
     let mut observed = 0_usize;
     let mut generation = 0_u64;
+    let mut dirty = false;
+    let mut pending_changes = 0_usize;
+    let mut last_source = "persistence_restore";
+    let mut next_rebuild = TokioInstant::now();
+    let mut inflight: Option<tokio::task::JoinHandle<Result<(GraphSnapshot, u128, usize, &'static str)>>> = None;
+    let mut source_open = true;
     loop {
-        match input.recv().await {
-            Ok(batch) => {
-                observed += batch.pools.len();
-                let mut changes = 0_usize;
-                for pool in &batch.pools {
-                    let candidate = eligible(pool, settings.min_tvl_usd);
-                    match candidate {
-                        Some(p) => {
-                            // A TVL or manifest-slot refresh inside the same eligible class
-                            // must not rebuild unchanged topology and group roles.
-                            let same_edge = prepared.get(&p.address)
-                                .is_some_and(|old| old.a == p.a && old.b == p.b);
-                            prepared.insert(p.address, p);
-                            if !same_edge { changes += 1; }
-                        }
-                        None => {
-                            if prepared.remove(&pool.address).is_some() { changes += 1; }
+        if !source_open && !dirty && inflight.is_none() { break; }
+        tokio::select! {
+            event = input.recv(), if source_open => match event {
+                Ok(batch) => {
+                    observed += batch.pools.len();
+                    let mut changes = 0_usize;
+                    for pool in &batch.pools {
+                        let candidate = eligible(pool, settings.min_tvl_usd);
+                        match candidate {
+                            Some(p) => {
+                                // TVL and slot changes in an existing edge do not
+                                // require a new topology generation.
+                                let same_edge = prepared.get(&p.address)
+                                    .is_some_and(|old| old.a == p.a && old.b == p.b);
+                                prepared.insert(p.address, p);
+                                if !same_edge { changes += 1; }
+                            }
+                            None => {
+                                if prepared.remove(&pool.address).is_some() { changes += 1; }
+                            }
                         }
                     }
+                    if changes > 0 {
+                        dirty = true;
+                        pending_changes += changes;
+                        last_source = batch.source;
+                    }
                 }
-                if changes == 0 { continue; }
-                generation = generation.checked_add(1).context("graph generation overflow")?;
-                let started = Instant::now();
-                let graph = Arc::new(build(prepared.values().copied(), generation)?);
-                let elapsed = started.elapsed();
+                Err(broadcast::error::RecvError::Lagged(skipped)) =>
+                    anyhow::bail!("liquidity graph lost {skipped} Registry update batches"),
+                Err(broadcast::error::RecvError::Closed) => source_open = false,
+            },
+            result = async { inflight.as_mut().expect("inflight graph build").await },
+                if inflight.is_some() => {
+                inflight.take();
+                let (graph, elapsed_us, changes, source) =
+                    result.context("liquidity graph build task panicked")??;
                 let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
-                let bridge = graph.groups.len() - direct;
-                let oversized = graph.groups.iter()
-                    .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
-                println!("liquidity graph rebuild generation={} source={} changed_pools={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
-                    generation, batch.source, changes, graph.qualified_pools, graph.mint_pairs,
+                let bridge = graph.groups.len()-direct;
+                crate::log_event!(Info,
+                    "rebuild generation={} source={} changed_pools={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
+                    graph.generation, source, changes, graph.qualified_pools, graph.mint_pairs,
                     graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
-                    oversized, graph.approx_index_bytes, elapsed.as_micros());
-                output.send_replace(graph);
+                    graph.approx_index_bytes, elapsed_us);
+                output.send_replace(Arc::new(graph));
                 changed_batches += 1;
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) =>
-                anyhow::bail!("liquidity graph lost {skipped} Registry update batches"),
-            Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = sleep_until(next_rebuild), if dirty && inflight.is_none() => {
+                generation = generation.checked_add(1).context("graph generation overflow")?;
+                let snapshot: Vec<PreparedPool> = prepared.values().copied().collect();
+                let changed = std::mem::take(&mut pending_changes);
+                let source = last_source;
+                dirty = false;
+                next_rebuild = TokioInstant::now() + REBUILD_SPACING;
+                inflight = Some(tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    let graph = build(snapshot.into_iter(), generation)?;
+                    Ok((graph, started.elapsed().as_micros(), changed, source))
+                }));
+            },
         }
     }
     let final_graph = output.borrow().clone();
-    println!("liquidity graph complete observed_pool_updates={} changed_batches={} generation={} prepared={} groups={}",
-        observed, changed_batches, final_graph.generation,
+    crate::log_event!(Info,
+        "complete observed_pool_updates={} changed_batches={} generation={} prepared={} groups={}",
+        observed,changed_batches,final_graph.generation,
         final_graph.qualified_pools,final_graph.groups.len());
 
-    // Evaluate economic thresholds on the identical, actually prepared pool set.
-    // Don't assert that a threshold predicts profit.
-    if settings.min_tvl_usd.is_none() && !prepared.is_empty() {
-        for threshold in [10.0_f64,100.0,1000.0] {
-            let started = Instant::now();
-            let graph = build(prepared.values().copied().filter(|p|
-                p.tvl_usd.is_some_and(|v|v>=threshold)), generation)?;
-            println!("liquidity graph scenario min_tvl_usd={} qualified={} groups={} trade_paths={} approx_index_bytes={} build_us={}",
-                threshold,graph.qualified_pools,graph.groups.len(),graph.route_options,
-                graph.approx_index_bytes,started.elapsed().as_micros());
-        }
-    }
+    // Diagnostic scenario builds belong only to finite live runs, not the
+    // production runtime: they add multiple expensive builds at shutdown.
     Ok(())
 }
 
