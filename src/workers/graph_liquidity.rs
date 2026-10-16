@@ -426,9 +426,10 @@ pub async fn run(
     let mut generation = 0_u64;
     let mut dirty = false;
     let mut pending_changes = 0_usize;
+    let mut pending_batches = 0_usize;
     let mut last_source = "persistence_restore";
     let mut next_rebuild = TokioInstant::now();
-    let mut builds=JoinSet::<Result<(GraphSnapshot, u128, usize, &'static str)>>::new();
+    let mut builds=JoinSet::<Result<(GraphSnapshot, u128, usize, usize, &'static str)>>::new();
     let mut source_open = true;
     loop {
         if !source_open && !dirty && builds.is_empty() { break; }
@@ -456,6 +457,7 @@ pub async fn run(
                     if changes > 0 {
                         dirty = true;
                         pending_changes += changes;
+                        pending_batches += 1;
                         last_source = batch.source;
                     }
                 }
@@ -464,7 +466,7 @@ pub async fn run(
                 Err(broadcast::error::RecvError::Closed) => source_open = false,
             },
             result = builds.join_next(), if !builds.is_empty() => {
-                let (graph, elapsed_us, changes, source) =
+                let (graph, elapsed_us, changes, batches, source) =
                     result.context("missing liquidity graph build")?
                         .context("liquidity graph build task panicked")??;
                 let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
@@ -472,8 +474,8 @@ pub async fn run(
                 let oversized = graph.groups.iter()
                     .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
                 crate::log_event!(Info,
-                    "rebuild generation={} source={} changed_pools={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
-                    graph.generation, source, changes, graph.qualified_pools, graph.mint_pairs,
+                    "rebuild generation={} source={} changed_pools={} coalesced_batches={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
+                    graph.generation, source, changes, batches, graph.qualified_pools, graph.mint_pairs,
                     graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
                     oversized, graph.approx_index_bytes, elapsed_us);
                 output.send_replace(Arc::new(graph));
@@ -483,13 +485,14 @@ pub async fn run(
                 generation = generation.checked_add(1).context("graph generation overflow")?;
                 let snapshot: Vec<PreparedPool> = prepared.values().copied().collect();
                 let changed = std::mem::take(&mut pending_changes);
+                let batches = std::mem::take(&mut pending_batches);
                 let source = last_source;
                 dirty = false;
                 next_rebuild = TokioInstant::now() + REBUILD_SPACING;
                 builds.spawn_blocking(move || {
                     let started = Instant::now();
                     let graph = build(snapshot.into_iter(), generation)?;
-                    Ok((graph, started.elapsed().as_micros(), changed, source))
+                    Ok((graph, started.elapsed().as_micros(), changed, batches, source))
                 });
             },
         }
