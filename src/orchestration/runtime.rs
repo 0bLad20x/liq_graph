@@ -275,14 +275,12 @@ pub async fn run()->Result<()>{
         discovery_byreal_clmm::Settings{once:false,max_pages:None,rpm:byreal_rpm});
     rest!(discovery_manifest,"discovery.manifest",discovery_manifest::Settings{once:false});
     let rolling=discovery_pumpswap::Settings::from_env(false,None)?;
-    use rpc_transport::{RpcOperation,AccountFilter,AccountView};
-    let program:solana_pubkey::Pubkey=
-        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".parse()?;
+    use rpc_transport::{RpcOperation,AccountView};
+    // Check generic transport capabilities only. The PumpSwap worker itself
+    // owns the program ID, discriminator, slice and pagination contract.
     let supported=rpc.supports(&RpcOperation::ProgramV2{
-        program,filters:vec![AccountFilter::Memcmp{
-            offset:0,bytes:vec![241,154,109,4,17,177,109,188]}],
-        view:AccountView::Slice{offset:43,length:64},cursor:None,
-        changed_since_slot:Some(1),limit:rolling.page_limit
+        program:solana_pubkey::Pubkey::default(),filters:Vec::new(),
+        view:AccountView::Full,cursor:None,changed_since_slot:Some(1),limit:1
     }) && rpc.supports(&RpcOperation::Slot{commitment:"finalized".into()});
     if supported{
         let client=rpc.clone();let tx=source.clone();
