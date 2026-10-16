@@ -6,10 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{damm_v2_completion, orca_completion, raydium_amm_v4_completion, raydium_cpmm_completion, raydium_clmm_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, orca, persistence, pool_registry, rpc_transport, http_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, orca_completion, raydium_amm_v4_completion, raydium_cpmm_completion, raydium_clmm_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, pancakeswap, orca, persistence, pool_registry, rpc_transport, http_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
-enum SourceSet { Dlmm, DlmmDammV2, Raydium, Orca, DammV2, All }
+enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Orca, DammV2, All }
 
 struct CompletionConfig {
     rpc: rpc_transport::RpcHandle,
@@ -83,6 +83,7 @@ fn settings() -> Result<Cli> {
             "--stability-live" => stability_live = true,
             "--rest-discovery-live" => { rest_discovery_live = true; once = true; },
             "--raydium-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Raydium); once = true; },
+            "--pancakeswap-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::PancakeSwap); once = true; },
             "--orca-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Orca); once = true; },
             "--damm-v2-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::DammV2); once = true; },
             "--completion-limit" => {
@@ -99,7 +100,7 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --http-transport-live, --completion-live, --damm-v2-completion-live, --orca-completion-live, --raydium-amm-v4-completion-live, --raydium-cpmm-completion-live, --raydium-clmm-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --http-transport-live, --completion-live, --damm-v2-completion-live, --orca-completion-live, --raydium-amm-v4-completion-live, --raydium-cpmm-completion-live, --raydium-clmm-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --pancakeswap-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
         }
     }
     ensure!(!(raydium_clmm_completion_live && (rpc_live || http_transport_live || jupiter_only
@@ -324,6 +325,13 @@ fn spawn_sources(
             .unwrap_or_else(|_| "10".into()).parse().context("invalid RAYDIUM_API_RPS")?;
         tasks.spawn(raydium::run(core::http_client()?, output.clone(), raydium::Settings {
             once: settings.once, max_pages: settings.max_pages, rps,
+        }));
+    }
+    if matches!(source_set, SourceSet::PancakeSwap | SourceSet::All) {
+        let rpm: u32 = env::var("PANCAKESWAP_API_RPM")
+            .unwrap_or_else(|_| "57".into()).parse().context("invalid PANCAKESWAP_API_RPM")?;
+        tasks.spawn(pancakeswap::run(core::http_client()?, output.clone(), pancakeswap::Settings {
+            once: settings.once, max_pages: settings.max_pages, rpm,
         }));
     }
     if matches!(source_set, SourceSet::Orca | SourceSet::All) {

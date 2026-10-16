@@ -15,5 +15,6 @@ pub mod liquidity_graph;
 pub mod graph_watch_catalog;
 pub mod persistence;
 pub mod raydium;
+pub mod pancakeswap;
 pub mod orca;
 pub mod meteora_damm_v2;
