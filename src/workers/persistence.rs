@@ -161,14 +161,14 @@ fn venue_code(venue: Venue) -> i16 {
         Venue::RaydiumAmmV4 => 3, Venue::RaydiumCpmm => 4, Venue::RaydiumClmm => 5,
         Venue::RaydiumStable => 6, Venue::OrcaWhirlpool => 7,
         Venue::PancakeSwapClmm => 8, Venue::ByrealClmm => 9,
-        Venue::Manifest => 10 }
+        Venue::Manifest => 10, Venue::PumpSwap => 11 }
 }
 
 fn venue_from(code: i16) -> Result<Venue> {
     match code { 1=>Ok(Venue::MeteoraDlmm), 2=>Ok(Venue::MeteoraDammV2),
         3=>Ok(Venue::RaydiumAmmV4), 4=>Ok(Venue::RaydiumCpmm),
         5=>Ok(Venue::RaydiumClmm), 6=>Ok(Venue::RaydiumStable),
-        7=>Ok(Venue::OrcaWhirlpool), 8=>Ok(Venue::PancakeSwapClmm), 9=>Ok(Venue::ByrealClmm), 10=>Ok(Venue::Manifest), _=>bail!("unsupported persisted venue {code}") }
+        7=>Ok(Venue::OrcaWhirlpool), 8=>Ok(Venue::PancakeSwapClmm), 9=>Ok(Venue::ByrealClmm), 10=>Ok(Venue::Manifest), 11=>Ok(Venue::PumpSwap), _=>bail!("unsupported persisted venue {code}") }
 }
 
 fn status_code(status: CompletionState) -> Result<i16> {

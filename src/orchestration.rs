@@ -6,10 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
 #[derive(Clone, Copy, Debug)]
-enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, Orca, DammV2, All }
+enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
 
 struct CompletionConfig {
     rpc: rpc_transport::RpcHandle,
@@ -22,6 +22,7 @@ struct CompletionConfig {
     pancakeswap_clmm: Option<completion_pancakeswap_clmm::Settings>,
     byreal_clmm: Option<completion_byreal_clmm::Settings>,
     manifest: Option<completion_manifest::Settings>,
+    pumpswap: Option<completion_pumpswap::Settings>,
 }
 
 struct Cli {
@@ -38,6 +39,9 @@ struct Cli {
     pancakeswap_clmm_completion_live: bool,
     byreal_clmm_completion_live: bool,
     manifest_completion_live: bool,
+    pumpswap_discovery_live: bool,
+    pumpswap_completion_live: bool,
+    pumpswap_rolling: bool,
     graph_live: bool,
     completion_limit: Option<usize>,
     persistence_write_live: bool,
@@ -64,6 +68,9 @@ fn settings() -> Result<Cli> {
     let mut pancakeswap_clmm_completion_live = false;
     let mut byreal_clmm_completion_live = false;
     let mut manifest_completion_live = false;
+    let mut pumpswap_discovery_live = false;
+    let mut pumpswap_completion_live = false;
+    let mut pumpswap_rolling = false;
     let mut graph_live = false;
     let mut completion_limit = None;
     let mut persistence_write_live = false;
@@ -88,6 +95,9 @@ fn settings() -> Result<Cli> {
             "--pancakeswap-clmm-completion-live" => { pancakeswap_clmm_completion_live = true; once = true; },
             "--byreal-clmm-completion-live" => { byreal_clmm_completion_live = true; once = true; },
             "--manifest-completion-live" => { manifest_completion_live = true; once = true; },
+            "--pumpswap-discovery-live" => { pumpswap_discovery_live = true; once = true; },
+            "--pumpswap-completion-live" => { pumpswap_completion_live = true; once = true; },
+            "--pumpswap-rolling" => { pumpswap_rolling = true; },
             "--graph-live" => { graph_live = true; once = true; },
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
@@ -197,7 +207,7 @@ fn settings() -> Result<Cli> {
         || orca_completion_live || raydium_amm_v4_completion_live
         || raydium_cpmm_completion_live || raydium_clmm_completion_live
         || pancakeswap_clmm_completion_live || byreal_clmm_completion_live
-        || manifest_completion_live || graph_live || persistence_write_live || stability_live,
+        || manifest_completion_live || pumpswap_completion_live || pumpswap_rolling || graph_live || persistence_write_live || stability_live,
         "--completion-limit requires a Completion/Graph/Persistence/Stability live mode");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
@@ -211,6 +221,26 @@ fn settings() -> Result<Cli> {
         && !persistence_restore_live && !persistence_v2_live && !stability_live
         && !rest_discovery_live && rest_source_only.is_none()),
         "--http-transport-live must be used alone");
+    let pump_modes = usize::from(pumpswap_discovery_live)
+        + usize::from(pumpswap_completion_live) + usize::from(pumpswap_rolling);
+    ensure!(pump_modes <= 1, "select only one PumpSwap mode");
+    if pump_modes > 0 {
+        ensure!(!jupiter_only && !rpc_live && !http_transport_live
+            && !completion_live && !damm_v2_completion_live && !orca_completion_live
+            && !raydium_amm_v4_completion_live && !raydium_cpmm_completion_live
+            && !raydium_clmm_completion_live && !pancakeswap_clmm_completion_live
+            && !byreal_clmm_completion_live && !manifest_completion_live
+            && !graph_live && !persistence_write_live && !persistence_restore_live
+            && !persistence_v2_live && !stability_live && !rest_discovery_live
+            && rest_source_only.is_none(),
+            "PumpSwap checkpoint mode is exclusive");
+        ensure!(!pumpswap_rolling || (!once && max_pages.is_none()),
+            "continuous PumpSwap rolling cannot use --once or --pages");
+        ensure!(!pumpswap_discovery_live || completion_limit.is_none(),
+            "PumpSwap discovery alone does not support --completion-limit");
+        ensure!(!pumpswap_completion_live || max_pages.is_none(),
+            "PumpSwap completion requires an untruncated discovery scan");
+    }
     Ok(Cli {
         meteora: discovery_meteora_dlmm::Settings { once, max_pages },
         jupiter_only,
@@ -225,6 +255,9 @@ fn settings() -> Result<Cli> {
         pancakeswap_clmm_completion_live,
         byreal_clmm_completion_live,
         manifest_completion_live,
+        pumpswap_discovery_live,
+        pumpswap_completion_live,
+        pumpswap_rolling,
         graph_live,
         completion_limit,
         persistence_write_live,
@@ -281,6 +314,7 @@ fn spawn_sources(
     source_set: SourceSet,
     strict_lag: bool,
 ) -> Result<()> {
+    let pump_rpc = completion.as_ref().map(|cfg|cfg.rpc.clone());
     let source_capacity: usize = env::var("REST_BROADCAST_CAPACITY")
         .unwrap_or_else(|_| "256".into()).parse().context("invalid REST_BROADCAST_CAPACITY")?;
     let registry_capacity: usize = env::var("REGISTRY_BROADCAST_CAPACITY")
@@ -342,6 +376,10 @@ fn spawn_sources(
             tasks.spawn(completion_pancakeswap_clmm::run(registry_output.subscribe(),
                 source_done_rx.clone(), config.rpc.clone(), clmm, completion_output.clone()));
         }
+        if let Some(pump) = config.pumpswap {
+            tasks.spawn(completion_pumpswap::run(registry_output.subscribe(),
+                source_done_rx.clone(), config.rpc.clone(), pump, completion_output.clone()));
+        }
         if let Some(manifest) = config.manifest {
             tasks.spawn(completion_manifest::run(registry_output.subscribe(),
                 source_done_rx.clone(), config.rpc.clone(), manifest, completion_output.clone()));
@@ -388,6 +426,11 @@ fn spawn_sources(
         tasks.spawn(discovery_byreal_clmm::run(core::http_client()?,output.clone(),discovery_byreal_clmm::Settings {
             once: settings.once,max_pages:settings.max_pages,rpm,
         }));
+    }
+    if matches!(source_set, SourceSet::PumpSwap) {
+        let rpc = pump_rpc.context("PumpSwap rolling requires the configured shared RPC transport")?;
+        let settings = discovery_pumpswap::Settings::from_env(settings.once, settings.max_pages)?;
+        tasks.spawn(discovery_pumpswap::run(rpc, output.clone(), settings));
     }
     if matches!(source_set, SourceSet::Manifest | SourceSet::All) {
         tasks.spawn(discovery_manifest::run(core::http_client()?,output.clone(),
@@ -460,6 +503,16 @@ pub async fn run() -> Result<()> {
     }
 
     let cli = settings()?;
+    if cli.pumpswap_discovery_live {
+        let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+        let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(256);
+        let observer = tokio::spawn(diagnostic_source::run(input, true));
+        let settings = discovery_pumpswap::Settings::from_env(true, cli.meteora.max_pages)?;
+        discovery_pumpswap::run(rpc, output, settings).await?;
+        observer.await??;
+        rpc_task.await??;
+        return Ok(());
+    }
     if cli.http_transport_live {
         http_transport::live_diagnostic().await?;
         return Ok(());
@@ -545,7 +598,7 @@ pub async fn run() -> Result<()> {
         || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
         || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
         || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-        || cli.manifest_completion_live || cli.graph_live || cli.persistence_write_live || cli.stability_live {
+        || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling || cli.graph_live || cli.persistence_write_live || cli.stability_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
         // Protocol completion workers share the RPC transport configuration;
@@ -556,7 +609,7 @@ pub async fn run() -> Result<()> {
             else if cli.graph_live || cli.persistence_write_live {5000}
             else if cli.orca_completion_live {200}
             else if cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-                || cli.manifest_completion_live {0}
+                || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {0}
             else {100});
 
         let graph = if cli.graph_live || cli.persistence_write_live
@@ -564,11 +617,15 @@ pub async fn run() -> Result<()> {
             || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
             || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
             || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-            || cli.manifest_completion_live {
+            || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {
             let graph_settings=graph_liquidity::Settings::from_env()?;
             if cli.manifest_completion_live {
                 ensure!(graph_settings.min_tvl_usd.is_none(),
                     "--manifest-completion-live requires GRAPH_MIN_TVL_USD unset (Manifest TVL is None)");
+            }
+            if cli.pumpswap_completion_live || cli.pumpswap_rolling {
+                ensure!(graph_settings.min_tvl_usd.is_none(),
+                    "PumpSwap completion requires GRAPH_MIN_TVL_USD unset until reserve/TVL worker exists");
             }
             Some(graph_settings)
         } else {None};
@@ -577,7 +634,7 @@ pub async fn run() -> Result<()> {
             || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
             || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
             || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-            || cli.manifest_completion_live {
+            || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {
             let db = persistence::Persistence::connect().await?;
             let registry = pool_registry::PoolRegistry::default();
             let restored = registry.restore(db.restore().await?)?;
@@ -588,7 +645,9 @@ pub async fn run() -> Result<()> {
             println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
                 cli.meteora.max_pages, completion_limit);
         }
-        let source_set = if cli.manifest_completion_live {
+        let source_set = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
+            SourceSet::PumpSwap
+        } else if cli.manifest_completion_live {
             SourceSet::Manifest
         } else if cli.byreal_clmm_completion_live {
             SourceSet::Byreal
@@ -610,7 +669,7 @@ pub async fn run() -> Result<()> {
         let dlmm = if !cli.orca_completion_live && !cli.raydium_amm_v4_completion_live
             && !cli.raydium_cpmm_completion_live && !cli.raydium_clmm_completion_live
             && !cli.pancakeswap_clmm_completion_live && !cli.byreal_clmm_completion_live
-            && !cli.manifest_completion_live
+            && !cli.manifest_completion_live && !cli.pumpswap_completion_live && !cli.pumpswap_rolling
             && (!cli.damm_v2_completion_live || cli.completion_live) {
             let mut settings = completion_meteora_dlmm::Settings::from_env()?;
             settings.limit = completion_limit;
@@ -646,6 +705,11 @@ pub async fn run() -> Result<()> {
             settings.limit=completion_limit;
             Some(settings)
         } else {None};
+        let pumpswap = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
+            let mut settings = completion_pumpswap::Settings::from_env()?;
+            settings.limit = completion_limit;
+            Some(settings)
+        } else {None};
         let manifest = if cli.manifest_completion_live {
             let mut settings=completion_manifest::Settings::from_env()?;
             settings.limit=completion_limit;
@@ -653,7 +717,7 @@ pub async fn run() -> Result<()> {
         } else {None};
         let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
         spawn_sources(&mut tasks, cli.meteora,
-            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest}),
+            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest, pumpswap}),
             graph, jupiter, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);

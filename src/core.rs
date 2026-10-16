@@ -18,6 +18,7 @@ pub enum Venue {
     PancakeSwapClmm,
     ByrealClmm,
     Manifest,
+    PumpSwap,
 }
 
 /// An immutable decoded response, fan-out via Arc<DataBatch> without payload copies.
