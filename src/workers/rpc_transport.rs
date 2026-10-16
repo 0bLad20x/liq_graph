@@ -567,9 +567,20 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
             let _=tasks.join_next().await;
         }
     }
-    while let Some(result)=tasks.join_next().await {result?;}
+    // The request channel closes only after every RpcHandle has been dropped.
+    // At that point no caller can consume an outstanding response. Cancel the
+    // remaining in-flight/queued provider calls rather than waiting for their
+    // rate-limit gates and timeouts during an otherwise graceful shutdown.
+    let abandoned = tasks.len();
+    tasks.abort_all();
+    while let Some(result)=tasks.join_next().await {
+        if let Err(error)=result {
+            if !error.is_cancelled() { return Err(error.into()); }
+        }
+    }
     reporter.abort();
     report_rpc(&stats);
+    crate::log_event!(Info,"rpc transport shutdown complete=true abandoned_calls={abandoned}");
     Ok(())
 }
 
