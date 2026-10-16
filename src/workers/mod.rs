@@ -11,11 +11,13 @@ pub mod raydium_amm_v4_completion;
 pub mod raydium_cpmm_completion;
 pub mod raydium_clmm_completion;
 pub mod pancakeswap_clmm_completion;
+pub mod byreal_clmm_completion;
 
 pub mod liquidity_graph;
 pub mod graph_watch_catalog;
 pub mod persistence;
 pub mod raydium;
 pub mod pancakeswap;
+pub mod byreal;
 pub mod orca;
 pub mod meteora_damm_v2;
