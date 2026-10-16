@@ -439,8 +439,7 @@ impl Scheduler {
         match self.attempts.get(&pool.address).copied() {
             None=>match pool.completion_state {
                 CompletionState::Unknown=>Some(1),
-                CompletionState::Incomplete if !pool.completion_reason.as_deref()
-                    .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(2),
+                CompletionState::Incomplete=>Some(2),
                 _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),
