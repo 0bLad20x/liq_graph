@@ -2,7 +2,7 @@
 //! Large responses are processed incrementally. No protocol decoding, mint hydration or DB writes.
 //! curl's --compressed handles providers that serve gzip even for Accept-Encoding: identity.
 use std::{
-    collections::HashSet, env, io::Write, process::{Command, Stdio},
+    collections::HashSet, env, io::{BufReader, Write}, process::{Command, Stdio},
     sync::Arc, thread, time::{Duration, Instant},
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -95,7 +95,7 @@ struct AccountHeader { owner: String, data: (String, String) }
 struct Entry { pubkey: String, account: AccountHeader }
 
 struct Collector {
-    program: Pubkey,
+    expected_owner: String,
     venue: Venue,
     output: broadcast::Sender<Arc<DataBatch>>,
     batch_spacing_ms: u64,
@@ -106,7 +106,7 @@ struct Collector {
 }
 impl Collector {
     fn accept(&mut self, entry: Entry) -> Result<()> {
-        ensure!(entry.account.owner == self.program.to_string(),
+        ensure!(entry.account.owner == self.expected_owner,
             "getProgramAccounts returned account with wrong program owner");
         ensure!(entry.account.data.0.is_empty() && entry.account.data.1 == "base64",
             "full scan must receive zero-length base64 dataSlice");
@@ -229,7 +229,8 @@ fn scan_one(index: usize, url: &str, settings: &Settings, collector: &mut Collec
     let started = Instant::now();
     let parse = {
         let stdout = child.stdout.take().context("curl stdout missing")?;
-        let mut deserializer = serde_json::Deserializer::from_reader(stdout);
+        let mut deserializer = serde_json::Deserializer::from_reader(
+            BufReader::with_capacity(256 * 1024, stdout));
         let parsed = EnvelopeSeed(collector).deserialize(&mut deserializer)
             .context("streaming getProgramAccounts JSON response");
         parsed.and_then(|_| deserializer.end().context("trailing JSON after RPC response"))
@@ -245,7 +246,7 @@ fn scan_one(index: usize, url: &str, settings: &Settings, collector: &mut Collec
 }
 fn blocking_run(settings: Settings, output: broadcast::Sender<Arc<DataBatch>>) -> Result<()> {
     let mut collector = Collector {
-        program: settings.program, venue: settings.venue, output,
+        expected_owner: settings.program.to_string(), venue: settings.venue, output,
         batch_spacing_ms: settings.batch_spacing_ms,
         seen: HashSet::new(), pending: Vec::with_capacity(BATCH),
         accepted: 0, duplicates: 0,
