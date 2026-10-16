@@ -365,6 +365,14 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             "token_program_0":ma.owner.to_string(),"token_program_1":mb.owner.to_string()
         }))
     });
+    // Byreal swap_v2 rejects bit4-enabled swap-dynamic-fee pools.
+    // They require swap_v3_dyn plus two Pyth accounts, which are absent
+    // from the public V10 CLMM account builder. Decay-fee bits 0..2 are supported.
+    if l.decay_fee_flag & 0b10000 != 0 {
+        return result(pool.address,CompletionStatus::Incomplete,Some(slot),
+            Some("Byreal swap-dynamic-fee requires swap_v3_dyn Pyth accounts not present in V10 CLMM builder".into()),
+            Some(ev),Some(proofs),None);
+    }
     let is_v2=ma.owner==token_2022||mb.owner==token_2022;
     let manifest=make_manifest(l,slot,&tick_arrays,&tick_arrays,is_v2,owner);
     // Manifest orientation follows Registry mint identity. V10 base_a denotes
