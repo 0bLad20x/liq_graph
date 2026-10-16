@@ -176,10 +176,10 @@ fn decode_mint(account:&AccountData,spl:Pubkey,token_2022:Pubkey,
     extensions.sort_unstable();
     ensure!(!extensions.windows(2).any(|w|w[0]==w[1]),
         "PancakeSwap CLMM duplicate Token-2022 extensions");
-    let unsupported=extensions.iter().copied()
-        .filter(|v|matches!(*v,4|9|14|16|24)).collect();
+    // V10's CLMM builder accepts both SPL Token and Token-2022 mints.
+    // Do not impose an extension blacklist not present in that builder.
     Ok(MintProof{address:account.address,token_2022:is_2022,
-        extensions,unsupported})
+        extensions,unsupported:Vec::new()})
 }
 fn validate_vault(account:&AccountData,mint:Pubkey,program:Pubkey,pool:Pubkey)->Result<()>{
     ensure!(full(account)&&account.owner==program && account.bytes.len()>=165,
@@ -342,7 +342,6 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
         return incomplete(pool.address,slot,format!("PancakeSwap CLMM vault1: {e:#}"));
     }
     let width=l.tick_spacing*60;
-    let center=l.tick_current.div_euclid(width)*width;
     let mut present=HashMap::<i32,Pubkey>::new();
     for (start,address) in arrays(l,owner) {
         let initialized=match array_initialized(parent,bitmap,start,width){
@@ -366,15 +365,15 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             None=>{}
         }
     }
-    // Supply first initialized array and further initialized arrays in traversal
-    // order; the PancakeSwap executor skips noninitialized arrays in its bitmap.
-    let up=(0..=ARRAY_RADIUS).map(|i|center+i*width)
-        .filter_map(|index|present.get(&index).copied()).collect::<Vec<_>>();
-    let down=(0..=ARRAY_RADIUS).map(|i|center-i*width)
-        .filter_map(|index|present.get(&index).copied()).collect::<Vec<_>>();
-    if up.is_empty()||down.is_empty(){
+    // The public V10 CLMM builder uses a single owner-validated array list,
+    // independent of swap direction, with 1..=6 arrays per pool block.
+    // Keep validated initialized arrays in the same ascending tick order.
+    let mut arrays=present.into_iter().collect::<Vec<_>>();
+    arrays.sort_unstable_by_key(|(start,_)|*start);
+    let arrays=arrays.into_iter().map(|(_,address)|address).collect::<Vec<_>>();
+    if arrays.is_empty(){
         return incomplete(pool.address,slot,
-            "PancakeSwap CLMM requires initialized TickArrays in both V10 directions within radius 2");
+            "V10 CLMM requires at least one initialized TickArray in the candidate window");
     }
     let proofs=if pool.mint_a==Some(l.mints[0]){[mint0,mint1]}else{[mint1,mint0]};
     let ev=Arc::new(CompletionEvidence{
@@ -387,19 +386,13 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             "tick_spacing":l.tick_spacing,"tick_current":l.tick_current,
             "status":l.status,"open_time":l.open_time,
             "radius":ARRAY_RADIUS,
-            "base_a_array_addresses":up.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "base_b_array_addresses":down.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "base_a_array_addresses":arrays.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "base_b_array_addresses":arrays.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "token_program_0":ma.owner.to_string(),"token_program_1":mb.owner.to_string()
         }))
     });
-    if proofs.iter().any(|m|!m.unsupported.is_empty()){
-        return result(pool.address,CompletionStatus::Incomplete,Some(slot),
-            Some(format!("V10 unsupported Token-2022 mint extensions: {:?} {:?}",
-                proofs[0].unsupported,proofs[1].unsupported)),
-            Some(ev),Some(proofs),None);
-    }
     let is_v2=ma.owner==token_2022||mb.owner==token_2022;
-    let manifest=make_manifest(l,slot,&up,&down,is_v2,owner);
+    let manifest=make_manifest(l,slot,&arrays,&arrays,is_v2,owner);
     // Manifest orientation follows Registry mint identity. V10 base_a denotes
     // mint A as quote, which may be opposite to CLMM's native token_mint_0.
     let swapped=pool.mint_a!=Some(l.mints[0]);
