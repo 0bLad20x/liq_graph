@@ -217,8 +217,8 @@ pub async fn run()->Result<()>{
                 let mut ack=Some(ready_tx);
                 tasks.spawn(supervise(concat!("completion.",stringify!($module)),
                     stop_rx.clone(),move||{
-                        let seed=initial.take().unwrap_or_else(||candidates(&reg,$venue));
-                        let live=updates.subscribe();let client=client.clone();
+                        let live=updates.subscribe();
+                        let seed=initial.take().unwrap_or_else(||candidates(&reg,$venue));let client=client.clone();
                         let sink=sink.clone();let done=source_done.clone();
                         let first_ack=ack.take();
                         async move{
@@ -328,7 +328,9 @@ pub async fn run()->Result<()>{
             if duration==0{std::future::pending::<()>().await}
             else{tokio::time::sleep(Duration::from_secs(duration)).await}
         }=>"duration",
-        _=operator_rx=>"operator",
+        _=async {
+            if operator_rx.await.is_err() {std::future::pending::<()>().await}
+        }=>"operator",
         joined=tasks.join_next()=>{
             error=Some(match joined{
                 Some(Ok(Err(e)))=>e,
