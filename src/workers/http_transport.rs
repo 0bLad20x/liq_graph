@@ -289,6 +289,7 @@ fn load_cached_routes(settings: &Settings) -> HashMap<String, Route> {
         println!("http_transport cache_verify_target_changed revalidating_all=true");
     }
     let now_ms = unix_ms();
+    let cache_age_s = now_ms.saturating_sub(cache.saved_at_unix_ms) / 1000;
     let mut routes = HashMap::new();
     for entry in cache.routes {
         if entry.last_verified_unix_ms == 0 ||
@@ -310,8 +311,8 @@ fn load_cached_routes(settings: &Settings) -> HashMap<String, Route> {
             });
         }
     }
-    println!("http_transport cache_loaded={} path={}", routes.len(),
-        settings.cache_path.display());
+    println!("http_transport cache_loaded={} age_s={} path={}", routes.len(),
+        cache_age_s, settings.cache_path.display());
     routes
 }
 
@@ -442,7 +443,8 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
 }
 
 async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<()> {
-    let discover = if shared.settings.public_discovery
+    let has_cached = !shared.inventory.lock().await.is_empty();
+    let discover = if has_cached || shared.settings.public_discovery
         || shared.settings.list_file.is_some() || !shared.settings.extra_txt_urls.is_empty()
     {
         let shared = shared.clone();
@@ -657,9 +659,15 @@ async fn discovery_loop(shared: Arc<Shared>) {
         println!("http_transport cache_revalidate_start routes={}", cached.len());
         verify_candidates(&shared, cached, "cache").await;
     }
-    // Public discovery remains a background refresh, never a precondition for
-    // requests once a cached route has passed its fresh health check.
-    let mut ticker = tokio::time::interval(shared.settings.refresh);
+    let discovery_enabled = shared.settings.public_discovery ||
+        shared.settings.list_file.is_some() || !shared.settings.extra_txt_urls.is_empty();
+    if !discovery_enabled { return; }
+    // Cache recovery never waits for a 76k candidate sweep. A healthy warm
+    // start postpones the first public sweep until the configured refresh time.
+    let recovered = !shared.snapshots.borrow().is_empty();
+    let first = if recovered { Instant::now() + shared.settings.refresh }
+        else { Instant::now() };
+    let mut ticker = tokio::time::interval_at(first, shared.settings.refresh);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
@@ -1156,8 +1164,8 @@ fn validate_live_payload(url: &str, body: &Bytes) -> Result<()> {
 pub async fn live_diagnostic() -> Result<()> {
     let config = Settings::from_env()?;
     ensure!(config.public_discovery || config.list_file.is_some()
-        || !config.extra_txt_urls.is_empty(),
-        "HTTP proxy live mode requires a configured proxy source");
+        || !config.extra_txt_urls.is_empty() || !load_cached_routes(&config).is_empty(),
+        "HTTP proxy live mode requires a configured source or a saved proxy cache");
     let target = env::var("HTTP_TRANSPORT_LIVE_URL")
         .unwrap_or_else(|_| config.probe_url.to_string());
     let calls: usize = env::var("HTTP_TRANSPORT_LIVE_REQUESTS")
