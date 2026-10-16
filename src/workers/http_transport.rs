@@ -679,13 +679,20 @@ async fn discovery_loop(shared: Arc<Shared>) {
 
 async fn refresh(shared: &Arc<Shared>) -> Result<()> {
     shared.host_route_cooldowns.lock().await.retain(|_, until| *until > Instant::now());
-    let (found, _complete) = fetch_inventory(shared).await?;
+    let (found, complete) = fetch_inventory(shared).await?;
     let inventory_count = found.len();
     let now = Instant::now();
+    let now_ms = unix_ms();
     let due = {
         let mut state = shared.inventory.lock().await;
-        // Source membership is not a health signal: never drop known-good routes
-        // merely because a public proxy feed no longer lists them.
+        // Never evict last-known-good routes because a feed dropped them.
+        // Drop unverified orphan candidates on a complete inventory refresh
+        // so the RAM map cannot grow forever.
+        if complete {
+            state.retain(|id, route| found.contains_key(id) ||
+                (route.last_verified_unix_ms != 0 &&
+                 now_ms.saturating_sub(route.last_verified_unix_ms) <= CACHE_MAX_AGE_MS));
+        }
         for (id, candidate) in found {
             if let Some(route) = state.get_mut(&id) {
                 route.candidate.sources = candidate.sources;
