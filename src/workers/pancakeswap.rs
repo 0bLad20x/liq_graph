@@ -176,6 +176,8 @@ pub async fn run(
 
         loop {
             while jobs.len() < MAX_IN_FLIGHT
+                // Do not run arbitrarily far ahead of a slow or missing page.
+                && u64::from(next_request) < u64::from(next_publish) + MAX_IN_FLIGHT as u64
                 && settings.max_pages.is_none_or(|max| next_request <= max)
             {
                 let page = next_request;
