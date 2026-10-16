@@ -5,16 +5,19 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
+    io::ErrorKind,
     net::Ipv4Addr,
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex as StdMutex, atomic::{AtomicUsize, Ordering}},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, Method, Proxy, StatusCode, Url, header::HeaderMap};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -27,6 +30,8 @@ use tokio::{
 const DEX_PROBE: &str = "https://api.dexscreener.com/token-pairs/v1/solana/DEW9dSN6QpWyNthphCpMmAbZP1Q4cEKR9xQXAri98WDP";
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_VERSION: u32 = 1;
+const CACHE_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutePolicy {
@@ -131,6 +136,7 @@ pub struct Settings {
     /// Budget per configured proxy IP and destination host; not necessarily egress IP.
     pub request_rps_per_route: u32,
     pub retry_attempts: usize,
+    pub cache_path: PathBuf,
 }
 
 fn from_env<T: FromStr>(name: &str, default: T) -> Result<T>
@@ -210,6 +216,8 @@ impl Settings {
             probe_rps, request_rps_per_host, probe_url, verify_url, extra_txt_urls,
             list_file, public_discovery, host_rps_overrides, request_rps_per_route,
             retry_attempts,
+            cache_path: PathBuf::from(env::var("HTTP_PROXY_CACHE_FILE")
+                .unwrap_or_else(|_| "target/http_proxy_working_set.json".into())),
         })
     }
 }
@@ -229,6 +237,125 @@ struct Route {
     verified: Option<Instant>,
     latency_ms: u64,
     next_check: Instant,
+    last_verified_unix_ms: u64,
+}
+
+
+#[derive(Serialize, Deserialize)]
+struct CachedRoute {
+    id: String,
+    sources: Vec<String>,
+    latency_ms: u64,
+    last_verified_unix_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedWorkingSet {
+    version: u32,
+    verify_url: String,
+    saved_at_unix_ms: u64,
+    routes: Vec<CachedRoute>,
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+// Cache entries are candidates, not verified active routes after a restart.
+fn load_cached_routes(settings: &Settings) -> HashMap<String, Route> {
+    let bytes = match std::fs::read(&settings.cache_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return HashMap::new(),
+        Err(error) => {
+            eprintln!("http_transport cache_read_error path={} error={error}",
+                settings.cache_path.display());
+            return HashMap::new();
+        }
+    };
+    let cache: CachedWorkingSet = match serde_json::from_slice(&bytes) {
+        Ok(cache) => cache,
+        Err(error) => {
+            eprintln!("http_transport cache_decode_error path={} error={error}",
+                settings.cache_path.display());
+            return HashMap::new();
+        }
+    };
+    if cache.version != CACHE_VERSION {
+        eprintln!("http_transport cache_version_mismatch version={}", cache.version);
+        return HashMap::new();
+    }
+    if cache.verify_url != settings.verify_url.as_str() {
+        println!("http_transport cache_verify_target_changed revalidating_all=true");
+    }
+    let now_ms = unix_ms();
+    let cache_age_s = now_ms.saturating_sub(cache.saved_at_unix_ms) / 1000;
+    let mut routes = HashMap::new();
+    for entry in cache.routes {
+        if entry.last_verified_unix_ms == 0 ||
+            now_ms.saturating_sub(entry.last_verified_unix_ms) > CACHE_MAX_AGE_MS {
+            continue;
+        }
+        let Ok(url) = Url::parse(&entry.id) else { continue };
+        if !url.username().is_empty() || url.password().is_some() { continue; }
+        let (Some(host), Some(port)) = (url.host_str(), url.port()) else { continue };
+        let mut parsed = HashMap::new();
+        add_candidate(&mut parsed, url.scheme(), host, port, "cached");
+        for (id, mut candidate) in parsed {
+            candidate.sources.extend(entry.sources.iter().cloned());
+            routes.insert(id, Route {
+                candidate, client: None, verified: None,
+                latency_ms: entry.latency_ms,
+                next_check: Instant::now(),
+                last_verified_unix_ms: entry.last_verified_unix_ms,
+            });
+        }
+    }
+    println!("http_transport cache_loaded={} age_s={} path={}", routes.len(),
+        cache_age_s, settings.cache_path.display());
+    routes
+}
+
+// Atomically replace the cache; never hold inventory locks across file I/O.
+// Preserve last-known-good candidates even if one refresh or source temporarily fails.
+async fn persist_cached_routes(shared: &Shared) {
+    let _write = shared.cache_write.lock().await;
+    let now = unix_ms();
+    let mut routes = {
+        let state = shared.inventory.lock().await;
+        state.values().filter(|r| r.last_verified_unix_ms != 0 &&
+            now.saturating_sub(r.last_verified_unix_ms) <= CACHE_MAX_AGE_MS)
+            .map(|r| {
+                let mut sources = r.candidate.sources.iter().cloned().collect::<Vec<_>>();
+                sources.sort();
+                CachedRoute {
+                    id: r.candidate.id.clone(), sources,
+                    latency_ms: r.latency_ms,
+                    last_verified_unix_ms: r.last_verified_unix_ms,
+                }
+            }).collect::<Vec<_>>()
+    };
+    routes.sort_by(|a,b| a.id.cmp(&b.id));
+    let file = CachedWorkingSet {
+        version: CACHE_VERSION, verify_url: shared.settings.verify_url.to_string(),
+        saved_at_unix_ms: now, routes,
+    };
+    let result = (|| -> Result<()> {
+        let path = &shared.settings.cache_path;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&file)?)?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("http_transport cache_write_error path={} error={error:#}",
+            shared.settings.cache_path.display());
+    }
 }
 
 #[derive(Default)]
@@ -278,6 +405,7 @@ struct Shared {
     host_route_cooldowns: Mutex<HashMap<(String, String), Instant>>,
     stats: StdMutex<TransportStats>,
     direct_client: Client,
+    cache_write: Mutex<()>,
 }
 
 pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)> {
@@ -296,9 +424,10 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
         .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()?;
+    let cached_routes = load_cached_routes(&settings);
     let shared = Arc::new(Shared {
         settings: settings.clone(),
-        inventory: Mutex::new(HashMap::new()),
+        inventory: Mutex::new(cached_routes),
         snapshots, cycles,
         selection: AtomicUsize::new(0),
         host_gates: Mutex::new(HashMap::new()),
@@ -307,13 +436,15 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
         host_route_cooldowns: Mutex::new(HashMap::new()),
         stats: StdMutex::new(TransportStats::default()),
         direct_client,
+        cache_write: Mutex::new(()),
     });
     let task = tokio::spawn(run(shared, receiver));
     Ok((HttpHandle { calls, routes: route_reader, cycles: cycle_reader }, task))
 }
 
 async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<()> {
-    let discover = if shared.settings.public_discovery
+    let has_cached = !shared.inventory.lock().await.is_empty();
+    let discover = if has_cached || shared.settings.public_discovery
         || shared.settings.list_file.is_some() || !shared.settings.extra_txt_urls.is_empty()
     {
         let shared = shared.clone();
@@ -519,7 +650,24 @@ async fn fetch_inventory(shared: &Shared) -> Result<(HashMap<String, Candidate>,
 }
 
 async fn discovery_loop(shared: Arc<Shared>) {
-    let mut ticker = tokio::time::interval(shared.settings.refresh);
+    let cached = {
+        let state = shared.inventory.lock().await;
+        state.values().filter(|route| route.last_verified_unix_ms > 0)
+            .map(|route| route.candidate.clone()).collect::<Vec<_>>()
+    };
+    if !cached.is_empty() {
+        println!("http_transport cache_revalidate_start routes={}", cached.len());
+        verify_candidates(&shared, cached, "cache").await;
+    }
+    let discovery_enabled = shared.settings.public_discovery ||
+        shared.settings.list_file.is_some() || !shared.settings.extra_txt_urls.is_empty();
+    if !discovery_enabled { return; }
+    // Cache recovery never waits for a 76k candidate sweep. A healthy warm
+    // start postpones the first public sweep until the configured refresh time.
+    let recovered = !shared.snapshots.borrow().is_empty();
+    let first = if recovered { Instant::now() + shared.settings.refresh }
+        else { Instant::now() };
+    let mut ticker = tokio::time::interval_at(first, shared.settings.refresh);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
@@ -534,10 +682,17 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
     let (found, complete) = fetch_inventory(shared).await?;
     let inventory_count = found.len();
     let now = Instant::now();
+    let now_ms = unix_ms();
     let due = {
         let mut state = shared.inventory.lock().await;
-        // One unavailable source must not evict its previously verified routes.
-        if complete { state.retain(|id, _| found.contains_key(id)); }
+        // Never evict last-known-good routes because a feed dropped them.
+        // Drop unverified orphan candidates on a complete inventory refresh
+        // so the RAM map cannot grow forever.
+        if complete {
+            state.retain(|id, route| found.contains_key(id) ||
+                (route.last_verified_unix_ms != 0 &&
+                 now_ms.saturating_sub(route.last_verified_unix_ms) <= CACHE_MAX_AGE_MS));
+        }
         for (id, candidate) in found {
             if let Some(route) = state.get_mut(&id) {
                 route.candidate.sources = candidate.sources;
@@ -545,6 +700,7 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
                 state.insert(id, Route {
                     candidate, client: None, verified: None,
                     latency_ms: u64::MAX, next_check: now,
+                    last_verified_unix_ms: 0,
                 });
             }
         }
@@ -592,6 +748,21 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
     println!("http_transport handshake_ok={} verify_queue={}", candidates.len(), candidates.len());
 
     // Every actual DEX request is globally paced. Handshakes are not charged to this gate.
+    verify_candidates(shared, candidates, "discovery").await;
+    shared.cycles.send_modify(|cycle| *cycle += 1);
+    Ok(())
+}
+
+
+fn signal_first_ready(shared: &Shared) {
+    if *shared.cycles.borrow() == 0 && !shared.snapshots.borrow().is_empty() {
+        shared.cycles.send_modify(|cycle| *cycle += 1);
+    }
+}
+
+// Reuse identical validation for warm-start routes and freshly discovered routes.
+// Publish partial successes immediately; do not wait for the whole inventory.
+async fn verify_candidates(shared: &Arc<Shared>, candidates: Vec<Candidate>, stage: &str) -> usize {
     let verify = stream::iter(candidates).map(|candidate| {
         let shared = shared.clone();
         async move {
@@ -632,6 +803,7 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
                     ok += 1;
                     route.client = Some(client);
                     route.verified = Some(Instant::now());
+                    route.last_verified_unix_ms = unix_ms();
                     route.latency_ms = elapsed;
                     route.next_check = Instant::now() + shared.settings.refresh;
                 }
@@ -643,15 +815,17 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
             }
         }
         drop(state);
-        if tested % 100 == 0 {
+        if tested % 25 == 0 {
             publish(shared).await;
-            println!("http_transport verify_tested={tested} verify_ok={ok}");
+            signal_first_ready(shared);
+            println!("http_transport {stage} verify_tested={tested} verify_ok={ok}");
         }
     }
     publish(shared).await;
-    println!("http_transport cycle_complete verified_tested={tested} verified_ok={ok} working={}", shared.snapshots.borrow().len());
-    shared.cycles.send_modify(|cycle| *cycle += 1);
-    Ok(())
+    signal_first_ready(shared);
+    println!("http_transport {stage}_complete verified_tested={tested} verified_ok={ok} working={}", shared.snapshots.borrow().len());
+    ok
+
 }
 
 async fn mark_failures(shared: &Shared, ids: Vec<String>) {
@@ -684,6 +858,7 @@ async fn publish(shared: &Shared) {
     healthy.sort_by_key(|v| v.latency_ms);
     drop(state);
     shared.snapshots.send_replace(Arc::new(healthy));
+    persist_cached_routes(shared).await;
 }
 
 async fn proxy_handshake(candidate: &Candidate, host: &str, port: u16) -> Result<()> {
@@ -943,6 +1118,7 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
             let mut state = shared.inventory.lock().await;
             if let Some(route) = state.get_mut(&route_id) {
                 route.verified = Some(Instant::now());
+                route.last_verified_unix_ms = unix_ms();
                 route.latency_ms = started.elapsed().as_millis() as u64;
                 route.next_check = Instant::now() + shared.settings.refresh;
             }
@@ -980,6 +1156,13 @@ fn validate_live_payload(url: &str, body: &Bytes) -> Result<()> {
         }));
         ensure!(matches, "live DEX payload lacks expected Solana mint");
     }
+    // Diagnostic validation only: reject a Cloudflare HTML challenge even if
+    // a proxy returns HTTP 200; DEX decoding remains inside source workers.
+    if url.contains("pancakeswap.com/api/") ||
+        url.starts_with("https://frontend-api-v3.pump.fun/coins") {
+        let value: Value = serde_json::from_slice(body).context("live API response is not JSON")?;
+        ensure!(value.is_object() || value.is_array(), "live API JSON must be object or array");
+    }
     Ok(())
 }
 
@@ -988,8 +1171,8 @@ fn validate_live_payload(url: &str, body: &Bytes) -> Result<()> {
 pub async fn live_diagnostic() -> Result<()> {
     let config = Settings::from_env()?;
     ensure!(config.public_discovery || config.list_file.is_some()
-        || !config.extra_txt_urls.is_empty(),
-        "HTTP proxy live mode requires a configured proxy source");
+        || !config.extra_txt_urls.is_empty() || !load_cached_routes(&config).is_empty(),
+        "HTTP proxy live mode requires a configured source or a saved proxy cache");
     let target = env::var("HTTP_TRANSPORT_LIVE_URL")
         .unwrap_or_else(|_| config.probe_url.to_string());
     let calls: usize = env::var("HTTP_TRANSPORT_LIVE_REQUESTS")
