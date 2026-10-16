@@ -553,7 +553,7 @@ pub async fn run() -> Result<()> {
     }
 
     let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.as_slice() == ["--run"] {
+    if args.len() == 1 && args[0] == "--run" {
         return runtime::run().await;
     }
     if args.first().map(String::as_str) == Some("--test") {

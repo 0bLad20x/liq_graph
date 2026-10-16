@@ -35,6 +35,7 @@ where F:Future<Output=Result<()>>+Send+'static {
 async fn supervise<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     let mut failures=0_u32;
+    println!("runtime worker={name} policy=restart started=true");
     loop {
         if *stop.borrow(){return Ok(());}
         let started=Instant::now();
@@ -62,6 +63,7 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
 }
 async fn once<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
+    println!("runtime worker={name} policy=once started=true");
     for attempt in 1..=3 {
         let mut task=tokio::spawn(factory());
         let result=tokio::select!{
