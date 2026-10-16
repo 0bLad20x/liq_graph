@@ -2,7 +2,6 @@
 //! No persistence, completion, reserve polling, or provider-specific HTTP.
 use std::{collections::HashSet, time::Duration, sync::Arc};
 use anyhow::{bail, ensure, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::json;
 use solana_pubkey::Pubkey;
 use tokio::{sync::broadcast, time::{sleep_until, Instant}};
@@ -13,7 +12,8 @@ use crate::{
 
 const PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const POOL_DISC: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
-const MIN_LEN: usize = 245;
+const MINT_OFFSET: usize = 43;
+const MINT_LEN: usize = 64;
 
 #[derive(Clone, Copy)]
 pub struct Settings {
@@ -49,32 +49,25 @@ fn key(d:&[u8], offset:usize) -> Result<Pubkey> {
         .context("truncated PumpSwap public key")?.try_into()?))
 }
 fn record(a:AccountData, program:Pubkey) -> Result<DataRecord> {
-    ensure!(a.owner==program && a.view==AccountView::Full
-        && a.original_len==Some(a.bytes.len()) && a.bytes.len()>=MIN_LEN
-        && a.bytes[..8]==POOL_DISC, "PumpSwap pool owner/discriminator/full length mismatch");
-    let d=&a.bytes;
-    let base=key(d,43)?;
-    let quote=key(d,75)?;
+    // memcmp on the server validates the Pool discriminator. The source only
+    // needs 64 mint bytes; the completion reads Pool+dependent accounts as one
+    // batched, validated RPC sequence instead of discarding full source bytes.
+    ensure!(a.owner==program
+        && a.view==AccountView::Slice{offset:MINT_OFFSET,length:MINT_LEN}
+        && a.bytes.len()==MINT_LEN,
+        "PumpSwap pool owner or 64-byte mint slice mismatch");
+    let base=key(&a.bytes,0)?;
+    let quote=key(&a.bytes,32)?;
     ensure!(base!=Pubkey::default() && quote!=Pubkey::default() && base!=quote,
         "invalid PumpSwap mint pair");
-    let creator=key(d,11)?;
-    let lp=key(d,107)?;
-    let base_vault=key(d,139)?;
-    let quote_vault=key(d,171)?;
-    ensure!(base_vault!=Pubkey::default() && quote_vault!=Pubkey::default()
-        && base_vault!=quote_vault,"invalid PumpSwap vault pair");
-    let payload=json!({
-        "kind":"pumpswap_pool_v1","account_bytes":d.len(),
-        "account_data_base64":STANDARD.encode(d),
-        "creator":creator.to_string(),"lp_mint":lp.to_string(),
-        "base_vault":base_vault.to_string(),"quote_vault":quote_vault.to_string(),
-        "coin_creator":key(d,211)?.to_string(),
-        "is_mayhem_mode":d[243]!=0,"is_cashback_coin":d[244]!=0,
-        "lp_supply_raw":u64::from_le_bytes(d[203..211].try_into()?),
-    });
-    Ok(DataRecord{identity:RecordIdentity::Pool{
-        address:a.address,venue:Venue::PumpSwap,mint_a:Some(base),mint_b:Some(quote)
-    },tvl_usd:None,payload})
+    Ok(DataRecord {
+        identity:RecordIdentity::Pool {address:a.address,venue:Venue::PumpSwap,
+            mint_a:Some(base),mint_b:Some(quote)},
+        tvl_usd:None,
+        payload:json!({"kind":"pumpswap_pool_v1","base_mint":base.to_string(),
+            "quote_mint":quote.to_string(),"data_offset":MINT_OFFSET,
+            "data_bytes":MINT_LEN,"account_space":a.original_len}),
+    })
 }
 
 pub async fn run(rpc:RpcHandle, output:broadcast::Sender<Arc<DataBatch>>,
@@ -82,7 +75,7 @@ pub async fn run(rpc:RpcHandle, output:broadcast::Sender<Arc<DataBatch>>,
     let program:Pubkey=PROGRAM.parse()?;
     let initial=RpcOperation::ProgramV2{program,
         filters:vec![AccountFilter::Memcmp{offset:0,bytes:POOL_DISC.to_vec()}],
-        view:AccountView::Full,cursor:None,changed_since_slot:Some(1),
+        view:AccountView::Slice{offset:MINT_OFFSET,length:MINT_LEN},cursor:None,changed_since_slot:Some(1),
         limit:settings.page_limit};
     ensure!(rpc.supports(&initial), "PumpSwap requires a configured getProgramAccountsV2 provider");
     ensure!(rpc.supports(&RpcOperation::Slot{commitment:"finalized".into()}),
@@ -106,7 +99,7 @@ pub async fn run(rpc:RpcHandle, output:broadcast::Sender<Arc<DataBatch>>,
         loop {
             let next=rpc.call(RpcOperation::ProgramV2{program,
                 filters:vec![AccountFilter::Memcmp{offset:0,bytes:POOL_DISC.to_vec()}],
-                view:AccountView::Full,cursor:cursor.clone(),
+                view:AccountView::Slice{offset:MINT_OFFSET,length:MINT_LEN},cursor:cursor.clone(),
                 changed_since_slot:Some(since),limit:settings.page_limit}).await?;
             let provider=next.provider;
             let RpcAnswer::Program{accounts,next_cursor}=next.answer else {
