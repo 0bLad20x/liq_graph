@@ -503,8 +503,20 @@ pub async fn run(
         observed,changed_batches,final_graph.generation,
         final_graph.qualified_pools,final_graph.groups.len());
 
-    // Diagnostic scenario builds belong only to finite live runs, not the
-    // production runtime: they add multiple expensive builds at shutdown.
+    // Retain the original finite-run threshold probes when this module is
+    // explicitly in DEBUG. Never perform these extra builds in normal --run.
+    if crate::core::logging::enabled(crate::core::logging::Level::Debug,module_path!())
+        && settings.min_tvl_usd.is_none() && !prepared.is_empty() {
+        for threshold in [10.0_f64,100.0,1000.0] {
+            let started=Instant::now();
+            let graph=build(prepared.values().copied().filter(|p|
+                p.tvl_usd.is_some_and(|v|v>=threshold)),generation)?;
+            crate::log_event!(Debug,
+                "scenario min_tvl_usd={} qualified={} groups={} trade_paths={} approx_index_bytes={} build_us={}",
+                threshold,graph.qualified_pools,graph.groups.len(),graph.route_options,
+                graph.approx_index_bytes,started.elapsed().as_micros());
+        }
+    }
     Ok(())
 }
 
