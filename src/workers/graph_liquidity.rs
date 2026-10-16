@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, time::{Instant as TokioInstant, sleep_until}};
+use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
 
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
 
@@ -428,10 +428,10 @@ pub async fn run(
     let mut pending_changes = 0_usize;
     let mut last_source = "persistence_restore";
     let mut next_rebuild = TokioInstant::now();
-    let mut inflight: Option<tokio::task::JoinHandle<Result<(GraphSnapshot, u128, usize, &'static str)>>> = None;
+    let mut builds=JoinSet::<Result<(GraphSnapshot, u128, usize, &'static str)>>::new();
     let mut source_open = true;
     loop {
-        if !source_open && !dirty && inflight.is_none() { break; }
+        if !source_open && !dirty && builds.is_empty() { break; }
         tokio::select! {
             event = input.recv(), if source_open => match event {
                 Ok(batch) => {
@@ -463,11 +463,10 @@ pub async fn run(
                     anyhow::bail!("liquidity graph lost {skipped} Registry update batches"),
                 Err(broadcast::error::RecvError::Closed) => source_open = false,
             },
-            result = async { inflight.as_mut().expect("inflight graph build").await },
-                if inflight.is_some() => {
-                inflight.take();
+            result = builds.join_next(), if !builds.is_empty() => {
                 let (graph, elapsed_us, changes, source) =
-                    result.context("liquidity graph build task panicked")??;
+                    result.context("missing liquidity graph build")?
+                        .context("liquidity graph build task panicked")??;
                 let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
                 let bridge = graph.groups.len()-direct;
                 let oversized = graph.groups.iter()
@@ -480,18 +479,18 @@ pub async fn run(
                 output.send_replace(Arc::new(graph));
                 changed_batches += 1;
             },
-            _ = sleep_until(next_rebuild), if dirty && inflight.is_none() => {
+            _ = sleep_until(next_rebuild), if dirty && builds.is_empty() => {
                 generation = generation.checked_add(1).context("graph generation overflow")?;
                 let snapshot: Vec<PreparedPool> = prepared.values().copied().collect();
                 let changed = std::mem::take(&mut pending_changes);
                 let source = last_source;
                 dirty = false;
                 next_rebuild = TokioInstant::now() + REBUILD_SPACING;
-                inflight = Some(tokio::task::spawn_blocking(move || {
+                builds.spawn_blocking(move || {
                     let started = Instant::now();
                     let graph = build(snapshot.into_iter(), generation)?;
                     Ok((graph, started.elapsed().as_micros(), changed, source))
-                }));
+                });
             },
         }
     }
