@@ -222,7 +222,7 @@ async fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)->Result
                 "Raydium CPMM RPC account address/full-read mismatch");
         }
     }
-    println!("raydium cpmm completion rpc provider={} slot={} accounts={} present={}",
+    crate::log_event!(Debug,"raydium cpmm completion rpc provider={} slot={} accounts={} present={}",
         response.provider,slot,accounts.len(),accounts.iter().filter(|a|a.is_some()).count());
     Ok(ReadBatch{slot,accounts})
 }
@@ -462,7 +462,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started=Instant::now();
-    println!("raydium cpmm completion started min_tvl_usd={} limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
+    crate::log_event!(Info,"raydium cpmm completion started min_tvl_usd={} limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
         MIN_TVL_USD,settings.limit,settings.parallel_batches,settings.pools_per_batch(),
         RETRY_COOLDOWN.as_secs());
     loop {
@@ -526,11 +526,11 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 prepared+=p;incomplete+=i;retryable+=r;
-                println!("raydium cpmm completion batch tier={tier} attempts={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
+                crate::log_event!(Debug,"raydium cpmm completion batch tier={tier} attempts={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
                     results.len(),started.elapsed().as_millis());
                 for result in results.iter().filter(|r|r.status==CompletionStatus::Prepared).take(2) {
                     if let Some(manifest)=&result.manifest {
-                        println!("raydium cpmm manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
+                        crate::log_event!(Debug,"raydium cpmm manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
                             manifest.pool,manifest.validated_slot,manifest.base_a.len(),manifest.base_b.len(),
                             manifest.base_a.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
                                 .collect::<Vec<_>>(),
@@ -539,7 +539,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 for result in results.iter().filter(|r|r.status!=CompletionStatus::Prepared).take(3) {
-                    println!("raydium cpmm completion result pool={} status={:?} reason={}",
+                    crate::log_event!(Debug,"raydium cpmm completion result pool={} status={:?} reason={}",
                         result.pool,result.status,result.reason.as_deref().unwrap_or("-"));
                 }
                 output.send(Arc::new(CompletionResultBatch {source:SOURCE,results}))
@@ -547,13 +547,13 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
             },
             _=pulse.tick()=>{
                 let (a,b,c)=scheduler.counts(Instant::now());
-                println!("raydium cpmm completion backlog seen={} candidate_unknown={a} candidate_incomplete={b} eligible_retry={c} candidates_in_ram={} active_batches={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable} registry_updates={received_updates}",
+                crate::log_event!(Debug,"raydium cpmm completion backlog seen={} candidate_unknown={a} candidate_incomplete={b} eligible_retry={c} candidates_in_ram={} active_batches={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable} registry_updates={received_updates}",
                     seen.len(),scheduler.candidates.len(),tasks.len());
             }
         }
     }
     let (a,b,c)=scheduler.counts(Instant::now());
-    println!("raydium cpmm completion complete min_tvl_usd={MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
+    crate::log_event!(Info,"raydium cpmm completion complete min_tvl_usd={MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }

@@ -102,7 +102,7 @@ pub async fn run(
     let mut cursor = 0_usize;
     let mut published = 0_u64;
 
-    eprintln!(
+    crate::log_event!(Info,
         "jupiter source started keys={} rate_per_key={} batch_size={} targets={}",
         lanes.len(), settings.calls_per_minute_per_key,
         settings.batch_size, input.borrow().len()
@@ -183,7 +183,7 @@ pub async fn run(
             changed = input.changed() => {
                 changed?;
                 cursor = 0;
-                eprintln!("jupiter source targets_updated={}", input.borrow().len());
+                crate::log_event!(Debug,"jupiter source targets_updated={}", input.borrow().len());
             }
             result = pending.join_next(), if has_pending => {
                 let Some(result) = result else { continue };
@@ -191,23 +191,23 @@ pub async fn run(
                 lanes[completion.lane].in_flight = false;
 
                 match completion.outcome {
-                    RequestOutcome::TransportError(error) => eprintln!(
+                    RequestOutcome::TransportError(error) => crate::log_event!(Warn,
                         "jupiter source lane={} transport_error={error}",
                         completion.lane
                     ),
-                    RequestOutcome::BodyError(error) => eprintln!(
+                    RequestOutcome::BodyError(error) => crate::log_event!(Warn,
                         "jupiter source lane={} body_error={error}",
                         completion.lane
                     ),
-                    RequestOutcome::DecodeError(error) => eprintln!(
+                    RequestOutcome::DecodeError(error) => crate::log_event!(Warn,
                         "jupiter source lane={} decode_error={error:#}",
                         completion.lane
                     ),
-                    RequestOutcome::RateLimited(retry_after) => eprintln!(
+                    RequestOutcome::RateLimited(retry_after) => crate::log_event!(Warn,
                         "jupiter source lane={} rate_limited retry_after={}",
                         completion.lane, retry_after.as_deref().unwrap_or("unspecified")
                     ),
-                    RequestOutcome::HttpError(status) => eprintln!(
+                    RequestOutcome::HttpError(status) => crate::log_event!(Warn,
                         "jupiter source lane={} http_status={status}",
                         completion.lane
                     ),
@@ -215,7 +215,7 @@ pub async fn run(
                         let records = batch.records.len();
                         let delivered = output.send(Arc::new(batch)).is_ok();
                         published += 1;
-                        eprintln!(
+                        crate::log_event!(Debug,
                             "jupiter source lane={} requested={} decoded_mints={} rejected_mints={} published={} subscriber={delivered}",
                             completion.lane, completion.requested, records, rejected, published
                         );

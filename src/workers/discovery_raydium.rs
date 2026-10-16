@@ -104,7 +104,7 @@ async fn fetch_page(
         let response = match request.send().await {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("raydium sort={sort} direction={direction} request_error={error:#}");
+                crate::log_event!(Warn,"raydium sort={sort} direction={direction} request_error={error:#}");
                 sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -113,21 +113,21 @@ async fn fetch_page(
             let seconds = response.headers().get(reqwest::header::RETRY_AFTER)
                 .and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).unwrap_or(5);
             cool_down(gate, Duration::from_secs(seconds)).await;
-            eprintln!("raydium sort={sort} direction={direction} http_429 cooldown_s={seconds}");
+            crate::log_event!(Info,"raydium sort={sort} direction={direction} http_429 cooldown_s={seconds}");
             continue;
         }
         if response.status().is_client_error() {
             bail!("Raydium {sort}/{direction} HTTP {}", response.status());
         }
         if !response.status().is_success() {
-            eprintln!("raydium sort={sort} direction={direction} http_error={}",response.status());
+            crate::log_event!(Warn,"raydium sort={sort} direction={direction} http_error={}",response.status());
             sleep(Duration::from_secs(2)).await;
             continue;
         }
         let bytes = response.bytes().await.context("read Raydium page bytes")?;
         let envelope: Response = serde_json::from_slice(&bytes).context("decode Raydium envelope")?;
         if !envelope.success {
-            eprintln!("raydium sort={sort} direction={direction} success=false retrying_cursor");
+            crate::log_event!(Info,"raydium sort={sort} direction={direction} success=false retrying_cursor");
             sleep(Duration::from_secs(2)).await;
             continue;
         }
@@ -155,7 +155,7 @@ fn publish(
                 rejected += 1;
                 if error.to_string().contains("unknown Raydium programId") { rejected_unknown += 1; }
                 if rejected <= 5 {
-                    eprintln!("raydium sort={sort} direction={direction} decode_rejected error={error:#}");
+                    crate::log_event!(Warn,"raydium sort={sort} direction={direction} decode_rejected error={error:#}");
                 }
             }
         }
@@ -272,13 +272,13 @@ async fn route_pass(
             }
         }
         if page_no == 1 || page_no % 10 == 0 {
-            println!("raydium route sort={sort} direction={direction} pages={page_no} received={received} accepted={accepted} rejected={rejected} rejected_unknown_program={rejected_unknown} elapsed_ms={}",started.elapsed().as_millis());
+            crate::log_event!(Info,"raydium route sort={sort} direction={direction} pages={page_no} received={received} accepted={accepted} rejected={rejected} rejected_unknown_program={rejected_unknown} elapsed_ms={}",started.elapsed().as_millis());
         }
         cursor = next;
         if stopped_on_overlap || cursor.is_none()
             || settings.max_pages.is_some_and(|max| page_no >= max) { break; }
     }
-    println!("raydium route complete sort={sort} direction={direction} pages={page_no} received={received} accepted={accepted} rejected={rejected} rejected_unknown_program={rejected_unknown} early_overlap={stopped_on_overlap} elapsed_ms={}",started.elapsed().as_millis());
+    crate::log_event!(Info,"raydium route complete sort={sort} direction={direction} pages={page_no} received={received} accepted={accepted} rejected={rejected} rejected_unknown_program={rejected_unknown} early_overlap={stopped_on_overlap} elapsed_ms={}",started.elapsed().as_millis());
     Ok(())
 }
 
@@ -299,7 +299,7 @@ async fn liquidity_pair(
                 "liquidity", "desc", Some(&overlap)),
         )?;
         let state = overlap.lock().await;
-        println!("raydium liquidity_pair pass={pass} overlapped={} common_addresses={} asc_last_tvl={:?} desc_last_tvl={:?} asc_sorted={} desc_sorted={}",
+        crate::log_event!(Info,"raydium liquidity_pair pass={pass} overlapped={} common_addresses={} asc_last_tvl={:?} desc_last_tvl={:?} asc_sorted={} desc_sorted={}",
             state.crossed, state.common_addresses, state.asc_last, state.desc_last,
             state.ascending_sorted, state.descending_sorted);
         drop(state);
@@ -329,18 +329,18 @@ async fn refresh_head(
         let started = Instant::now();
         match fetch_page(&client, &gate, spacing, sort, direction, None).await {
             Ok(page) => match publish(&output, page.data, sort, direction) {
-                Ok(decoded) => println!(
+                Ok(decoded) => crate::log_event!(Debug,
                     "raydium head_refresh sort={sort} direction={direction} received={} accepted={} rejected={} elapsed_ms={}",
                     decoded.received, decoded.accepted, decoded.rejected,
                     started.elapsed().as_millis(),
                 ),
                 Err(error) => {
-                    eprintln!("raydium head_refresh_stopped sort={sort} direction={direction} error={error:#}");
+                    crate::log_event!(Warn,"raydium head_refresh_stopped sort={sort} direction={direction} error={error:#}");
                     return;
                 }
             },
             Err(error) => {
-                eprintln!("raydium head_refresh_failed sort={sort} direction={direction} error={error:#}");
+                crate::log_event!(Warn,"raydium head_refresh_failed sort={sort} direction={direction} error={error:#}");
             }
         }
     }
@@ -358,7 +358,7 @@ pub async fn run(
         "RAYDIUM_HEAD_REFRESH_SECONDS must be 5..=3600");
     let spacing = Duration::from_secs_f64(1.0/f64::from(settings.rps));
     let gate = Arc::new(Mutex::new(Instant::now()));
-    println!("raydium discovery routes=10 head_refresh_seconds={refresh_seconds} liquidity_overlap_min_common={OVERLAP_CONFIRM_ADDRESSES} rps={}",settings.rps);
+    crate::log_event!(Info,"raydium discovery routes=10 head_refresh_seconds={refresh_seconds} liquidity_overlap_min_common={OVERLAP_CONFIRM_ADDRESSES} rps={}",settings.rps);
 
     let mut refresh_tasks = Vec::with_capacity(ROUTES.len());
     for (sort, direction) in ROUTES {
@@ -377,7 +377,7 @@ pub async fn run(
             let result = ordinary_lane(client, gate, spacing, output, settings, sort, direction).await;
             if !settings.once {
                 if let Err(error) = &result {
-                    eprintln!("raydium route_stopped sort={sort} direction={direction} error={error:#}");
+                    crate::log_event!(Warn,"raydium route_stopped sort={sort} direction={direction} error={error:#}");
                 }
                 Ok(())
             } else { result }
@@ -387,7 +387,7 @@ pub async fn run(
         let result = liquidity_pair(client, gate, spacing, output, settings).await;
         if !settings.once {
             if let Err(error) = &result {
-                eprintln!("raydium liquidity_pair_stopped error={error:#}");
+                crate::log_event!(Warn,"raydium liquidity_pair_stopped error={error:#}");
             }
             Ok(())
         } else { result }

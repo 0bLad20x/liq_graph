@@ -124,7 +124,7 @@ impl Collector {
         self.accepted += 1;
         if self.pending.len() == BATCH { self.flush()?; }
         if self.accepted % 50000 == 0 {
-            println!("rpc full scan progress unique={} duplicates={}",
+            crate::log_event!(Info,"rpc full scan progress unique={} duplicates={}",
                 self.accepted, self.duplicates);
         }
         Ok(())
@@ -240,7 +240,7 @@ fn scan_one(index: usize, url: &str, settings: &Settings, collector: &mut Collec
     parse?;
     ensure!(exit.success(), "full scan RPC_{index} HTTP transfer failed: {exit}");
     collector.flush()?;
-    println!("rpc full scan provider={} complete=true unique={} duplicates={} elapsed_ms={}",
+    crate::log_event!(Info,"rpc full scan provider={} complete=true unique={} duplicates={} elapsed_ms={}",
         index, collector.accepted, collector.duplicates, started.elapsed().as_millis());
     Ok(())
 }
@@ -253,16 +253,16 @@ fn blocking_run(settings: Settings, output: broadcast::Sender<Arc<DataBatch>>) -
     };
     let mut errors = Vec::new();
     for (index,url) in &settings.providers {
-        println!("rpc full scan start provider={} venue={:?} program={} slice_bytes=0",
+        crate::log_event!(Info,"rpc full scan start provider={} venue={:?} program={} slice_bytes=0",
             index, settings.venue, settings.program);
         match scan_one(*index, url, &settings, &mut collector) {
             Ok(()) => {
-                println!("rpc full scan summary complete=true program={} venue={:?} unique={} duplicates={}",
+                crate::log_event!(Info,"rpc full scan summary complete=true program={} venue={:?} unique={} duplicates={}",
                     settings.program, settings.venue, collector.accepted, collector.duplicates);
                 return Ok(());
             },
             Err(e) => {
-                eprintln!("rpc full scan provider={} failed={} retrying_next_provider=true",index,e);
+                crate::log_event!(Warn,"rpc full scan provider={} failed={} retrying_next_provider=true",index,e);
                 errors.push(format!("RPC_{index}: {e}"));
             }
         }

@@ -112,7 +112,7 @@ pub async fn run(rpc:RpcHandle, output:broadcast::Sender<Arc<DataBatch>>,
                 if !seen.insert(account.address) { continue; }
                 match record(account,program) {
                     Ok(record)=>records.push(record),
-                    Err(e)=>{rejected+=1;eprintln!("pumpswap discovery invalid_account={e:#}");}
+                    Err(e)=>{rejected+=1;crate::log_event!(Warn,"pumpswap discovery invalid_account={e:#}");}
                 }
             }
             let accepted=records.len();
@@ -121,7 +121,7 @@ pub async fn run(rpc:RpcHandle, output:broadcast::Sender<Arc<DataBatch>>,
                     received_at_ms:next.received_at_ms,records}))
                     .map_err(|_|anyhow::anyhow!("PumpSwap discovery has no Registry consumer"))?;
             }
-            println!("pumpswap rolling pass={pass} page={pages} provider={provider} received_total={received} accepted_page={accepted} unique={} rejected={rejected} next={}",
+            crate::log_event!(Info,"pumpswap rolling pass={pass} page={pages} provider={provider} received_total={received} accepted_page={accepted} unique={} rejected={rejected} next={}",
                 seen.len(),next_cursor.is_some());
             match next_cursor {
                 None=>{complete=true;break;}
@@ -133,7 +133,7 @@ pub async fn run(rpc:RpcHandle, output:broadcast::Sender<Arc<DataBatch>>,
             }
             if settings.max_pages.is_some_and(|max|pages>=max) {break;}
         }
-        println!("pumpswap rolling summary pass={pass} current_slot={current} since_slot={since} pages={pages} received={received} unique={} rejected={rejected} complete={complete} elapsed_ms={}",
+        crate::log_event!(Info,"pumpswap rolling summary pass={pass} current_slot={current} since_slot={since} pages={pages} received={received} unique={} rejected={rejected} complete={complete} elapsed_ms={}",
             seen.len(),started.elapsed().as_millis());
         if settings.once {return Ok(());}
         ensure!(complete,"continuous PumpSwap scan must not truncate pagination");

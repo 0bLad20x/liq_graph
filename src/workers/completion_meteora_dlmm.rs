@@ -256,7 +256,7 @@ async fn read(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>) ->
     let provider = response.provider.clone();
     let RpcAnswer::Multiple { slot, accounts } = response.answer
         else { bail!("RPC returned unexpected answer to getMultipleAccounts"); };
-    println!("execution completion rpc method=getMultipleAccounts provider={provider} slot={slot} accounts={} present={}",
+    crate::log_event!(Debug,"execution completion rpc method=getMultipleAccounts provider={provider} slot={slot} accounts={} present={}",
         accounts.len(), accounts.iter().filter(|item|item.is_some()).count());
     ensure!(accounts.len() == expected.len(), "RPC result cardinality mismatch");
     ensure!(min_slot.is_none_or(|minimum| slot >= minimum), "RPC result below minContextSlot");
@@ -778,7 +778,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let started=Instant::now();
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    println!("dlmm completion started min_tvl_usd={} limit={} (0=unbounded) parallel={} pools_per_batch={} retry_cooldown_s={}",
+    crate::log_event!(Info,"dlmm completion started min_tvl_usd={} limit={} (0=unbounded) parallel={} pools_per_batch={} retry_cooldown_s={}",
         MIN_COMPLETION_TVL_USD,settings.limit,settings.parallel_batches,
         POOLS_PER_WORK_BATCH,RETRY_COOLDOWN.as_secs());
 
@@ -859,7 +859,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 prepared_count+=prep;incomplete_count+=inc;retryable_count+=retry;
-                println!("dlmm completion batch tier={} attempts={} prepared={} incomplete={} retryable={} missing_arrays={} unsupported_mints={} total_attempts={} first_attempts={} retries={} elapsed_ms={}",
+                crate::log_event!(Warn,"dlmm completion batch tier={} attempts={} prepared={} incomplete={} retryable={} missing_arrays={} unsupported_mints={} total_attempts={} first_attempts={} retries={} elapsed_ms={}",
                     tier,results.len(),prep,inc,retry,missing_arrays,unsupported_mints,
                     total_attempts,initial_attempts,repeated_attempts,started.elapsed().as_millis());
                 // Small, fully evaluated batches flow to Registry/Persistence/Graph at once.
@@ -869,7 +869,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
             },
             _=pulse.tick()=>{
                 let (unknown,incomplete,retryable,blocked)=scheduler.classify();
-                println!("dlmm completion backlog distinct_dlmm_seen={} eligible_unknown={} eligible_incomplete={} cooldown_retryable={} blocked_incompatible={} candidates_in_ram={} active_batches={} first_attempts={} retries={} prepared={} incomplete={} retryable={} observed_updates={}",
+                crate::log_event!(Debug,"dlmm completion backlog distinct_dlmm_seen={} eligible_unknown={} eligible_incomplete={} cooldown_retryable={} blocked_incompatible={} candidates_in_ram={} active_batches={} first_attempts={} retries={} prepared={} incomplete={} retryable={} observed_updates={}",
                     unique_dlmm_seen.len(),unknown,incomplete,retryable,blocked,scheduler.candidates.len(),tasks.len(),
                     initial_attempts,repeated_attempts,prepared_count,incomplete_count,retryable_count,observed);
             }
@@ -877,7 +877,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     }
 
     let (unknown,incomplete,retryable,blocked)=scheduler.classify();
-    println!("dlmm completion complete min_tvl_usd={} distinct_dlmm_seen={} observed_updates={} first_attempts={} retries={} prepared={} incomplete={} retryable={} eligible_unknown_left={} eligible_incomplete_left={} eligible_retryable_left={} blocked_incompatible={} elapsed_ms={}",
+    crate::log_event!(Info,"dlmm completion complete min_tvl_usd={} distinct_dlmm_seen={} observed_updates={} first_attempts={} retries={} prepared={} incomplete={} retryable={} eligible_unknown_left={} eligible_incomplete_left={} eligible_retryable_left={} blocked_incompatible={} elapsed_ms={}",
         MIN_COMPLETION_TVL_USD,unique_dlmm_seen.len(),observed,initial_attempts,repeated_attempts,
         prepared_count,incomplete_count,retryable_count,unknown,incomplete,retryable,
         blocked,started.elapsed().as_millis());
@@ -895,18 +895,18 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                 for result in &batch.results {
                     results += 1;
                     if let Some(evidence) = &result.evidence {
-                        println!("execution evidence pool={} kind={} version={} payload={}",
+                        crate::log_event!(Debug,"execution evidence pool={} kind={} version={} payload={}",
                             result.pool, evidence.kind, evidence.version, evidence.payload);
                     }
                     if let Some(mints) = &result.mints {
                         for mint in mints {
-                            println!("execution mint pool={} mint={} token_2022={} extensions={:?} unsupported={:?}",
+                            crate::log_event!(Warn,"execution mint pool={} mint={} token_2022={} extensions={:?} unsupported={:?}",
                                 result.pool, mint.address, mint.token_2022, mint.extensions, mint.unsupported);
                         }
                     }
                     if let Some(manifest) = &result.manifest {
                         manifests += 1;
-                        println!(
+                        crate::log_event!(Debug,
                             "execution manifest pool={} status={:?} slot={} mint_a={} mint_b={} \
                              base_a_accounts={:?} base_b_accounts={:?}",
                             manifest.pool, result.status, manifest.validated_slot,
@@ -919,12 +919,12 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
                                 .collect::<Vec<_>>(),
                         );
                     } else {
-                        println!("execution result pool={} status={:?} slot={:?} reason={}",
+                        crate::log_event!(Debug,"execution result pool={} status={:?} slot={:?} reason={}",
                             result.pool, result.status, result.validated_slot,
                             result.reason.as_deref().unwrap_or("-"));
                     }
                 }
-                println!("execution completion consumer source={} batches={} results={}",
+                crate::log_event!(Debug,"execution completion consumer source={} batches={} results={}",
                     batch.source, batches, results);
             }
             Err(broadcast::error::RecvError::Lagged(count)) =>
@@ -932,6 +932,6 @@ pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>)
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    println!("execution completion consumer complete batches={batches} results={results} validated_manifests={manifests}");
+    crate::log_event!(Info,"execution completion consumer complete batches={batches} results={results} validated_manifests={manifests}");
     Ok(())
 }

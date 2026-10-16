@@ -35,12 +35,12 @@ pub async fn run(mut input: broadcast::Receiver<Arc<DataBatch>>, fail_on_lag: bo
                     let payload_fields = sample
                         .and_then(|record| record.payload.as_object())
                         .map_or(0, |object| object.len());
-                    println!(
+                    crate::log_event!(Debug,
                         "DataBatch source={} received_at_ms={} records={} payload_fields={} {}",
                         batch.source, batch.received_at_ms, batch.records.len(), payload_fields, identity,
                     );
                 } else if received % 25 == 0 {
-                    println!(
+                    crate::log_event!(Debug,
                         "DataBatch source={} received_batches={} received_records={}",
                         batch.source, received, received_records,
                     );
@@ -48,19 +48,19 @@ pub async fn run(mut input: broadcast::Receiver<Arc<DataBatch>>, fail_on_lag: bo
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 lagged += skipped;
-                eprintln!("DataBatch consumer lagged missed_batches={skipped}");
+                crate::log_event!(Warn,"DataBatch consumer lagged missed_batches={skipped}");
                 if fail_on_lag { anyhow::bail!("REST broadcast overflow: diagnostic lost {skipped} source batches"); }
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 
-    println!(
+    crate::log_event!(Warn,
         "DataBatch output complete source={} received_batches={received} received_records={received_records} lagged_batches={lagged}",
         source.unwrap_or("unknown"),
     );
     let mut per_source = sources.into_iter().collect::<Vec<_>>();
     per_source.sort_by_key(|(name,_)| *name);
-    println!("DataBatch per_source_batches_records={per_source:?} strict_lag={fail_on_lag}");
+    crate::log_event!(Debug,"DataBatch per_source_batches_records={per_source:?} strict_lag={fail_on_lag}");
     Ok(())
 }

@@ -454,7 +454,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started=Instant::now();
-    println!("orca completion started min_tvl_usd={} limit={} radius={} parallel={} pools_per_batch={}",
+    crate::log_event!(Info,"orca completion started min_tvl_usd={} limit={} radius={} parallel={} pools_per_batch={}",
         settings.min_tvl_usd,settings.limit,settings.radius,
         settings.parallel_batches,settings.pools_per_batch());
     loop {
@@ -515,11 +515,11 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 prepared+=p;incomplete+=i;retryable+=r;
-                println!("orca completion batch tier={tier} pools={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
+                crate::log_event!(Debug,"orca completion batch tier={tier} pools={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
                     results.len(),started.elapsed().as_millis());
                 for item in results.iter().filter(|v|v.status==CompletionStatus::Prepared).take(2) {
                     if let Some(manifest)=&item.manifest {
-                        println!("orca manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
+                        crate::log_event!(Debug,"orca manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
                             manifest.pool,manifest.validated_slot,manifest.base_a.len(),
                             manifest.base_b.len(),
                             manifest.base_a.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
@@ -529,7 +529,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 for item in results.iter().filter(|v|v.status!=CompletionStatus::Prepared).take(3) {
-                    println!("orca completion result pool={} status={:?} reason={}",
+                    crate::log_event!(Debug,"orca completion result pool={} status={:?} reason={}",
                         item.pool,item.status,item.reason.as_deref().unwrap_or("-"));
                 }
                 output.send(Arc::new(CompletionResultBatch{source:SOURCE,results}))
@@ -537,13 +537,13 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
             },
             _=pulse.tick()=>{
                 let (upgrade,a,b,c)=scheduler.counts(Instant::now());
-                println!("orca completion backlog seen={} evidence_upgrade={upgrade} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
+                crate::log_event!(Debug,"orca completion backlog seen={} evidence_upgrade={upgrade} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
                     seen.len(),scheduler.candidates.len(),tasks.len());
             }
         }
     }
     let (upgrade,a,b,c)=scheduler.counts(Instant::now());
-    println!("orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_evidence_upgrade={upgrade} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
+    crate::log_event!(Info,"orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_evidence_upgrade={upgrade} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }

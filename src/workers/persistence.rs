@@ -365,7 +365,7 @@ impl Persistence {
             .context("connect PostgreSQL for liq_graph persistence")?;
         tokio::spawn(async move {
             if let Err(err)=connection.await {
-                eprintln!("persistence connection failed: {err}");
+                crate::log_event!(Warn,"persistence connection failed: {err}");
             }
         });
         client.batch_execute(CREATE_TABLE).await.context("initialize liq_graph_pool_cache")?;
@@ -377,7 +377,7 @@ impl Persistence {
         if !v2 {
             client.batch_execute(MIGRATE_TABLE).await
                 .context("migrate liq_graph_pool_cache V2")?;
-            println!("persistence migrated_schema=V2");
+            crate::log_event!(Info,"persistence migrated_schema=V2");
         }
         Ok(Self {client})
     }
@@ -461,7 +461,7 @@ impl Persistence {
                 after=Some(raw_address);
             }
         }
-        println!("persistence restored pools={} unknown={} prepared={} incomplete={} table={TABLE}",
+        crate::log_event!(Info,"persistence restored pools={} unknown={} prepared={} incomplete={} table={TABLE}",
             pools.len(),unknown,prepared,incomplete);
         Ok(pools)
     }
@@ -510,7 +510,7 @@ impl Persistence {
             };
             *written+=usize::try_from(changed)?;
             for pool in &batch { staged.remove(&pool.address); }
-            println!("persistence batch kind={} input={} upserted={} total_upserted={} sample_pool={}",
+            crate::log_event!(Debug,"persistence batch kind={} input={} upserted={} total_upserted={} sample_pool={}",
                 match kind{WriteKind::Identity=>"identity",WriteKind::Completion=>"completion"},
                 batch.len(),changed,*written,batch[0].address);
         }
@@ -579,7 +579,7 @@ impl Persistence {
         }
         self.flush(&mut pending_identity,WriteKind::Identity,&mut written_identity).await?;
         self.flush(&mut pending_completion,WriteKind::Completion,&mut written_completion).await?;
-        println!("persistence complete identities_seen={identities_seen} completions_seen={completions_seen} identities_upserted={written_identity} completions_upserted={written_completion} table={TABLE}");
+        crate::log_event!(Info,"persistence complete identities_seen={identities_seen} completions_seen={completions_seen} identities_upserted={written_identity} completions_upserted={written_completion} table={TABLE}");
         Ok(())
     }
 }

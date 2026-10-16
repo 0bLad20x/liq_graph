@@ -102,7 +102,7 @@ async fn fetch_page(
         ]).send().await {
             Ok(response) => response,
             Err(error) => {
-                eprintln!("pancakeswap page={page} request_error={error:#}");
+                crate::log_event!(Warn,"pancakeswap page={page} request_error={error:#}");
                 sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -116,21 +116,21 @@ async fn fetch_page(
                 .unwrap_or(10);
             let delay = Duration::from_secs(retry_seconds.max(1));
             cooldown(gate, delay).await;
-            eprintln!("pancakeswap page={page} http_429 cooldown_s={retry_seconds}");
+            crate::log_event!(Debug,"pancakeswap page={page} http_429 cooldown_s={retry_seconds}");
             continue;
         }
         if status.is_client_error() {
             bail!("PancakeSwap page={page} HTTP {status}");
         }
         if !status.is_success() {
-            eprintln!("pancakeswap page={page} http_error={status}");
+            crate::log_event!(Warn,"pancakeswap page={page} http_error={status}");
             sleep(RETRY_DELAY).await;
             continue;
         }
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("pancakeswap page={page} body_error={error:#}");
+                crate::log_event!(Warn,"pancakeswap page={page} body_error={error:#}");
                 sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -138,7 +138,7 @@ async fn fetch_page(
         let envelope: Response = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("pancakeswap page={page} json_error={error:#}");
+                crate::log_event!(Warn,"pancakeswap page={page} json_error={error:#}");
                 sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -222,7 +222,7 @@ pub async fn run(
                         Err(error) => {
                             rejected += 1;
                             if rejected <= 5 {
-                                eprintln!("pancakeswap page={next_publish} rejected_pool={error:#}");
+                                crate::log_event!(Warn,"pancakeswap page={next_publish} rejected_pool={error:#}");
                             }
                         }
                     }
@@ -244,7 +244,7 @@ pub async fn run(
                 break;
             }
         }
-        println!(
+        crate::log_event!(Info,
             "pancakeswap pass={pass} pages={pages} first_empty_page={last_empty_page:?} received={received} unique={accepted} duplicates={duplicates} rejected={rejected} rpm={} elapsed_ms={}",
             settings.rpm, started.elapsed().as_millis()
         );
