@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
@@ -42,6 +42,7 @@ struct Cli {
     pumpswap_discovery_live: bool,
     pumpswap_completion_live: bool,
     pumpswap_rolling: bool,
+    rpc_full_scan_live: bool,
     graph_live: bool,
     completion_limit: Option<usize>,
     persistence_write_live: bool,
@@ -71,6 +72,7 @@ fn settings() -> Result<Cli> {
     let mut pumpswap_discovery_live = false;
     let mut pumpswap_completion_live = false;
     let mut pumpswap_rolling = false;
+    let mut rpc_full_scan_live = false;
     let mut graph_live = false;
     let mut completion_limit = None;
     let mut persistence_write_live = false;
@@ -98,6 +100,7 @@ fn settings() -> Result<Cli> {
             "--pumpswap-discovery-live" => { pumpswap_discovery_live = true; once = true; },
             "--pumpswap-completion-live" => { pumpswap_completion_live = true; once = true; },
             "--pumpswap-rolling" => { pumpswap_rolling = true; },
+            "--rpc-full-scan-live" => { rpc_full_scan_live = true; once = true; },
             "--graph-live" => { graph_live = true; once = true; },
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
@@ -224,6 +227,17 @@ fn settings() -> Result<Cli> {
     let pump_modes = usize::from(pumpswap_discovery_live)
         + usize::from(pumpswap_completion_live) + usize::from(pumpswap_rolling);
     ensure!(pump_modes <= 1, "select only one PumpSwap mode");
+    if rpc_full_scan_live {
+        ensure!(!jupiter_only && !rpc_live && !http_transport_live && !completion_live
+            && !damm_v2_completion_live && !orca_completion_live && !raydium_amm_v4_completion_live
+            && !raydium_cpmm_completion_live && !raydium_clmm_completion_live
+            && !pancakeswap_clmm_completion_live && !byreal_clmm_completion_live
+            && !manifest_completion_live && pump_modes == 0 && !graph_live
+            && !persistence_write_live && !persistence_restore_live && !persistence_v2_live
+            && !stability_live && !rest_discovery_live && rest_source_only.is_none()
+            && max_pages.is_none() && completion_limit.is_none(),
+            "RPC Full Scan checkpoint mode is exclusive; no --pages or Completion");
+    }
     if pump_modes > 0 {
         ensure!(!jupiter_only && !rpc_live && !http_transport_live
             && !completion_live && !damm_v2_completion_live && !orca_completion_live
@@ -256,6 +270,7 @@ fn settings() -> Result<Cli> {
         pumpswap_discovery_live,
         pumpswap_completion_live,
         pumpswap_rolling,
+        rpc_full_scan_live,
         graph_live,
         completion_limit,
         persistence_write_live,
@@ -501,6 +516,36 @@ pub async fn run() -> Result<()> {
     }
 
     let cli = settings()?;
+    if cli.rpc_full_scan_live {
+        let settings = discovery_rpc_full::Settings::from_env()?;
+        let db = persistence::Persistence::connect().await?;
+        let registry = pool_registry::PoolRegistry::default();
+        let restored = registry.restore(db.restore().await?)?;
+        println!("rpc full scan initial restored_pools={restored}");
+        let (source, source_rx) = broadcast::channel::<Arc<core::DataBatch>>(256);
+        let registry_rx = source.subscribe();
+        let (updates, _) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(256);
+        let writer_rx = updates.subscribe();
+        let (source_done, _) = watch::channel(false);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(diagnostic_source::run(source_rx, true));
+        tasks.spawn(db.run(writer_rx));
+        tasks.spawn(pool_registry::run(registry_rx, None, registry, updates.clone(), source_done, true));
+        drop(updates);
+        let scanned = discovery_rpc_full::run(source, settings).await;
+        let mut downstream = Ok(());
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result.context("full scan downstream task join").and_then(|r|r) {
+                downstream = Err(e);
+                tasks.abort_all();
+                break;
+            }
+        }
+        downstream?;
+        scanned?;
+        println!("rpc full scan live complete=true");
+        return Ok(());
+    }
     if cli.pumpswap_discovery_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(256);
