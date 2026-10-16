@@ -238,8 +238,6 @@ fn settings() -> Result<Cli> {
             "continuous PumpSwap rolling cannot use --once or --pages");
         ensure!(!pumpswap_discovery_live || completion_limit.is_none(),
             "PumpSwap discovery alone does not support --completion-limit");
-        ensure!(!pumpswap_completion_live || max_pages.is_none(),
-            "PumpSwap completion requires an untruncated discovery scan");
     }
     Ok(Cli {
         meteora: discovery_meteora_dlmm::Settings { once, max_pages },
