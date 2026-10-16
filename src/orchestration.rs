@@ -2,6 +2,8 @@
 
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
+mod runtime;
+
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
@@ -53,8 +55,8 @@ struct Cli {
     rest_source_only: Option<SourceSet>,
 }
 
-fn settings() -> Result<Cli> {
-    let mut args = env::args().skip(1);
+fn settings(args: impl Iterator<Item=String>) -> Result<Cli> {
+    let mut args = args;
     let mut once = false;
     let mut max_pages = None;
     let mut jupiter_only = false;
@@ -508,6 +510,41 @@ fn spawn_jupiter(
     });
 }
 
+fn test_command(worker: &str) -> Result<&'static str> {
+    let legacy=match worker {
+        "completion_meteora_dlmm"=>"--completion-live",
+        "completion_meteora_damm_v2"=>"--damm-v2-completion-live",
+        "completion_orca_whirlpool"=>"--orca-completion-live",
+        "completion_raydium_amm_v4"=>"--raydium-amm-v4-completion-live",
+        "completion_raydium_cpmm"=>"--raydium-cpmm-completion-live",
+        "completion_raydium_clmm"=>"--raydium-clmm-completion-live",
+        "completion_pancakeswap_clmm"=>"--pancakeswap-clmm-completion-live",
+        "completion_byreal_clmm"=>"--byreal-clmm-completion-live",
+        "completion_manifest"=>"--manifest-completion-live",
+        "completion_pumpswap"=>"--pumpswap-completion-live",
+        "discovery_meteora_dlmm"=>"--once",
+        "discovery_meteora_damm_v2"=>"--damm-v2-live",
+        "discovery_orca_whirlpool"=>"--orca-live",
+        "discovery_raydium"=>"--raydium-live",
+        "discovery_pancakeswap_clmm"=>"--pancakeswap-live",
+        "discovery_byreal_clmm"=>"--byreal-live",
+        "discovery_manifest"=>"--manifest-live",
+        "discovery_pumpswap"=>"--pumpswap-discovery-live",
+        "discovery_rpc_full"=>"--rpc-full-scan-live",
+        "discovery_pumpswap_rolling"=>"--pumpswap-rolling",
+        "source_jupiter_mint"=>"--jupiter-only",
+        "graph_liquidity"=>"--graph-live",
+        "persistence_write"=>"--persistence-write-live",
+        "persistence_restore"=>"--persistence-restore-live",
+        "persistence_discovery"=>"--persistence-v2-live",
+        "rpc_transport"=>"--rpc-live",
+        "http_transport"=>"--http-transport-live",
+        "discovery_rest_all"=>"--rest-discovery-live",
+        _=>bail!("unknown --test module {worker}"),
+    };
+    Ok(legacy)
+}
+
 pub async fn run() -> Result<()> {
     match dotenvy::dotenv() {
         Ok(_) => {}
@@ -515,7 +552,17 @@ pub async fn run() -> Result<()> {
         Err(error) => return Err(error).context("load .env"),
     }
 
-    let cli = settings()?;
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.as_slice() == ["--run"] {
+        return runtime::run().await;
+    }
+    if args.first().map(String::as_str) == Some("--test") {
+        ensure!(args.len()>=2,"--test requires a module name");
+        let normalized=test_command(&args[1])?.to_string();
+        args.drain(..2);
+        args.insert(0,normalized);
+    }
+    let cli = settings(args.into_iter())?;
     if cli.rpc_full_scan_live {
         let settings = discovery_rpc_full::Settings::from_env()?;
         let db = persistence::Persistence::connect().await?;
