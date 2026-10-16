@@ -30,7 +30,22 @@ fn enabled(key:&str)->Result<bool>{
 fn critical<F>(tasks:&mut JoinSet<Result<()>>,name:&'static str,run:F)
 where F:Future<Output=Result<()>>+Send+'static {
     println!("runtime worker={name} policy=fatal started=true");
-    tasks.spawn(async move {run.await.with_context(||format!("critical worker {name}"))});
+    tasks.spawn(async move {
+        let started=Instant::now();
+        // Join the inner task to preserve the worker name even if its future panics.
+        // AbortOnDrop prevents an orphaned worker if its supervisor is cancelled.
+        let mut worker=AbortOnDrop(tokio::spawn(run));
+        let result=match (&mut worker.0).await {
+            Ok(Ok(()))=>Ok(()),
+            Ok(Err(error))=>Err(error).with_context(||format!("critical worker {name}")),
+            Err(error)=>Err(anyhow!("critical worker {name} panicked_or_cancelled={error}")),
+        };
+        if let Err(ref error)=result {
+            eprintln!("runtime fatal worker={name} elapsed_ms={} error={error:#}",
+                started.elapsed().as_millis());
+        }
+        result
+    });
 }
 async fn supervise<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
@@ -172,11 +187,20 @@ pub async fn run()->Result<()>{
     critical(&mut tasks,"persistence",database.run(updates.subscribe()));
     critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
         updates.subscribe(),graph_tx,graph_settings));
-    critical(&mut tasks,"graph_watch_catalog.observe",graph_watch_catalog::observe(catalog_rx));
+    // Observers must not take down the state-owning runtime on diagnostic lag.
+    tasks.spawn(supervise("observer.graph_watch_catalog",stop_rx.clone(),move||{
+        let input=catalog_rx.clone();
+        async move{graph_watch_catalog::observe(input).await}
+    }));
     let jupiter_mints=if jupiter_settings()?.is_some(){
         let (mint_tx,mint_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(32);
-        critical(&mut tasks,"source_jupiter_mint.observe",diagnostic_source::run(jupiter_rx,true));
+        let observer_sender=jupiter_out.clone();
+        drop(jupiter_rx);
+        tasks.spawn(supervise("observer.source_jupiter_mint",stop_rx.clone(),move||{
+            let input=observer_sender.subscribe();
+            async move{diagnostic_source::run(input,true).await}
+        }));
         let client=http.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
             let output=jupiter_out.clone();let client=client.clone();
@@ -190,9 +214,18 @@ pub async fn run()->Result<()>{
     }else{None};
     critical(&mut tasks,"graph_watch_catalog",graph_watch_catalog::run(
         graph_rx,catalog_tx,jupiter_mints));
-    critical(&mut tasks,"diagnostic_source",diagnostic_source::run(diagnostic_rx,true));
-    critical(&mut tasks,"pool_registry.observe",
-        pool_registry::observe_updates(observe_rx,true,true));
+    drop(diagnostic_rx);
+    let diagnostic_sender=source.clone();
+    tasks.spawn(supervise("observer.discovery_batches",stop_rx.clone(),move||{
+        let input=diagnostic_sender.subscribe();
+        async move{diagnostic_source::run(input,true).await}
+    }));
+    drop(observe_rx);
+    let registry_observer_sender=updates.clone();
+    tasks.spawn(supervise("observer.registry_updates",stop_rx.clone(),move||{
+        let input=registry_observer_sender.subscribe();
+        async move{pool_registry::observe_updates(input,true,true).await}
+    }));
     critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
 
     // Seed graph before completion can change a Prepared state.
@@ -332,12 +365,15 @@ pub async fn run()->Result<()>{
             if operator_rx.await.is_err() {std::future::pending::<()>().await}
         }=>"operator",
         joined=tasks.join_next()=>{
-            error=Some(match joined{
+            let cause=match joined{
                 Some(Ok(Err(e)))=>e,
-                Some(Ok(Ok(())))=>anyhow!("managed worker exited unexpectedly"),
-                Some(Err(e))=>anyhow!("managed worker panicked: {e}"),
+                Some(Ok(Ok(())))=>anyhow!("managed task ended unexpectedly"),
+                Some(Err(e))=>anyhow!("managed supervisor task panicked: {e}"),
                 None=>anyhow!("all runtime tasks exited"),
-            });
+            };
+            // Log before shutdown: drain errors previously hid the original failure.
+            eprintln!("runtime fatal error={cause:#}");
+            error=Some(cause);
             "fatal"
         }
     };
@@ -348,8 +384,22 @@ pub async fn run()->Result<()>{
         Ok::<(),anyhow::Error>(())
     }).await;
     match drained{
-        Ok(result)=>result?,
-        Err(_)=>{tasks.abort_all();bail!("runtime graceful shutdown exceeded 30 seconds");}
+        Ok(Ok(()))=>{},
+        Ok(Err(drain_error))=>{
+            eprintln!("runtime shutdown drain_error={drain_error:#}");
+            if let Some(original)=error.take(){
+                return Err(original.context(format!("shutdown also failed: {drain_error:#}")));
+            }
+            return Err(drain_error);
+        },
+        Err(_)=>{
+            tasks.abort_all();
+            eprintln!("runtime shutdown drain_timeout_s=30");
+            if let Some(original)=error.take(){
+                return Err(original.context("shutdown drain exceeded 30 seconds"));
+            }
+            bail!("runtime graceful shutdown exceeded 30 seconds");
+        }
     }
     if let Some(error)=error{return Err(error);}
     println!("runtime shutdown complete=true");
