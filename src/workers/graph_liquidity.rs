@@ -470,11 +470,13 @@ pub async fn run(
                     result.context("liquidity graph build task panicked")??;
                 let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
                 let bridge = graph.groups.len()-direct;
+                let oversized = graph.groups.iter()
+                    .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
                 crate::log_event!(Info,
-                    "rebuild generation={} source={} changed_pools={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
+                    "rebuild generation={} source={} changed_pools={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
                     graph.generation, source, changes, graph.qualified_pools, graph.mint_pairs,
                     graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
-                    graph.approx_index_bytes, elapsed_us);
+                    oversized, graph.approx_index_bytes, elapsed_us);
                 output.send_replace(Arc::new(graph));
                 changed_batches += 1;
             },
