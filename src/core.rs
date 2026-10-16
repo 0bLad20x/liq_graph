@@ -16,6 +16,7 @@ pub enum Venue {
     RaydiumStable,
     OrcaWhirlpool,
     PancakeSwapClmm,
+    ByrealClmm,
 }
 
 /// An immutable decoded response, fan-out via Arc<DataBatch> without payload copies.
