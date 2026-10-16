@@ -42,7 +42,8 @@ pub fn enabled(level:Level,target:&str)->bool {
     let Some(config)=CONFIG.get() else{return true;};
     let mut limit=config.default;
     for (name,configured) in &config.modules {
-        if name=="*" || target==name || target.ends_with(&format!("::{name}")) {
+        if name=="*" || target.strip_suffix(name)
+            .is_some_and(|prefix|prefix.is_empty()||prefix.ends_with("::")) {
             limit=*configured;
         }
     }
