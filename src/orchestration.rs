@@ -308,11 +308,11 @@ fn spawn_sources(
         }
         if let Some(orca) = config.orca {
             tasks.spawn(completion_orca_whirlpool::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), discovery_orca_whirlpool, completion_output.clone()));
+                source_done_rx.clone(), config.rpc.clone(), orca, completion_output.clone()));
         }
         if let Some(raydium) = config.raydium_amm_v4 {
             tasks.spawn(completion_raydium_amm_v4::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), discovery_raydium, completion_output.clone()));
+                source_done_rx.clone(), config.rpc.clone(), raydium, completion_output.clone()));
         }
         if let Some(cpmm) = config.raydium_cpmm {
             tasks.spawn(completion_raydium_cpmm::run(registry_output.subscribe(),
@@ -613,7 +613,7 @@ pub async fn run() -> Result<()> {
         } else {None};
         let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
         spawn_sources(&mut tasks, cli.meteora,
-            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, discovery_orca_whirlpool, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm}),
+            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm}),
             graph, jupiter, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
