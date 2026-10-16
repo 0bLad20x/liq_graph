@@ -218,7 +218,7 @@ fn validate_bitmap(account:&AccountData,l:Layout,program:Pubkey)->Result<()>{
         "PancakeSwap CLMM bitmap extension owner/length/pool mismatch");
     Ok(())
 }
-fn validate_array(account:&AccountData,l:Layout,start:i32,program:Pubkey)->Result<bool>{
+fn validate_array(account:&AccountData,l:Layout,start:i32,program:Pubkey)->Result<()>{
     ensure!(full(account)&&account.owner==program && account.bytes.len()==ARRAY_LEN
         && account.bytes[..8]==ARRAY_DISC
         && key(&account.bytes,8)?==l.pool
@@ -227,30 +227,7 @@ fn validate_array(account:&AccountData,l:Layout,start:i32,program:Pubkey)->Resul
     // 60 * TickState::LEN (168) follows the 44-byte header.
     let count=account.bytes[44+60*168];
     ensure!(count<=60,"PancakeSwap CLMM initialized TickArray count exceeds 60");
-    Ok(count>0)
-}
-// PancakeSwap CLMM's pool bitmap has 1024 bits centered on tick-array index 0.
-// Outside that range, bitmap-extension pages hold 512 bits per side/page.
-fn array_initialized(pool:&AccountData,extension:&AccountData,start:i32,width:i32)->Result<bool>{
-    let index=start.div_euclid(width);
-    let (data,offset,bit)=if (-512..512).contains(&index) {
-        let bit=usize::try_from(index+512)?;
-        (pool.bytes.as_ref(),904+8*(bit/64),bit%64)
-    }else{
-        let boundary=512*width;
-        let absolute=start.abs();
-        let mut page=absolute/boundary-1;
-        if start<0 && absolute%boundary==0 {page-=1;}
-        ensure!((0..14).contains(&page),
-            "PancakeSwap CLMM bitmap extension page outside range");
-        let within=absolute%boundary;
-        let local=if start<0 && within!=0 {512-within/width}else{within/width};
-        let local=usize::try_from(local)?;
-        let base=8+32+if start<0 {14*64}else{0};
-        let offset=base+usize::try_from(page)?*64+8*(local/64);
-        (extension.bytes.as_ref(),offset,local%64)
-    };
-    Ok((u64_at(data,offset)? & (1_u64<<bit))!=0)
+    Ok(())
 }
 
 fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
@@ -341,39 +318,22 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     if let Err(e)=validate_vault(vb,l.mints[1],mb.owner,l.pool){
         return incomplete(pool.address,slot,format!("PancakeSwap CLMM vault1: {e:#}"));
     }
-    let width=l.tick_spacing*60;
-    let mut present=HashMap::<i32,Pubkey>::new();
+    // Match the public V10 AccountLoader: list each existing TickArray
+    // in ascending tick order, regardless of direction or liquidity bitmap.
+    // Account ownership/layout is still verified before publishing it.
+    let mut tick_arrays=Vec::new();
     for (start,address) in arrays(l,owner) {
-        let initialized=match array_initialized(parent,bitmap,start,width){
-            Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
-                format!("PancakeSwap CLMM bitmap start={start}: {e:#}")),
-        };
-        match get(address) {
-            Some(account)=>{
-                let contains=match validate_array(account,l,start,owner){
-                    Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
-                        format!("PancakeSwap CLMM TickArray start={start}: {e:#}")),
-                };
-                if contains!=initialized {
-                    return incomplete(pool.address,slot,
-                        format!("PancakeSwap CLMM TickArray count/bitmap disagreement at {start}"));
-                }
-                if initialized {present.insert(start,address);}
+        if let Some(account)=get(address) {
+            if let Err(e)=validate_array(account,l,start,owner){
+                return incomplete(pool.address,slot,
+                    format!("PancakeSwap CLMM TickArray start={start}: {e:#}"));
             }
-            None if initialized =>return incomplete(pool.address,slot,
-                format!("PancakeSwap CLMM initialized TickArray missing at {start}")),
-            None=>{}
+            tick_arrays.push(address);
         }
     }
-    // The public V10 CLMM builder uses a single owner-validated array list,
-    // independent of swap direction, with 1..=6 arrays per pool block.
-    // Keep validated initialized arrays in the same ascending tick order.
-    let mut arrays=present.into_iter().collect::<Vec<_>>();
-    arrays.sort_unstable_by_key(|(start,_)|*start);
-    let arrays=arrays.into_iter().map(|(_,address)|address).collect::<Vec<_>>();
-    if arrays.is_empty(){
+    if tick_arrays.is_empty(){
         return incomplete(pool.address,slot,
-            "V10 CLMM requires at least one initialized TickArray in the candidate window");
+            "V10 CLMM requires at least one existing TickArray in the candidate window");
     }
     let proofs=if pool.mint_a==Some(l.mints[0]){[mint0,mint1]}else{[mint1,mint0]};
     let ev=Arc::new(CompletionEvidence{
@@ -386,13 +346,13 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             "tick_spacing":l.tick_spacing,"tick_current":l.tick_current,
             "status":l.status,"open_time":l.open_time,
             "radius":ARRAY_RADIUS,
-            "base_a_array_addresses":arrays.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "base_b_array_addresses":arrays.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "base_a_array_addresses":tick_arrays.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "base_b_array_addresses":tick_arrays.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "token_program_0":ma.owner.to_string(),"token_program_1":mb.owner.to_string()
         }))
     });
     let is_v2=ma.owner==token_2022||mb.owner==token_2022;
-    let manifest=make_manifest(l,slot,&arrays,&arrays,is_v2,owner);
+    let manifest=make_manifest(l,slot,&tick_arrays,&tick_arrays,is_v2,owner);
     // Manifest orientation follows Registry mint identity. V10 base_a denotes
     // mint A as quote, which may be opposite to CLMM's native token_mint_0.
     let swapped=pool.mint_a!=Some(l.mints[0]);
