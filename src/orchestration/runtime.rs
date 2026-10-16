@@ -196,9 +196,10 @@ pub async fn run()->Result<()>{
         let (mint_tx,mint_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(32);
         let observer_sender=jupiter_out.clone();
-        drop(jupiter_rx);
+        let mut first_jupiter_observer=Some(jupiter_rx);
         tasks.spawn(supervise("observer.source_jupiter_mint",stop_rx.clone(),move||{
-            let input=observer_sender.subscribe();
+            let input=first_jupiter_observer.take()
+                .unwrap_or_else(||observer_sender.subscribe());
             async move{diagnostic_source::run(input,true).await}
         }));
         let client=http.clone();
@@ -214,16 +215,18 @@ pub async fn run()->Result<()>{
     }else{None};
     critical(&mut tasks,"graph_watch_catalog",graph_watch_catalog::run(
         graph_rx,catalog_tx,jupiter_mints));
-    drop(diagnostic_rx);
     let diagnostic_sender=source.clone();
+    let mut first_discovery_observer=Some(diagnostic_rx);
     tasks.spawn(supervise("observer.discovery_batches",stop_rx.clone(),move||{
-        let input=diagnostic_sender.subscribe();
+        let input=first_discovery_observer.take()
+            .unwrap_or_else(||diagnostic_sender.subscribe());
         async move{diagnostic_source::run(input,true).await}
     }));
-    drop(observe_rx);
     let registry_observer_sender=updates.clone();
+    let mut first_registry_observer=Some(observe_rx);
     tasks.spawn(supervise("observer.registry_updates",stop_rx.clone(),move||{
-        let input=registry_observer_sender.subscribe();
+        let input=first_registry_observer.take()
+            .unwrap_or_else(||registry_observer_sender.subscribe());
         async move{pool_registry::observe_updates(input,true,true).await}
     }));
     critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
