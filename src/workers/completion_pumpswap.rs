@@ -1,46 +1,38 @@
-//! PumpSwap V10 completion: Registry candidates -> shared multi-provider RPC -> execution manifests.
-//! Reads current pool/mint/vault/global state in batches and verifies fee recipients;
-//! no perpetual TVL or vault polling in this checkpoint.
+//! PumpSwap wallet-independent completion: Registry pools -> validated RPC state/evidence.
+//! Wallet-dependent V10 accounts are deferred to execution adapter (issue #20).
+//! No perpetual TVL or vault polling in this checkpoint.
 use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde_json::json;
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast,watch}, task::JoinSet, time::{Instant,MissedTickBehavior}};
 use crate::{
-    core::{AccountMeta,CompletionEvidence,CompletionResult,CompletionResultBatch,
-        CompletionState,CompletionStatus,ExecutionManifest,MintProof,PoolState,PoolUpdateBatch,Venue},
+    core::{CompletionEvidence,CompletionResult,CompletionResultBatch,
+        CompletionState,CompletionStatus,MintProof,PoolState,PoolUpdateBatch,Venue},
     workers::rpc_transport::{AccountData,AccountView,RpcAnswer,RpcHandle,RpcOperation},
 };
 
 const SOURCE:&str="pumpswap_v10_completion";
 const PUMP:&str="pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-const PUMP_FEE:&str="pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const TOKEN:&str="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022:&str="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED:&str="ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const SOL:&str="So11111111111111111111111111111111111111112";
-const USDC:&str="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const DISC:[u8;8]=[241,154,109,4,17,177,109,188];
 const RETRY_COOLDOWN:Duration=Duration::from_secs(60);
 
 #[derive(Clone,Copy)]
 pub struct Settings {
     pub limit:usize,
-    wallet:Pubkey,
     account_batch_size:usize,
     parallel_batches:usize,
 }
 impl Settings {
     pub fn from_env() -> Result<Self> {
-        let wallet:Pubkey=env::var("PUMPSWAP_V10_WALLET")
-            .context("PUMPSWAP_V10_WALLET must be the bot execution wallet public key")?
-            .parse().context("invalid PUMPSWAP_V10_WALLET")?;
-        ensure!(wallet!=Pubkey::default(),"PumpSwap V10 wallet cannot be zero");
         let account_batch_size:usize=env::var("RPC_ACCOUNT_BATCH_SIZE")
             .unwrap_or_else(|_|"100".into()).parse()?;
         ensure!((6..=100).contains(&account_batch_size),
             "PumpSwap requires RPC_ACCOUNT_BATCH_SIZE in 6..=100");
-        Ok(Self {limit:0,wallet,account_batch_size,parallel_batches:8})
+        Ok(Self {limit:0,account_batch_size,parallel_batches:8})
     }
     fn pools_per_batch(self)->usize {
         10_usize.min((self.account_batch_size-1)/5)
@@ -164,50 +156,14 @@ async fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
 }
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
-    mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>)->CompletionResult {
-    CompletionResult{pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    mints:Option<[MintProof;2]>)->CompletionResult {
+    CompletionResult{pool,status,validated_slot:slot,reason,evidence,mints,manifest:None}
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
-    result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
+    result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None)
 }
 fn incomplete(pool:Pubkey,slot:u64,reason:impl Into<String>)->CompletionResult {
-    result(pool,CompletionStatus::Incomplete,Some(slot),Some(reason.into()),None,None,None)
-}
-fn block(l:Layout,base:Pubkey,x:Pubkey,quote_program:Pubkey,
-    recipient:Pubkey,buyback:Pubkey,wallet:Pubkey)->Result<Arc<[AccountMeta]>> {
-    let program:Pubkey=PUMP.parse()?;
-    let fee_program:Pubkey=PUMP_FEE.parse()?;
-    let associated:Pubkey=ASSOCIATED.parse()?;
-    let quote=l.mints[1];
-    let base_vault=if base==l.mints[0] {l.vaults[0]} else {l.vaults[1]};
-    let x_vault=if x==l.mints[0] {l.vaults[0]} else {l.vaults[1]};
-    let volume=pda(program,&[b"user_volume_accumulator",wallet.as_ref()]);
-    let creator_vault=pda(program,&[b"creator_vault",l.creator.as_ref()]);
-    let fee_config=pda(fee_program,&[b"fee_config",program.as_ref()]);
-    let ro=|address|AccountMeta{address,writable:false};
-    let rw=|address|AccountMeta{address,writable:true};
-    // Public Cetipoo V10 Pump legacy account block. Use v1 in all cases:
-    // no v2 buyback-ATA initialization assumption.
-    let mut accounts=vec![
-        ro(program),ro(base),ro(global_key(program)),
-        ro(pda(program,&[b"__event_authority"])),
-        ro(recipient),rw(l.address),rw(x_vault),rw(base_vault),
-        rw(ata(recipient,quote,quote_program,associated)),
-        rw(ata(creator_vault,quote,quote_program,associated)),
-        ro(creator_vault),
-        ro(pda(program,&[b"global_volume_accumulator"])),
-        rw(volume),ro(fee_config),ro(fee_program),
-    ];
-    if l.cashback {
-        accounts.push(rw(ata(volume,quote,quote_program,associated)));
-        accounts.push(rw(volume));
-    }
-    if l.creator!=Pubkey::default() {
-        accounts.push(ro(pda(program,&[b"pool-v2",l.mints[0].as_ref()])));
-    }
-    accounts.push(ro(buyback));
-    accounts.push(rw(ata(buyback,quote,quote_program,associated)));
-    Ok(Arc::from(accounts))
+    result(pool,CompletionStatus::Incomplete,Some(slot),Some(reason.into()),None,None)
 }
 async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
     ->Vec<CompletionResult> {
@@ -331,51 +287,48 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
             results.insert(pool.address,retry(pool.address,"PumpSwap fee recipient candidates missing"));
             continue;
         };
-        // Prefer a checked, initialized fee ATA. Legacy V10 may create a missing
-        // quote ATA itself, so choose first configured recipient if none exists.
-        let recipient=candidates.iter().copied().find(|recipient|{
+        // Validate and persist pool evidence; wallet-dependent V10 accounts
+        // (user_volume_accumulator) belong to the future execution adapter.
+        let initialized=candidates.iter().copied().filter(|recipient|{
             let fee_ata=ata(*recipient,l.mints[1],m1.owner,associated);
             fee_accounts.get(&fee_ata).and_then(Option::as_ref).is_some_and(|a|
                 full(a) && a.owner==m1.owner && a.bytes.len()>=165
                     && key(&a.bytes,0).ok()==Some(l.mints[1])
                     && key(&a.bytes,32).ok()==Some(*recipient)
                     && a.bytes[108]==1)
-        }).unwrap_or(candidates[0]);
+        }).collect::<Vec<_>>();
+        let recipient=initialized.first().copied().unwrap_or(candidates[0]);
         let [a,b]=[l.mints[0],l.mints[1]];
-        let built=(||->Result<ExecutionManifest>{
-            Ok(ExecutionManifest{pool:l.address,mint_a:a,mint_b:b,
-                validated_slot:last_slot,
-                base_a:block(l,a,b,m1.owner,recipient,buyback,settings.wallet)?,
-                base_b:block(l,b,a,m1.owner,recipient,buyback,settings.wallet)?})
-        })();
-        match built {
-            Err(e)=>{
-                results.insert(pool.address,incomplete(pool.address,last_slot,
-                    format!("PumpSwap V10 accounts: {e:#}")));
-            }
-            Ok(manifest)=>{
-                let evidence=Arc::new(CompletionEvidence{
-                    kind:"pumpswap_v10_legacy".into(),version:1,
-                    payload:Arc::new(json!({
-                        "program":program.to_string(),"wallet":settings.wallet.to_string(),
-                        "global_config":global_addr.to_string(),
-                        "pool":l.address.to_string(),"base_mint":a.to_string(),
-                        "quote_mint":b.to_string(),"base_vault":l.vaults[0].to_string(),
-                        "quote_vault":l.vaults[1].to_string(),
-                        "quote_token_program":m1.owner.to_string(),
-                        "recipient":recipient.to_string(),"buyback":buyback.to_string(),
-                        "creator":l.creator.to_string(),
-                        "is_mayhem_mode":l.mayhem,"is_cashback_coin":l.cashback,
-                        "pump_quote_is_base_a":false,"pump_quote_is_base_b":true,
-                        "v10_pump_layout":"legacy","pool_snapshot_slot":pool_slot,
-                        "fee_snapshot_slot":last_slot
-                    }))
-                });
-                results.insert(pool.address,result(pool.address,
-                    CompletionStatus::Prepared,Some(last_slot),None,
-                    Some(evidence),Some(proofs),Some(Arc::new(manifest))));
-            }
-        }
+        let evidence=Arc::new(CompletionEvidence{
+            kind:"pumpswap_pool_validated_v1".into(),version:1,
+            payload:Arc::new(json!({
+                "program":program.to_string(),"pool":l.address.to_string(),
+                "global_config":global_addr.to_string(),
+                "base_mint":a.to_string(),"quote_mint":b.to_string(),
+                "base_vault":l.vaults[0].to_string(),
+                "quote_vault":l.vaults[1].to_string(),
+                "base_token_program":m0.owner.to_string(),
+                "quote_token_program":m1.owner.to_string(),
+                "base_decimals":m0.bytes[44],"quote_decimals":m1.bytes[44],
+                "recipient":recipient.to_string(),
+                "recipient_candidates":candidates.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "initialized_recipients":initialized.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "buyback":buyback.to_string(),
+                "coin_creator":l.creator.to_string(),
+                "is_mayhem_mode":l.mayhem,"is_cashback_coin":l.cashback,
+                "pump_quote_is_base_a":false,"pump_quote_is_base_b":true,
+                "pool_snapshot_slot":pool_slot,"rpc_last_slot":last_slot,
+                "execution_accounts_resolved":false,
+                "deferred_issue":"https://github.com/0bLad20x/liq_graph/issues/20"
+            }))
+        });
+        // The Registry requires a fully resolved ExecutionManifest for Prepared.
+        // Keep a verified pool as Incomplete until execution resolution, with
+        // durable evidence and mint proofs, never a fabricated wallet address.
+        results.insert(pool.address,result(pool.address,
+            CompletionStatus::Incomplete,Some(pool_slot),
+            Some("wallet-independent PumpSwap pool validated; V10 execution resolution deferred (#20)".into()),
+            Some(evidence),Some(proofs)));
     }
     pools.iter().map(|p|results.remove(&p.address)
         .expect("every PumpSwap pool has a result")).collect()
@@ -389,7 +342,9 @@ struct Scheduler {
 impl Scheduler {
     fn update(&mut self,p:&PoolState) {
         if p.venue!=Venue::PumpSwap {return;}
-        if p.completion_state==CompletionState::Prepared {
+        if p.completion_state==CompletionState::Prepared
+            || p.completion_evidence.as_ref().is_some_and(|e|
+                e.kind=="pumpswap_pool_validated_v1") {
             self.candidates.remove(&p.address);
             self.retry_after.remove(&p.address);
         } else if p.mint_a.is_some() && p.mint_b.is_some() {
@@ -425,8 +380,8 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut retryable=0_usize;
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    println!("pumpswap completion started wallet={} limit={} batch={} parallel={}",
-        settings.wallet,settings.limit,settings.pools_per_batch(),settings.parallel_batches);
+    println!("pumpswap completion started wallet_independent=true limit={} batch={} parallel={}",
+        settings.limit,settings.pools_per_batch(),settings.parallel_batches);
     loop {
         while tasks.len()<settings.parallel_batches &&
             (settings.limit==0 || attempts<settings.limit) {
@@ -472,7 +427,15 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                                 }
                             }
                         }
-                        CompletionStatus::Incomplete=>{incomplete+=1;}
+                        CompletionStatus::Incomplete=>{
+                            incomplete+=1;
+                            if r.evidence.as_ref().is_some_and(|e|e.kind=="pumpswap_pool_validated_v1") {
+                                scheduler.candidates.remove(&r.pool);
+                                scheduler.retry_after.remove(&r.pool);
+                                println!("pumpswap pool_completed pool={} validated_slot={} v10_resolution=deferred",
+                                    r.pool,r.validated_slot.unwrap_or_default());
+                            }
+                        }
                         CompletionStatus::Retryable=>{
                             retryable+=1;
                             if scheduler.attempts.get(&r.pool)==Some(&1) {

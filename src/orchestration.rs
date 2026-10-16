@@ -636,23 +636,6 @@ pub async fn run() -> Result<()> {
             let db = persistence::Persistence::connect().await?;
             let registry = pool_registry::PoolRegistry::default();
             let restored_data = db.restore().await?;
-            if cli.pumpswap_completion_live || cli.pumpswap_rolling {
-                // Pump V10 manifests contain wallet-derived account addresses.
-                // Never publish a restored Prepared manifest for another wallet.
-                let wallet = env::var("PUMPSWAP_V10_WALLET")
-                    .context("PUMPSWAP_V10_WALLET is required for restored PumpSwap descriptors")?;
-                for pool in &restored_data {
-                    if pool.venue == core::Venue::PumpSwap
-                        && pool.completion_state == core::CompletionState::Prepared {
-                        let stored = pool.completion_evidence.as_ref()
-                            .and_then(|e|e.payload.get("wallet"))
-                            .and_then(serde_json::Value::as_str);
-                        ensure!(stored == Some(wallet.as_str()),
-                            "PumpSwap Prepared descriptor for pool {} belongs to another/missing V10 wallet; refuse stale wallet-specific graph state",
-                            pool.address);
-                    }
-                }
-            }
             let restored = registry.restore(restored_data)?;
             println!("orchestration initial persistence restored_pools={restored}");
             (Some(registry), Some(db))
