@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::watch;
 
-use super::liquidity_graph::{GraphSnapshot, Group, GroupKind};
+use super::graph_liquidity::{GraphSnapshot, Group, GroupKind};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
