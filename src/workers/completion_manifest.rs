@@ -150,7 +150,7 @@ fn validate_vault(account: &AccountData, expected_mint: Pubkey,
     Ok(())
 }
 
-async fn read(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>)
+async fn read_rpc(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>)
     -> Result<(u64,Vec<Option<AccountData>>)> {
     ensure!(!addresses.is_empty(),"empty Manifest RPC request");
     let expected=addresses.clone();
@@ -246,7 +246,7 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
     let spl:Pubkey=SPL_TOKEN.parse().expect("known SPL Token program");
     let token_2022:Pubkey=TOKEN_2022.parse().expect("known Token-2022 program");
     let mut results:Vec<Option<CompletionResult>>=vec![None;pools.len()];
-    let (first_slot,parents)=match read(rpc,pools.iter().map(|p|p.address).collect(),None).await {
+    let (first_slot,parents)=match read_rpc(rpc,pools.iter().map(|p|p.address).collect(),None).await {
         Ok(v)=>v,Err(e)=>return pools.iter().map(|p|
             retry(p.address,format!("Manifest initial RPC: {e:#}"))).collect(),
     };
@@ -275,7 +275,7 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
                     "Manifest final RPC account set exceeds configured batch size"));
             }
         } else {
-            match read(rpc,addresses.clone(),Some(first_slot)).await {
+            match read_rpc(rpc,addresses.clone(),Some(first_slot)).await {
                 Ok((slot,all))=>{
                     let lookup=addresses.into_iter().zip(all).collect::<HashMap<_,_>>();
                     for (i,l) in pending {
