@@ -212,7 +212,7 @@ pub async fn run(
         let total=reported_total.unwrap_or(0);
         let capped=settings.max_pages.is_some_and(|max|page>max);
         println!("byreal pass={pass} reported_total={total} pages={pages} received={received} unique={} duplicates={duplicates} rejected={rejected} complete={} rpm={} elapsed_ms={}",
-            seen.len(),duplicates,rejected,!capped&&seen.len()==total&&rejected==0,settings.rpm,started.elapsed().as_millis());
+            seen.len(),!capped&&seen.len()==total&&rejected==0,settings.rpm,started.elapsed().as_millis());
         if settings.once{return Ok(());}
     }
 }
