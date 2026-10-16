@@ -12,6 +12,7 @@ pub mod completion_raydium_cpmm;
 pub mod completion_raydium_clmm;
 pub mod completion_pancakeswap_clmm;
 pub mod completion_byreal_clmm;
+pub mod completion_manifest;
 
 pub mod graph_liquidity;
 pub mod graph_watch_catalog;
@@ -19,5 +20,6 @@ pub mod persistence;
 pub mod discovery_raydium;
 pub mod discovery_pancakeswap_clmm;
 pub mod discovery_byreal_clmm;
+pub mod discovery_manifest;
 pub mod discovery_orca_whirlpool;
 pub mod discovery_meteora_damm_v2;
