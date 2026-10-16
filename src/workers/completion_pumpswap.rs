@@ -73,7 +73,8 @@ fn pool_layout(a:&AccountData,p:&PoolState,program:Pubkey)->Result<Layout> {
         && mints[0]!=mints[1] && mints.iter().all(|m|*m!=Pubkey::default())
         && vaults[0]!=vaults[1] && vaults.iter().all(|v|*v!=Pubkey::default()),
         "PumpSwap pool identity mismatch");
-    Ok(Layout {address:a.address,mints,vaults,creator:key(d,11)?,
+    // V10 PumpKeys::from_state uses coin_creator at offset 211, NOT the pool PDA creator at 11.
+    Ok(Layout {address:a.address,mints,vaults,creator:key(d,211)?,
         mayhem:d[243]!=0,cashback:d[244]!=0})
 }
 fn proof(a:&AccountData,spl:Pubkey,token_2022:Pubkey)->Result<MintProof> {
