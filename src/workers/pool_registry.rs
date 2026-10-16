@@ -142,7 +142,7 @@ impl PoolRegistry {
                         mint_b.as_ref().is_some_and(|mint| current.mint_b.is_some_and(|old| old != *mint))
                     {
                         stats.conflicts += 1;
-                        eprintln!("pool registry identity_conflict pool={address} source={}", batch.source);
+                        crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
                         continue;
                     }
 
@@ -391,11 +391,11 @@ pub async fn run(
                             pools: stats.updates,
                             persist_identity: stats.identity,
                         })).is_err() {
-                            eprintln!("pool registry update_broadcast_no_subscribers");
+                            crate::log_event!(Warn,"pool registry update_broadcast_no_subscribers");
                         }
                     }
                     if batches == 1 || batches % 25 == 0 {
-                        println!(
+                        crate::log_event!(Warn,
                             "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
                             batch.source, stats.total, stats.ignored_mints,
                         );
@@ -403,7 +403,7 @@ pub async fn run(
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     lagged += skipped;
-                    eprintln!("pool registry source_lagged missed_batches={skipped}");
+                    crate::log_event!(Error,"pool registry source_lagged missed_batches={skipped}");
                     if fail_on_lag { anyhow::bail!("REST broadcast overflow: Registry lost {skipped} source batches"); }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -429,7 +429,7 @@ pub async fn run(
                     incomplete_delta += stats.incomplete_delta;
                     manifest_delta += stats.manifest_delta;
                     let updated = stats.updates.len();
-                    println!("pool registry completion source={} received={} applied={} preserved_retryable={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
+                    crate::log_event!(Debug,"pool registry completion source={} received={} applied={} preserved_retryable={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
                         batch.source, stats.received, stats.applied, stats.preserved_retryable,
                         stats.prepared, stats.incomplete, stats.retryable, stats.stale, stats.invalid,
                         stats.missing_pool, updated);
@@ -440,7 +440,7 @@ pub async fn run(
                         pools: stats.updates,
                         persist_identity: Vec::new(),
                     })).is_err() {
-                        eprintln!("pool registry completion_broadcast_no_subscribers");
+                        crate::log_event!(Warn,"pool registry completion_broadcast_no_subscribers");
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) =>
@@ -456,7 +456,7 @@ pub async fn run(
     let incomplete = snapshot.iter().filter(|p| p.completion_state == CompletionState::Incomplete).count();
     let manifests = snapshot.iter().filter(|p| p.execution_manifest.is_some()).count();
     let evidences = snapshot.iter().filter(|p| p.completion_evidence.is_some()).count();
-    println!(
+    crate::log_event!(Info,
         "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",
         snapshot.len(),
     );
@@ -470,7 +470,7 @@ pub async fn run(
         let expected_prepared = i64::try_from(bootstrap_prepared)? + prepared_delta;
         let expected_incomplete = i64::try_from(bootstrap_incomplete)? + incomplete_delta;
         let expected_manifests = i64::try_from(bootstrap_manifests)? + manifest_delta;
-        println!("pool registry completion status_net prepared={prepared_delta:+} incomplete={incomplete_delta:+} manifests={manifest_delta:+} expected_prepared={expected_prepared} expected_incomplete={expected_incomplete} expected_manifests={expected_manifests}");
+        crate::log_event!(Debug,"pool registry completion status_net prepared={prepared_delta:+} incomplete={incomplete_delta:+} manifests={manifest_delta:+} expected_prepared={expected_prepared} expected_incomplete={expected_incomplete} expected_manifests={expected_manifests}");
         anyhow::ensure!(i64::try_from(prepared)? == expected_prepared
             && i64::try_from(incomplete)? == expected_incomplete
             && i64::try_from(manifests)? == expected_manifests,
@@ -482,7 +482,7 @@ pub async fn run(
     for pool in registry.snapshot() { *venue_counts.entry(format!("{:?}",pool.venue)).or_default() += 1; }
     let mut venue_counts = venue_counts.into_iter().collect::<Vec<_>>();
     venue_counts.sort_by(|a,b|a.0.cmp(&b.0));
-    println!("pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
+    crate::log_event!(Info,"pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
     Ok(())
 }
 
@@ -526,7 +526,7 @@ pub async fn observe_updates(
                     completion_incomplete += incomplete;
                     completion_retryable += retryable;
                     completion_with_evidence += with_evidence;
-                    println!("pool registry completion consumer source={} received={} prepared={} incomplete={} retryable={} evidences={} manifests={} sample_pool={} sample_slot={:?}",
+                    crate::log_event!(Debug,"pool registry completion consumer source={} received={} prepared={} incomplete={} retryable={} evidences={} manifests={} sample_pool={} sample_slot={:?}",
                         batch.source, batch.pools.len(), prepared, incomplete, retryable, with_evidence,
                         batch.pools.iter().filter(|p|p.execution_manifest.is_some()).count(),
                         batch.pools.first().map_or(Pubkey::default(), |p|p.address),
@@ -534,7 +534,7 @@ pub async fn observe_updates(
                 }
                 if batches == 1 {
                     if let Some(pool) = batch.pools.first() {
-                        println!(
+                        crate::log_event!(Debug,
                             "pool registry consumer source={} received_at_ms={} batch_pools={} sample_pool={} venue={:?} mint_a={:?} mint_b={:?} tvl_usd={:?} completion={:?} first_seen_ms={} last_seen_ms={} last_changed_ms={}",
                             batch.source, batch.received_at_ms, batch.pools.len(),
                             pool.address, pool.venue, pool.mint_a, pool.mint_b,
@@ -543,20 +543,20 @@ pub async fn observe_updates(
                         );
                     }
                 } else if batches % 25 == 0 {
-                    println!(
+                    crate::log_event!(Debug,
                         "pool registry consumer received_batches={batches} pool_updates={pool_updates}"
                     );
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 lagged += skipped;
-                eprintln!("pool registry consumer_lagged missed_batches={skipped}");
+                crate::log_event!(Warn,"pool registry consumer_lagged missed_batches={skipped}");
                 if fail_on_lag { anyhow::bail!("Registry broadcast overflow: observer lost {skipped} update batches"); }
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    println!(
+    crate::log_event!(Info,
         "pool registry consumer complete received_batches={batches} pool_updates={pool_updates} lagged_batches={lagged} completion_batches={completion_batches} completion_pools={completion_pools} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_evidences={completion_with_evidence}"
     );
     if require_completion {

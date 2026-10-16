@@ -69,12 +69,12 @@ async fn fetch(client: &reqwest::Client) -> Result<Vec<Value>> {
                 let retry = response.headers().get(reqwest::header::RETRY_AFTER)
                     .and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok())
                     .unwrap_or(3).max(1);
-                eprintln!("manifest discovery attempt={attempt} http={status} retry_s={retry}");
+                crate::log_event!(Info,"manifest discovery attempt={attempt} http={status} retry_s={retry}");
                 tokio::time::sleep(Duration::from_secs(retry)).await;
             }
             Err(error) => {
                 if attempt == 4 { return Err(error).context("Manifest /tickers HTTP transport"); }
-                eprintln!("manifest discovery attempt={attempt} transport={error}");
+                crate::log_event!(Warn,"manifest discovery attempt={attempt} transport={error}");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
@@ -109,7 +109,7 @@ pub async fn run(
                 Err(error) => {
                     rejected += 1;
                     if rejected <= 5 {
-                        eprintln!("manifest discovery rejected_market={error:#}");
+                        crate::log_event!(Warn,"manifest discovery rejected_market={error:#}");
                     }
                 }
             }
@@ -121,7 +121,7 @@ pub async fn run(
         output.send(Arc::new(DataBatch {
             source: SOURCE, received_at_ms: now_unix_ms()?, records,
         })).map_err(|_|anyhow!("Manifest discovery has no DataBatch consumer"))?;
-        println!("manifest discovery pass={pass} received={reported} unique={unique} duplicates={duplicates} rejected={rejected} complete=true tvl_usd=none elapsed_ms={}",
+        crate::log_event!(Info,"manifest discovery pass={pass} received={reported} unique={unique} duplicates={duplicates} rejected={rejected} complete=true tvl_usd=none elapsed_ms={}",
             started.elapsed().as_millis());
         if settings.once {return Ok(());}
         tokio::time::sleep(REFRESH).await;

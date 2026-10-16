@@ -495,7 +495,7 @@ fn report_rpc(stats:&RpcStats) {
         let failed=v.calls-v.succeeded;
         let success_pct=100.0*(v.succeeded as f64)/(v.calls as f64);
         let avg_ms=v.total_ms/u128::from(v.calls);
-        println!("rpc stats provider={provider} method={method} calls={} ok={} failed={failed} ok_pct={success_pct:.1} avg_ms={avg_ms} max_ms={} http_401={} http_403={} http_429={} rpc_32602={} rpc_32016={} transport={} invalid_response={} other={}",
+        crate::log_event!(Info,"rpc stats provider={provider} method={method} calls={} ok={} failed={failed} ok_pct={success_pct:.1} avg_ms={avg_ms} max_ms={} http_401={} http_403={} http_429={} rpc_32602={} rpc_32016={} transport={} invalid_response={} other={}",
             v.calls,v.succeeded,v.max_ms,v.http_401,v.http_403,v.http_429,
             v.rpc_32602,v.rpc_32016,v.transport,v.invalid_response,v.other);
     }
@@ -546,7 +546,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                             }
                             Err(invalid)=>{
                                 record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),Some("response_validation"));
-                                eprintln!("rpc provider={} method={} response_validation_error={invalid:#}",
+                                crate::log_event!(Warn,"rpc provider={} method={} response_validation_error={invalid:#}",
                                     provider.cfg.name,operation.method());
                                 error=Some(invalid);
                             }
@@ -554,7 +554,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                         Err(err)=>{
                             let reason=format!("{err:#}");
                             record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),Some(&reason));
-                            eprintln!("rpc provider={} method={} error={err:#}",provider.cfg.name,operation.method());
+                            crate::log_event!(Warn,"rpc provider={} method={} error={err:#}",provider.cfg.name,operation.method());
                             error=Some(err);
                         }
                     }
@@ -567,9 +567,20 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
             let _=tasks.join_next().await;
         }
     }
-    while let Some(result)=tasks.join_next().await {result?;}
+    // The request channel closes only after every RpcHandle has been dropped.
+    // At that point no caller can consume an outstanding response. Cancel the
+    // remaining in-flight/queued provider calls rather than waiting for their
+    // rate-limit gates and timeouts during an otherwise graceful shutdown.
+    let abandoned = tasks.len();
+    tasks.abort_all();
+    while let Some(result)=tasks.join_next().await {
+        if let Err(error)=result {
+            if !error.is_cancelled() { return Err(error.into()); }
+        }
+    }
     reporter.abort();
     report_rpc(&stats);
+    crate::log_event!(Info,"rpc transport shutdown complete=true abandoned_calls={abandoned}");
     Ok(())
 }
 
@@ -716,7 +727,7 @@ async fn ws_session(
                             received_at_ms:now_unix_ms()?,value:payload,
                         }),
                         Err(error)=>{
-                            eprintln!("rpc websocket provider={name} decode_error={error:#}");
+                            crate::log_event!(Warn,"rpc websocket provider={name} decode_error={error:#}");
                             emit(&events,WsEvent::Gap{provider:name.clone(),reason:"malformed_account_notification"});
                             break 'connected;
                         }
@@ -818,14 +829,14 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
         if !handle.supports(&operation) { continue; }
         let method=operation.method();
         let response=handle.call(operation).await.with_context(||format!("live RPC {method} failed"))?;
-        println!("rpc live provider={} received_at_ms={}",response.provider,response.received_at_ms);
+        crate::log_event!(Info,"rpc live provider={} received_at_ms={}",response.provider,response.received_at_ms);
         match response.answer {
-            RpcAnswer::GenesisHash(hash)=>println!("rpc live method={method} genesis_hash={hash}"),
-            RpcAnswer::Slot(slot)=>println!("rpc live method={method} slot={slot}"),
-            RpcAnswer::Account{slot,account}=>println!(
+            RpcAnswer::GenesisHash(hash)=>crate::log_event!(Debug,"rpc live method={method} genesis_hash={hash}"),
+            RpcAnswer::Slot(slot)=>crate::log_event!(Debug,"rpc live method={method} slot={slot}"),
+            RpcAnswer::Account{slot,account}=>crate::log_event!(Debug,
                 "rpc live method={method} slot={slot} found={} bytes={}",
                 account.is_some(),account.as_ref().map_or(0,|a|a.bytes.len())),
-            RpcAnswer::Multiple{slot,accounts}=>println!(
+            RpcAnswer::Multiple{slot,accounts}=>crate::log_event!(Debug,
                 "rpc live method={method} slot={slot} returned={} found={}",
                 accounts.len(),accounts.iter().filter(|a|a.is_some()).count()),
             _=>bail!("unexpected RPC live response for {method}"),
@@ -841,16 +852,16 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
         if !handle.supports(&operation) { continue; }
         let method=operation.method();
         let response=handle.call(operation).await.with_context(||format!("live RPC {method} failed"))?;
-        println!("rpc live provider={} received_at_ms={}",response.provider,response.received_at_ms);
+        crate::log_event!(Info,"rpc live provider={} received_at_ms={}",response.provider,response.received_at_ms);
         match response.answer {
-            RpcAnswer::Program{accounts,next_cursor}=>println!(
+            RpcAnswer::Program{accounts,next_cursor}=>crate::log_event!(Debug,
                 "rpc live method={method} accounts={} next_cursor_present={}",
                 accounts.len(),next_cursor.is_some()),
             _=>bail!("unexpected RPC live response for {method}"),
         }
         passed+=1;
     }
-    println!("rpc live http_methods_passed={passed}");
+    crate::log_event!(Info,"rpc live http_methods_passed={passed}");
     ensure!(passed>0 || handle.can_watch(),"no RPC HTTP method or WebSocket watch enabled");
 
     if handle.can_watch() {
@@ -860,14 +871,14 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
             loop {
                 match events.recv().await {
                     Ok(WsEvent::Subscribed{provider,address})=>{
-                        println!("rpc live websocket subscribed provider={provider} account={address}");
+                        crate::log_event!(Info,"rpc live websocket subscribed provider={provider} account={address}");
                         return Ok(());
                     }
                     Ok(WsEvent::Account{provider,address,slot,value,received_at_ms})=>{
-                        println!("rpc live websocket update provider={provider} address={address} slot={slot} received_at_ms={received_at_ms} found={}",value.is_some());
+                        crate::log_event!(Info,"rpc live websocket update provider={provider} address={address} slot={slot} received_at_ms={received_at_ms} found={}",value.is_some());
                     }
                     Ok(WsEvent::Gap{provider,reason})=>
-                        eprintln!("rpc live websocket gap provider={provider} reason={reason}"),
+                        crate::log_event!(Info,"rpc live websocket gap provider={provider} reason={reason}"),
                     Ok(WsEvent::Rejected{provider,address,code})=>
                         bail!("rpc live websocket subscription rejected provider={provider} address={address} code={code}"),
                     Ok(_)=>{},
@@ -881,11 +892,11 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
             loop {
                 match events.recv().await {
                     Ok(WsEvent::Unsubscribed{provider,address:removed}) if removed==address=>{
-                        println!("rpc live websocket unsubscribed provider={provider} account={removed}");
+                        crate::log_event!(Info,"rpc live websocket unsubscribed provider={provider} account={removed}");
                         return Ok(());
                     }
                     Ok(WsEvent::Gap{provider,reason})=>
-                        eprintln!("rpc live websocket gap provider={provider} reason={reason}"),
+                        crate::log_event!(Info,"rpc live websocket gap provider={provider} reason={reason}"),
                     Ok(_)=>{},
                     Err(error)=>bail!("rpc live unsubscribe event error: {error}"),
                 }
@@ -893,7 +904,7 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
         }).await;
         removed.context("WebSocket unsubscribe ACK timeout")??;
     } else {
-        println!("rpc live websocket not configured or not enabled");
+        crate::log_event!(Info,"rpc live websocket not configured or not enabled");
     }
     Ok(())
 }

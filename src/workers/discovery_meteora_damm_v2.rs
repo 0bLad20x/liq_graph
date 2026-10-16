@@ -66,7 +66,7 @@ fn decode_page(bytes:&[u8],page:u32)->Result<Page>{
             Ok(record)=>records.push(record),
             Err(err)=>{
                 rejected+=1;
-                if rejected<=5{eprintln!("damm_v2 page={page} rejected_pool error={err:#}");}
+                if rejected<=5{crate::log_event!(Warn,"damm_v2 page={page} rejected_pool error={err:#}");}
             }
         }
     }
@@ -90,7 +90,7 @@ async fn fetch_retry(client:reqwest::Client,gate:Arc<Mutex<Instant>>,page:u32)->
         match fetch(&client,page).await{
             Ok(page)=>return page,
             Err(err)=>{
-                eprintln!("damm_v2 page={page} retry_error={err:#}");
+                crate::log_event!(Warn,"damm_v2 page={page} retry_error={err:#}");
                 sleep(RETRY_DELAY).await;
             }
         }
@@ -127,7 +127,7 @@ pub async fn run(client:reqwest::Client,output:broadcast::Sender<Arc<DataBatch>>
                 completed+=1;
             }
         }
-        println!("damm_v2 source complete pages={completed}/{total_pages} decoded_pools={records} rejected_pools={rejected} elapsed_ms={}",started.elapsed().as_millis());
+        crate::log_event!(Info,"damm_v2 source complete pages={completed}/{total_pages} decoded_pools={records} rejected_pools={rejected} elapsed_ms={}",started.elapsed().as_millis());
         if settings.once{return Ok(());}
     }
 }

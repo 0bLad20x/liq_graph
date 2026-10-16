@@ -268,7 +268,7 @@ fn load_cached_routes(settings: &Settings) -> HashMap<String, Route> {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return HashMap::new(),
         Err(error) => {
-            eprintln!("http_transport cache_read_error path={} error={error}",
+            crate::log_event!(Warn,"http_transport cache_read_error path={} error={error}",
                 settings.cache_path.display());
             return HashMap::new();
         }
@@ -276,17 +276,17 @@ fn load_cached_routes(settings: &Settings) -> HashMap<String, Route> {
     let cache: CachedWorkingSet = match serde_json::from_slice(&bytes) {
         Ok(cache) => cache,
         Err(error) => {
-            eprintln!("http_transport cache_decode_error path={} error={error}",
+            crate::log_event!(Warn,"http_transport cache_decode_error path={} error={error}",
                 settings.cache_path.display());
             return HashMap::new();
         }
     };
     if cache.version != CACHE_VERSION {
-        eprintln!("http_transport cache_version_mismatch version={}", cache.version);
+        crate::log_event!(Info,"http_transport cache_version_mismatch version={}", cache.version);
         return HashMap::new();
     }
     if cache.verify_url != settings.verify_url.as_str() {
-        println!("http_transport cache_verify_target_changed revalidating_all=true");
+        crate::log_event!(Info,"http_transport cache_verify_target_changed revalidating_all=true");
     }
     let now_ms = unix_ms();
     let cache_age_s = now_ms.saturating_sub(cache.saved_at_unix_ms) / 1000;
@@ -311,7 +311,7 @@ fn load_cached_routes(settings: &Settings) -> HashMap<String, Route> {
             });
         }
     }
-    println!("http_transport cache_loaded={} age_s={} path={}", routes.len(),
+    crate::log_event!(Info,"http_transport cache_loaded={} age_s={} path={}", routes.len(),
         cache_age_s, settings.cache_path.display());
     routes
 }
@@ -353,7 +353,7 @@ async fn persist_cached_routes(shared: &Shared) {
         Ok(())
     })();
     if let Err(error) = result {
-        eprintln!("http_transport cache_write_error path={} error={error:#}",
+        crate::log_event!(Warn,"http_transport cache_write_error path={} error={error:#}",
             shared.settings.cache_path.display());
     }
 }
@@ -381,7 +381,7 @@ fn sample(values: &mut VecDeque<u64>, ms: u64) {
 
 fn report_stats(shared: &Shared, throughput_rps: f64) {
     let stats = shared.stats.lock().expect("HTTP stats lock poisoned");
-    println!(
+    crate::log_event!(Warn,
         "http_transport stats submitted={} completed={} ok={} failed={} attempts={} failovers={} http_429={} http_403={} http_5xx={} transport_errors={} other_errors={} distinct_routes={} working_routes={} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={} queue_p95_ms={}",
         stats.submitted, stats.completed, stats.succeeded,
         stats.completed.saturating_sub(stats.succeeded), stats.attempts, stats.failovers,
@@ -409,7 +409,7 @@ struct Shared {
 }
 
 pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)> {
-    println!(
+    crate::log_event!(Info,
         "http_transport config refresh_s={} verify_url={} public_discovery={} configured_file={} probe_rps={} host_default_rps={} route_rps={} host_overrides={} in_flight={} queue={} retries={}",
         settings.refresh.as_secs(), settings.verify_url,
         settings.public_discovery, settings.list_file.is_some(), settings.probe_rps,
@@ -633,17 +633,17 @@ async fn fetch_inventory(shared: &Shared) -> Result<(HashMap<String, Candidate>,
                 };
                 if let Err(error) = parsed {
                     failures += 1;
-                    eprintln!("http_transport source={name} url={url} parse_error={error:#}");
+                    crate::log_event!(Warn,"http_transport source={name} url={url} parse_error={error:#}");
                 }
             }
             Err(error) => {
                 failures += 1;
-                eprintln!("http_transport source={name} url={url} error={error:#}");
+                crate::log_event!(Warn,"http_transport source={name} url={url} error={error:#}");
             }
         }
     }
     if failures != 0 {
-        eprintln!("http_transport discovery partial_source_failures={failures} preserving_previous_routes=true");
+        crate::log_event!(Info,"http_transport discovery partial_source_failures={failures} preserving_previous_routes=true");
     }
     ensure!(!map.is_empty(), "proxy discovery returned empty inventory");
     Ok((map, failures == 0))
@@ -656,7 +656,7 @@ async fn discovery_loop(shared: Arc<Shared>) {
             .map(|route| route.candidate.clone()).collect::<Vec<_>>()
     };
     if !cached.is_empty() {
-        println!("http_transport cache_revalidate_start routes={}", cached.len());
+        crate::log_event!(Info,"http_transport cache_revalidate_start routes={}", cached.len());
         verify_candidates(&shared, cached, "cache").await;
     }
     let discovery_enabled = shared.settings.public_discovery ||
@@ -672,7 +672,7 @@ async fn discovery_loop(shared: Arc<Shared>) {
     loop {
         ticker.tick().await;
         if let Err(error) = refresh(&shared).await {
-            eprintln!("http_transport discovery_error={error:#}");
+            crate::log_event!(Warn,"http_transport discovery_error={error:#}");
         }
     }
 }
@@ -725,7 +725,7 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
         if live { open.push(candidate); } else { dead.push(candidate.id); }
     }
     mark_failures(shared, dead).await;
-    println!("http_transport inventory={inventory_count} due={tcp_total} tcp_open={}", open.len());
+    crate::log_event!(Info,"http_transport inventory={inventory_count} due={tcp_total} tcp_open={}", open.len());
 
     let host = shared.settings.verify_url.host_str().context("missing verify host")?.to_owned();
     let port = shared.settings.verify_url.port_or_known_default().unwrap_or(443);
@@ -745,7 +745,7 @@ async fn refresh(shared: &Arc<Shared>) -> Result<()> {
         if fine { candidates.push(candidate); } else { invalid.push(candidate.id); }
     }
     mark_failures(shared, invalid).await;
-    println!("http_transport handshake_ok={} verify_queue={}", candidates.len(), candidates.len());
+    crate::log_event!(Info,"http_transport handshake_ok={} verify_queue={}", candidates.len(), candidates.len());
 
     // Every actual DEX request is globally paced. Handshakes are not charged to this gate.
     verify_candidates(shared, candidates, "discovery").await;
@@ -818,12 +818,12 @@ async fn verify_candidates(shared: &Arc<Shared>, candidates: Vec<Candidate>, sta
         if tested % 25 == 0 {
             publish(shared).await;
             signal_first_ready(shared);
-            println!("http_transport {stage} verify_tested={tested} verify_ok={ok}");
+            crate::log_event!(Info,"http_transport {stage} verify_tested={tested} verify_ok={ok}");
         }
     }
     publish(shared).await;
     signal_first_ready(shared);
-    println!("http_transport {stage}_complete verified_tested={tested} verified_ok={ok} working={}", shared.snapshots.borrow().len());
+    crate::log_event!(Info,"http_transport {stage}_complete verified_tested={tested} verified_ok={ok} working={}", shared.snapshots.borrow().len());
     ok
 
 }
@@ -1194,7 +1194,7 @@ pub async fn live_diagnostic() -> Result<()> {
     }).await.context("HTTP proxy discovery did not finish within 900 seconds")??;
     let verified = handle.working_set();
     ensure!(!verified.is_empty(), "HTTP discovery finished with no verified proxies");
-    println!(
+    crate::log_event!(Info,
         "http_transport live working_set={} fastest_ms={} protocol={} sources={} oldest_verified_age_ms={} published_routes={}",
         verified.len(), verified[0].latency_ms, verified[0].protocol,
         verified[0].sources.join(","),
@@ -1241,7 +1241,7 @@ pub async fn live_diagnostic() -> Result<()> {
                             Err(error) => {
                                 invalid_payload += 1;
                                 if invalid_payload <= 3 {
-                                    eprintln!("http_transport live invalid_payload={error:#}");
+                                    crate::log_event!(Warn,"http_transport live invalid_payload={error:#}");
                                 }
                             }
                         }
@@ -1253,7 +1253,7 @@ pub async fn live_diagnostic() -> Result<()> {
                 }
                 Err(error) => {
                     failed += 1;
-                    if failed <= 3 { eprintln!("http_transport live request_error={error:#}"); }
+                    if failed <= 3 { crate::log_event!(Warn,"http_transport live request_error={error:#}"); }
                 }
             }
         }
@@ -1264,13 +1264,13 @@ pub async fn live_diagnostic() -> Result<()> {
     let p95 = latencies.get(latencies.len().saturating_sub(1) * 95 / 100)
         .copied().unwrap_or(0);
     let elapsed = started.elapsed().as_secs_f64();
-    println!(
+    crate::log_event!(Warn,
         "http_transport live benchmark requests={} success={} errors={} http_429={} other_http={} invalid_payload={} distinct_routes={} bytes={} elapsed_s={:.2} throughput_rps={:.2} latency_p50_ms={} latency_p95_ms={}",
         calls, ok, failed, status_429, other_status, invalid_payload, routes_used.len(),
         bytes, elapsed, calls as f64 / elapsed.max(0.001), p50, p95
     );
     ensure!(ok > 0, "HTTP proxy transport did not produce a successful response");
-    println!("http_transport live PASS {}", sample.unwrap_or_default());
+    crate::log_event!(Info,"http_transport live PASS {}", sample.unwrap_or_default());
     drop(cycles);
     drop(handle);
     task.await??;

@@ -2,6 +2,8 @@
 
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
+mod runtime;
+
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
@@ -53,8 +55,8 @@ struct Cli {
     rest_source_only: Option<SourceSet>,
 }
 
-fn settings() -> Result<Cli> {
-    let mut args = env::args().skip(1);
+fn settings(args: impl Iterator<Item=String>) -> Result<Cli> {
+    let mut args = args;
     let mut once = false;
     let mut max_pages = None;
     let mut jupiter_only = false;
@@ -334,7 +336,7 @@ fn spawn_sources(
         .unwrap_or_else(|_| "256".into()).parse().context("invalid REGISTRY_BROADCAST_CAPACITY")?;
     ensure!((32..=65536).contains(&source_capacity) && (32..=65536).contains(&registry_capacity),
         "REST/REGISTRY broadcast capacities must be 32..=65536");
-    println!("orchestration rest_sources={source_set:?} source_broadcast_capacity={} registry_broadcast_capacity={} fail_on_lag={strict_lag}",
+    crate::log_event!(Info,"orchestration rest_sources={source_set:?} source_broadcast_capacity={} registry_broadcast_capacity={} fail_on_lag={strict_lag}",
         source_capacity, registry_capacity);
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(source_capacity);
     let registry_input = output.subscribe();
@@ -419,7 +421,7 @@ fn spawn_sources(
             pools: restored,
             persist_identity: Vec::new(),
         })).map_err(|_|anyhow::anyhow!("no registry bootstrap subscriber"))?;
-        println!("orchestration bootstrap seeded_pools={count}");
+        crate::log_event!(Info,"orchestration bootstrap seeded_pools={count}");
     }
     if let Some(writer) = persist {
         tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
@@ -508,20 +510,66 @@ fn spawn_jupiter(
     });
 }
 
+fn test_command(worker: &str) -> Result<&'static str> {
+    let legacy=match worker {
+        "completion_meteora_dlmm"=>"--completion-live",
+        "completion_meteora_damm_v2"=>"--damm-v2-completion-live",
+        "completion_orca_whirlpool"=>"--orca-completion-live",
+        "completion_raydium_amm_v4"=>"--raydium-amm-v4-completion-live",
+        "completion_raydium_cpmm"=>"--raydium-cpmm-completion-live",
+        "completion_raydium_clmm"=>"--raydium-clmm-completion-live",
+        "completion_pancakeswap_clmm"=>"--pancakeswap-clmm-completion-live",
+        "completion_byreal_clmm"=>"--byreal-clmm-completion-live",
+        "completion_manifest"=>"--manifest-completion-live",
+        "completion_pumpswap"=>"--pumpswap-completion-live",
+        "discovery_meteora_dlmm"=>"--once",
+        "discovery_meteora_damm_v2"=>"--damm-v2-live",
+        "discovery_orca_whirlpool"=>"--orca-live",
+        "discovery_raydium"=>"--raydium-live",
+        "discovery_pancakeswap_clmm"=>"--pancakeswap-live",
+        "discovery_byreal_clmm"=>"--byreal-live",
+        "discovery_manifest"=>"--manifest-live",
+        "discovery_pumpswap"=>"--pumpswap-discovery-live",
+        "discovery_rpc_full"=>"--rpc-full-scan-live",
+        "discovery_pumpswap_rolling"=>"--pumpswap-rolling",
+        "source_jupiter_mint"=>"--jupiter-only",
+        "graph_liquidity"=>"--graph-live",
+        "persistence_write"=>"--persistence-write-live",
+        "persistence_restore"=>"--persistence-restore-live",
+        "persistence_discovery"=>"--persistence-v2-live",
+        "rpc_transport"=>"--rpc-live",
+        "http_transport"=>"--http-transport-live",
+        "discovery_rest_all"=>"--rest-discovery-live",
+        _=>bail!("unknown --test module {worker}"),
+    };
+    Ok(legacy)
+}
+
 pub async fn run() -> Result<()> {
     match dotenvy::dotenv() {
         Ok(_) => {}
         Err(error) if error.not_found() => {}
         Err(error) => return Err(error).context("load .env"),
     }
+    core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
 
-    let cli = settings()?;
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "--run" {
+        return runtime::run().await;
+    }
+    if args.first().map(String::as_str) == Some("--test") {
+        ensure!(args.len()>=2,"--test requires a module name");
+        let normalized=test_command(&args[1])?.to_string();
+        args.drain(..2);
+        args.insert(0,normalized);
+    }
+    let cli = settings(args.into_iter())?;
     if cli.rpc_full_scan_live {
         let settings = discovery_rpc_full::Settings::from_env()?;
         let db = persistence::Persistence::connect().await?;
         let registry = pool_registry::PoolRegistry::default();
         let restored = registry.restore(db.restore().await?)?;
-        println!("rpc full scan initial restored_pools={restored}");
+        crate::log_event!(Info,"rpc full scan initial restored_pools={restored}");
         let (source, source_rx) = broadcast::channel::<Arc<core::DataBatch>>(256);
         let registry_rx = source.subscribe();
         let (updates, _) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(256);
@@ -543,7 +591,7 @@ pub async fn run() -> Result<()> {
         }
         downstream?;
         scanned?;
-        println!("rpc full scan live complete=true");
+        crate::log_event!(Info,"rpc full scan live complete=true");
         return Ok(());
     }
     if cli.pumpswap_discovery_live {
@@ -593,7 +641,7 @@ pub async fn run() -> Result<()> {
             persist_identity: Vec::new(),
         })).map_err(|_| anyhow::anyhow!("no Jupiter graph bootstrap subscriber"))?;
         drop(updates);
-        println!("orchestration jupiter-graph-live restored_pools={restored} source=persistence_restore");
+        crate::log_event!(Info,"orchestration jupiter-graph-live restored_pools={restored} source=persistence_restore");
         // Jupiter Search runs continuously against the restored graph's mint set.
         // The catalog producer retains the Jupiter mint sender during streaming.
         while let Some(result) = tasks.join_next().await { result??; }
@@ -603,12 +651,12 @@ pub async fn run() -> Result<()> {
         let database=persistence::Persistence::connect().await?;
         let registry=pool_registry::PoolRegistry::default();
         let restored=registry.restore(database.restore().await?)?;
-        println!("orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
+        crate::log_event!(Info,"orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
         let mut tasks=JoinSet::new();
         spawn_sources(&mut tasks,cli.meteora,None,None,None,
             Some(registry),Some(database),SourceSet::All,true)?;
         while let Some(result)=tasks.join_next().await {result??;}
-        println!("orchestration persistence-v2-live complete rpc_calls=0");
+        crate::log_event!(Info,"orchestration persistence-v2-live complete rpc_calls=0");
         return Ok(());
     }
     if cli.persistence_restore_live {
@@ -634,7 +682,7 @@ pub async fn run() -> Result<()> {
         })).map_err(|_|anyhow::anyhow!("no graph bootstrap receiver"))?;
         drop(updates);
         while let Some(result)=tasks.join_next().await {result??;}
-        println!("persistence restore-live complete restored_pools={restored} rpc_calls=0");
+        crate::log_event!(Info,"persistence restore-live complete restored_pools={restored} rpc_calls=0");
         return Ok(());
     }
     if cli.completion_live || cli.damm_v2_completion_live
@@ -682,11 +730,11 @@ pub async fn run() -> Result<()> {
             let registry = pool_registry::PoolRegistry::default();
             let restored_data = db.restore().await?;
             let restored = registry.restore(restored_data)?;
-            println!("orchestration initial persistence restored_pools={restored}");
+            crate::log_event!(Info,"orchestration initial persistence restored_pools={restored}");
             (Some(registry), Some(db))
         } else {(None,None)};
         if cli.stability_live {
-            println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
+            crate::log_event!(Info,"orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
                 cli.meteora.max_pages, completion_limit);
         }
         let source_set = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
@@ -783,7 +831,7 @@ pub async fn run() -> Result<()> {
         let database = persistence::Persistence::connect().await?;
         let registry = pool_registry::PoolRegistry::default();
         let restored = registry.restore(database.restore().await?)?;
-        println!("orchestration Jupiter graph bootstrap restored_pools={restored}");
+        crate::log_event!(Info,"orchestration Jupiter graph bootstrap restored_pools={restored}");
         (Some(registry), Some(graph_liquidity::Settings::from_env()?))
     } else { (None, None) };
 

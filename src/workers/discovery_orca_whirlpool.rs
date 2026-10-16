@@ -87,7 +87,7 @@ async fn lane(client:reqwest::Client,gate:Arc<Mutex<Instant>>,
                 Ok(v)=>v,
                 Err(err)=>{
                     errors+=1;
-                    eprintln!("orca route={name} request_error={err:#}");
+                    crate::log_event!(Warn,"orca route={name} request_error={err:#}");
                     sleep(Duration::from_secs(2)).await;continue;
                 }
             };
@@ -96,7 +96,7 @@ async fn lane(client:reqwest::Client,gate:Arc<Mutex<Instant>>,
                 let secs=response.headers().get(reqwest::header::RETRY_AFTER)
                     .and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).unwrap_or(5);
                 cooldown(&gate,Duration::from_secs(secs)).await;
-                eprintln!("orca route={name} http_429 cooldown_s={secs}");
+                crate::log_event!(Info,"orca route={name} http_429 cooldown_s={secs}");
                 continue;
             }
             if response.status().is_client_error(){
@@ -104,7 +104,7 @@ async fn lane(client:reqwest::Client,gate:Arc<Mutex<Instant>>,
             }
             if !response.status().is_success(){
                 errors+=1;
-                eprintln!("orca route={name} http_error={}",response.status());
+                crate::log_event!(Warn,"orca route={name} http_error={}",response.status());
                 sleep(Duration::from_secs(2)).await;continue;
             }
             let bytes=response.bytes().await.context("read Orca response")?;
@@ -125,7 +125,7 @@ async fn lane(client:reqwest::Client,gate:Arc<Mutex<Instant>>,
                     Ok(record)=>records.push(record),
                     Err(err)=>{
                         rejected+=1;
-                        if rejected<=5{eprintln!("orca route={name} rejected error={err:#}");}
+                        if rejected<=5{crate::log_event!(Warn,"orca route={name} rejected error={err:#}");}
                     }
                 }
             }
@@ -136,12 +136,12 @@ async fn lane(client:reqwest::Client,gate:Arc<Mutex<Instant>>,
                 })).map_err(|_|anyhow!("Orca batch has no consumer"))?;
             }
             if page_no==1||page_no%10==0{
-                println!("orca route={name} pages={page_no} received={received} accepted={accepted} rejected={rejected} errors={errors} elapsed_ms={}",started.elapsed().as_millis());
+                crate::log_event!(Info,"orca route={name} pages={page_no} received={received} accepted={accepted} rejected={rejected} errors={errors} elapsed_ms={}",started.elapsed().as_millis());
             }
             cursor=page.meta.cursor.next;
             if cursor.is_none()||settings.max_pages.is_some_and(|max|page_no>=max){break;}
         }
-        println!("orca route complete route={name} pages={page_no} received={received} accepted={accepted} rejected={rejected} errors={errors} elapsed_ms={}",started.elapsed().as_millis());
+        crate::log_event!(Info,"orca route complete route={name} pages={page_no} received={received} accepted={accepted} rejected={rejected} errors={errors} elapsed_ms={}",started.elapsed().as_millis());
         if settings.once{return Ok(());}
     }
 }
@@ -157,7 +157,7 @@ pub async fn run(client:reqwest::Client,output:broadcast::Sender<Arc<DataBatch>>
         tasks.spawn(async move{
             let result=lane(http,limiter,tx,settings,name,sort,direction,filter).await;
             if !settings.once{
-                if let Err(err)=&result{eprintln!("orca route_stopped route={name} error={err:#}");}
+                if let Err(err)=&result{crate::log_event!(Warn,"orca route_stopped route={name} error={err:#}");}
                 Ok(())
             }else{result}
         });

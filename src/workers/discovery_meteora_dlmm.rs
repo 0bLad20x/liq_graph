@@ -87,7 +87,7 @@ fn decode_page(body: &[u8], page: u32) -> Result<Page> {
             Ok(record) => records.push(record),
             Err(error) => {
                 rejected += 1;
-                eprintln!("meteora page={page} rejected_pool error={error:#}");
+                crate::log_event!(Warn,"meteora page={page} rejected_pool error={error:#}");
             }
         }
     }
@@ -132,7 +132,7 @@ async fn fetch_with_retry(
         match fetch_page(&client, page).await {
             Ok(result) => return result,
             Err(error) => {
-                eprintln!("meteora page={page} retry error={error:#}");
+                crate::log_event!(Warn,"meteora page={page} retry error={error:#}");
                 sleep(RETRY_DELAY).await;
             }
         }
@@ -181,7 +181,7 @@ pub async fn run(
             }
         }
 
-        eprintln!(
+        crate::log_event!(Info,
             "meteora source pages={scanned}/{total_pages} decoded_pools={records} rejected_pools={rejected} unconsumed_batches={unconsumed_batches} elapsed_ms={}",
             started.elapsed().as_millis()
         );

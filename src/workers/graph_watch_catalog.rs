@@ -299,7 +299,7 @@ pub async fn run(
                 tx.send_replace(mint_addresses);
             }
         }
-        println!("graph watch catalog published generation={} groups={} mints={} pools={} mint_pairs={}",
+        crate::log_event!(Info,"graph watch catalog published generation={} groups={} mints={} pools={} mint_pairs={}",
             catalog.generation, catalog.graph.groups.len(),
             catalog.mints.len(), catalog.pools.len(), catalog.pairs.len());
     }
@@ -331,7 +331,7 @@ pub async fn observe(mut input: watch::Receiver<Arc<WatchCatalog>>) -> Result<()
         let bridge4_mints: BTreeSet<_> = bridge4_pairs.iter()
             .flat_map(|&(a,b)| [a,b]).collect();
         let parallel_pairs = catalog.pairs.iter().filter(|p| p.pools.len() >= 2).count();
-        println!("graph watch catalog consumer generation={} direct_2={} direct_3={} triangle_3={} triangle_4={} mints={} pools={} mint_pairs={} parallel_pairs={} triangle4_intermediate_pools={} triangle4_intermediate_pairs={} triangle4_intermediate_mints={}",
+        crate::log_event!(Debug,"graph watch catalog consumer generation={} direct_2={} direct_3={} triangle_3={} triangle_4={} mints={} pools={} mint_pairs={} parallel_pairs={} triangle4_intermediate_pools={} triangle4_intermediate_pairs={} triangle4_intermediate_mints={}",
             catalog.generation, categories[0], categories[1],
             categories[2], categories[3], catalog.mints.len(),
             catalog.pools.len(), catalog.pairs.len(), parallel_pairs,
@@ -354,7 +354,7 @@ pub async fn observe(mut input: watch::Receiver<Arc<WatchCatalog>>) -> Result<()
                 "catalog indexed pair missing referencing pool");
             ensure!(selected.contexts.iter().all(|ctx| pair.contexts.contains(ctx)),
                 "catalog pair missing a referenced pool context");
-            println!("graph watch catalog sample generation={} pool={} mint_a={} mint_b={} pair_pool_count={} group_refs={} group_settlement={} group_target={} mint_contexts={:?} mint_group_refs={} pair_contexts={:?} pair_pools={}",
+            crate::log_event!(Debug,"graph watch catalog sample generation={} pool={} mint_a={} mint_b={} pair_pool_count={} group_refs={} group_settlement={} group_target={} mint_contexts={:?} mint_group_refs={} pair_contexts={:?} pair_pools={}",
                 catalog.generation, selected.address, selected.mint_a, selected.mint_b,
                 selected.pair_pool_count, selected.group_ids.len(),
                 group.settlement, group.target, mint.contexts,

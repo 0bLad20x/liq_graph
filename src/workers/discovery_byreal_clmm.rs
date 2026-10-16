@@ -105,7 +105,7 @@ async fn fetch_page(
         ]).send().await {
             Ok(response) => response,
             Err(error) => {
-                eprintln!("byreal page={page} request_error={error:#}");
+                crate::log_event!(Warn,"byreal page={page} request_error={error:#}");
                 sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -119,21 +119,21 @@ async fn fetch_page(
                 .unwrap_or(10);
             let delay = Duration::from_secs(retry_seconds.max(1));
             cooldown(gate, delay).await;
-            eprintln!("byreal page={page} http_429 cooldown_s={retry_seconds}");
+            crate::log_event!(Debug,"byreal page={page} http_429 cooldown_s={retry_seconds}");
             continue;
         }
         if status.is_client_error() {
             bail!("Byreal page={page} HTTP {status}");
         }
         if !status.is_success() {
-            eprintln!("byreal page={page} http_error={status}");
+            crate::log_event!(Warn,"byreal page={page} http_error={status}");
             sleep(RETRY_DELAY).await;
             continue;
         }
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("byreal page={page} body_error={error:#}");
+                crate::log_event!(Warn,"byreal page={page} body_error={error:#}");
                 sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -141,7 +141,7 @@ async fn fetch_page(
         let envelope: Response = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("byreal page={page} json_error={error:#}");
+                crate::log_event!(Warn,"byreal page={page} json_error={error:#}");
                 sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -195,7 +195,7 @@ pub async fn run(
                     }
                     Err(error)=>{
                         rejected+=1;
-                        if rejected<=5 {eprintln!("byreal page={page} rejected_pool={error:#}");}
+                        if rejected<=5 {crate::log_event!(Warn,"byreal page={page} rejected_pool={error:#}");}
                     }
                 }
             }
@@ -211,7 +211,7 @@ pub async fn run(
         }
         let total=reported_total.unwrap_or(0);
         let capped=settings.max_pages.is_some_and(|max|page>max);
-        println!("byreal pass={pass} reported_total={total} pages={pages} received={received} unique={} duplicates={duplicates} rejected={rejected} complete={} rpm={} elapsed_ms={}",
+        crate::log_event!(Info,"byreal pass={pass} reported_total={total} pages={pages} received={received} unique={} duplicates={duplicates} rejected={rejected} complete={} rpm={} elapsed_ms={}",
             seen.len(),!capped&&seen.len()==total&&rejected==0,settings.rpm,started.elapsed().as_millis());
         if settings.once{return Ok(());}
     }

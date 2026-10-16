@@ -150,7 +150,7 @@ async fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
         && accounts.iter().zip(&ids).all(|(a,id)|
             a.as_ref().is_none_or(|a|a.address==*id && full(a))),
         "PumpSwap RPC result cardinality/address/full snapshot mismatch");
-    println!("pumpswap completion rpc provider={} slot={slot} requested={} present={}",
+    crate::log_event!(Debug,"pumpswap completion rpc provider={} slot={slot} requested={} present={}",
         response.provider,ids.len(),accounts.iter().filter(|a|a.is_some()).count());
     Ok((slot,ids.into_iter().zip(accounts).collect()))
 }
@@ -380,7 +380,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut retryable=0_usize;
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    println!("pumpswap completion started wallet_independent=true limit={} batch={} parallel={}",
+    crate::log_event!(Info,"pumpswap completion started wallet_independent=true limit={} batch={} parallel={}",
         settings.limit,settings.pools_per_batch(),settings.parallel_batches);
     loop {
         while tasks.len()<settings.parallel_batches &&
@@ -422,7 +422,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                             scheduler.retry_after.remove(&r.pool);
                             if prepared<=3 {
                                 if let Some(m)=&r.manifest {
-                                    println!("pumpswap manifest pool={} slot={} base_a={} base_b={}",
+                                    crate::log_event!(Debug,"pumpswap manifest pool={} slot={} base_a={} base_b={}",
                                         m.pool,m.validated_slot,m.base_a.len(),m.base_b.len());
                                 }
                             }
@@ -432,7 +432,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                             if r.evidence.as_ref().is_some_and(|e|e.kind=="pumpswap_pool_validated_v1") {
                                 scheduler.candidates.remove(&r.pool);
                                 scheduler.retry_after.remove(&r.pool);
-                                println!("pumpswap pool_completed pool={} validated_slot={} v10_resolution=deferred",
+                                crate::log_event!(Debug,"pumpswap pool_completed pool={} validated_slot={} v10_resolution=deferred",
                                     r.pool,r.validated_slot.unwrap_or_default());
                             }
                         }
@@ -444,21 +444,21 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                         }
                     }
                     if r.status!=CompletionStatus::Prepared {
-                        println!("pumpswap completion result pool={} status={:?} reason={}",
+                        crate::log_event!(Debug,"pumpswap completion result pool={} status={:?} reason={}",
                             r.pool,r.status,r.reason.as_deref().unwrap_or("-"));
                     }
                 }
-                println!("pumpswap completion batch results={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}",
+                crate::log_event!(Debug,"pumpswap completion batch results={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}",
                     results.len());
                 output.send(Arc::new(CompletionResultBatch{source:SOURCE,results}))
                     .map_err(|_|anyhow!("PumpSwap completion has no Registry receiver"))?;
             },
             _=pulse.tick()=>{
-                println!("pumpswap completion backlog={} in_flight={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}",
+                crate::log_event!(Debug,"pumpswap completion backlog={} in_flight={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}",
                     scheduler.candidates.len(),tasks.len());
             }
         }
     }
-    println!("pumpswap completion complete attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}");
+    crate::log_event!(Info,"pumpswap completion complete attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}");
     Ok(())
 }

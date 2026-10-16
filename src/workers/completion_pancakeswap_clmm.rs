@@ -490,7 +490,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started=Instant::now();
-    println!("pancakeswap clmm completion started limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
+    crate::log_event!(Info,"pancakeswap clmm completion started limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
         settings.limit,settings.parallel_batches,settings.pools_per_batch(),
         RETRY_COOLDOWN.as_secs());
     loop {
@@ -554,11 +554,11 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 prepared+=p;incomplete+=i;retryable+=r;
-                println!("pancakeswap clmm completion batch tier={tier} attempts={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
+                crate::log_event!(Debug,"pancakeswap clmm completion batch tier={tier} attempts={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
                     results.len(),started.elapsed().as_millis());
                 for result in results.iter().filter(|r|r.status==CompletionStatus::Prepared).take(2) {
                     if let Some(manifest)=&result.manifest {
-                        println!("pancakeswap clmm manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
+                        crate::log_event!(Debug,"pancakeswap clmm manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
                             manifest.pool,manifest.validated_slot,manifest.base_a.len(),manifest.base_b.len(),
                             manifest.base_a.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
                                 .collect::<Vec<_>>(),
@@ -567,7 +567,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     }
                 }
                 for result in results.iter().filter(|r|r.status!=CompletionStatus::Prepared).take(3) {
-                    println!("pancakeswap clmm completion result pool={} status={:?} reason={}",
+                    crate::log_event!(Debug,"pancakeswap clmm completion result pool={} status={:?} reason={}",
                         result.pool,result.status,result.reason.as_deref().unwrap_or("-"));
                 }
                 output.send(Arc::new(CompletionResultBatch {source:SOURCE,results}))
@@ -575,13 +575,13 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
             },
             _=pulse.tick()=>{
                 let (a,b,c)=scheduler.counts(Instant::now());
-                println!("pancakeswap clmm completion backlog seen={} candidate_unknown={a} candidate_incomplete={b} eligible_retry={c} candidates_in_ram={} active_batches={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable} registry_updates={received_updates}",
+                crate::log_event!(Debug,"pancakeswap clmm completion backlog seen={} candidate_unknown={a} candidate_incomplete={b} eligible_retry={c} candidates_in_ram={} active_batches={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable} registry_updates={received_updates}",
                     seen.len(),scheduler.candidates.len(),tasks.len());
             }
         }
     }
     let (a,b,c)=scheduler.counts(Instant::now());
-    println!("pancakeswap clmm completion complete pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
+    crate::log_event!(Info,"pancakeswap clmm completion complete pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }
