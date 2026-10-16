@@ -10,7 +10,7 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
-        diagnostic_source, graph_liquidity, graph_watch_catalog, persistence, pool_registry,
+        diagnostic_source, graph_liquidity, graph_watch_catalog, identity_hydration_pumpswap, persistence, pool_registry,
         rpc_transport, source_jupiter_mint}};
 use super::jupiter_settings;
 
@@ -159,6 +159,10 @@ pub async fn run()->Result<()>{
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
+    let hydration_seed=restored.iter()
+        .filter(|p|p.venue==Venue::PumpSwap
+            && (p.mint_a.is_none()||p.mint_b.is_none()))
+        .map(|p|p.address).collect::<Vec<_>>();
     let graph_boot:Vec<PoolState>=restored.iter()
         .filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();
     let mut boot:Vec<(Venue,Vec<PoolState>)>=Vec::new();
@@ -281,6 +285,29 @@ pub async fn run()->Result<()>{
         confirmed.await.context("completion failed before startup readiness")?;
     }
     drop(completions);
+    // Full Scan emits address-only records; restored + newly discovered unknown
+    // PumpSwap pools use the same verified hydration path back into Registry.
+    // Subscribe before starting Discovery to avoid losing the initial updates.
+    let hydrate_registry=registry.clone();
+    let hydrate_updates=updates.clone();
+    let hydrate_source=source.clone();
+    let hydrate_rpc=rpc.clone();
+    let mut first_seed=Some(hydration_seed);
+    let mut first_hydrate_rx=Some(updates.subscribe());
+    tasks.spawn(supervise("identity_hydration.pumpswap",stop_rx.clone(),move||{
+        let seed=first_seed.take().unwrap_or_else(||hydrate_registry.snapshot()
+            .into_iter().filter(|p|p.venue==Venue::PumpSwap
+                && (p.mint_a.is_none()||p.mint_b.is_none()))
+            .map(|p|p.address).collect());
+        let input=first_hydrate_rx.take()
+            .unwrap_or_else(||hydrate_updates.subscribe());
+        let output=hydrate_source.clone();
+        let client=hydrate_rpc.clone();
+        async move{
+            identity_hydration_pumpswap::run(seed,input,client,output,
+                identity_hydration_pumpswap::Settings::from_env()?,false).await
+        }
+    }));
     crate::log_event!(Info,"runtime ready=true workers_completion=10");
 
     // Keep REST source ownership and retry entirely outside the protocol workers.
