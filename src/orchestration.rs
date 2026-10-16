@@ -6,10 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{damm_v2_completion, orca_completion, raydium_amm_v4_completion, raydium_cpmm_completion, raydium_clmm_completion, pancakeswap_clmm_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, pancakeswap, orca, persistence, pool_registry, rpc_transport, http_transport, source_diagnostic}};
+use crate::{core, workers::{damm_v2_completion, orca_completion, raydium_amm_v4_completion, raydium_cpmm_completion, raydium_clmm_completion, pancakeswap_clmm_completion, byreal_clmm_completion, execution_completion, graph_watch_catalog, jupiter_search, liquidity_graph, meteora_dlmm, meteora_damm_v2, raydium, pancakeswap, byreal, orca, persistence, pool_registry, rpc_transport, http_transport, source_diagnostic}};
 
 #[derive(Clone, Copy, Debug)]
-enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Orca, DammV2, All }
+enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Orca, DammV2, All }
 
 struct CompletionConfig {
     rpc: rpc_transport::RpcHandle,
@@ -20,6 +20,7 @@ struct CompletionConfig {
     raydium_cpmm: Option<raydium_cpmm_completion::Settings>,
     raydium_clmm: Option<raydium_clmm_completion::Settings>,
     pancakeswap_clmm: Option<pancakeswap_clmm_completion::Settings>,
+    byreal_clmm: Option<byreal_clmm_completion::Settings>,
 }
 
 struct Cli {
@@ -34,6 +35,7 @@ struct Cli {
     raydium_cpmm_completion_live: bool,
     raydium_clmm_completion_live: bool,
     pancakeswap_clmm_completion_live: bool,
+    byreal_clmm_completion_live: bool,
     graph_live: bool,
     completion_limit: Option<usize>,
     persistence_write_live: bool,
@@ -58,6 +60,7 @@ fn settings() -> Result<Cli> {
     let mut raydium_cpmm_completion_live = false;
     let mut raydium_clmm_completion_live = false;
     let mut pancakeswap_clmm_completion_live = false;
+    let mut byreal_clmm_completion_live = false;
     let mut graph_live = false;
     let mut completion_limit = None;
     let mut persistence_write_live = false;
@@ -80,6 +83,7 @@ fn settings() -> Result<Cli> {
             "--raydium-cpmm-completion-live" => { raydium_cpmm_completion_live = true; once = true; },
             "--raydium-clmm-completion-live" => { raydium_clmm_completion_live = true; once = true; },
             "--pancakeswap-clmm-completion-live" => { pancakeswap_clmm_completion_live = true; once = true; },
+            "--byreal-clmm-completion-live" => { byreal_clmm_completion_live = true; once = true; },
             "--graph-live" => { graph_live = true; once = true; },
             "--persistence-write-live" => { persistence_write_live = true; once = true; },
             "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
@@ -88,6 +92,7 @@ fn settings() -> Result<Cli> {
             "--rest-discovery-live" => { rest_discovery_live = true; once = true; },
             "--raydium-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Raydium); once = true; },
             "--pancakeswap-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::PancakeSwap); once = true; },
+            "--byreal-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Byreal); once = true; },
             "--orca-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Orca); once = true; },
             "--damm-v2-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::DammV2); once = true; },
             "--completion-limit" => {
@@ -104,9 +109,17 @@ fn settings() -> Result<Cli> {
                 ensure!(count > 0, "--pages must be positive");
                 max_pages = Some(count);
             }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --http-transport-live, --completion-live, --damm-v2-completion-live, --orca-completion-live, --raydium-amm-v4-completion-live, --raydium-cpmm-completion-live, --raydium-clmm-completion-live, --pancakeswap-clmm-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --pancakeswap-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
+            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --http-transport-live, --completion-live, --damm-v2-completion-live, --orca-completion-live, --raydium-amm-v4-completion-live, --raydium-cpmm-completion-live, --raydium-clmm-completion-live, --pancakeswap-clmm-completion-live, --byreal-clmm-completion-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --pancakeswap-live, --byreal-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
         }
     }
+    ensure!(!(byreal_clmm_completion_live && (rpc_live || http_transport_live || jupiter_only
+        || completion_live || damm_v2_completion_live || orca_completion_live
+        || raydium_amm_v4_completion_live || raydium_cpmm_completion_live
+        || raydium_clmm_completion_live || pancakeswap_clmm_completion_live
+        || graph_live || persistence_write_live || persistence_restore_live
+        || persistence_v2_live || stability_live || rest_discovery_live
+        || rest_source_only.is_some())),
+        "--byreal-clmm-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
     ensure!(!(pancakeswap_clmm_completion_live && (rpc_live || http_transport_live || jupiter_only
         || completion_live || damm_v2_completion_live || orca_completion_live
         || raydium_amm_v4_completion_live || raydium_cpmm_completion_live
@@ -168,7 +181,8 @@ fn settings() -> Result<Cli> {
     ensure!(completion_limit.is_none() || completion_live || damm_v2_completion_live
         || orca_completion_live || raydium_amm_v4_completion_live
         || raydium_cpmm_completion_live || raydium_clmm_completion_live
-        || pancakeswap_clmm_completion_live || graph_live || persistence_write_live || stability_live,
+        || pancakeswap_clmm_completion_live || byreal_clmm_completion_live
+        || graph_live || persistence_write_live || stability_live,
         "--completion-limit requires a Completion/Graph/Persistence/Stability live mode");
     ensure!(
         !(jupiter_only && (once || max_pages.is_some())),
@@ -194,6 +208,7 @@ fn settings() -> Result<Cli> {
         raydium_cpmm_completion_live,
         raydium_clmm_completion_live,
         pancakeswap_clmm_completion_live,
+        byreal_clmm_completion_live,
         graph_live,
         completion_limit,
         persistence_write_live,
@@ -309,6 +324,10 @@ fn spawn_sources(
         }
         if let Some(clmm) = config.pancakeswap_clmm {
             tasks.spawn(pancakeswap_clmm_completion::run(registry_output.subscribe(),
+                source_done_rx.clone(), config.rpc.clone(), clmm, completion_output.clone()));
+        }
+        if let Some(clmm) = config.byreal_clmm {
+            tasks.spawn(byreal_clmm_completion::run(registry_output.subscribe(),
                 source_done_rx, config.rpc, clmm, completion_output.clone()));
         }
         // Registry closes only after every completion producer has finished.
@@ -341,6 +360,13 @@ fn spawn_sources(
             .unwrap_or_else(|_| "10".into()).parse().context("invalid RAYDIUM_API_RPS")?;
         tasks.spawn(raydium::run(core::http_client()?, output.clone(), raydium::Settings {
             once: settings.once, max_pages: settings.max_pages, rps,
+        }));
+    }
+    if matches!(source_set, SourceSet::Byreal | SourceSet::All) {
+        let rpm:u32=env::var("BYREAL_API_RPM")
+            .unwrap_or_else(|_| "57".into()).parse().context("invalid BYREAL_API_RPM")?;
+        tasks.spawn(byreal::run(core::http_client()?,output.clone(),byreal::Settings {
+            once: settings.once,max_pages:settings.max_pages,rpm,
         }));
     }
     if matches!(source_set, SourceSet::PancakeSwap | SourceSet::All) {
@@ -494,7 +520,8 @@ pub async fn run() -> Result<()> {
     if cli.completion_live || cli.damm_v2_completion_live
         || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
         || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
-        || cli.pancakeswap_clmm_completion_live || cli.graph_live || cli.persistence_write_live || cli.stability_live {
+        || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
+        || cli.graph_live || cli.persistence_write_live || cli.stability_live {
         let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let mut tasks = JoinSet::new();
         // Protocol completion workers share the RPC transport configuration;
@@ -504,21 +531,21 @@ pub async fn run() -> Result<()> {
             if cli.stability_live {0}
             else if cli.graph_live || cli.persistence_write_live {5000}
             else if cli.orca_completion_live {200}
-            else if cli.pancakeswap_clmm_completion_live {0}
+            else if cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live {0}
             else {100});
 
         let graph = if cli.graph_live || cli.persistence_write_live
             || cli.stability_live || cli.damm_v2_completion_live
             || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
             || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
-            || cli.pancakeswap_clmm_completion_live {
+            || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live {
             Some(liquidity_graph::Settings::from_env()?)
         } else {None};
         let (registry, writer) = if cli.persistence_write_live
             || cli.stability_live || cli.damm_v2_completion_live
             || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
             || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
-            || cli.pancakeswap_clmm_completion_live {
+            || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live {
             let db = persistence::Persistence::connect().await?;
             let registry = pool_registry::PoolRegistry::default();
             let restored = registry.restore(db.restore().await?)?;
@@ -529,7 +556,9 @@ pub async fn run() -> Result<()> {
             println!("orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
                 cli.meteora.max_pages, completion_limit);
         }
-        let source_set = if cli.pancakeswap_clmm_completion_live {
+        let source_set = if cli.byreal_clmm_completion_live {
+            SourceSet::Byreal
+        } else if cli.pancakeswap_clmm_completion_live {
             SourceSet::PancakeSwap
         } else if cli.orca_completion_live {
             SourceSet::Orca
@@ -546,7 +575,7 @@ pub async fn run() -> Result<()> {
         } else { None };
         let dlmm = if !cli.orca_completion_live && !cli.raydium_amm_v4_completion_live
             && !cli.raydium_cpmm_completion_live && !cli.raydium_clmm_completion_live
-            && !cli.pancakeswap_clmm_completion_live
+            && !cli.pancakeswap_clmm_completion_live && !cli.byreal_clmm_completion_live
             && (!cli.damm_v2_completion_live || cli.completion_live) {
             let mut settings = execution_completion::Settings::from_env()?;
             settings.limit = completion_limit;
@@ -577,9 +606,14 @@ pub async fn run() -> Result<()> {
             settings.limit = completion_limit;
             Some(settings)
         } else { None };
+        let byreal_clmm = if cli.byreal_clmm_completion_live {
+            let mut settings=byreal_clmm_completion::Settings::from_env()?;
+            settings.limit=completion_limit;
+            Some(settings)
+        } else {None};
         let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
         spawn_sources(&mut tasks, cli.meteora,
-            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm}),
+            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm}),
             graph, jupiter, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
