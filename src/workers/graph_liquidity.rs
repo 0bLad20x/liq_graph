@@ -375,7 +375,7 @@ fn probe(snapshot: &GraphSnapshot) {
         .copied().take(32).map(|k|(true,k)).collect();
     samples.extend(snapshot.pool_index.keys().copied().take(32).map(|k|(false,k)));
     if samples.is_empty() {
-        println!("liquidity graph lookup skipped=no_qualified_v10_groups");
+        crate::log_event!(Debug,"liquidity graph lookup skipped=no_qualified_v10_groups");
         return;
     }
     let mut lookup_ns = Vec::with_capacity(4096);
@@ -399,7 +399,7 @@ fn probe(snapshot: &GraphSnapshot) {
     lookup_ns.sort_unstable();
     resolve_ns.sort_unstable();
     let percentile = |samples: &[u64], numer:usize| samples[((samples.len()-1)*numer)/100];
-    println!("liquidity graph lookup generation={} samples={} resolved_pool_refs={} lookup_p50_ns={} lookup_p95_ns={} lookup_p99_ns={} lookup_max_ns={} resolve4_p50_ns={} resolve4_p95_ns={} resolve4_p99_ns={} resolve4_max_ns={}",
+    crate::log_event!(Debug,"liquidity graph lookup generation={} samples={} resolved_pool_refs={} lookup_p50_ns={} lookup_p95_ns={} lookup_p99_ns={} lookup_max_ns={} resolve4_p50_ns={} resolve4_p95_ns={} resolve4_p99_ns={} resolve4_max_ns={}",
         snapshot.generation,lookup_ns.len(),matched,
         percentile(&lookup_ns,50),percentile(&lookup_ns,95),
         percentile(&lookup_ns,99),lookup_ns[lookup_ns.len()-1],
@@ -528,7 +528,7 @@ pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<(
         observed += 1;
         probe(&snapshot);
         if let Some(group) = snapshot.groups.first() {
-            println!("liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={} direct_pool_samples={:?} bridge_pool_samples={:?}",
+            crate::log_event!(Debug,"liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={} direct_pool_samples={:?} bridge_pool_samples={:?}",
                 snapshot.generation,snapshot.groups.len(),group.kind,group.settlement,group.target,
                 group.bridge,group.intermediate,group.conversion,group.direct_s.len(),
                 group.direct_q.len(),group.bridge_pools.len(),group.route_options,
@@ -536,6 +536,6 @@ pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<(
                 group.bridge_pools.iter().take(3).collect::<Vec<_>>());
         }
     }
-    println!("liquidity graph consumer complete generations={observed}");
+    crate::log_event!(Info,"liquidity graph consumer complete generations={observed}");
     Ok(())
 }
