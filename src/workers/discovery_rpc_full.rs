@@ -37,14 +37,19 @@ impl Settings {
             "RaydiumAmmV4" => Venue::RaydiumAmmV4,
             "RaydiumCpmm" => Venue::RaydiumCpmm,
             "RaydiumClmm" => Venue::RaydiumClmm,
+            "RaydiumStable" => Venue::RaydiumStable,
             "OrcaWhirlpool" => Venue::OrcaWhirlpool,
             "PancakeSwapClmm" => Venue::PancakeSwapClmm,
             "ByrealClmm" => Venue::ByrealClmm,
             "Manifest" => Venue::Manifest,
             _ => bail!("unsupported FULL_SCAN_VENUE={venue_name}"),
         };
-        let program: Pubkey = env::var("FULL_SCAN_PROGRAM_ID")
-            .unwrap_or_else(|_| PUMP.into()).parse().context("FULL_SCAN_PROGRAM_ID")?;
+        let program_name = match env::var("FULL_SCAN_PROGRAM_ID") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) if venue == Venue::PumpSwap => PUMP.into(),
+            Err(e) => bail!("FULL_SCAN_PROGRAM_ID required for custom venue: {e}"),
+        };
+        let program: Pubkey = program_name.parse().context("FULL_SCAN_PROGRAM_ID")?;
         ensure!(program != Pubkey::default(), "zero FULL_SCAN_PROGRAM_ID");
         let filter_offset: usize = env::var("FULL_SCAN_FILTER_OFFSET")
             .unwrap_or_else(|_| "0".into()).parse()?;
@@ -67,16 +72,16 @@ impl Settings {
                 .with_context(|| format!("RPC_{index}_HTTP_URL not set"))?;
             ensure!(endpoint.starts_with("https://") || endpoint.starts_with("http://"),
                 "invalid HTTP scheme for RPC_{index}");
-            ensure!(!endpoint.contains(['\n','\r','"','\\']),
+            ensure!(!endpoint.chars().any(|ch| matches!(ch, '\n'|'\r'|'"'|'\\')),
                 "invalid RPC URL for curl config");
             providers.push((index, endpoint));
         }
         ensure!(!providers.is_empty(), "FULL_SCAN_RPC_INDICES is empty");
         let timeout_seconds: u64 = env::var("FULL_SCAN_TIMEOUT_SECONDS")
-            .unwrap_or_else(|_| "900".into()).parse()?;
+            .unwrap_or_else(|_| "1800".into()).parse()?;
         let batch_spacing_ms: u64 = env::var("FULL_SCAN_BATCH_SPACING_MS")
             .unwrap_or_else(|_| "250".into()).parse()?;
-        ensure!(timeout_seconds >= 30 && timeout_seconds <= 3600
+        ensure!(timeout_seconds >= 30 && timeout_seconds <= 7200
             && (10..=10000).contains(&batch_spacing_ms),
             "invalid full scan timeout / batch spacing");
         Ok(Self { program, venue, filter_offset, filter_bytes, providers,
@@ -179,7 +184,7 @@ impl<'de> Visitor<'de> for EnvelopeVisitor<'_> {
             match key.as_str() {
                 "result" => {
                     if has_result { return Err(serde::de::Error::custom("duplicate result")); }
-                    map.next_value_seed(ListSeed(self.0))?;
+                    map.next_value_seed(ListSeed(&mut *self.0))?;
                     has_result = true;
                 },
                 "id" => {
