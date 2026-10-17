@@ -173,6 +173,39 @@ pub async fn run()->Result<()>{
             }
             Some((p.address,p.venue))
         }).collect();
+    // Finite real-provider checkpoint: only multi-venue Hydration, Registry and
+    // Persistence. No REST discovery, Graph, Completion or legacy PumpSwap worker.
+    if enabled("IDENTITY_HYDRATION_ONLY")? {
+        let registry=pool_registry::PoolRegistry::default();
+        let restored_count=registry.restore(restored)?;
+        let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+        let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
+        let db_rx=updates.subscribe();
+        let hydrate_rx=updates.subscribe();
+        let (done,_) = watch::channel(false);
+        let registry_task=tokio::spawn(pool_registry::run(source_rx,None,registry,
+            updates.clone(),done,true));
+        let writer_task=tokio::spawn(database.run(db_rx));
+        crate::log_event!(Info,
+            "multi venue hydration standalone restored={} requested={} pumpswap_shadow_limit={}",
+            restored_count,venue_hydration_seed.len(),
+            venue_hydration_settings.pumpswap_shadow_limit);
+        let result=identity_hydration_venues::run(venue_hydration_seed,hydrate_rx,
+            rpc.clone(),source.clone(),venue_hydration_settings,true).await;
+        drop(source);
+        drop(updates);
+        drop(rpc);
+        // Preserve upstream errors and wait for the Registry/Persistence drain.
+        let registry_result=registry_task.await.context("hydration Registry task panicked")?;
+        let writer_result=writer_task.await.context("hydration Persistence task panicked")?;
+        let rpc_result=rpc_task.await.context("hydration RPC task panicked")?;
+        result?;
+        registry_result?;
+        writer_result?;
+        rpc_result?;
+        crate::log_event!(Info,"multi venue hydration standalone complete=true persisted=true");
+        return Ok(());
+    }
     let hydration_seed=restored.iter()
         .filter(|p|p.venue==Venue::PumpSwap
             && (p.mint_a.is_none()||p.mint_b.is_none()))
