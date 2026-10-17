@@ -98,7 +98,9 @@ fn layout(venue: Venue) -> Layout {
         },
         Venue::PumpSwap => Layout {
             program: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
-            mint_a: 43, mint_b: 75, account_len: 245, exact_len: false,
+            // Identity needs only the first 107 bytes; older pool variants can
+            // legitimately be shorter than Completion's 245-byte full-state frame.
+            mint_a: 43, mint_b: 75, account_len: 107, exact_len: false,
             discriminator: Some(DAMM), version_at_8: None,
         },
     }
