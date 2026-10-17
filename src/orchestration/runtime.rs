@@ -302,6 +302,7 @@ pub async fn run()->Result<()>{
     // Full Scan emits address-only records; restored + newly discovered unknown
     // PumpSwap pools use the same verified hydration path back into Registry.
     // Subscribe before starting Discovery to avoid losing the initial updates.
+    if !enabled("IDENTITY_HYDRATION_SKIP_LEGACY_PUMPSWAP")? {
     let hydrate_registry=registry.clone();
     let hydrate_updates=updates.clone();
     let hydrate_source=source.clone();
@@ -322,6 +323,7 @@ pub async fn run()->Result<()>{
                 identity_hydration_pumpswap::Settings::from_env()?,false).await
         }
     }));
+    }
     // Separate multi-venue identity reader; the existing PumpSwap reader remains
     // unchanged. Shadow PumpSwap reads are bounded and opt-in for live comparison.
     let venue_hydrate_registry=registry.clone();
