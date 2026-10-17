@@ -10,7 +10,8 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
-        diagnostic_source, graph_liquidity, graph_watch_catalog, identity_hydration_pumpswap, persistence, pool_registry,
+        diagnostic_source, graph_liquidity, graph_watch_catalog, identity_hydration_pumpswap,
+        identity_hydration_venues, persistence, pool_registry,
         rpc_transport, source_jupiter_mint}};
 use super::jupiter_settings;
 
@@ -159,6 +160,52 @@ pub async fn run()->Result<()>{
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
+    let venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
+    let mut pump_shadow_seeded=0_usize;
+    let venue_hydration_seed:Vec<(solana_pubkey::Pubkey,Venue)>=restored.iter()
+        .filter_map(|p|{
+            if p.mint_a.is_some() && p.mint_b.is_some(){return None;}
+            if p.venue==Venue::PumpSwap {
+                if pump_shadow_seeded>=venue_hydration_settings.pumpswap_shadow_limit {
+                    return None;
+                }
+                pump_shadow_seeded+=1;
+            }
+            Some((p.address,p.venue))
+        }).collect();
+    // Finite real-provider checkpoint: only multi-venue Hydration, Registry and
+    // Persistence. No REST discovery, Graph, Completion or legacy PumpSwap worker.
+    if enabled("IDENTITY_HYDRATION_ONLY")? {
+        let registry=pool_registry::PoolRegistry::default();
+        let restored_count=registry.restore(restored)?;
+        let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+        let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
+        let db_rx=updates.subscribe();
+        let hydrate_rx=updates.subscribe();
+        let (done,_) = watch::channel(false);
+        let registry_task=tokio::spawn(pool_registry::run(source_rx,None,registry,
+            updates.clone(),done,true));
+        let writer_task=tokio::spawn(database.run(db_rx));
+        crate::log_event!(Info,
+            "multi venue hydration standalone restored={} requested={} pumpswap_shadow_limit={}",
+            restored_count,venue_hydration_seed.len(),
+            venue_hydration_settings.pumpswap_shadow_limit);
+        let result=identity_hydration_venues::run(venue_hydration_seed,hydrate_rx,
+            rpc.clone(),source.clone(),venue_hydration_settings,true).await;
+        drop(source);
+        drop(updates);
+        drop(rpc);
+        // Preserve upstream errors and wait for the Registry/Persistence drain.
+        let registry_result=registry_task.await.context("hydration Registry task panicked")?;
+        let writer_result=writer_task.await.context("hydration Persistence task panicked")?;
+        let rpc_result=rpc_task.await.context("hydration RPC task panicked")?;
+        result?;
+        registry_result?;
+        writer_result?;
+        rpc_result?;
+        crate::log_event!(Info,"multi venue hydration standalone complete=true persisted=true");
+        return Ok(());
+    }
     let hydration_seed=restored.iter()
         .filter(|p|p.venue==Venue::PumpSwap
             && (p.mint_a.is_none()||p.mint_b.is_none()))
@@ -288,6 +335,7 @@ pub async fn run()->Result<()>{
     // Full Scan emits address-only records; restored + newly discovered unknown
     // PumpSwap pools use the same verified hydration path back into Registry.
     // Subscribe before starting Discovery to avoid losing the initial updates.
+    if !enabled("IDENTITY_HYDRATION_SKIP_LEGACY_PUMPSWAP")? {
     let hydrate_registry=registry.clone();
     let hydrate_updates=updates.clone();
     let hydrate_source=source.clone();
@@ -306,6 +354,38 @@ pub async fn run()->Result<()>{
         async move{
             identity_hydration_pumpswap::run(seed,input,client,output,
                 identity_hydration_pumpswap::Settings::from_env()?,false).await
+        }
+    }));
+    }
+    // Separate multi-venue identity reader; the existing PumpSwap reader remains
+    // unchanged. Shadow PumpSwap reads are bounded and opt-in for live comparison.
+    let venue_hydrate_registry=registry.clone();
+    let venue_hydrate_updates=updates.clone();
+    let venue_hydrate_source=source.clone();
+    let venue_hydrate_rpc=rpc.clone();
+    let mut first_venue_seed=Some(venue_hydration_seed);
+    let mut first_venue_rx=Some(updates.subscribe());
+    tasks.spawn(supervise("identity_hydration.venues",stop_rx.clone(),move||{
+        let seed=first_venue_seed.take().unwrap_or_else(||{
+            let mut pump_count=0_usize;
+            venue_hydrate_registry.snapshot().into_iter().filter_map(|p|{
+                if p.mint_a.is_some() && p.mint_b.is_some(){return None;}
+                if p.venue==Venue::PumpSwap {
+                    if pump_count>=venue_hydration_settings.pumpswap_shadow_limit {
+                        return None;
+                    }
+                    pump_count+=1;
+                }
+                Some((p.address,p.venue))
+            }).collect()
+        });
+        let live=first_venue_rx.take()
+            .unwrap_or_else(||venue_hydrate_updates.subscribe());
+        let output=venue_hydrate_source.clone();
+        let rpc=venue_hydrate_rpc.clone();
+        async move{
+            identity_hydration_venues::run(seed,live,rpc,output,
+                venue_hydration_settings,false).await
         }
     }));
     crate::log_event!(Info,"runtime ready=true workers_completion=10");
