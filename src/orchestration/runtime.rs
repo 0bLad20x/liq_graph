@@ -160,7 +160,13 @@ pub async fn run()->Result<()>{
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
-    let venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
+    let hydration_only=enabled("IDENTITY_HYDRATION_ONLY")?;
+    let mut venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
+    // Finite standalone backfill covers all unresolved venues including PumpSwap.
+    // Production retains the configured PumpSwap shadow guard and legacy worker.
+    if hydration_only {
+        venue_hydration_settings.pumpswap_shadow_limit=usize::MAX;
+    }
     let mut pump_shadow_seeded=0_usize;
     let venue_hydration_seed:Vec<(solana_pubkey::Pubkey,Venue)>=restored.iter()
         .filter_map(|p|{
@@ -175,7 +181,7 @@ pub async fn run()->Result<()>{
         }).collect();
     // Finite real-provider checkpoint: only multi-venue Hydration, Registry and
     // Persistence. No REST discovery, Graph, Completion or legacy PumpSwap worker.
-    if enabled("IDENTITY_HYDRATION_ONLY")? {
+    if hydration_only {
         let registry=pool_registry::PoolRegistry::default();
         let restored_count=registry.restore(restored)?;
         let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
