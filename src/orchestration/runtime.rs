@@ -206,6 +206,10 @@ pub async fn run()->Result<()>{
         crate::log_event!(Info,"multi venue hydration standalone complete=true persisted=true");
         return Ok(());
     }
+    // Existing V10 PumpSwap Prepared manifests contain signer-specific PDAs.
+    // Check the current signer before seeding the graph with persisted blocks.
+    completion_pumpswap::ensure_wallet_cache(
+        &restored,completion_pumpswap::Settings::from_env()?.wallet)?;
     let hydration_seed=restored.iter()
         .filter(|p|p.venue==Venue::PumpSwap
             && (p.mint_a.is_none()||p.mint_b.is_none()))
