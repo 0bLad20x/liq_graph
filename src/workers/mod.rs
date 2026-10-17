@@ -23,6 +23,7 @@ pub mod discovery_byreal_clmm;
 pub mod discovery_manifest;
 pub mod discovery_pumpswap;
 pub mod identity_hydration_pumpswap;
+pub mod identity_hydration_venues;
 pub mod completion_pumpswap;
 pub mod discovery_orca_whirlpool;
 pub mod discovery_meteora_damm_v2;
