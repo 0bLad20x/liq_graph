@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast,watch};
 
@@ -17,16 +17,37 @@ use crate::core::{
     CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind,
 };
 
+/// Per-pool provenance. REST has priority while fresh; DexScreener fills missing
+/// or stale protocol liquidity. Last-known persistence never implies freshness.
+#[derive(Clone,Copy)]
+struct Quote { value:f64, at:u64, source:&'static str }
+#[derive(Default)]
+struct PoolQuotes { protocol:Option<Quote>, dex:Option<Quote>, last_persisted:u64 }
+const TVL_SOURCE_MAX_AGE_MS: u64 = 3_600_000;
+const TVL_PERSIST_INTERVAL_MS: u64 = 900_000;
+const DEX_SOURCE: &str = "dexscreener_token_pairs";
+
+fn select_tvl(quotes:&PoolQuotes, now:u64)->Option<Quote> {
+    let recent=|q:Quote|q.at<=now && now.saturating_sub(q.at)<=TVL_SOURCE_MAX_AGE_MS;
+    quotes.protocol.filter(|q|recent(*q)).or_else(||quotes.dex.filter(|q|recent(*q)))
+}
+
 /// The write owner is the registry worker. Consumers can only request typed snapshots.
 #[derive(Clone, Default)]
 pub struct PoolRegistry {
     entries: Arc<RwLock<HashMap<Pubkey, PoolState>>>,
+    quotes: Arc<RwLock<HashMap<Pubkey,PoolQuotes>>>,
 }
 
 impl PoolRegistry {
     pub fn snapshot(&self) -> Vec<PoolState> {
         self.entries.read().expect("pool registry lock poisoned")
             .values().cloned().collect()
+    }
+
+    pub fn get(&self, address: Pubkey) -> Option<PoolState> {
+        self.entries.read().expect("pool registry lock poisoned")
+            .get(&address).cloned()
     }
 
     /// Bootstrap complete, previously validated state before any producer starts.
@@ -88,6 +109,7 @@ impl PoolRegistry {
     fn apply(&self, batch: &DataBatch) -> BatchStats {
         let mut stats = BatchStats::default();
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
+        let mut quotes = self.quotes.write().expect("pool market state lock poisoned");
         let mut updates = Vec::new();
 
         for record in &batch.records {
@@ -102,7 +124,16 @@ impl PoolRegistry {
                 continue;
             }
 
-            let observed_tvl = record.tvl_usd;
+            let observed_tvl = record.tvl_usd.filter(|v|v.is_finite() && *v>=0.0);
+            // Track sources independently; DexScreener never blindly overwrites
+            // recent protocol TVL.
+            let selected = if let Some(value)=observed_tvl {
+                let state=quotes.entry(*address).or_default();
+                let quote=Quote{value,at:batch.received_at_ms,source:batch.source};
+                let slot=if batch.source==DEX_SOURCE {&mut state.dex} else {&mut state.protocol};
+                if slot.is_none_or(|old|quote.at>=old.at) {*slot=Some(quote);}
+                select_tvl(state,batch.received_at_ms)
+            } else {quotes.get(address).and_then(|state|select_tvl(state,batch.received_at_ms))};
             match entries.get_mut(address) {
                 None => {
                     let state = PoolState {
@@ -114,9 +145,12 @@ impl PoolRegistry {
                         first_seen_ms: batch.received_at_ms,
                         last_seen_ms: batch.received_at_ms,
                         last_changed_ms: batch.received_at_ms,
-                        tvl_usd: observed_tvl,
+                        tvl_usd: selected.map(|v|v.value),
                         pool_config: None,
-                        last_observation: None,
+                        last_observation: selected.map(|v|Arc::new(json!({
+                            "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
+                            "first_seen_ms":batch.received_at_ms
+                        }))),
                         completion_state: CompletionState::Unknown,
                         completion_validated_slot: None,
                         execution_manifest: None,
@@ -158,17 +192,26 @@ impl PoolRegistry {
                         changed = true;
                         identity_changed = true;
                     }
-                    if let Some(tvl) = observed_tvl {
-                        if current.tvl_usd != Some(tvl) {
-                            // Only the first ever usable TVL snapshot merits a
-                            // persistence refresh. Subsequent TVL changes stay RAM-only.
-                            if current.tvl_usd.is_none() && current.last_observation.as_ref()
-                                .and_then(|o| o.get("tvl_usd"))
-                                .and_then(Value::as_f64).is_none() {
-                                identity_changed = true;
-                            }
-                            current.tvl_usd = Some(tvl);
-                            changed = true;
+                    if let Some(chosen)=selected {
+                        let prior=current.last_observation.as_ref();
+                        let prior_source=prior.and_then(|o|o.get("source")).and_then(Value::as_str);
+                        let value_changed=current.tvl_usd!=Some(chosen.value);
+                        let source_changed=prior_source!=Some(chosen.source);
+                        let tracking=quotes.get_mut(address).expect("quote was inserted");
+                        let should_persist=tracking.last_persisted==0 ||
+                            batch.received_at_ms.saturating_sub(tracking.last_persisted)>=TVL_PERSIST_INTERVAL_MS;
+                        if value_changed || source_changed {
+                            current.tvl_usd=Some(chosen.value);
+                            changed=true;
+                        }
+                        current.last_observation=Some(Arc::new(json!({
+                            "tvl_usd":chosen.value,"source":chosen.source,
+                            "observed_at_ms":chosen.at,"first_seen_ms":current.first_seen_ms
+                        })));
+                        if should_persist {
+                            identity_changed=true;
+                            tracking.last_persisted=batch.received_at_ms;
+                            changed=true;
                         }
                     }
                     if current.source != batch.source {
