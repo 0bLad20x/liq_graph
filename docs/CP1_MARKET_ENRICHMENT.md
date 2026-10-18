@@ -15,8 +15,9 @@ cargo check --locked
 
 $env:CP1_PROBE_DURATION_SECONDS = "300"
 $env:MINT_QUALIFICATION_REFRESH_SECONDS = "60"
-$env:DEXSCREENER_CP1_MINTS_PER_CYCLE = "100"
-$env:DEXSCREENER_REFRESH_SECONDS = "60"
+$env:DEXSCREENER_PARALLEL = "16"
+$env:DEXSCREENER_REFRESH_SECONDS = "1800"
+$env:DEXSCREENER_FAILURE_RETRY_SECONDS = "120"
 $env:DEXSCREENER_PROXY_WAIT_SECONDS = "60"
 $env:RUST_LOG = "info"
 
@@ -29,6 +30,25 @@ Benötigt: `LIQ_GRAPH_DATABASE_URL` oder `DATABASE_URL`,
 `http_transport`-Proxy-Einstellungen; DexScreener nutzt die
 getestete `ProxyOnly`-Route aus dem Diagnose-Worker.
 Der CP1-Checkpoint startet weder DEX-Discovery noch Completion-RPC.
+
+### Kontinuierlicher Mint-Scheduler
+
+Der Source fragt **eine Mint-Adresse pro HTTP-Request** über
+`/token-pairs/v1/solana/{mint}` ab. Es gibt keine festen 100-Mint-Runden.
+Jeder Mint hat einen eigenen nächsten Fälligkeitszeitpunkt, standardmäßig
+30 Minuten nach einer erfolgreichen Anfrage.
+Neue qualifizierte Mints werden unmittelbar aufgenommen. Weggefallene Mints
+werden nicht mehr eingeplant. Läuft für einen wegfallenden Mint noch ein
+HTTP-Request, wird dessen Ergebnis nicht weiter veröffentlicht.
+Fehlgeschlagene Requests werden mit Abstand erneut eingeplant
+(`DEXSCREENER_FAILURE_RETRY_SECONDS`, Standard 120 Sekunden).
+
+`DEXSCREENER_PARALLEL` begrenzt lediglich gleichzeitige Requests
+(Standard 48); die bestehende HTTP-Transport-Schicht kontrolliert
+Proxy-Routen, Ratenlimits und Backpressure.
+Eine HTTP-Antwort mit leerer Pool-Liste gilt als erfolgreiche Abfrage.
+Die tatsächliche Einhaltung des Refresh-Intervalls hängt von
+Durchsatz, Anzahl der Mints und verfügbaren Routen ab.
 Der Jupiter-Vollbackfill ist für diesen isolierten Test explizit deaktiviert.
 
 ## Kontrollquery
@@ -87,7 +107,10 @@ Completion-Worker. Die Einschränkung auf qualifizierte Pools und
 ### Abnahmemessung
 
 1. Logs enthalten `mint qualification published qualified=N`.
-2. DexScreener-Logs melden `cp1 target_mints` und erfolgreiche Anfragen.
+2. DexScreener-Logs melden `continuous started`,
+   `selection_changed` und regelmäßig `continuous active_mints=...`
+   mit `queued`, `in_flight`, `completed` und `failed`.
+   Keine wiederholten `selected=100`-Durchläufe.
 3. Die Kontrollquery zählt gespeicherte DexScreener-TVL pro Venue.
 4. Unbekannte `pairAddress` und abweichende Mint-Paarungen erzeugen
    keine neuen Pool-Identitäten.
