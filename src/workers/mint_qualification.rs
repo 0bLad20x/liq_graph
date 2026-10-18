@@ -63,7 +63,7 @@ pub async fn run(
     let mut qualified=Arc::<[Pubkey]>::from([]);
     let mut candidate_missing=HashSet::<Pubkey>::new();
     let mut checked_mints=HashSet::<Pubkey>::new();
-
+    let mut dirty=true;
     let mut elapsed=refresh_secs;
     loop {
         tokio::select! {
@@ -78,7 +78,8 @@ pub async fn run(
                                 }
                             }
                         }
-                     },
+                        dirty=true;
+                    },
                     Err(broadcast::error::RecvError::Lagged(n))=>
                         anyhow::bail!("qualification lost {n} registry batches"),
                     Err(broadcast::error::RecvError::Closed)=>break,
@@ -88,17 +89,19 @@ pub async fn run(
                 match event {
                     Ok(batch)=>{
                         if batch.records.iter().any(|r|matches!(&r.identity,RecordIdentity::Mint{..})) {
-                         }
+                            dirty=true;
+                        }
                     },
                     Err(broadcast::error::RecvError::Lagged(_))=>{
                         // The periodic SQL snapshot remains authoritative.
+                        dirty=true;
                     },
                     Err(broadcast::error::RecvError::Closed)=>break,
                 }
             },
             _=pulse.tick()=>{
                 elapsed=elapsed.saturating_add(10);
-                if elapsed>=refresh_secs {
+                if elapsed>=refresh_secs || (dirty && elapsed>=30) {
                     let rows=db.query(SELECT_QUALIFIED,&[]).await.context("qualify Jupiter catalog")?;
                     let mut v=Vec::with_capacity(rows.len());
                     for row in rows {v.push(key(row.get::<_,Vec<u8>>(0))?);}
@@ -108,6 +111,7 @@ pub async fn run(
                         qualified_tx.send_replace(qualified.clone());
                     }
                     elapsed=0;
+                    dirty=false;
                     crate::log_event!(Info,"mint qualification published qualified={} pending_candidates={}",
                         qualified.len(),candidate_missing.len());
                 }
