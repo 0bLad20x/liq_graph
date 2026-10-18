@@ -117,6 +117,31 @@ impl PoolRegistry {
         Ok(entries.len())
     }
 
+    /// Re-evaluate canonical TVL even when no new REST/DexScreener event arrives.
+    /// Historical last_observation stays intact; expired quotes never masquerade
+    /// as current liquidity. Called only by the Registry's single writer.
+    fn refresh_tvl(&self, now:u64) -> Vec<PoolState> {
+        let mut entries=self.entries.write().expect("pool registry lock poisoned");
+        let mut quotes=self.quotes.write().expect("pool market state lock poisoned");
+        let mut updates=Vec::new();
+        for (address, market) in quotes.iter_mut() {
+            let selected=select_tvl(market,now);
+            if let Some(pool)=entries.get_mut(address) {
+                if pool.tvl_usd!=selected.map(|q|q.value) {
+                    pool.tvl_usd=selected.map(|q|q.value);
+                    pool.last_changed_ms=now;
+                    // Keep the last actual observation even when it has expired.
+                    // The selected live value is represented only by tvl_usd.
+                    updates.push(pool.clone());
+                }
+            }
+        }
+        // Prevent indefinite growth from ever-seen, now-expired sources.
+        quotes.retain(|_,q|q.protocol.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS)
+             || q.dex.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS));
+        updates
+    }
+
     fn apply(&self, batch: &DataBatch) -> BatchStats {
         let mut stats = BatchStats::default();
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
@@ -407,6 +432,8 @@ pub async fn run(
     let mut incomplete_delta = 0_i64;
     let mut manifest_delta = 0_i64;
     let mut source_open = true;
+    let mut freshness=tokio::time::interval(std::time::Duration::from_secs(60));
+    freshness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut completion_open = completion.is_some();
     let require_completion = completion_open;
     let bootstrap_snapshot = registry.snapshot();
@@ -419,6 +446,20 @@ pub async fn run(
 
     while source_open || completion_open {
         tokio::select! {
+            _=freshness.tick()=>{
+                let invalidated=registry.refresh_tvl(now_unix_ms()?);
+                if !invalidated.is_empty() {
+                    let count=invalidated.len();
+                    output.send(Arc::new(PoolUpdateBatch {
+                        kind:PoolUpdateKind::Source,
+                        source:"tvl_freshness",
+                        received_at_ms:now_unix_ms()?,
+                        pools:invalidated,
+                        persist_identity:Vec::new(),
+                    })).map_err(|_|anyhow::anyhow!("Registry freshness update has no subscribers"))?;
+                    crate::log_event!(Info,"pool registry tvl_freshness_changed pools={count}");
+                }
+            },
             event = input.recv(), if source_open => match event {
                 Ok(batch) => {
                     batches += 1;
