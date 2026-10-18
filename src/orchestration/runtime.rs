@@ -170,7 +170,7 @@ pub async fn cp1_live() -> Result<()> {
     // This isolated checkpoint must not start an unbounded full backfill.
     let mut jupiter_settings=settings;
     jupiter_settings.backfill_on_start=false;
-    let jupiter=tokio::spawn(source_jupiter_mint::run(
+    let jupiter=tokio::spawn(source_jupiter_mint::run_targeted(
         core::http_client()?,jupiter_settings,target_rx,jupiter_out.clone()));
     let dex=tokio::spawn(source_dexscreener::run_live(
         qualified_rx,registry.clone(),source.clone()));
@@ -312,7 +312,11 @@ pub async fn run()->Result<()>{
             let mints=mint_rx.clone();
             async move{
                 let settings=jupiter_settings()?.context("Jupiter keys disappeared")?;
-                source_jupiter_mint::run(client,settings,mints,output).await
+                if cp1 {
+                    source_jupiter_mint::run_targeted(client,settings,mints,output).await
+                } else {
+                    source_jupiter_mint::run(client,settings,mints,output).await
+                }
             }
         }));
         if cp1 {None} else {Some(mint_tx)}
