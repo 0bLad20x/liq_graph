@@ -1,6 +1,6 @@
 //! CP1: read-only economic mint selection, independent of Prepared graph state.
 //! The database remains the source of truth; no new table or persisted flag.
-use std::{collections::HashSet, env, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time::{interval, MissedTickBehavior}};
@@ -27,6 +27,23 @@ WHERE m.updated_at BETWEEN NOW()-INTERVAL '90 days' AND NOW()
   AND m.liquidity_usd>=2000
   AND m.market_cap_usd>=10000
 ORDER BY m.mint_address
+"#;
+
+const MAX_PENDING_MINTS: usize = 20_000;
+const SCAN_PAGE_POOLS: i64 = 2_000;
+const PENDING_RETRY_AGE: Duration = Duration::from_secs(900);
+const SCAN_MINT_IDENTITIES: &str = r#"
+SELECT pool_address,mint_a,mint_b
+FROM public.liq_graph_pool_cache
+WHERE pool_address > $1::bytea
+ORDER BY pool_address LIMIT $2
+"#;
+const KNOWN_MINTS: &str = r#"
+SELECT mint_address FROM public.liq_graph_mint_catalog
+WHERE mint_address=ANY($1::bytea[])
+  AND updated_at IS NOT NULL
+  AND liquidity_usd IS NOT NULL
+  AND market_cap_usd IS NOT NULL
 "#;
 
 fn key(bytes: Vec<u8>) -> Result<Pubkey> {
@@ -61,8 +78,12 @@ pub async fn run(
     let mut pulse=interval(Duration::from_secs(10));
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut qualified=Arc::<[Pubkey]>::from([]);
-    let mut candidate_missing=HashSet::<Pubkey>::new();
-    let mut checked_mints=HashSet::<Pubkey>::new();
+    // Bounded in-flight catalogue misses, not a permanent "seen" cache.
+    // Persisted pool identities are scanned with a PK cursor so even updates
+    // missed at capacity (and pools restored after a restart) are revisited.
+    let mut candidate_missing=HashMap::<Pubkey,tokio::time::Instant>::new();
+    let mut pool_cursor=vec![0_u8;32];
+    let mut scan_pools=0_u64;
     let mut dirty=true;
     let mut elapsed=refresh_secs;
     loop {
@@ -73,8 +94,8 @@ pub async fn run(
                         // Even an existing pool can gain previously unknown mint identities.
                         for p in &batch.pools {
                             for mint in [p.mint_a,p.mint_b].into_iter().flatten() {
-                                if candidate_missing.len()<20000 && checked_mints.insert(mint) {
-                                    candidate_missing.insert(mint);
+                                if candidate_missing.len()<MAX_PENDING_MINTS {
+                                    candidate_missing.entry(mint).or_insert_with(tokio::time::Instant::now);
                                 }
                             }
                         }
@@ -101,6 +122,48 @@ pub async fn run(
             },
             _=pulse.tick()=>{
                 elapsed=elapsed.saturating_add(10);
+                // Absence of an API result must not block reconciliation forever.
+                // Expired misses will be rediscovered on subsequent PK scans.
+                candidate_missing.retain(|_,enqueued|
+                    enqueued.elapsed()<PENDING_RETRY_AGE);
+                if candidate_missing.len()<MAX_PENDING_MINTS {
+                    let rows=db.query(SCAN_MINT_IDENTITIES,
+                        &[&pool_cursor,&SCAN_PAGE_POOLS]).await
+                        .context("scan persisted pool identities for missing Jupiter mints")?;
+                    if rows.is_empty() {
+                        pool_cursor=vec![0_u8;32];
+                        crate::log_event!(Info,
+                            "mint qualification reconciliation_wrap scanned_pools={scan_pools}");
+                        scan_pools=0;
+                    } else {
+                        let mut found=HashSet::<Pubkey>::new();
+                        for row in &rows {
+                            pool_cursor=row.get::<_,Vec<u8>>(0);
+                            for column in [1,2] {
+                                if let Some(bytes)=row.get::<_,Option<Vec<u8>>>(column) {
+                                    let mint=key(bytes)?;
+                                    if !candidate_missing.contains_key(&mint) {
+                                        found.insert(mint);
+                                    }
+                                }
+                            }
+                        }
+                        scan_pools+=rows.len() as u64;
+                        if !found.is_empty() {
+                            let keys=found.iter().map(|m|m.to_bytes().to_vec()).collect::<Vec<_>>();
+                            let complete=db.query(KNOWN_MINTS,&[&keys]).await
+                                .context("check reconciled Jupiter catalog records")?;
+                            for row in complete {
+                                found.remove(&key(row.get::<_,Vec<u8>>(0))?);
+                            }
+                            for mint in found {
+                                if candidate_missing.len()>=MAX_PENDING_MINTS {break}
+                                candidate_missing.entry(mint)
+                                    .or_insert_with(tokio::time::Instant::now);
+                            }
+                        }
+                    }
+                }
                 if elapsed>=refresh_secs || (dirty && elapsed>=30) {
                     let rows=db.query(SELECT_QUALIFIED,&[]).await.context("qualify Jupiter catalog")?;
                     let mut v=Vec::with_capacity(rows.len());
@@ -118,21 +181,18 @@ pub async fn run(
                 // Check only NEW registry mint addresses against the existing catalog.
                 // No full-table Jupiter scan is required for these requests.
                 if !candidate_missing.is_empty() {
-                    let keys:Vec<Vec<u8>>=candidate_missing.iter().map(|m|m.to_bytes().to_vec()).collect();
-                    let known=db.query(
-                        "SELECT mint_address FROM public.liq_graph_mint_catalog
-                         WHERE mint_address=ANY($1::bytea[])
-                           AND updated_at IS NOT NULL
-                           AND liquidity_usd IS NOT NULL
-                           AND market_cap_usd IS NOT NULL",
-                        &[&keys]).await.context("check targeted Jupiter catalog misses")?;
-                    for row in known {candidate_missing.remove(&key(row.get::<_,Vec<u8>>(0))?);}
+                    let keys:Vec<Vec<u8>>=candidate_missing.keys().map(|m|m.to_bytes().to_vec()).collect();
+                    let known=db.query(KNOWN_MINTS,&[&keys]).await
+                        .context("check targeted Jupiter catalog misses")?;
+                    for row in known {
+                        candidate_missing.remove(&key(row.get::<_,Vec<u8>>(0))?);
+                    }
                 }
                 let mut targets=Vec::with_capacity(candidate_missing.len()+qualified.len());
-                let mut missing:Vec<_>=candidate_missing.iter().copied().collect();
+                let mut missing:Vec<_>=candidate_missing.keys().copied().collect();
                 missing.sort_unstable();
                 targets.extend(missing);
-                targets.extend(qualified.iter().copied().filter(|mint|!candidate_missing.contains(mint)));
+                targets.extend(qualified.iter().copied().filter(|mint|!candidate_missing.contains_key(mint)));
                 let next:Arc<[Pubkey]>=Arc::from(targets);
                 if next.as_ref()!=jupiter_targets.borrow().as_ref() {
                     jupiter_targets.send_replace(next);
