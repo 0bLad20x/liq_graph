@@ -82,7 +82,7 @@ impl Settings {
         let backfill_limit = env::var("JUPITER_MINT_BACKFILL_LIMIT")
             .unwrap_or_else(|_| "0".into()).parse::<usize>()?;
         let backfill_on_start = match env::var("JUPITER_BACKFILL_ON_START")
-            .unwrap_or_else(|_| "true".into()).as_str() {
+            .unwrap_or_else(|_| "false".into()).as_str() {
                 "true" | "1" => true,
                 "false" | "0" => false,
                 _ => bail!("JUPITER_BACKFILL_ON_START must be true or false"),
