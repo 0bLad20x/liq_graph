@@ -50,6 +50,21 @@ Eine HTTP-Antwort mit leerer Pool-Liste gilt als erfolgreiche Abfrage.
 Die tatsächliche Einhaltung des Refresh-Intervalls hängt von
 Durchsatz, Anzahl der Mints und verfügbaren Routen ab.
 Der Jupiter-Vollbackfill ist für diesen isolierten Test explizit deaktiviert.
+In der regulären Runtime mit `CP1_MARKET_ENRICHMENT_ENABLED=true`
+ist Jupiter ebenfalls im gezielten Watch-Modus: **kein automatischer
+Vollbackfill**. Der bestehende eigenständige
+`--jupiter-mint-backfill`-Befehl bleibt verfügbar.
+
+Die Qualifizierung prüft initial die vorhandenen Mint-Katalogdaten
+gegen sämtliche Pool-Beziehungen. Parallel werden persistierte Pool-Identitäten
+in festen Seiten von 2.000 Pool-Adressen über den Primärschlüssel
+durchlaufen, um fehlende/unvollständige Jupiter-Mintdaten auch nach einem
+Neustart ohne Discovery-Ereignis zu finden. Maximal 20.000 offene Mints
+werden gleichzeitig an den vorhandenen Jupiter-Watch geliefert. Der Cursor
+wartet bei voller Queue und läuft anschließend weiter. Nicht beantwortete
+Mints werden nach 15 Minuten aus der offenen Queue genommen und bei einer
+späteren erneuten Registry-Reconciliation erneut berücksichtigt.
+Das ist ein **lokaler, inkrementeller SQL-Scan**, kein Jupiter-API-Vollbackfill.
 
 ## Kontrollquery
 
@@ -96,6 +111,10 @@ Completion-Worker. Die Einschränkung auf qualifizierte Pools und
 - REST-TVL geht bei gültiger Frische (60 Minuten) vor DexScreener-TVL.
   Fehlt frische REST-TVL, darf frische DexScreener-TVL den Wert ergänzen.
 - `last_observation` enthält Herkunft und Beobachtungszeitpunkt.
+- Die Registry entfernt TVL aus ihrem **Live-RAM-Wert** nach Ablauf
+  der 60-Minuten-Frist oder wechselt zu frischer DexScreener-TVL;
+  ein 60-Sekunden-Ticker prüft dies auch ohne Source-Ereignisse.
+  Die historische Beobachtung in PostgreSQL wird beim Ablauf nicht gelöscht.
   Persistenzänderungen werden je Pool auf maximal einen Refresh alle
   15 Minuten gedrosselt, abgesehen vom ersten TVL.
 - Historische Postgres-Werte sind keine aktuellen Live-TVL-Quotes.
@@ -115,7 +134,14 @@ Completion-Worker. Die Einschränkung auf qualifizierte Pools und
 4. Unbekannte `pairAddress` und abweichende Mint-Paarungen erzeugen
    keine neuen Pool-Identitäten.
 5. `--cp1-live` meldet `completion_workers=0` und endet
-   mit `cp1 live complete=true persisted=true`.
+   mit `cp1 live complete=true persisted=true qualified_mints=N live_tvl_pools=N`.
+   Bei null qualifizierten Mints oder null frischen TVL-Pools schlägt
+   die Abnahme ausdrücklich fehl.
+6. `cargo test --locked tvl_freshness_tests` validiert die
+   Protokoll-Priorität, den DexScreener-Fallback und den TVL-Ablauf.
 
-Ein lokaler Rust-Build und RPC-/Proxy-Livetest müssen noch ausgeführt
-werden. Stand der Implementierung: Feature-Branch, nicht `main`.
+Der ältere CP1-v2-Live-Test mit Rundenscheduler belegte 8.498
+persistierte TVL-Beobachtungen. **Die hier nachfolgend korrigierte Version
+mit SQL-Reconciliation, gezieltem Jupiter-Mode und Registry-TVL-Expiry
+wurde noch nicht lokal neu kompiliert und live geprüft.**
+Stand der Implementierung: Feature-Branch, nicht `main`.
