@@ -110,9 +110,6 @@ fn layout(venue: Venue) -> Layout {
 pub struct Settings {
     pub batch_size: usize,
     pub parallel_batches: usize,
-    /// Zero disables duplicate PumpSwap reads in production. Nonzero enables
-    /// a bounded side-by-side live comparison with the existing PumpSwap worker.
-    pub pumpswap_shadow_limit: usize,
 }
 
 impl Settings {
@@ -123,13 +120,9 @@ impl Settings {
         let parallel_batches = env::var("IDENTITY_HYDRATION_PARALLEL_BATCHES")
             .unwrap_or_else(|_| "2".into()).parse::<usize>()
             .context("invalid IDENTITY_HYDRATION_PARALLEL_BATCHES")?;
-        let pumpswap_shadow_limit = env::var("IDENTITY_HYDRATION_PUMPSWAP_SHADOW_LIMIT")
-            .unwrap_or_else(|_| "0".into()).parse::<usize>()
-            .context("invalid IDENTITY_HYDRATION_PUMPSWAP_SHADOW_LIMIT")?;
         ensure!((1..=100).contains(&batch_size), "invalid hydration RPC batch size");
         ensure!((1..=16).contains(&parallel_batches), "hydration parallel batches must be 1..=16");
-        ensure!(pumpswap_shadow_limit <= 1000, "PumpSwap shadow limit must be <=1000");
-        Ok(Self { batch_size, parallel_batches, pumpswap_shadow_limit })
+        Ok(Self { batch_size, parallel_batches })
     }
 }
 
@@ -195,15 +188,10 @@ fn index(venue: Venue) -> usize {
 }
 
 fn enqueue(address: Pubkey, venue: Venue,
-    queues: &mut [VecDeque<Pubkey>], pending: &mut HashSet<Pubkey>,
-    pump_admitted: &mut usize, settings: Settings)
+    queues: &mut [VecDeque<Pubkey>], pending: &mut HashSet<Pubkey>)
 {
-    if venue == Venue::PumpSwap && *pump_admitted >= settings.pumpswap_shadow_limit {
-        return;
-    }
     if pending.insert(address) {
         queues[index(venue)].push_back(address);
-        if venue == Venue::PumpSwap { *pump_admitted += 1; }
     }
 }
 
@@ -226,9 +214,8 @@ pub async fn run(
 
     let mut queues = vec![VecDeque::<Pubkey>::new(); VENUES.len()];
     let mut pending = HashSet::new();
-    let mut pump_admitted = 0_usize;
     for (address, venue) in initial {
-        enqueue(address, venue, &mut queues, &mut pending, &mut pump_admitted, settings);
+        enqueue(address, venue, &mut queues, &mut pending);
     }
     let initial_pending = pending.len();
     let mut jobs = JoinSet::new();
@@ -244,9 +231,8 @@ pub async fn run(
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     crate::log_event!(Info,
-        "multi venue hydration started initial_missing={} batch_size={} parallel={} pumpswap_shadow_limit={} finite={finite}",
-        initial_pending, settings.batch_size, settings.parallel_batches,
-        settings.pumpswap_shadow_limit);
+        "multi venue hydration started initial_missing={} batch_size={} parallel={} finite={finite}",
+        initial_pending, settings.batch_size, settings.parallel_batches);
 
     loop {
         while jobs.len() < settings.parallel_batches {
@@ -277,8 +263,7 @@ pub async fn run(
                     if pool.mint_a.is_some() && pool.mint_b.is_some() {
                         pending.remove(&pool.address);
                     } else {
-                        enqueue(pool.address, pool.venue, &mut queues,
-                            &mut pending, &mut pump_admitted, settings);
+                        enqueue(pool.address, pool.venue, &mut queues, &mut pending);
                     }
                 },
                 Err(broadcast::error::RecvError::Lagged(n)) =>
@@ -348,6 +333,9 @@ pub async fn run(
     crate::log_event!(Info,
         "multi venue hydration complete attempted={attempted} published={published} missing_accounts={missing} invalid={invalid} rpc_failures={rpc_failures} pending={} published_by_venue={by_venue:?}",
         pending.len());
-    if finite { ensure!(published > 0, "finite hydration produced no valid identities"); }
+    if finite {
+        ensure!(attempted == published + invalid + missing && invalid == 0 && missing == 0,
+            "finite hydration incomplete: attempted={attempted} published={published} missing_accounts={missing} invalid={invalid}");
+    }
     Ok(())
 }
