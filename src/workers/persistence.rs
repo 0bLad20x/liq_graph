@@ -86,8 +86,8 @@ $migration$;
 COMMIT;
 "#;
 
-/// Source events insert identities and fill previously unknown mints/configuration.
-/// No changes to already validated execution state; TVL-only updates never arrive here.
+/// Source events insert identities and update bounded provenance-rich TVL snapshots.
+/// Completion status and manifests are independent of market observations.
 const UPSERT_IDENTITY: &str = r#"
 INSERT INTO public.liq_graph_pool_cache AS existing
 (pool_address,venue,mint_a,mint_b,status,pool_config,last_observation)
@@ -103,9 +103,10 @@ ON CONFLICT (pool_address) DO UPDATE SET
       WHEN existing.pool_config='{}'::jsonb THEN EXCLUDED.pool_config
       ELSE existing.pool_config END,
     last_observation=CASE
-      WHEN existing.last_observation IS NULL
-        OR (existing.last_observation->>'tvl_usd' IS NULL
-            AND EXCLUDED.last_observation->>'tvl_usd' IS NOT NULL)
+      WHEN EXCLUDED.last_observation IS NOT NULL AND
+         (existing.last_observation IS NULL
+          OR COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
+             COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0))
         THEN EXCLUDED.last_observation
       ELSE existing.last_observation END
 WHERE existing.venue=EXCLUDED.venue
@@ -116,8 +117,8 @@ WHERE existing.venue=EXCLUDED.venue
    OR (existing.mint_b IS NULL AND EXCLUDED.mint_b IS NOT NULL)
    OR (existing.pool_config='{}'::jsonb AND EXCLUDED.pool_config<>'{}'::jsonb)
    OR (existing.last_observation IS NULL AND EXCLUDED.last_observation IS NOT NULL)
-   OR (existing.last_observation->>'tvl_usd' IS NULL
-       AND EXCLUDED.last_observation->>'tvl_usd' IS NOT NULL))
+   OR COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
+      COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0))
 "#;
 
 /// Only an accepted completion may update an execution descriptor, at a non-stale slot.
@@ -144,9 +145,11 @@ ON CONFLICT (pool_address) DO UPDATE SET
       WHEN existing.pool_config='{}'::jsonb THEN EXCLUDED.pool_config
       ELSE existing.pool_config END,
     last_observation=CASE
-      WHEN EXCLUDED.last_observation->>'tvl_usd' IS NOT NULL
+      WHEN existing.last_observation IS NULL THEN EXCLUDED.last_observation
+      WHEN COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
+           COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0)
         THEN EXCLUDED.last_observation
-      ELSE COALESCE(existing.last_observation,EXCLUDED.last_observation) END
+      ELSE existing.last_observation END
 WHERE existing.venue=EXCLUDED.venue
   AND (existing.mint_a IS NULL OR existing.mint_a=EXCLUDED.mint_a)
   AND (existing.mint_b IS NULL OR existing.mint_b=EXCLUDED.mint_b)
@@ -338,7 +341,12 @@ fn encoded_config(pool:&PoolState) -> Result<String> {
 }
 
 fn encoded_observation(pool:&PoolState) -> Option<String> {
-    // Fresh observation is a persisted historical snapshot, never a live quote.
+    // Preserve the canonical TVL source and its own observation timestamp.
+    // Never relabel a DexScreener value as a venue REST observation (or vice versa).
+    if pool.last_observation.as_ref().is_some_and(|o|
+        o.get("observed_at_ms").is_some()) {
+        return pool.last_observation.as_ref().map(ToString::to_string);
+    }
     if pool.last_seen_ms>0 && pool.source!="persistence_restore" {
         Some(json!({"tvl_usd":pool.tvl_usd,
             "first_seen_ms":pool.first_seen_ms,
