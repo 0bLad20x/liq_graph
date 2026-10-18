@@ -63,7 +63,7 @@ pub async fn run(
     let mut qualified=Arc::<[Pubkey]>::from([]);
     let mut candidate_missing=HashSet::<Pubkey>::new();
     let mut checked_mints=HashSet::<Pubkey>::new();
-    let mut dirty=true;
+
     let mut elapsed=refresh_secs;
     loop {
         tokio::select! {
@@ -78,8 +78,7 @@ pub async fn run(
                                 }
                             }
                         }
-                        dirty=true;
-                    },
+                     },
                     Err(broadcast::error::RecvError::Lagged(n))=>
                         anyhow::bail!("qualification lost {n} registry batches"),
                     Err(broadcast::error::RecvError::Closed)=>break,
@@ -89,13 +88,10 @@ pub async fn run(
                 match event {
                     Ok(batch)=>{
                         if batch.records.iter().any(|r|matches!(&r.identity,RecordIdentity::Mint{..})) {
-                            dirty=true;
-                        }
+                         }
                     },
                     Err(broadcast::error::RecvError::Lagged(_))=>{
-                        // Full SQL refresh remains authoritative even if diagnostic mint
-                        // events coalesce; never lose a pool identity update.
-                        dirty=true;
+                        // The periodic SQL snapshot remains authoritative.
                     },
                     Err(broadcast::error::RecvError::Closed)=>break,
                 }
@@ -111,7 +107,6 @@ pub async fn run(
                         qualified=new;
                         qualified_tx.send_replace(qualified.clone());
                     }
-                    dirty=false;
                     elapsed=0;
                     crate::log_event!(Info,"mint qualification published qualified={} pending_candidates={}",
                         qualified.len(),candidate_missing.len());
