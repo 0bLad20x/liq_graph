@@ -398,7 +398,9 @@ impl Engine {
             tokio::select! {
                 changed=input.changed(), if source_open && Instant::now()<deadline =>{
                     if changed.is_err() {source_open=false;}
-                    cursor=0;
+                    // Do not restart at the beginning on every qualification
+                    // update; doing so starves later targets in a changing list.
+                    if cursor>=input.borrow().len() {cursor=0;}
                     crate::log_event!(Debug,"jupiter watch targets_updated={}",input.borrow().len());
                 }
                 result=self.pending.join_next(), if !self.pending.is_empty()=>{
@@ -432,6 +434,21 @@ impl Engine {
         Ok(())
     }
 }
+/// CP1: preserve the existing API lanes and targeted watch scheduler but
+/// never start the full-catalogue scan as part of active qualification.
+/// The dedicated --jupiter-mint-backfill command remains available separately.
+pub async fn run_targeted(http:Client,mut settings:Settings,
+    mut input:watch::Receiver<Arc<[Pubkey]>>,
+    output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {
+    // The targeted mode never triggers backfill, regardless of inherited ENV.
+    settings.backfill_on_start=false;
+    let mut engine=Engine::new(http,settings).await?;
+    loop {
+        let deadline=Instant::now()+engine.settings.backfill_interval;
+        engine.watch_until(&mut input,&output,deadline).await?;
+    }
+}
+
 /// Production: one process, one API scheduler. Backfill and watch never overlap.
 pub async fn run(http:Client,settings:Settings,mut input:watch::Receiver<Arc<[Pubkey]>>,
     output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {

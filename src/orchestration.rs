@@ -530,6 +530,9 @@ pub async fn run() -> Result<()> {
     if args.len() == 1 && args[0] == "--run" {
         return runtime::run().await;
     }
+    if args.len()==1 && args[0]=="--cp1-live" {
+        return runtime::cp1_live().await;
+    }
     // Finite standalone Jupiter catalog import. No Graph/Registry/Completion is started.
     if (args.len() == 1 && args[0] == "--jupiter-mint-backfill")
         || (args.len() == 2 && args[0] == "--test" && args[1] == "jupiter_mint_backfill")

@@ -538,6 +538,189 @@ pub async fn live_diagnostic()->Result<()> {
     Ok(())
 }
 
+/// CP1: long-running, typed DexScreener enrichment for economically selected mints.
+/// Unknown pool addresses are not invented: their venue and canonical identities
+/// must already exist in PoolRegistry. The finite diagnostic entrypoint is retained.
+pub async fn run_live(
+    mut qualified: tokio::sync::watch::Receiver<Arc<[Pubkey]>>,
+    registry: super::pool_registry::PoolRegistry,
+    output: broadcast::Sender<Arc<crate::core::DataBatch>>,
+) -> Result<()> {
+    use crate::core::{DataBatch, DataRecord, RecordIdentity};
+    let settings=Settings::from_env()?;
+    let refresh_secs=env::var("DEXSCREENER_REFRESH_SECONDS")
+        .unwrap_or_else(|_|"1800".into()).parse::<u64>()
+        .context("DEXSCREENER_REFRESH_SECONDS")?;
+    ensure!((60..=86400).contains(&refresh_secs),
+        "DEXSCREENER_REFRESH_SECONDS must be 60..86400");
+    let mut transport=http_transport::Settings::from_env()?;
+    transport.stats_interval=Duration::from_secs(60);
+    transport.host_rps_overrides.insert(HOST.into(),0);
+    transport.proxy_ip_rpm_overrides.insert(HOST.into(),settings.per_proxy_ip_rpm);
+    transport.proxy_latency_ceiling_ms.insert(HOST.into(),settings.max_proxy_latency_ms);
+    let (handle,transport_task)=http_transport::spawn(transport)?;
+    let mut cycles=handle.subscribe_cycles();
+    tokio::time::timeout(settings.proxy_wait,async {
+        loop {
+            if *cycles.borrow_and_update()>0 {break Ok::<(),anyhow::Error>(());}
+            cycles.changed().await.context("DexScreener proxy discovery closed")?;
+        }
+    }).await.context("DexScreener proxy discovery timeout")??;
+    ensure!(!handle.working_set().is_empty(),"no verified DexScreener HTTP proxies");
+    let (tx,mut rx)=broadcast::channel::<Arc<DexPairBatch>>(256);
+    let publish=tokio::spawn(async move {
+        let mut recent=HashMap::<Pubkey,u64>::new();
+        loop {
+            let batch=match rx.recv().await {
+                Ok(batch)=>batch,
+                Err(broadcast::error::RecvError::Closed)=>break,
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    bail!("DexScreener enrichment lost {n} batches"),
+            };
+            let mut rows=Vec::new();
+            for pair in &batch.pairs {
+                let Some(tvl)=pair.liquidity_usd else {continue};
+                let Some(pool)=registry.get(pair.address) else {continue};
+                let same=pool.mint_a==Some(pair.mint_a)&&pool.mint_b==Some(pair.mint_b);
+                let reverse=pool.mint_a==Some(pair.mint_b)&&pool.mint_b==Some(pair.mint_a);
+                if !same && !reverse {continue;}
+                if recent.get(&pair.address).is_some_and(|previous|
+                    batch.received_at_ms.saturating_sub(*previous)<60_000) {continue;}
+                recent.insert(pair.address,batch.received_at_ms);
+                rows.push(DataRecord {
+                    identity:RecordIdentity::Pool {
+                        address:pool.address,venue:pool.venue,mint_a:pool.mint_a,mint_b:pool.mint_b,
+                    },
+                    tvl_usd:Some(tvl),
+                    payload:json!({"dexId":pair.dex_id,"liquidityUsd":tvl,
+                        "requestedMint":batch.requested_mint.to_string()}),
+                });
+            }
+            if !rows.is_empty() {
+                output.send(Arc::new(DataBatch {
+                    source:SOURCE,received_at_ms:batch.received_at_ms,records:rows,
+                })).map_err(|_|anyhow::anyhow!("Registry discovery receiver closed"))?;
+            }
+            if recent.len()>100_000 {
+                recent.retain(|_,t|batch.received_at_ms.saturating_sub(*t)<60_000);
+            }
+        }
+        Ok::<(),anyhow::Error>(())
+    });
+    // Each mint has its own next-due timestamp. No fixed-size request rounds:
+    // one HTTP request per mint, kept continuously in flight as transport allows.
+    // Existing deadlines survive membership changes in the qualified watch set.
+    let failure_retry_secs=env::var("DEXSCREENER_FAILURE_RETRY_SECONDS")
+        .unwrap_or_else(|_|"120".into()).parse::<u64>()
+        .context("DEXSCREENER_FAILURE_RETRY_SECONDS")?;
+    ensure!((10..=3600).contains(&failure_retry_secs),
+        "DEXSCREENER_FAILURE_RETRY_SECONDS must be 10..3600");
+    let refresh=Duration::from_secs(refresh_secs);
+    let retry=Duration::from_secs(failure_retry_secs);
+    let mut active=HashSet::<Pubkey>::new();
+    let mut inflight=HashSet::<Pubkey>::new();
+    let mut due=std::collections::BTreeSet::<(tokio::time::Instant,Pubkey)>::new();
+    let mut tasks=tokio::task::JoinSet::<RequestResult>::new();
+    let mut pulse=tokio::time::interval(Duration::from_secs(30));
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut completed=0_u64;
+    let mut failures=0_u64;
+    let mut published_pairs=0_u64;
+    let mut changes=0_u64;
+    let mut source_open=true;
+    // Initial snapshot also covers updates published before proxy discovery finished.
+    let initial=qualified.borrow_and_update().clone();
+    for &mint in initial.iter() {
+        if active.insert(mint) {due.insert((tokio::time::Instant::now(),mint));}
+    }
+    crate::log_event!(Info,
+        "dexscreener cp1 continuous started=true active_mints={} parallel={} refresh_s={} failure_retry_s={}",
+        active.len(),settings.parallel,refresh_secs,failure_retry_secs);
+    loop {
+        // Dispatch every due mint until the concurrency limit is reached.
+        // The shared HTTP transport owns proxy/rate limiting and backpressure.
+        while tasks.len()<settings.parallel {
+            let Some(&(at,mint))=due.first() else {break};
+            if at>tokio::time::Instant::now(){break}
+            due.pop_first();
+            if !active.contains(&mint) || !inflight.insert(mint) {continue}
+            let client=handle.clone();
+            tasks.spawn(async move {fetch_one(client,mint).await});
+        }
+        if !source_open && tasks.is_empty() {break}
+        let next_due=due.first().map(|&(at,_)|at);
+        tokio::select! {
+            update=qualified.changed(), if source_open=>{
+                if update.is_err(){
+                    source_open=false;
+                    active.clear();
+                    due.clear();
+                } else {
+                    let latest=qualified.borrow_and_update().clone();
+                    let new_active:HashSet<Pubkey>=latest.iter().copied().collect();
+                    let now=tokio::time::Instant::now();
+                    due.retain(|(_,mint)|new_active.contains(mint));
+                    let mut added=0_usize;
+                    for &mint in &new_active {
+                        if !active.contains(&mint) && !inflight.contains(&mint) {
+                            due.insert((now,mint));
+                            added+=1;
+                        }
+                    }
+                    let removed=active.len().saturating_sub(active.intersection(&new_active).count());
+                    active=new_active;
+                    changes+=1;
+                    crate::log_event!(Info,
+                        "dexscreener cp1 selection_changed active_mints={} added={} removed={} queued={} in_flight={} change={changes}",
+                        active.len(),added,removed,due.len(),tasks.len());
+                }
+            },
+            finished=tasks.join_next(), if !tasks.is_empty()=>{
+                let result=finished.context("DexScreener CP1 request missing")?
+                    .context("DexScreener CP1 request task panicked")?;
+                inflight.remove(&result.mint);
+                if !active.contains(&result.mint) {continue;}
+                let now=tokio::time::Instant::now();
+                if let Some((route,proxy_ip,pairs,_,_))=result.response {
+                    published_pairs+=pairs.len() as u64;
+                    completed+=1;
+                    tx.send(Arc::new(DexPairBatch {
+                        requested_mint:result.mint,
+                        received_at_ms:now_unix_ms()?,
+                        route_id:route,proxy_ip,pairs,
+                    })).map_err(|_|anyhow::anyhow!("DexScreener enrichment publisher closed"))?;
+                    due.insert((now+refresh,result.mint));
+                } else {
+                    failures+=1;
+                    if failures<=5 || failures%100==0 {
+                        crate::log_event!(Warn,
+                            "dexscreener cp1 request_failed mint={} attempts={} total_failed={} reason={}",
+                            result.mint,result.attempts,failures,result.error.as_deref().unwrap_or("unknown"));
+                    }
+                    due.insert((now+retry,result.mint));
+                }
+            },
+            _=tokio::time::sleep_until(
+                next_due.unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(3600))
+            ), if tasks.len()<settings.parallel && next_due.is_some()=>{},
+            _=pulse.tick()=>{
+                crate::log_event!(Info,
+                    "dexscreener cp1 continuous active_mints={} queued={} in_flight={} completed={} failed={} pairs={} refresh_s={}",
+                    active.len(),due.len(),tasks.len(),completed,failures,published_pairs,refresh_secs);
+            }
+        }
+        if publish.is_finished() {
+            publish.await.context("DexScreener enrichment publisher panicked")??;
+            bail!("DexScreener enrichment publisher exited");
+        }
+    }
+    drop(tx);
+    publish.await.context("DexScreener enrichment publisher panicked")??;
+    drop(cycles);drop(handle);
+    transport_task.await.context("DexScreener transport panicked")??;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

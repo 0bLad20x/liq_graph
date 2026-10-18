@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast,watch};
 
@@ -17,16 +17,53 @@ use crate::core::{
     CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind,
 };
 
+/// Per-pool provenance. REST has priority while fresh; DexScreener fills missing
+/// or stale protocol liquidity. Last-known persistence never implies freshness.
+#[derive(Clone,Copy)]
+struct Quote { value:f64, at:u64, source:&'static str }
+#[derive(Default)]
+struct PoolQuotes { protocol:Option<Quote>, dex:Option<Quote>, last_persisted:u64 }
+const TVL_SOURCE_MAX_AGE_MS: u64 = 3_600_000;
+const TVL_PERSIST_INTERVAL_MS: u64 = 900_000;
+const DEX_SOURCE: &str = "dexscreener_token_pairs";
+
+fn select_tvl(quotes:&PoolQuotes, now:u64)->Option<Quote> {
+    let recent=|q:Quote|q.at<=now && now.saturating_sub(q.at)<=TVL_SOURCE_MAX_AGE_MS;
+    quotes.protocol.filter(|q|recent(*q)).or_else(||quotes.dex.filter(|q|recent(*q)))
+}
+fn record_tvl(quotes:&mut HashMap<Pubkey,PoolQuotes>,address:Pubkey,
+              source:&'static str,at:u64,value:Option<f64>)->Option<Quote> {
+    let Some(value)=value else {
+        return quotes.get(&address).and_then(|market|select_tvl(market,at));
+    };
+    let state=quotes.entry(address).or_default();
+    let quote=Quote{value,at,source};
+    let slot=if source==DEX_SOURCE {&mut state.dex} else {&mut state.protocol};
+    if slot.is_none_or(|old|quote.at>=old.at) {*slot=Some(quote);}
+    select_tvl(state,at)
+}
+
 /// The write owner is the registry worker. Consumers can only request typed snapshots.
 #[derive(Clone, Default)]
 pub struct PoolRegistry {
     entries: Arc<RwLock<HashMap<Pubkey, PoolState>>>,
+    quotes: Arc<RwLock<HashMap<Pubkey,PoolQuotes>>>,
 }
 
 impl PoolRegistry {
     pub fn snapshot(&self) -> Vec<PoolState> {
         self.entries.read().expect("pool registry lock poisoned")
             .values().cloned().collect()
+    }
+
+    pub fn get(&self, address: Pubkey) -> Option<PoolState> {
+        self.entries.read().expect("pool registry lock poisoned")
+            .get(&address).cloned()
+    }
+
+    pub fn live_tvl_count(&self) -> usize {
+        self.entries.read().expect("pool registry lock poisoned")
+            .values().filter(|p|p.tvl_usd.is_some()).count()
     }
 
     /// Bootstrap complete, previously validated state before any producer starts.
@@ -85,9 +122,49 @@ impl PoolRegistry {
         Ok(entries.len())
     }
 
+    /// Re-evaluate canonical TVL even when no new REST/DexScreener event arrives.
+    /// Historical last_observation stays intact; expired quotes never masquerade
+    /// as current liquidity. Called only by the Registry's single writer.
+    fn refresh_tvl(&self, now:u64) -> (Vec<PoolState>,Vec<Pubkey>) {
+        let mut entries=self.entries.write().expect("pool registry lock poisoned");
+        let mut quotes=self.quotes.write().expect("pool market state lock poisoned");
+        let mut updates=Vec::new();
+        let mut persist=Vec::new();
+        for (address, market) in quotes.iter_mut() {
+            let selected=select_tvl(market,now);
+            if let Some(pool)=entries.get_mut(address) {
+                let source=pool.last_observation.as_ref().and_then(|o|o.get("source"))
+                    .and_then(Value::as_str);
+                if pool.tvl_usd!=selected.map(|q|q.value)
+                    || selected.is_some_and(|q|source!=Some(q.source)) {
+                    pool.tvl_usd=selected.map(|q|q.value);
+                    if let Some(q)=selected {
+                        pool.last_observation=Some(Arc::new(json!({
+                            "tvl_usd":q.value,"source":q.source,
+                            "observed_at_ms":q.at,"first_seen_ms":pool.first_seen_ms
+                        })));
+                        if market.last_persisted==0
+                            || now.saturating_sub(market.last_persisted)>=TVL_PERSIST_INTERVAL_MS {
+                            market.last_persisted=now;
+                            persist.push(*address);
+                        }
+                    }
+                    // Expiry only clears the live value; the DB retains history.
+                    pool.last_changed_ms=now;
+                    updates.push(pool.clone());
+                }
+            }
+        }
+        // Prevent indefinite growth from ever-seen, now-expired sources.
+        quotes.retain(|_,q|q.protocol.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS)
+             || q.dex.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS));
+        (updates,persist)
+    }
+
     fn apply(&self, batch: &DataBatch) -> BatchStats {
         let mut stats = BatchStats::default();
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
+        let mut quotes = self.quotes.write().expect("pool market state lock poisoned");
         let mut updates = Vec::new();
 
         for record in &batch.records {
@@ -102,9 +179,11 @@ impl PoolRegistry {
                 continue;
             }
 
-            let observed_tvl = record.tvl_usd;
+            let observed_tvl = record.tvl_usd.filter(|v|v.is_finite() && *v>=0.0);
             match entries.get_mut(address) {
                 None => {
+                    let selected=record_tvl(&mut quotes,*address,batch.source,
+                        batch.received_at_ms,observed_tvl);
                     let state = PoolState {
                         address: *address,
                         venue: *venue,
@@ -114,9 +193,12 @@ impl PoolRegistry {
                         first_seen_ms: batch.received_at_ms,
                         last_seen_ms: batch.received_at_ms,
                         last_changed_ms: batch.received_at_ms,
-                        tvl_usd: observed_tvl,
+                        tvl_usd: selected.map(|v|v.value),
                         pool_config: None,
-                        last_observation: None,
+                        last_observation: selected.map(|v|Arc::new(json!({
+                            "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
+                            "first_seen_ms":batch.received_at_ms
+                        }))),
                         completion_state: CompletionState::Unknown,
                         completion_validated_slot: None,
                         execution_manifest: None,
@@ -145,7 +227,8 @@ impl PoolRegistry {
                         crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
                         continue;
                     }
-
+                    let selected=record_tvl(&mut quotes,*address,batch.source,
+                        batch.received_at_ms,observed_tvl);
                     let mut changed = false;
                     let mut identity_changed = false;
                     if current.mint_a.is_none() && mint_a.is_some() {
@@ -158,17 +241,26 @@ impl PoolRegistry {
                         changed = true;
                         identity_changed = true;
                     }
-                    if let Some(tvl) = observed_tvl {
-                        if current.tvl_usd != Some(tvl) {
-                            // Only the first ever usable TVL snapshot merits a
-                            // persistence refresh. Subsequent TVL changes stay RAM-only.
-                            if current.tvl_usd.is_none() && current.last_observation.as_ref()
-                                .and_then(|o| o.get("tvl_usd"))
-                                .and_then(Value::as_f64).is_none() {
-                                identity_changed = true;
-                            }
-                            current.tvl_usd = Some(tvl);
-                            changed = true;
+                    if let Some(chosen)=selected {
+                        let prior=current.last_observation.as_ref();
+                        let prior_source=prior.and_then(|o|o.get("source")).and_then(Value::as_str);
+                        let value_changed=current.tvl_usd!=Some(chosen.value);
+                        let source_changed=prior_source!=Some(chosen.source);
+                        let tracking=quotes.get_mut(address).expect("quote was inserted");
+                        let should_persist=tracking.last_persisted==0 ||
+                            batch.received_at_ms.saturating_sub(tracking.last_persisted)>=TVL_PERSIST_INTERVAL_MS;
+                        if value_changed || source_changed {
+                            current.tvl_usd=Some(chosen.value);
+                            changed=true;
+                        }
+                        current.last_observation=Some(Arc::new(json!({
+                            "tvl_usd":chosen.value,"source":chosen.source,
+                            "observed_at_ms":chosen.at,"first_seen_ms":current.first_seen_ms
+                        })));
+                        if should_persist {
+                            identity_changed=true;
+                            tracking.last_persisted=batch.received_at_ms;
+                            changed=true;
                         }
                     }
                     if current.source != batch.source {
@@ -359,6 +451,8 @@ pub async fn run(
     let mut incomplete_delta = 0_i64;
     let mut manifest_delta = 0_i64;
     let mut source_open = true;
+    let mut freshness=tokio::time::interval(std::time::Duration::from_secs(60));
+    freshness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut completion_open = completion.is_some();
     let require_completion = completion_open;
     let bootstrap_snapshot = registry.snapshot();
@@ -371,6 +465,20 @@ pub async fn run(
 
     while source_open || completion_open {
         tokio::select! {
+            _=freshness.tick()=>{
+                let (invalidated,persist)=registry.refresh_tvl(now_unix_ms()?);
+                if !invalidated.is_empty() {
+                    let count=invalidated.len();
+                    output.send(Arc::new(PoolUpdateBatch {
+                        kind:PoolUpdateKind::Source,
+                        source:"tvl_freshness",
+                        received_at_ms:now_unix_ms()?,
+                        pools:invalidated,
+                        persist_identity:persist,
+                    })).map_err(|_|anyhow::anyhow!("Registry freshness update has no subscribers"))?;
+                    crate::log_event!(Info,"pool registry tvl_freshness_changed pools={count}");
+                }
+            },
             event = input.recv(), if source_open => match event {
                 Ok(batch) => {
                     batches += 1;
@@ -484,6 +592,21 @@ pub async fn run(
     venue_counts.sort_by(|a,b|a.0.cmp(&b.0));
     crate::log_event!(Info,"pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tvl_freshness_tests {
+    use super::*;
+    #[test]
+    fn fresh_protocol_preferred_then_dex_fallback_then_expiry() {
+        let mut state=PoolQuotes::default();
+        state.protocol=Some(Quote{value:800.0,at:100,source:"rest"});
+        state.dex=Some(Quote{value:650.0,at:200,source:DEX_SOURCE});
+        assert_eq!(select_tvl(&state,201).map(|q|q.value),Some(800.0));
+        assert_eq!(select_tvl(&state,TVL_SOURCE_MAX_AGE_MS+101)
+            .map(|q|q.value),Some(650.0));
+        assert!(select_tvl(&state,TVL_SOURCE_MAX_AGE_MS+201).is_none());
+    }
 }
 
 /// Temporary live-test subscriber: proves changed states reach a real consumer.

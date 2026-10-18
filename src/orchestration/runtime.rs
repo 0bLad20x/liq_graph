@@ -10,7 +10,7 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
-        diagnostic_source, graph_liquidity, graph_watch_catalog,
+        diagnostic_source, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
         identity_hydration_venues, persistence, pool_registry,
         rpc_transport, source_jupiter_mint}};
 use super::jupiter_settings;
@@ -148,6 +148,65 @@ async fn completion_feed(
     }
 }
 
+/// Isolated CP1 live checkpoint: real Jupiter and DexScreener, restored
+/// Registry and the single PostgreSQL writer; NO discovery or Completion RPC.
+pub async fn cp1_live() -> Result<()> {
+    let database=persistence::Persistence::connect().await?;
+    let restored=database.restore().await?;
+    let registry=pool_registry::PoolRegistry::default();
+    let pool_count=registry.restore(restored)?;
+    let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
+    let (done,_) = watch::channel(false);
+    let registry_task=tokio::spawn(pool_registry::run(
+        source_rx,None,registry.clone(),updates.clone(),done,true));
+    let writer=tokio::spawn(database.run(updates.subscribe()));
+    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
+    let qualification=tokio::spawn(mint_qualification::run(
+        updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
+    let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
+    // This isolated checkpoint must not start an unbounded full backfill.
+    let mut jupiter_settings=settings;
+    jupiter_settings.backfill_on_start=false;
+    let jupiter=tokio::spawn(source_jupiter_mint::run_targeted(
+        core::http_client()?,jupiter_settings,target_rx,jupiter_out.clone()));
+    let qualification_evidence=qualified_rx.clone();
+    let dex=tokio::spawn(source_dexscreener::run_live(
+        qualified_rx,registry.clone(),source.clone()));
+    let duration=number("CP1_PROBE_DURATION_SECONDS",300)?;
+    ensure_duration(duration)?;
+    crate::log_event!(Info,"cp1 live started=true restored_pools={pool_count} duration_s={duration} completion_workers=0");
+    let mut dex=dex;
+    let mut jupiter=jupiter;
+    let mut qualification=qualification;
+    tokio::select! {
+        _=tokio::time::sleep(Duration::from_secs(duration))=>{},
+        result=&mut dex=>{result.context("CP1 DexScreener task panicked")??;bail!("CP1 DexScreener exited unexpectedly");},
+        result=&mut jupiter=>{result.context("CP1 Jupiter task panicked")??;bail!("CP1 Jupiter exited unexpectedly");},
+        result=&mut qualification=>{result.context("CP1 qualification task panicked")??;bail!("CP1 qualification exited unexpectedly");},
+    }
+    dex.abort();jupiter.abort();qualification.abort();
+    let _=tokio::join!(dex,jupiter,qualification);
+    drop(jupiter_out);
+    drop(source);
+    registry_task.await.context("CP1 Registry task panicked")??;
+    drop(updates);
+    writer.await.context("CP1 Persistence task panicked")??;
+    let qualified_count=qualification_evidence.borrow().len();
+    let live_tvl=registry.live_tvl_count();
+    anyhow::ensure!(qualified_count>0 && live_tvl>0,
+        "CP1 live produced no qualified mints or no enriched pool TVL");
+    crate::log_event!(Info,
+        "cp1 live complete=true persisted=true qualified_mints={qualified_count} live_tvl_pools={live_tvl}");
+    Ok(())
+}
+fn ensure_duration(n:u64)->Result<()> {
+    anyhow::ensure!((10..=86400).contains(&n),"CP1_PROBE_DURATION_SECONDS must be 10..86400");
+    Ok(())
+}
+
 pub async fn run()->Result<()>{
     let duration=number("RUN_DURATION_SECONDS",0)?;
     let full_scan=enabled("RUN_FULL_SCAN")?;
@@ -235,9 +294,13 @@ pub async fn run()->Result<()>{
         let input=catalog_rx.clone();
         async move{graph_watch_catalog::observe(input).await}
     }));
+    let cp1=enabled("CP1_MARKET_ENRICHMENT_ENABLED")?;
+    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let mut qualification_jupiter_rx=None;
+    let mut qualification_jupiter_tx=None;
     let jupiter_mints=if jupiter_settings()?.is_some(){
         let (mint_tx,mint_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-        let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(32);
+        let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(256);
         let observer_sender=jupiter_out.clone();
         let mut first_jupiter_observer=Some(jupiter_rx);
         tasks.spawn(supervise("observer.source_jupiter_mint",stop_rx.clone(),move||{
@@ -245,19 +308,39 @@ pub async fn run()->Result<()>{
                 .unwrap_or_else(||observer_sender.subscribe());
             async move{diagnostic_source::run(input,true).await}
         }));
+        if cp1 {
+            qualification_jupiter_rx=Some(jupiter_out.subscribe());
+            qualification_jupiter_tx=Some(mint_tx.clone());
+        }
         let client=http.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
             let output=jupiter_out.clone();let client=client.clone();
             let mints=mint_rx.clone();
             async move{
                 let settings=jupiter_settings()?.context("Jupiter keys disappeared")?;
-                source_jupiter_mint::run(client,settings,mints,output).await
+                if cp1 {
+                    source_jupiter_mint::run_targeted(client,settings,mints,output).await
+                } else {
+                    source_jupiter_mint::run(client,settings,mints,output).await
+                }
             }
         }));
-        Some(mint_tx)
+        if cp1 {None} else {Some(mint_tx)}
     }else{None};
     critical(&mut tasks,"graph_watch_catalog",graph_watch_catalog::run(
         graph_rx,catalog_tx,jupiter_mints));
+    if cp1 {
+        let jupiter_rx=qualification_jupiter_rx.context("CP1 requires Jupiter API keys")?;
+        let targets=qualification_jupiter_tx.context("CP1 Jupiter targets missing")?;
+        critical(&mut tasks,"mint_qualification",mint_qualification::run(
+            updates.subscribe(),jupiter_rx,qualified_tx,targets));
+        let reg=registry.clone();let publisher=source.clone();
+        tasks.spawn(supervise("source_dexscreener.cp1",stop_rx.clone(),move||{
+            let selection=qualified_rx.clone();
+            let reg=reg.clone();let publisher=publisher.clone();
+            async move{source_dexscreener::run_live(selection,reg,publisher).await}
+        }));
+    }
     let diagnostic_sender=source.clone();
     let mut first_discovery_observer=Some(diagnostic_rx);
     tasks.spawn(supervise("observer.discovery_batches",stop_rx.clone(),move||{
