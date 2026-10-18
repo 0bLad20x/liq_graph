@@ -27,4 +27,3 @@ pub mod completion_pumpswap;
 pub mod discovery_orca_whirlpool;
 pub mod discovery_meteora_damm_v2;
 pub mod discovery_rpc_full;
-pub mod jupiter_mint_backfill;
