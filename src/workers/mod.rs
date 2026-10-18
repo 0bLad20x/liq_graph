@@ -1,5 +1,6 @@
 pub mod discovery_meteora_dlmm;
 pub mod source_jupiter_mint;
+pub mod mint_qualification;
 pub mod source_dexscreener;
 pub mod diagnostic_source;
 pub mod pool_registry;
