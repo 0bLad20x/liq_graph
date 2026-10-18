@@ -62,6 +62,7 @@ pub async fn run(
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut qualified=Arc::<[Pubkey]>::from([]);
     let mut candidate_missing=HashSet::<Pubkey>::new();
+    let mut checked_mints=HashSet::<Pubkey>::new();
     let mut dirty=true;
     let mut elapsed=refresh_secs;
     loop {
@@ -72,7 +73,9 @@ pub async fn run(
                         // Even an existing pool can gain previously unknown mint identities.
                         for p in &batch.pools {
                             for mint in [p.mint_a,p.mint_b].into_iter().flatten() {
-                                if candidate_missing.len()<20000 {candidate_missing.insert(mint);}
+                                if candidate_missing.len()<20000 && checked_mints.insert(mint) {
+                                    candidate_missing.insert(mint);
+                                }
                             }
                         }
                         dirty=true;
@@ -85,7 +88,7 @@ pub async fn run(
             event=jupiter_updates.recv()=>{
                 match event {
                     Ok(batch)=>{
-                        if batch.records.iter().any(|r|matches!(r.identity,RecordIdentity::Mint{..})) {
+                        if batch.records.iter().any(|r|matches!(&r.identity,RecordIdentity::Mint{..})) {
                             dirty=true;
                         }
                     },
@@ -99,7 +102,7 @@ pub async fn run(
             },
             _=pulse.tick()=>{
                 elapsed=elapsed.saturating_add(10);
-                if dirty || elapsed>=refresh_secs {
+                if elapsed>=refresh_secs {
                     let rows=db.query(SELECT_QUALIFIED,&[]).await.context("qualify Jupiter catalog")?;
                     let mut v=Vec::with_capacity(rows.len());
                     for row in rows {v.push(key(row.get::<_,Vec<u8>>(0))?);}
@@ -118,7 +121,11 @@ pub async fn run(
                 if !candidate_missing.is_empty() {
                     let keys:Vec<Vec<u8>>=candidate_missing.iter().map(|m|m.to_bytes().to_vec()).collect();
                     let known=db.query(
-                        "SELECT mint_address FROM public.liq_graph_mint_catalog WHERE mint_address=ANY($1::bytea[])",
+                        "SELECT mint_address FROM public.liq_graph_mint_catalog
+                         WHERE mint_address=ANY($1::bytea[])
+                           AND updated_at IS NOT NULL
+                           AND liquidity_usd IS NOT NULL
+                           AND market_cap_usd IS NOT NULL",
                         &[&keys]).await.context("check targeted Jupiter catalog misses")?;
                     for row in known {candidate_missing.remove(&key(row.get::<_,Vec<u8>>(0))?);}
                 }
