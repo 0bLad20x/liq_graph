@@ -607,6 +607,12 @@ pub async fn run_live(
         }
         Ok::<(),anyhow::Error>(())
     });
+    let max_per_cycle=env::var("DEXSCREENER_CP1_MINTS_PER_CYCLE")
+        .unwrap_or_else(|_|"10000".into()).parse::<usize>()
+        .context("DEXSCREENER_CP1_MINTS_PER_CYCLE")?;
+    ensure!((1..=MAX_MINTS).contains(&max_per_cycle),
+        "DEXSCREENER_CP1_MINTS_PER_CYCLE must be 1..=10000");
+    let mut cursor=0_usize;
     let mut pulse=tokio::time::interval(Duration::from_secs(refresh_secs));
     pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -618,7 +624,10 @@ pub async fn run_live(
         }
         let targets=qualified.borrow_and_update().clone();
         if targets.is_empty(){continue;}
-        let mints=targets.iter().take(settings.mint_limit).copied().collect::<Vec<_>>();
+        let count=targets.len().min(max_per_cycle);
+        let mints=(0..count).map(|offset|targets[(cursor+offset)%targets.len()])
+            .collect::<Vec<_>>();
+        cursor=(cursor+count)%targets.len();
         crate::log_event!(Info,"dexscreener cp1 target_mints={} selected={} refresh_s={refresh_secs}",
             targets.len(),mints.len());
         // The finite fetch implementation reports partial failure, but emits every
