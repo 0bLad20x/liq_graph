@@ -23,10 +23,10 @@ CREATE TABLE IF NOT EXISTS public.liq_graph_mint_catalog (
  created_at TIMESTAMPTZ NULL, updated_at TIMESTAMPTZ NULL,
  liquidity_usd NUMERIC NULL, market_cap_usd NUMERIC NULL,
  holder_count BIGINT NULL CHECK (holder_count IS NULL OR holder_count>=0),
- usd_price NUMERIC NULL)"#;
+ usd_price NUMERIC NULL, fetched_at TIMESTAMPTZ NULL)"#;
 const UPSERT: &str = r#"
 INSERT INTO public.liq_graph_mint_catalog AS old
- (mint_address,created_at,updated_at,liquidity_usd,market_cap_usd,holder_count,usd_price)
+ (mint_address,created_at,updated_at,liquidity_usd,market_cap_usd,holder_count,usd_price,fetched_at)
 SELECT d.mint,
  CASE WHEN d.created ~ '^-?[0-9]{1,16}$'
       THEN to_timestamp(d.created::double precision /
@@ -38,7 +38,7 @@ SELECT d.mint,
            CASE WHEN length(trim(leading '-' from d.updated))>=13 THEN 1000.0 ELSE 1.0 END)
       WHEN pg_input_is_valid(d.updated,'timestamp with time zone') THEN d.updated::timestamptz
       ELSE NULL END,
- d.liquidity::numeric,d.mcap::numeric,d.holders::bigint,d.price::numeric
+ d.liquidity::numeric,d.mcap::numeric,d.holders::bigint,d.price::numeric,clock_timestamp()
 FROM UNNEST($1::bytea[],$2::text[],$3::text[],$4::text[],
             $5::text[],$6::text[],$7::text[])
  AS d(mint,created,updated,liquidity,mcap,holders,price)
@@ -48,7 +48,8 @@ ON CONFLICT (mint_address) DO UPDATE SET
  liquidity_usd=COALESCE(EXCLUDED.liquidity_usd,old.liquidity_usd),
  market_cap_usd=COALESCE(EXCLUDED.market_cap_usd,old.market_cap_usd),
  holder_count=COALESCE(EXCLUDED.holder_count,old.holder_count),
- usd_price=COALESCE(EXCLUDED.usd_price,old.usd_price)"#;
+ usd_price=COALESCE(EXCLUDED.usd_price,old.usd_price),
+ fetched_at=EXCLUDED.fetched_at"#;
 
 #[derive(Clone)]
 pub struct Settings {
@@ -183,6 +184,8 @@ async fn connect() -> Result<Db> {
         .await.context("acquire Jupiter exclusive database lease")?.get(0);
     ensure!(acquired,"another Jupiter worker/backfill holds the catalog lease");
     db.batch_execute(CREATE).await.context("create Jupiter mint catalog")?;
+    db.batch_execute("ALTER TABLE public.liq_graph_mint_catalog ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ NULL")
+        .await.context("migrate Jupiter catalog fetched_at")?;
     Ok(db)
 }
 async fn write(db:&Db,rows:Vec<Token>) -> Result<u64> {
