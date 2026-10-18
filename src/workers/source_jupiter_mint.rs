@@ -437,9 +437,11 @@ impl Engine {
 /// CP1: preserve the existing API lanes and targeted watch scheduler but
 /// never start the full-catalogue scan as part of active qualification.
 /// The dedicated --jupiter-mint-backfill command remains available separately.
-pub async fn run_targeted(http:Client,settings:Settings,
+pub async fn run_targeted(http:Client,mut settings:Settings,
     mut input:watch::Receiver<Arc<[Pubkey]>>,
     output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {
+    // The targeted mode never triggers backfill, regardless of inherited ENV.
+    settings.backfill_on_start=false;
     let mut engine=Engine::new(http,settings).await?;
     loop {
         let deadline=Instant::now()+engine.settings.backfill_interval;
