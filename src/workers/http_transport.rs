@@ -70,6 +70,8 @@ pub struct HttpResponse {
     pub body: Bytes,
     pub elapsed_ms: u64,
     pub route_id: String,
+    /// Configured proxy address used for per-IP pacing; not verified egress IP.
+    pub proxy_ip: String,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +135,10 @@ pub struct Settings {
     pub list_file: Option<String>,
     pub public_discovery: bool,
     pub host_rps_overrides: HashMap<String, u32>,
+    /// Optional per-destination proxy-IP budget, in requests per minute.
+    pub proxy_ip_rpm_overrides: HashMap<String, u32>,
+    /// Prefer recently verified fast proxies for selected hosts; fall back to all.
+    pub proxy_latency_ceiling_ms: HashMap<String, u64>,
     /// Budget per configured proxy IP and destination host; not necessarily egress IP.
     pub request_rps_per_route: u32,
     pub retry_attempts: usize,
@@ -214,7 +220,9 @@ impl Settings {
             retry_failure_after: Duration::from_secs(retry),
             tcp_parallel, handshake_parallel, probe_parallel, request_parallel, queue_capacity,
             probe_rps, request_rps_per_host, probe_url, verify_url, extra_txt_urls,
-            list_file, public_discovery, host_rps_overrides, request_rps_per_route,
+            list_file, public_discovery, host_rps_overrides,
+            proxy_ip_rpm_overrides: HashMap::new(),
+            proxy_latency_ceiling_ms: HashMap::new(), request_rps_per_route,
             retry_attempts,
             cache_path: PathBuf::from(env::var("HTTP_PROXY_CACHE_FILE")
                 .unwrap_or_else(|_| "target/http_proxy_working_set.json".into())),
@@ -401,6 +409,7 @@ struct Shared {
     selection: AtomicUsize,
     host_gates: Mutex<HashMap<String, Instant>>,
     host_backoffs: Mutex<HashMap<String, Instant>>,
+    proxy_ip_backoffs: Mutex<HashMap<(String, String), Instant>>,
     route_gates: Mutex<HashMap<(String, String), Instant>>,
     host_route_cooldowns: Mutex<HashMap<(String, String), Instant>>,
     stats: StdMutex<TransportStats>,
@@ -432,6 +441,7 @@ pub fn spawn(settings: Settings) -> Result<(HttpHandle, JoinHandle<Result<()>>)>
         selection: AtomicUsize::new(0),
         host_gates: Mutex::new(HashMap::new()),
         host_backoffs: Mutex::new(HashMap::new()),
+        proxy_ip_backoffs: Mutex::new(HashMap::new()),
         route_gates: Mutex::new(HashMap::new()),
         host_route_cooldowns: Mutex::new(HashMap::new()),
         stats: StdMutex::new(TransportStats::default()),
@@ -951,8 +961,11 @@ async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
             at + Duration::from_secs_f64(1.0 / f64::from(host_rps)));
     }
     if route_id != "direct" {
-        route_gates.insert(route_key,
-            at + Duration::from_secs_f64(1.0 / f64::from(shared.settings.request_rps_per_route)));
+        let delay = shared.settings.proxy_ip_rpm_overrides.get(host)
+            .map(|rpm| Duration::from_secs_f64(60.0 / f64::from(*rpm)))
+            .unwrap_or_else(||Duration::from_secs_f64(
+                1.0 / f64::from(shared.settings.request_rps_per_route)));
+        route_gates.insert(route_key, at + delay);
     }
     drop(route_gates);
     drop(host_gates);
@@ -963,7 +976,12 @@ async fn pace_request(shared: &Shared, host: &str, route_id: &str) {
 // After a cooldown, reserve a fresh provider-rate slot to prevent a wake-up burst.
 async fn respect_backoff(shared: &Shared, host: &str, route_id: &str) {
     loop {
-        let until = shared.host_backoffs.lock().await.get(host).copied();
+        let until = if shared.settings.proxy_ip_rpm_overrides.contains_key(host) {
+            shared.proxy_ip_backoffs.lock().await
+                .get(&(host.to_owned(),route_id.to_owned())).copied()
+        } else {
+            shared.host_backoffs.lock().await.get(host).copied()
+        };
         let Some(until) = until.filter(|deadline| *deadline > Instant::now()) else { break; };
         sleep_until(until).await;
         pace_request(shared, host, route_id).await;
@@ -976,14 +994,24 @@ async fn choose_route(shared: &Shared, host: &str, excluded: &HashSet<String>) -
     let start = shared.selection.fetch_add(1, Ordering::Relaxed) % snapshot.len();
     let blocked = shared.host_route_cooldowns.lock().await;
     let state = shared.inventory.lock().await;
-    for offset in 0..snapshot.len() {
-        let id = &snapshot[(start + offset) % snapshot.len()].id;
-        if excluded.contains(id) || blocked.get(&(host.to_owned(), id.clone()))
-            .is_some_and(|until| *until > Instant::now()) { continue; }
-        if let Some(route) = state.get(id) {
-            if route.verified.is_some_and(|at| at.elapsed() < shared.settings.healthy_for) {
-                if let Some(client) = &route.client {
-                    return Ok((id.clone(), route.candidate.host.clone(), client.clone()));
+    // On selected hosts try all verified fast routes before any slow fallback.
+    // The snapshot is continuously republished by the proxy discovery worker.
+    let ceiling=shared.settings.proxy_latency_ceiling_ms.get(host).copied();
+    for pass in 0..(if ceiling.is_some() {2} else {1}) {
+        for offset in 0..snapshot.len() {
+            let candidate=&snapshot[(start+offset)%snapshot.len()];
+            if let Some(ms)=ceiling {
+                if pass==0 && candidate.latency_ms>ms {continue;}
+                if pass==1 && candidate.latency_ms<=ms {continue;}
+            }
+            let id=&candidate.id;
+            if excluded.contains(id) || blocked.get(&(host.to_owned(), id.clone()))
+                .is_some_and(|until| *until > Instant::now()) { continue; }
+            if let Some(route)=state.get(id) {
+                if route.verified.is_some_and(|at| at.elapsed()<shared.settings.healthy_for) {
+                    if let Some(client)=&route.client {
+                        return Ok((id.clone(),route.candidate.host.clone(),client.clone()));
+                    }
                 }
             }
         }
@@ -1090,14 +1118,19 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
                 .and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(5).clamp(1, 3600);
             let deadline = Instant::now() + Duration::from_secs(retry);
-            let mut backoffs = shared.host_backoffs.lock().await;
-            let previous = backoffs.entry(host.clone()).or_insert(deadline);
-            *previous = (*previous).max(deadline);
-            drop(backoffs);
-            let mut gates = shared.host_gates.lock().await;
-            let at = gates.entry(host.clone()).or_insert(deadline);
-            *at = (*at).max(deadline);
-            drop(gates);
+            if shared.settings.proxy_ip_rpm_overrides.contains_key(&host) {
+                let mut backoffs=shared.proxy_ip_backoffs.lock().await;
+                let at=backoffs.entry((host.clone(),proxy_ip.clone())).or_insert(deadline);
+                *at=(*at).max(deadline);
+            } else {
+                let mut backoffs = shared.host_backoffs.lock().await;
+                let previous = backoffs.entry(host.clone()).or_insert(deadline);
+                *previous = (*previous).max(deadline);
+                drop(backoffs);
+                let mut gates = shared.host_gates.lock().await;
+                let at = gates.entry(host.clone()).or_insert(deadline);
+                *at = (*at).max(deadline);
+            }
         } else if status == StatusCode::FORBIDDEN {
             shared.stats.lock().expect("HTTP stats lock poisoned").http_403 += 1;
         } else if status.is_server_error() {
@@ -1134,7 +1167,8 @@ async fn execute(shared: &Shared, request: HttpRequest) -> Result<HttpResponse> 
         }
         // HTTP statuses, including 429, are returned to the caller for its policy.
         return Ok(HttpResponse {
-            status, body, route_id, elapsed_ms: started.elapsed().as_millis() as u64,
+            status, body, route_id, proxy_ip,
+            elapsed_ms: started.elapsed().as_millis() as u64,
         });
     }
     Err(last_error.unwrap_or_else(|| anyhow!("HTTP transport retries exhausted")))

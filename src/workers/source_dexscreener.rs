@@ -55,6 +55,7 @@ pub struct DexPairBatch {
     pub requested_mint: Pubkey,
     pub received_at_ms: u64,
     pub route_id: String,
+    pub proxy_ip: String,
     pub pairs: Vec<DexPair>,
 }
 
@@ -62,6 +63,8 @@ pub struct DexPairBatch {
 pub struct Settings {
     pub mint_limit: usize,
     pub parallel: usize,
+    pub per_proxy_ip_rpm: u32,
+    pub max_proxy_latency_ms: u64,
     pub report_file: PathBuf,
     pub proxy_wait: Duration,
 }
@@ -71,8 +74,14 @@ impl Settings {
             .unwrap_or_else(|_| "100".into()).parse::<usize>()
             .context("DEXSCREENER_MINT_LIMIT")?;
         let parallel = env::var("DEXSCREENER_PARALLEL")
-            .unwrap_or_else(|_| "8".into()).parse::<usize>()
+            .unwrap_or_else(|_| "48".into()).parse::<usize>()
             .context("DEXSCREENER_PARALLEL")?;
+        let per_proxy_ip_rpm=env::var("DEXSCREENER_PROXY_IP_RPM")
+            .unwrap_or_else(|_| "280".into()).parse::<u32>()
+            .context("DEXSCREENER_PROXY_IP_RPM")?;
+        let max_proxy_latency_ms=env::var("DEXSCREENER_PROXY_MAX_LATENCY_MS")
+            .unwrap_or_else(|_| "5000".into()).parse::<u64>()
+            .context("DEXSCREENER_PROXY_MAX_LATENCY_MS")?;
         let proxy_wait = env::var("DEXSCREENER_PROXY_WAIT_SECONDS")
             .unwrap_or_else(|_| "900".into()).parse::<u64>()
             .context("DEXSCREENER_PROXY_WAIT_SECONDS")?;
@@ -80,12 +89,16 @@ impl Settings {
             .unwrap_or_else(|_| "target/dexscreener_cp2.jsonl".into()));
         ensure!((1..=MAX_MINTS).contains(&mint_limit),
             "DEXSCREENER_MINT_LIMIT must be 1..=100 for CP2");
-        ensure!((1..=32).contains(&parallel), "DEXSCREENER_PARALLEL must be 1..=32");
+        ensure!((1..=128).contains(&parallel), "DEXSCREENER_PARALLEL must be 1..=128");
+        ensure!((1..=3600).contains(&per_proxy_ip_rpm),
+            "DEXSCREENER_PROXY_IP_RPM must be 1..=3600");
+        ensure!((1..=60000).contains(&max_proxy_latency_ms),
+            "DEXSCREENER_PROXY_MAX_LATENCY_MS must be 1..=60000");
         ensure!((1..=1800).contains(&proxy_wait),
             "DEXSCREENER_PROXY_WAIT_SECONDS must be 1..=1800");
         ensure!(!report_file.as_os_str().is_empty(), "empty DEXSCREENER_REPORT_PATH");
-        Ok(Self { mint_limit, parallel, report_file,
-            proxy_wait: Duration::from_secs(proxy_wait) })
+        Ok(Self { mint_limit, parallel, per_proxy_ip_rpm,max_proxy_latency_ms,
+            report_file, proxy_wait: Duration::from_secs(proxy_wait) })
     }
 }
 
@@ -214,10 +227,11 @@ struct Counters {
     http_429:usize,http_403:usize,http_5xx:usize,retries:usize,
     bytes:usize,
     routes:HashSet<String>,
+    proxy_ip_counts:HashMap<String,usize>,
 }
 struct RequestResult {
     mint:Pubkey,
-    response:Option<(String,Vec<DexPair>,usize,usize)>,
+    response:Option<(String,String,Vec<DexPair>,usize,usize)>,
     attempts:usize,
     count_429:usize,
     count_403:usize,
@@ -256,8 +270,8 @@ async fn fetch_one(handle:HttpHandle,mint:Pubkey)->RequestResult {
                 }
                 match decode(&response.body,mint) {
                     Ok(decoded)=>{
-                        result.response=Some((response.route_id,decoded.pairs,
-                            decoded.rejected,response.body.len()));
+                        result.response=Some((response.route_id,response.proxy_ip,
+                            decoded.pairs,decoded.rejected,response.body.len()));
                         result.error=None;
                         break;
                     }
@@ -285,16 +299,17 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
         stats.http_403+=result.count_403;
         stats.http_5xx+=result.count_5xx;
         stats.retries+=result.attempts.saturating_sub(1);
-        if let Some((route,pairs,rejected,bytes))=result.response {
+        if let Some((route,proxy_ip,pairs,rejected,bytes))=result.response {
             stats.ok+=1;
             stats.empty+=usize::from(pairs.is_empty());
             stats.rejected+=rejected;
             stats.bytes+=bytes;
             stats.routes.insert(route.clone());
+            *stats.proxy_ip_counts.entry(proxy_ip.clone()).or_default()+=1;
             tx.send(Arc::new(DexPairBatch {
                 requested_mint:result.mint,
                 received_at_ms:now_unix_ms()?,
-                route_id:route,
+                route_id:route,proxy_ip,
                 pairs,
             })).map_err(|_|anyhow::anyhow!("DexScreener typed stream has no reader"))?;
         } else {
@@ -304,11 +319,14 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
                 result.mint,result.attempts,result.error.as_deref().unwrap_or("unknown"));
         }
     }
+    let elapsed=started.elapsed().as_secs_f64();
+    let max_per_ip=stats.proxy_ip_counts.values().copied().max().unwrap_or(0);
     crate::log_event!(Info,
-        "dexscreener source complete requests={total} success={} empty={} failed={} invalid_pairs={} retries={} http_429={} http_403={} http_5xx={} proxy_routes={} response_bytes={} elapsed_ms={}",
+        "dexscreener source complete requests={total} success={} empty={} failed={} invalid_pairs={} retries={} http_429={} http_403={} http_5xx={} proxy_routes={} proxy_ips={} max_success_per_ip={} response_bytes={} elapsed_s={:.2} success_rps={:.2}",
         stats.ok,stats.empty,stats.failed,stats.rejected,stats.retries,
         stats.http_429,stats.http_403,stats.http_5xx,
-        stats.routes.len(),stats.bytes,started.elapsed().as_millis());
+        stats.routes.len(),stats.proxy_ip_counts.len(),max_per_ip,
+        stats.bytes,elapsed,stats.ok as f64/elapsed.max(0.001));
     ensure!(stats.ok>0,"DexScreener returned no successful token-pairs responses");
     Ok(())
 }
@@ -346,7 +364,7 @@ fn window_json(value:&WindowMetrics)->Value {
 }
 async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
     report_file:PathBuf)->Result<()> {
-    let mut pairs=HashMap::<Pubkey,(Pubkey,u64,String,DexPair)>::new();
+    let mut pairs=HashMap::<Pubkey,(Pubkey,u64,String,String,DexPair)>::new();
     let mut received=0;
     let mut repeated=0usize;
     loop {
@@ -358,7 +376,8 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
                         repeated+=1;
                     } else {
                         pairs.insert(pair.address,(batch.requested_mint,
-                            batch.received_at_ms,batch.route_id.clone(),pair.clone()));
+                            batch.received_at_ms,batch.route_id.clone(),
+                            batch.proxy_ip.clone(),pair.clone()));
                     }
                 }
             }
@@ -381,7 +400,7 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
     let (mut known_pairs,mut mismatched,mut liquid,mut price,mut price_change,mut volume,
          mut transactions)=(0,0,0,0,0,0,0);
     for address in addresses {
-        let (requested,at,route,pair)=pairs.remove(&address).context("missing decoded pair")?;
+        let (requested,at,route,proxy_ip,pair)=pairs.remove(&address).context("missing decoded pair")?;
         *dex_counts.entry(pair.dex_id.clone()).or_default()+=1;
         let db_pool=known.get(&address);
         if db_pool.is_some(){known_pairs+=1;}
@@ -399,7 +418,7 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
         transactions+=usize::from(pair.windows.iter().any(|w|w.buys.is_some()||w.sells.is_some()));
         let entry=json!({
             "source":SOURCE, "requestedMint":requested.to_string(),
-            "receivedAtMs":at,"routeId":route,
+            "receivedAtMs":at,"routeId":route,"proxyIp":proxy_ip,
             "pairAddress":pair.address.to_string(),"dexId":pair.dex_id,
             "labels":pair.labels,
             "baseMint":pair.mint_a.to_string(),"quoteMint":pair.mint_b.to_string(),
@@ -432,10 +451,12 @@ pub async fn live_diagnostic()->Result<()> {
     let (db,db_task)=connect_db().await?;
     let mints=mint_sample(&db,settings.mint_limit).await?;
     let mut transport=http_transport::Settings::from_env()?;
-    // The provider's documented 300 RPM is a GLOBAL host budget, not per proxy.
-    // Host pacing applies to EVERY transport attempt, including retries.
-    transport.host_rps_overrides.entry(HOST.into())
-        .and_modify(|v|*v=(*v).clamp(1,4)).or_insert(4);
+    // CP2 benchmark mode: no shared 4-RPS host gate. Every verified proxy
+    // address gets its own independently paced 280-RPM budget (configurable).
+    // Multiple proxy ports on the same address share that budget.
+    transport.host_rps_overrides.insert(HOST.into(),0);
+    transport.proxy_ip_rpm_overrides.insert(HOST.into(),settings.per_proxy_ip_rpm);
+    transport.proxy_latency_ceiling_ms.insert(HOST.into(),settings.max_proxy_latency_ms);
     let (handle,task)=http_transport::spawn(transport)?;
     let mut cycles=handle.subscribe_cycles();
     tokio::time::timeout(settings.proxy_wait,async {
@@ -447,8 +468,9 @@ pub async fn live_diagnostic()->Result<()> {
     ensure!(!handle.working_set().is_empty(),
         "no verified HTTP proxies for DexScreener");
     crate::log_event!(Info,
-        "dexscreener CP2 started selected_mints={} proxy_routes={} host_rps_cap=4 parallel={} read_only=true",
-        mints.len(),handle.working_set().len(),settings.parallel);
+        "dexscreener CP2 started selected_mints={} proxy_routes={} global_host_cap=disabled proxy_ip_rpm={} parallel={} preferred_proxy_latency_ms={} read_only=true",
+        mints.len(),handle.working_set().len(),
+        settings.per_proxy_ip_rpm,settings.parallel,settings.max_proxy_latency_ms);
     let (tx,rx)=broadcast::channel::<Arc<DexPairBatch>>(128);
     let observer=tokio::spawn(observe(rx,db,settings.report_file));
     let result=fetch_all(handle.clone(),mints,settings.parallel,tx.clone()).await;
