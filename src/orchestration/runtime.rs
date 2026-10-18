@@ -172,6 +172,7 @@ pub async fn cp1_live() -> Result<()> {
     jupiter_settings.backfill_on_start=false;
     let jupiter=tokio::spawn(source_jupiter_mint::run_targeted(
         core::http_client()?,jupiter_settings,target_rx,jupiter_out.clone()));
+    let qualification_evidence=qualified_rx.clone();
     let dex=tokio::spawn(source_dexscreener::run_live(
         qualified_rx,registry.clone(),source.clone()));
     let duration=number("CP1_PROBE_DURATION_SECONDS",300)?;
@@ -193,7 +194,12 @@ pub async fn cp1_live() -> Result<()> {
     registry_task.await.context("CP1 Registry task panicked")??;
     drop(updates);
     writer.await.context("CP1 Persistence task panicked")??;
-    crate::log_event!(Info,"cp1 live complete=true persisted=true");
+    let qualified_count=qualification_evidence.borrow().len();
+    let live_tvl=registry.live_tvl_count();
+    anyhow::ensure!(qualified_count>0 && live_tvl>0,
+        "CP1 live produced no qualified mints or no enriched pool TVL");
+    crate::log_event!(Info,
+        "cp1 live complete=true persisted=true qualified_mints={qualified_count} live_tvl_pools={live_tvl}");
     Ok(())
 }
 fn ensure_duration(n:u64)->Result<()> {
