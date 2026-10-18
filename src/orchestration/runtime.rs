@@ -148,6 +148,59 @@ async fn completion_feed(
     }
 }
 
+/// Isolated CP1 live checkpoint: real Jupiter and DexScreener, restored
+/// Registry and the single PostgreSQL writer; NO discovery or Completion RPC.
+pub async fn cp1_live() -> Result<()> {
+    let database=persistence::Persistence::connect().await?;
+    let restored=database.restore().await?;
+    let registry=pool_registry::PoolRegistry::default();
+    let pool_count=registry.restore(restored)?;
+    let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
+    let (done,_) = watch::channel(false);
+    let registry_task=tokio::spawn(pool_registry::run(
+        source_rx,None,registry.clone(),updates.clone(),done,true));
+    let writer=tokio::spawn(database.run(updates.subscribe()));
+    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
+    let qualification=tokio::spawn(mint_qualification::run(
+        updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
+    let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
+    // This isolated checkpoint must not start an unbounded full backfill.
+    let mut jupiter_settings=settings;
+    jupiter_settings.backfill_on_start=false;
+    let jupiter=tokio::spawn(source_jupiter_mint::run(
+        core::http_client()?,jupiter_settings,target_rx,jupiter_out.clone()));
+    let dex=tokio::spawn(source_dexscreener::run_live(
+        qualified_rx,registry.clone(),source.clone()));
+    let duration=number("CP1_PROBE_DURATION_SECONDS",300)?;
+    ensure_duration(duration)?;
+    crate::log_event!(Info,"cp1 live started=true restored_pools={pool_count} duration_s={duration} completion_workers=0");
+    let mut dex=dex;
+    let mut jupiter=jupiter;
+    let mut qualification=qualification;
+    tokio::select! {
+        _=tokio::time::sleep(Duration::from_secs(duration))=>{},
+        result=&mut dex=>{result.context("CP1 DexScreener task panicked")??;bail!("CP1 DexScreener exited unexpectedly");},
+        result=&mut jupiter=>{result.context("CP1 Jupiter task panicked")??;bail!("CP1 Jupiter exited unexpectedly");},
+        result=&mut qualification=>{result.context("CP1 qualification task panicked")??;bail!("CP1 qualification exited unexpectedly");},
+    }
+    dex.abort();jupiter.abort();qualification.abort();
+    let _=tokio::join!(dex,jupiter,qualification);
+    drop(jupiter_out);
+    drop(source);
+    registry_task.await.context("CP1 Registry task panicked")??;
+    drop(updates);
+    writer.await.context("CP1 Persistence task panicked")??;
+    crate::log_event!(Info,"cp1 live complete=true persisted=true");
+    Ok(())
+}
+fn ensure_duration(n:u64)->Result<()> {
+    anyhow::ensure!((10..=86400).contains(&n),"CP1_PROBE_DURATION_SECONDS must be 10..86400");
+    Ok(())
+}
+
 pub async fn run()->Result<()>{
     let duration=number("RUN_DURATION_SECONDS",0)?;
     let full_scan=enabled("RUN_FULL_SCAN")?;
