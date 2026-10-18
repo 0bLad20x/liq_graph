@@ -4,6 +4,19 @@ Umfang: Jupiter (gezielte neue/unvollständige Mints), SQL-Qualifizierung,
 dauerhafter DexScreener-Consumer, kanonischer Pool-TVL mit Provenienz,
 gebündelte Persistenz. **Keine Completion- oder Graph-Zulassung:** Das ist CP2.
 
+## Ein-Kommando-Abnahme
+
+```powershell
+.\scripts\cp1_acceptance.ps1
+```
+
+Das Skript prüft `cargo check --locked`, den gezielten
+TVL-Expiry-/Source-Fallback-Test und einen fünfminütigen
+**echten** Jupiter-/DexScreener-/PostgreSQL-Lauf. Es schlägt fehl,
+wenn keine qualifizierten Mints oder keine frische Pool-TVL entstehen,
+wenn die Registry Konflikte oder Broadcast-Verluste meldet oder
+der Abschlussindikator fehlt. Log: `cp1_live_final.log`.
+
 ## Lokaler Live-Checkpoint ohne Completion-RPC
 
 PowerShell im Repository:
@@ -141,7 +154,8 @@ Completion-Worker. Die Einschränkung auf qualifizierte Pools und
    Protokoll-Priorität, den DexScreener-Fallback und den TVL-Ablauf.
 
 Der ältere CP1-v2-Live-Test mit Rundenscheduler belegte 8.498
-persistierte TVL-Beobachtungen. **Die hier nachfolgend korrigierte Version
-mit SQL-Reconciliation, gezieltem Jupiter-Mode und Registry-TVL-Expiry
-wurde noch nicht lokal neu kompiliert und live geprüft.**
+persistierte TVL-Beobachtungen. **Die hier korrigierte Version mit SQL-Reconciliation, gezieltem
+Jupiter-Mode und Registry-TVL-Expiry wurde noch nicht lokal neu
+kompiliert und live geprüft. Der Abnahmebefehl ist vorhanden,
+das Ergebnis steht bis zur Ausführung offen.**
 Stand der Implementierung: Feature-Branch, nicht `main`.
