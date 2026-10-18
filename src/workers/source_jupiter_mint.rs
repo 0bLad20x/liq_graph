@@ -367,20 +367,29 @@ impl Engine {
         let mut cursor=0_usize;
         let mut source_open=true;
         let mut fetched=0_u64;
+        let mut in_flight=HashSet::<Pubkey>::new();
         crate::log_event!(Info,"jupiter mode=watch started targets={}",input.borrow().len());
         while Instant::now()<deadline || !self.pending.is_empty() {
             let targets=input.borrow_and_update().clone();
             if Instant::now()<deadline && !targets.is_empty() {
                 for lane in 0..self.lanes.len() {
                     if self.lanes[lane].in_flight || Instant::now()<self.lanes[lane].next_due {continue;}
-                    if cursor>=targets.len() {cursor=0;}
-                    let n=self.settings.batch_size.min(targets.len()-cursor);
-                    let work=Work{mints:targets[cursor..cursor+n].to_vec(),retry:0};
-                    cursor=(cursor+n)%targets.len();
-                    self.dispatch(lane,work);
+                    let mut mints=Vec::new();
+                    let mut scanned=0;
+                    while scanned<targets.len() && mints.len()<self.settings.batch_size {
+                        if cursor>=targets.len() {cursor=0;}
+                        let mint=targets[cursor];
+                        cursor=(cursor+1)%targets.len();
+                        scanned+=1;
+                        if in_flight.insert(mint) {mints.push(mint);}
+                    }
+                    if !mints.is_empty() {
+                        self.dispatch(lane,Work{mints,retry:0});
+                    }
                 }
             }
-            let due=if Instant::now()<deadline && !targets.is_empty() {
+            let due=if Instant::now()<deadline
+                && targets.iter().any(|mint|!in_flight.contains(mint)) {
                 self.available_due().map(|t|t.min(deadline))
             } else {None};
             tokio::select! {
@@ -392,6 +401,7 @@ impl Engine {
                 result=self.pending.join_next(), if !self.pending.is_empty()=>{
                     let finished=result.context("missing Jupiter watch response")??;
                     self.lanes[finished.lane].in_flight=false;
+                    for mint in &finished.work.mints {in_flight.remove(mint);}
                     match finished.outcome {
                         Outcome::Success(decoded)=>{
                             let returned=decoded.rows.len();
