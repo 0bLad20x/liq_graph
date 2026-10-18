@@ -59,8 +59,9 @@ fn env_seconds(name: &str, default: u64) -> Result<u64> {
 }
 
 /// Rebuild the economic set at boot, on time boundaries and after catalog changes.
-/// Targeted Jupiter requests for newly discovered missing mints share the EXISTING
-/// Jupiter API lanes; the periodic full backfill remains a separate fallback.
+/// Targeted Jupiter requests share the existing lanes. Indexed reconciliation
+/// also catches restored / overflowed pool identities without triggering a
+/// remote full-catalogue backfill.
 pub async fn run(
     mut pool_updates: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     mut jupiter_updates: broadcast::Receiver<Arc<DataBatch>>,
@@ -91,6 +92,10 @@ pub async fn run(
             event=pool_updates.recv()=>{
                 match event {
                     Ok(batch)=>{
+                        // TVL-only enrichment cannot introduce new mint identities.
+                        // Do not turn price refreshes into Jupiter queue churn.
+                        if batch.source=="dexscreener_token_pairs"
+                            || batch.source=="tvl_freshness" {continue}
                         // Even an existing pool can gain previously unknown mint identities.
                         for p in &batch.pools {
                             for mint in [p.mint_a,p.mint_b].into_iter().flatten() {
@@ -139,7 +144,7 @@ pub async fn run(
                         let mut found=HashSet::<Pubkey>::new();
                         for row in &rows {
                             pool_cursor=row.get::<_,Vec<u8>>(0);
-                            for column in [1,2] {
+                            for column in [1_usize,2_usize] {
                                 if let Some(bytes)=row.get::<_,Option<Vec<u8>>>(column) {
                                     let mint=key(bytes)?;
                                     if !candidate_missing.contains_key(&mint) {
