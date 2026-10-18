@@ -607,33 +607,107 @@ pub async fn run_live(
         }
         Ok::<(),anyhow::Error>(())
     });
-    let max_per_cycle=env::var("DEXSCREENER_CP1_MINTS_PER_CYCLE")
-        .unwrap_or_else(|_|"10000".into()).parse::<usize>()
-        .context("DEXSCREENER_CP1_MINTS_PER_CYCLE")?;
-    ensure!((1..=MAX_MINTS).contains(&max_per_cycle),
-        "DEXSCREENER_CP1_MINTS_PER_CYCLE must be 1..=10000");
-    let mut cursor=0_usize;
-    let mut pulse=tokio::time::interval(Duration::from_secs(refresh_secs));
+    // Each mint has its own next-due timestamp. No fixed-size request rounds:
+    // one HTTP request per mint, kept continuously in flight as transport allows.
+    // Existing deadlines survive membership changes in the qualified watch set.
+    let failure_retry_secs=env::var("DEXSCREENER_FAILURE_RETRY_SECONDS")
+        .unwrap_or_else(|_|"120".into()).parse::<u64>()
+        .context("DEXSCREENER_FAILURE_RETRY_SECONDS")?;
+    ensure!((10..=3600).contains(&failure_retry_secs),
+        "DEXSCREENER_FAILURE_RETRY_SECONDS must be 10..3600");
+    let refresh=Duration::from_secs(refresh_secs);
+    let retry=Duration::from_secs(failure_retry_secs);
+    let mut active=HashSet::<Pubkey>::new();
+    let mut inflight=HashSet::<Pubkey>::new();
+    let mut due=std::collections::BTreeSet::<(tokio::time::Instant,Pubkey)>::new();
+    let mut tasks=tokio::task::JoinSet::<RequestResult>::new();
+    let mut pulse=tokio::time::interval(Duration::from_secs(30));
     pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut completed=0_u64;
+    let mut failures=0_u64;
+    let mut published_pairs=0_u64;
+    let mut changes=0_u64;
+    let mut source_open=true;
+    // Initial snapshot also covers updates published before proxy discovery finished.
+    let initial=qualified.borrow_and_update().clone();
+    for &mint in initial.iter() {
+        if active.insert(mint) {due.insert((tokio::time::Instant::now(),mint));}
+    }
+    crate::log_event!(Info,
+        "dexscreener cp1 continuous started=true active_mints={} parallel={} refresh_s={} failure_retry_s={}",
+        active.len(),settings.parallel,refresh_secs,failure_retry_secs);
     loop {
-        tokio::select! {
-            _=pulse.tick()=>{},
-            event=qualified.changed()=>{
-                if event.is_err(){break;}
-            }
+        // Dispatch every due mint until the concurrency limit is reached.
+        // The shared HTTP transport owns proxy/rate limiting and backpressure.
+        while tasks.len()<settings.parallel {
+            let Some(&(at,mint))=due.first() else {break};
+            if at>tokio::time::Instant::now(){break}
+            due.pop_first();
+            if !active.contains(&mint) || !inflight.insert(mint) {continue}
+            let client=handle.clone();
+            tasks.spawn(async move {fetch_one(client,mint).await});
         }
-        let targets=qualified.borrow_and_update().clone();
-        if targets.is_empty(){continue;}
-        let count=targets.len().min(max_per_cycle);
-        let mints=(0..count).map(|offset|targets[(cursor+offset)%targets.len()])
-            .collect::<Vec<_>>();
-        cursor=(cursor+count)%targets.len();
-        crate::log_event!(Info,"dexscreener cp1 target_mints={} selected={} refresh_s={refresh_secs}",
-            targets.len(),mints.len());
-        // The finite fetch implementation reports partial failure, but emits every
-        // successful response immediately. Retry failed mints in the next cycle.
-        if let Err(error)=fetch_all(handle.clone(),mints,settings.parallel,tx.clone()).await {
-            crate::log_event!(Warn,"dexscreener cp1 partial_cycle_error={error:#}");
+        if !source_open && tasks.is_empty() {break}
+        let next_due=due.first().map(|&(at,_)|at);
+        tokio::select! {
+            update=qualified.changed(), if source_open=>{
+                if update.is_err(){
+                    source_open=false;
+                    active.clear();
+                    due.clear();
+                } else {
+                    let latest=qualified.borrow_and_update().clone();
+                    let new_active:HashSet<Pubkey>=latest.iter().copied().collect();
+                    let now=tokio::time::Instant::now();
+                    due.retain(|(_,mint)|new_active.contains(mint));
+                    let mut added=0_usize;
+                    for &mint in &new_active {
+                        if !active.contains(&mint) && !inflight.contains(&mint) {
+                            due.insert((now,mint));
+                            added+=1;
+                        }
+                    }
+                    let removed=active.len().saturating_sub(active.intersection(&new_active).count());
+                    active=new_active;
+                    changes+=1;
+                    crate::log_event!(Info,
+                        "dexscreener cp1 selection_changed active_mints={} added={} removed={} queued={} in_flight={} change={changes}",
+                        active.len(),added,removed,due.len(),tasks.len());
+                }
+            },
+            finished=tasks.join_next(), if !tasks.is_empty()=>{
+                let result=finished.context("DexScreener CP1 request missing")?
+                    .context("DexScreener CP1 request task panicked")?;
+                inflight.remove(&result.mint);
+                if !active.contains(&result.mint) {continue;}
+                let now=tokio::time::Instant::now();
+                if let Some((route,proxy_ip,pairs,_,_))=result.response {
+                    published_pairs+=pairs.len() as u64;
+                    completed+=1;
+                    tx.send(Arc::new(DexPairBatch {
+                        requested_mint:result.mint,
+                        received_at_ms:now_unix_ms()?,
+                        route_id:route,proxy_ip,pairs,
+                    })).map_err(|_|anyhow::anyhow!("DexScreener enrichment publisher closed"))?;
+                    due.insert((now+refresh,result.mint));
+                } else {
+                    failures+=1;
+                    if failures<=5 || failures%100==0 {
+                        crate::log_event!(Warn,
+                            "dexscreener cp1 request_failed mint={} attempts={} total_failed={} reason={}",
+                            result.mint,result.attempts,failures,result.error.as_deref().unwrap_or("unknown"));
+                    }
+                    due.insert((now+retry,result.mint));
+                }
+            },
+            _=tokio::time::sleep_until(
+                next_due.unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(3600))
+            ), if tasks.len()<settings.parallel && next_due.is_some()=>{},
+            _=pulse.tick()=>{
+                crate::log_event!(Info,
+                    "dexscreener cp1 continuous active_mints={} queued={} in_flight={} completed={} failed={} pairs={} refresh_s={}",
+                    active.len(),due.len(),tasks.len(),completed,failures,published_pairs,refresh_secs);
+            }
         }
         if publish.is_finished() {
             publish.await.context("DexScreener enrichment publisher panicked")??;
