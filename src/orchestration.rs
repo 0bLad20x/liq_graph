@@ -1,6 +1,6 @@
 //! Resource provisioning, channel connections, and worker lifecycle only.
 
-use std::{collections::HashSet, env, sync::Arc, time::Duration};
+use std::{env, sync::Arc};
 
 mod runtime;
 
@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, jupiter_mint_backfill, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
@@ -285,37 +285,10 @@ fn settings(args: impl Iterator<Item=String>) -> Result<Cli> {
 }
 
 fn jupiter_settings() -> Result<Option<source_jupiter_mint::Settings>> {
-    let keys = env::var("JUPITER_SEARCH_API_KEYS").unwrap_or_default();
-    let mut seen = HashSet::new();
-    let api_keys = keys.split(|ch| ch == ',' || ch == '\n')
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .filter(|key| seen.insert((*key).to_owned()))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if api_keys.is_empty() {
+    if env::var("JUPITER_SEARCH_API_KEYS").unwrap_or_default().trim().is_empty() {
         return Ok(None);
     }
-
-    let calls_per_minute_per_key = env::var("JUPITER_SEARCH_CALLS_PER_MINUTE")
-        .unwrap_or_else(|_| "57".to_owned())
-        .parse::<f64>()
-        .context("invalid JUPITER_SEARCH_CALLS_PER_MINUTE")?;
-    let batch_size = env::var("JUPITER_SEARCH_BATCH_SIZE")
-        .unwrap_or_else(|_| "100".to_owned())
-        .parse::<usize>()
-        .context("invalid JUPITER_SEARCH_BATCH_SIZE")?;
-    let timeout = env::var("JUPITER_SEARCH_REQUEST_TIMEOUT_SECONDS")
-        .unwrap_or_else(|_| "20".to_owned())
-        .parse::<u64>()
-        .context("invalid JUPITER_SEARCH_REQUEST_TIMEOUT_SECONDS")?;
-    let url = env::var("JUPITER_SEARCH_URL")
-        .unwrap_or_else(|_| "https://api.jup.ag/tokens/v2/search".to_owned());
-
-    Ok(Some(source_jupiter_mint::Settings {
-        url, api_keys, calls_per_minute_per_key, batch_size,
-        timeout: Duration::from_secs(timeout),
-    }))
+    Ok(Some(source_jupiter_mint::Settings::from_env()?))
 }
 
 fn spawn_sources(
@@ -561,8 +534,8 @@ pub async fn run() -> Result<()> {
     if (args.len() == 1 && args[0] == "--jupiter-mint-backfill")
         || (args.len() == 2 && args[0] == "--test" && args[1] == "jupiter_mint_backfill")
     {
-        return jupiter_mint_backfill::run(
-            core::http_client()?, jupiter_mint_backfill::Settings::from_env()?
+        return source_jupiter_mint::run_backfill(
+            core::http_client()?, source_jupiter_mint::Settings::from_env()?
         ).await;
     }
     if args.first().map(String::as_str) == Some("--test") {
