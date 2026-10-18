@@ -18,7 +18,7 @@ use crate::core::now_unix_ms;
 
 const SOURCE: &str = "dexscreener_token_pairs";
 const HOST: &str = "api.dexscreener.com";
-const MAX_MINTS: usize = 100;
+const MAX_MINTS: usize = 10_000;
 const MAX_REQUEST_ATTEMPTS: usize = 3;
 const WINDOWS: [&str; 4] = ["m5", "h1", "h6", "h24"];
 
@@ -88,7 +88,7 @@ impl Settings {
         let report_file = PathBuf::from(env::var("DEXSCREENER_REPORT_PATH")
             .unwrap_or_else(|_| "target/dexscreener_cp2.jsonl".into()));
         ensure!((1..=MAX_MINTS).contains(&mint_limit),
-            "DEXSCREENER_MINT_LIMIT must be 1..=100 for CP2");
+            "DEXSCREENER_MINT_LIMIT must be 1..=10000 for CP2");
         ensure!((1..=128).contains(&parallel), "DEXSCREENER_PARALLEL must be 1..=128");
         ensure!((1..=3600).contains(&per_proxy_ip_rpm),
             "DEXSCREENER_PROXY_IP_RPM must be 1..=3600");
@@ -203,21 +203,44 @@ fn decode_db_key(bytes:Vec<u8>)->Result<Pubkey> {
     Ok(Pubkey::new_from_array(bytes))
 }
 async fn mint_sample(db:&Db, limit:usize)->Result<Vec<Pubkey>> {
-    // Prepared pool identities yield a reproducible, trade-relevant diagnostic sample.
-    // Do not depend on Jupiter or the Graph runtime. No schema updates.
-    let sql="SELECT mint FROM (
+    // Retain the original 100-Mint test's deterministic Prepared-pool sample.
+    // If there are fewer Prepared mints than requested, fill from the remaining
+    // distinct pool-catalog mints without duplicating any address.
+    const PREPARED:&str="SELECT mint FROM (
         SELECT mint_a AS mint FROM public.liq_graph_pool_cache
             WHERE status=1 AND mint_a IS NOT NULL
         UNION
         SELECT mint_b AS mint FROM public.liq_graph_pool_cache
             WHERE status=1 AND mint_b IS NOT NULL
     ) AS m ORDER BY mint LIMIT $1";
-    let rows=db.query(sql,&[&(limit as i64)]).await
-        .context("read 100 distinct mints from Prepared pools")?;
-    let mut result=Vec::with_capacity(rows.len());
-    for row in rows {result.push(decode_db_key(row.get::<_,Vec<u8>>(0))?);}
-    ensure!(!result.is_empty(),"no Prepared pool mint addresses found");
-    ensure!(result.len()==limit,"only {} distinct Prepared mints found; need {limit}",result.len());
+    const ALL:&str="SELECT mint FROM (
+        SELECT mint_a AS mint FROM public.liq_graph_pool_cache WHERE mint_a IS NOT NULL
+        UNION
+        SELECT mint_b AS mint FROM public.liq_graph_pool_cache WHERE mint_b IS NOT NULL
+    ) AS m ORDER BY mint LIMIT $1";
+    let rows=db.query(PREPARED,&[&(limit as i64)]).await
+        .context("read distinct Prepared-pool mints")?;
+    let mut result=Vec::with_capacity(limit);
+    let mut seen=HashSet::with_capacity(limit);
+    for row in rows {
+        let mint=decode_db_key(row.get::<_,Vec<u8>>(0))?;
+        if seen.insert(mint){result.push(mint);}
+    }
+    let from_prepared=result.len();
+    if result.len()<limit {
+        let rows=db.query(ALL,&[&(limit as i64)]).await
+            .context("fill benchmark from distinct known pool mints")?;
+        for row in rows {
+            let mint=decode_db_key(row.get::<_,Vec<u8>>(0))?;
+            if seen.insert(mint){result.push(mint);}
+            if result.len()==limit {break;}
+        }
+    }
+    ensure!(result.len()==limit,
+        "only {} unique pool mints available; {limit} requested",result.len());
+    crate::log_event!(Info,
+        "dexscreener mint sample selected={} prepared_mints={} other_pool_mints={}",
+        result.len(),from_prepared,result.len()-from_prepared);
     Ok(result)
 }
 
@@ -254,7 +277,7 @@ async fn fetch_one(handle:HttpHandle,mint:Pubkey)->RequestResult {
                 if response.status==StatusCode::TOO_MANY_REQUESTS {
                     result.count_429+=1;
                     result.error=Some("HTTP 429".into());
-                    crate::log_event!(Warn,"dexscreener http_429 mint={mint} attempt={}",attempt+1);
+                    crate::log_event!(Debug,"dexscreener http_429 mint={mint} attempt={}",attempt+1);
                     if attempt+1<MAX_REQUEST_ATTEMPTS {sleep(Duration::from_secs(5)).await;}
                     continue;
                 }
@@ -289,6 +312,8 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
     let started=StdInstant::now();
     let total=mints.len();
     let mut stats=Counters::default();
+    let mut last_report=StdInstant::now();
+    let mut last_report_done=0usize;
     let jobs=stream::iter(mints).map(|mint|{
         let handle=handle.clone();
         async move {fetch_one(handle,mint).await}
@@ -299,6 +324,11 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
         stats.http_403+=result.count_403;
         stats.http_5xx+=result.count_5xx;
         stats.retries+=result.attempts.saturating_sub(1);
+        if result.count_429>0 && stats.http_429<=5 {
+            crate::log_event!(Warn,
+                "dexscreener http_429 mint={} occurrences={} total_429={}",
+                result.mint,result.count_429,stats.http_429);
+        }
         if let Some((route,proxy_ip,pairs,rejected,bytes))=result.response {
             stats.ok+=1;
             stats.empty+=usize::from(pairs.is_empty());
@@ -314,20 +344,39 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
             })).map_err(|_|anyhow::anyhow!("DexScreener typed stream has no reader"))?;
         } else {
             stats.failed+=1;
-            crate::log_event!(Warn,
-                "dexscreener mint_failed mint={} attempts={} reason={}",
-                result.mint,result.attempts,result.error.as_deref().unwrap_or("unknown"));
+            if stats.failed<=5 {
+                crate::log_event!(Warn,
+                    "dexscreener mint_failed mint={} attempts={} reason={}",
+                    result.mint,result.attempts,result.error.as_deref().unwrap_or("unknown"));
+            }
+        }
+        let done=stats.ok+stats.failed;
+        let seconds=last_report.elapsed().as_secs_f64();
+        if done<total && (done-last_report_done>=1000 || seconds>=30.0) {
+            crate::log_event!(Info,
+                "dexscreener progress completed={done}/{total} ok={} failed={} http_429={} http_403={} http_5xx={} retries={} proxy_ips={} window_rps={:.2} mean_rps={:.2}",
+                stats.ok,stats.failed,stats.http_429,stats.http_403,
+                stats.http_5xx,stats.retries,stats.proxy_ip_counts.len(),
+                (done-last_report_done) as f64/seconds.max(0.001),
+                done as f64/started.elapsed().as_secs_f64().max(0.001));
+            last_report=StdInstant::now();
+            last_report_done=done;
         }
     }
     let elapsed=started.elapsed().as_secs_f64();
-    let max_per_ip=stats.proxy_ip_counts.values().copied().max().unwrap_or(0);
+    let mut per_ip=stats.proxy_ip_counts.values().copied().collect::<Vec<_>>();
+    per_ip.sort_unstable();
+    let max_per_ip=per_ip.last().copied().unwrap_or(0);
+    let p50_per_ip=per_ip.get(per_ip.len().saturating_sub(1)/2).copied().unwrap_or(0);
+    let p95_per_ip=per_ip.get(per_ip.len().saturating_sub(1)*95/100).copied().unwrap_or(0);
     crate::log_event!(Info,
-        "dexscreener source complete requests={total} success={} empty={} failed={} invalid_pairs={} retries={} http_429={} http_403={} http_5xx={} proxy_routes={} proxy_ips={} max_success_per_ip={} response_bytes={} elapsed_s={:.2} success_rps={:.2}",
+        "dexscreener source complete requests={total} success={} empty={} failed={} invalid_pairs={} retries={} http_429={} http_403={} http_5xx={} proxy_routes={} proxy_ips={} success_per_ip_p50={} success_per_ip_p95={} success_per_ip_max={} response_bytes={} elapsed_s={:.2} success_rps={:.2}",
         stats.ok,stats.empty,stats.failed,stats.rejected,stats.retries,
         stats.http_429,stats.http_403,stats.http_5xx,
-        stats.routes.len(),stats.proxy_ip_counts.len(),max_per_ip,
+        stats.routes.len(),stats.proxy_ip_counts.len(),p50_per_ip,p95_per_ip,max_per_ip,
         stats.bytes,elapsed,stats.ok as f64/elapsed.max(0.001));
-    ensure!(stats.ok>0,"DexScreener returned no successful token-pairs responses");
+    ensure!(stats.ok==total,
+        "DexScreener full benchmark incomplete: success={} of {total}; failed={}",stats.ok,stats.failed);
     Ok(())
 }
 
@@ -451,6 +500,11 @@ pub async fn live_diagnostic()->Result<()> {
     let (db,db_task)=connect_db().await?;
     let mints=mint_sample(&db,settings.mint_limit).await?;
     let mut transport=http_transport::Settings::from_env()?;
+    // Keep longer benchmarks readable: regular transport snapshots once/minute,
+    // with source progress reported every 1000 completions / 30 seconds.
+    if settings.mint_limit>=1000 {
+        transport.stats_interval=Duration::from_secs(60);
+    }
     // CP2 benchmark mode: no shared 4-RPS host gate. Every verified proxy
     // address gets its own independently paced 280-RPM budget (configurable).
     // Multiple proxy ports on the same address share that budget.

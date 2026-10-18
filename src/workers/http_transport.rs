@@ -117,6 +117,7 @@ struct Call {
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub refresh: Duration,
+    pub stats_interval: Duration,
     pub tcp_timeout: Duration,
     pub handshake_timeout: Duration,
     pub probe_timeout: Duration,
@@ -156,6 +157,9 @@ where T::Err: std::fmt::Display {
 impl Settings {
     pub fn from_env() -> Result<Self> {
         let refresh = from_env("HTTP_PROXY_REFRESH_SECONDS", 900_u64)?;
+        let stats_interval = from_env("HTTP_TRANSPORT_STATS_INTERVAL_SECONDS", 10_u64)?;
+        ensure!((1..=3600).contains(&stats_interval),
+            "HTTP_TRANSPORT_STATS_INTERVAL_SECONDS must be 1..=3600");
         let tcp = from_env("HTTP_PROXY_TCP_TIMEOUT_MS", 500_u64)?;
         let handshake = from_env("HTTP_PROXY_HANDSHAKE_TIMEOUT_MS", 1500_u64)?;
         let probe = from_env("HTTP_PROXY_PROBE_TIMEOUT_MS", 4000_u64)?;
@@ -213,6 +217,7 @@ impl Settings {
         ensure!(extra_txt_urls.iter().all(|v| v.scheme() == "https"), "extra source URLs must be HTTPS");
         Ok(Self {
             refresh: Duration::from_secs(refresh),
+            stats_interval: Duration::from_secs(stats_interval),
             tcp_timeout: Duration::from_millis(tcp),
             handshake_timeout: Duration::from_millis(handshake),
             probe_timeout: Duration::from_millis(probe),
@@ -464,13 +469,14 @@ async fn run(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Call>) -> Result<
     let reporter = {
         let shared = shared.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut tick = tokio::time::interval(shared.settings.stats_interval);
             tick.tick().await;
             let mut previous = 0_u64;
             loop {
                 tick.tick().await;
                 let completed = shared.stats.lock().expect("HTTP stats lock poisoned").completed;
-                report_stats(&shared, (completed.saturating_sub(previous)) as f64 / 10.0);
+                report_stats(&shared, (completed.saturating_sub(previous)) as f64
+                    / shared.settings.stats_interval.as_secs_f64());
                 previous = completed;
             }
         })
