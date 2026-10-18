@@ -120,18 +120,32 @@ impl PoolRegistry {
     /// Re-evaluate canonical TVL even when no new REST/DexScreener event arrives.
     /// Historical last_observation stays intact; expired quotes never masquerade
     /// as current liquidity. Called only by the Registry's single writer.
-    fn refresh_tvl(&self, now:u64) -> Vec<PoolState> {
+    fn refresh_tvl(&self, now:u64) -> (Vec<PoolState>,Vec<Pubkey>) {
         let mut entries=self.entries.write().expect("pool registry lock poisoned");
         let mut quotes=self.quotes.write().expect("pool market state lock poisoned");
         let mut updates=Vec::new();
+        let mut persist=Vec::new();
         for (address, market) in quotes.iter_mut() {
             let selected=select_tvl(market,now);
             if let Some(pool)=entries.get_mut(address) {
-                if pool.tvl_usd!=selected.map(|q|q.value) {
+                let source=pool.last_observation.as_ref().and_then(|o|o.get("source"))
+                    .and_then(Value::as_str);
+                if pool.tvl_usd!=selected.map(|q|q.value)
+                    || selected.is_some_and(|q|source!=Some(q.source)) {
                     pool.tvl_usd=selected.map(|q|q.value);
+                    if let Some(q)=selected {
+                        pool.last_observation=Some(Arc::new(json!({
+                            "tvl_usd":q.value,"source":q.source,
+                            "observed_at_ms":q.at,"first_seen_ms":pool.first_seen_ms
+                        })));
+                        if market.last_persisted==0
+                            || now.saturating_sub(market.last_persisted)>=TVL_PERSIST_INTERVAL_MS {
+                            market.last_persisted=now;
+                            persist.push(*address);
+                        }
+                    }
+                    // Expiry only clears the live value; the DB retains history.
                     pool.last_changed_ms=now;
-                    // Keep the last actual observation even when it has expired.
-                    // The selected live value is represented only by tvl_usd.
                     updates.push(pool.clone());
                 }
             }
@@ -139,7 +153,7 @@ impl PoolRegistry {
         // Prevent indefinite growth from ever-seen, now-expired sources.
         quotes.retain(|_,q|q.protocol.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS)
              || q.dex.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS));
-        updates
+        (updates,persist)
     }
 
     fn apply(&self, batch: &DataBatch) -> BatchStats {
@@ -447,7 +461,7 @@ pub async fn run(
     while source_open || completion_open {
         tokio::select! {
             _=freshness.tick()=>{
-                let invalidated=registry.refresh_tvl(now_unix_ms()?);
+                let (invalidated,persist)=registry.refresh_tvl(now_unix_ms()?);
                 if !invalidated.is_empty() {
                     let count=invalidated.len();
                     output.send(Arc::new(PoolUpdateBatch {
@@ -455,7 +469,7 @@ pub async fn run(
                         source:"tvl_freshness",
                         received_at_ms:now_unix_ms()?,
                         pools:invalidated,
-                        persist_identity:Vec::new(),
+                        persist_identity:persist,
                     })).map_err(|_|anyhow::anyhow!("Registry freshness update has no subscribers"))?;
                     crate::log_event!(Info,"pool registry tvl_freshness_changed pools={count}");
                 }
