@@ -538,6 +538,106 @@ pub async fn live_diagnostic()->Result<()> {
     Ok(())
 }
 
+/// CP1: long-running, typed DexScreener enrichment for economically selected mints.
+/// Unknown pool addresses are not invented: their venue and canonical identities
+/// must already exist in PoolRegistry. The finite diagnostic entrypoint is retained.
+pub async fn run_live(
+    mut qualified: tokio::sync::watch::Receiver<Arc<[Pubkey]>>,
+    registry: super::pool_registry::PoolRegistry,
+    output: broadcast::Sender<Arc<crate::core::DataBatch>>,
+) -> Result<()> {
+    use crate::core::{DataBatch, DataRecord, RecordIdentity};
+    let settings=Settings::from_env()?;
+    let refresh_secs=env::var("DEXSCREENER_REFRESH_SECONDS")
+        .unwrap_or_else(|_|"1800".into()).parse::<u64>()
+        .context("DEXSCREENER_REFRESH_SECONDS")?;
+    ensure!((60..=86400).contains(&refresh_secs),
+        "DEXSCREENER_REFRESH_SECONDS must be 60..86400");
+    let mut transport=http_transport::Settings::from_env()?;
+    transport.stats_interval=Duration::from_secs(60);
+    transport.host_rps_overrides.insert(HOST.into(),0);
+    transport.proxy_ip_rpm_overrides.insert(HOST.into(),settings.per_proxy_ip_rpm);
+    transport.proxy_latency_ceiling_ms.insert(HOST.into(),settings.max_proxy_latency_ms);
+    let (handle,transport_task)=http_transport::spawn(transport)?;
+    let mut cycles=handle.subscribe_cycles();
+    tokio::time::timeout(settings.proxy_wait,async {
+        loop {
+            if *cycles.borrow_and_update()>0 {break Ok::<(),anyhow::Error>(());}
+            cycles.changed().await.context("DexScreener proxy discovery closed")?;
+        }
+    }).await.context("DexScreener proxy discovery timeout")??;
+    ensure!(!handle.working_set().is_empty(),"no verified DexScreener HTTP proxies");
+    let (tx,mut rx)=broadcast::channel::<Arc<DexPairBatch>>(256);
+    let publish=tokio::spawn(async move {
+        let mut recent=HashMap::<Pubkey,u64>::new();
+        loop {
+            let batch=match rx.recv().await {
+                Ok(batch)=>batch,
+                Err(broadcast::error::RecvError::Closed)=>break,
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    bail!("DexScreener enrichment lost {n} batches"),
+            };
+            let mut rows=Vec::new();
+            for pair in &batch.pairs {
+                let Some(tvl)=pair.liquidity_usd else {continue};
+                let Some(pool)=registry.get(pair.address) else {continue};
+                let same=pool.mint_a==Some(pair.mint_a)&&pool.mint_b==Some(pair.mint_b);
+                let reverse=pool.mint_a==Some(pair.mint_b)&&pool.mint_b==Some(pair.mint_a);
+                if !same && !reverse {continue;}
+                if recent.get(&pair.address).is_some_and(|previous|
+                    batch.received_at_ms.saturating_sub(*previous)<60_000) {continue;}
+                recent.insert(pair.address,batch.received_at_ms);
+                rows.push(DataRecord {
+                    identity:RecordIdentity::Pool {
+                        address:pool.address,venue:pool.venue,mint_a:pool.mint_a,mint_b:pool.mint_b,
+                    },
+                    tvl_usd:Some(tvl),
+                    payload:json!({"dexId":pair.dex_id,"liquidityUsd":tvl,
+                        "requestedMint":batch.requested_mint.to_string()}),
+                });
+            }
+            if !rows.is_empty() {
+                output.send(Arc::new(DataBatch {
+                    source:SOURCE,received_at_ms:batch.received_at_ms,records:rows,
+                })).map_err(|_|anyhow::anyhow!("Registry discovery receiver closed"))?;
+            }
+            if recent.len()>100_000 {
+                recent.retain(|_,t|batch.received_at_ms.saturating_sub(*t)<60_000);
+            }
+        }
+        Ok::<(),anyhow::Error>(())
+    });
+    let mut pulse=tokio::time::interval(Duration::from_secs(refresh_secs));
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _=pulse.tick()=>{},
+            event=qualified.changed()=>{
+                if event.is_err(){break;}
+            }
+        }
+        let targets=qualified.borrow_and_update().clone();
+        if targets.is_empty(){continue;}
+        let mints=targets.iter().take(settings.mint_limit).copied().collect::<Vec<_>>();
+        crate::log_event!(Info,"dexscreener cp1 target_mints={} selected={} refresh_s={refresh_secs}",
+            targets.len(),mints.len());
+        // The finite fetch implementation reports partial failure, but emits every
+        // successful response immediately. Retry failed mints in the next cycle.
+        if let Err(error)=fetch_all(handle.clone(),mints,settings.parallel,tx.clone()).await {
+            crate::log_event!(Warn,"dexscreener cp1 partial_cycle_error={error:#}");
+        }
+        if publish.is_finished() {
+            publish.await.context("DexScreener enrichment publisher panicked")??;
+            bail!("DexScreener enrichment publisher exited");
+        }
+    }
+    drop(tx);
+    publish.await.context("DexScreener enrichment publisher panicked")??;
+    drop(cycles);drop(handle);
+    transport_task.await.context("DexScreener transport panicked")??;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
