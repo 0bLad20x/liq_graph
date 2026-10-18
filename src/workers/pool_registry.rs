@@ -31,6 +31,17 @@ fn select_tvl(quotes:&PoolQuotes, now:u64)->Option<Quote> {
     let recent=|q:Quote|q.at<=now && now.saturating_sub(q.at)<=TVL_SOURCE_MAX_AGE_MS;
     quotes.protocol.filter(|q|recent(*q)).or_else(||quotes.dex.filter(|q|recent(*q)))
 }
+fn record_tvl(quotes:&mut HashMap<Pubkey,PoolQuotes>,address:Pubkey,
+              source:&'static str,at:u64,value:Option<f64>)->Option<Quote> {
+    let Some(value)=value else {
+        return quotes.get(&address).and_then(|market|select_tvl(market,at));
+    };
+    let state=quotes.entry(address).or_default();
+    let quote=Quote{value,at,source};
+    let slot=if source==DEX_SOURCE {&mut state.dex} else {&mut state.protocol};
+    if slot.is_none_or(|old|quote.at>=old.at) {*slot=Some(quote);}
+    select_tvl(state,at)
+}
 
 /// The write owner is the registry worker. Consumers can only request typed snapshots.
 #[derive(Clone, Default)]
@@ -125,17 +136,10 @@ impl PoolRegistry {
             }
 
             let observed_tvl = record.tvl_usd.filter(|v|v.is_finite() && *v>=0.0);
-            // Track sources independently; DexScreener never blindly overwrites
-            // recent protocol TVL.
-            let selected = if let Some(value)=observed_tvl {
-                let state=quotes.entry(*address).or_default();
-                let quote=Quote{value,at:batch.received_at_ms,source:batch.source};
-                let slot=if batch.source==DEX_SOURCE {&mut state.dex} else {&mut state.protocol};
-                if slot.is_none_or(|old|quote.at>=old.at) {*slot=Some(quote);}
-                select_tvl(state,batch.received_at_ms)
-            } else {quotes.get(address).and_then(|state|select_tvl(state,batch.received_at_ms))};
             match entries.get_mut(address) {
                 None => {
+                    let selected=record_tvl(&mut quotes,*address,batch.source,
+                        batch.received_at_ms,observed_tvl);
                     let state = PoolState {
                         address: *address,
                         venue: *venue,
@@ -179,7 +183,8 @@ impl PoolRegistry {
                         crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
                         continue;
                     }
-
+                    let selected=record_tvl(&mut quotes,*address,batch.source,
+                        batch.received_at_ms,observed_tvl);
                     let mut changed = false;
                     let mut identity_changed = false;
                     if current.mint_a.is_none() && mint_a.is_some() {
