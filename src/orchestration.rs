@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, jupiter_mint_backfill, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, identity_hydration_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, jupiter_mint_backfill, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
@@ -545,47 +545,6 @@ fn test_command(worker: &str) -> Result<&'static str> {
     Ok(legacy)
 }
 
-/// Bounded live check using real restored unknown PumpSwap pools, shared RPC,
-/// the existing Registry and PostgreSQL writer. No full-scan or synthetic data.
-async fn identity_hydration_pumpswap_live() -> Result<()> {
-    let limit=env::var("PUMPSWAP_HYDRATION_TEST_POOLS")
-        .unwrap_or_else(|_|"200".into()).parse::<usize>()
-        .context("invalid PUMPSWAP_HYDRATION_TEST_POOLS")?;
-    ensure!((1..=1000).contains(&limit),"PUMPSWAP_HYDRATION_TEST_POOLS must be 1..=1000");
-    let db=persistence::Persistence::connect().await?;
-    let restored=db.restore().await?;
-    let seed=restored.iter()
-        .filter(|p|p.venue==core::Venue::PumpSwap
-            && (p.mint_a.is_none()||p.mint_b.is_none()))
-        .take(limit).map(|p|p.address).collect::<Vec<_>>();
-    ensure!(!seed.is_empty(),"no incomplete PumpSwap identities available for live hydration");
-    let registry=pool_registry::PoolRegistry::default();
-    registry.restore(restored)?;
-    let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
-    let (source,input)=broadcast::channel::<Arc<core::DataBatch>>(256);
-    let (updates,writer_rx)=broadcast::channel::<Arc<core::PoolUpdateBatch>>(256);
-    let hydrate_rx=updates.subscribe();
-    let (done,_)=watch::channel(false);
-    let registry_task=tokio::spawn(pool_registry::run(input,None,registry,updates.clone(),done,true));
-    let writer_task=tokio::spawn(db.run(writer_rx));
-    drop(updates);
-    let requested=seed.len();
-    let result=identity_hydration_pumpswap::run(seed,hydrate_rx,rpc.clone(),source,
-        identity_hydration_pumpswap::Settings::from_env()?,true).await;
-    drop(rpc);
-    // The Registry drains the emitted identities before Persistence completes
-    // its final SQL flush. Never announce completion ahead of both consumers.
-    let registry_result=registry_task.await.context("hydration Registry task panicked")?;
-    let writer_result=writer_task.await.context("hydration Persistence task panicked")?;
-    let rpc_result=rpc_task.await.context("hydration RPC task panicked")?;
-    result?;
-    registry_result?;
-    writer_result?;
-    rpc_result?;
-    crate::log_event!(Info,"identity hydration standalone complete=true requested={requested} persistence_flushed=true");
-    Ok(())
-}
-
 pub async fn run() -> Result<()> {
     match dotenvy::dotenv() {
         Ok(_) => {}
@@ -605,11 +564,6 @@ pub async fn run() -> Result<()> {
         return jupiter_mint_backfill::run(
             core::http_client()?, jupiter_mint_backfill::Settings::from_env()?
         ).await;
-    }
-    if args.first().map(String::as_str)==Some("--test")
-        && args.get(1).map(String::as_str)==Some("identity_hydration_pumpswap") {
-        ensure!(args.len()==2,"identity_hydration_pumpswap takes no arguments");
-        return identity_hydration_pumpswap_live().await;
     }
     if args.first().map(String::as_str) == Some("--test") {
         ensure!(args.len()>=2,"--test requires a module name");

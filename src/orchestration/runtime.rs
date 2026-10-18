@@ -10,7 +10,7 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
-        diagnostic_source, graph_liquidity, graph_watch_catalog, identity_hydration_pumpswap,
+        diagnostic_source, graph_liquidity, graph_watch_catalog,
         identity_hydration_venues, persistence, pool_registry,
         rpc_transport, source_jupiter_mint}};
 use super::jupiter_settings;
@@ -161,24 +161,11 @@ pub async fn run()->Result<()>{
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
     let hydration_only=enabled("IDENTITY_HYDRATION_ONLY")?;
-    let mut venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
-    // Finite standalone backfill covers all unresolved venues including PumpSwap.
-    // Production retains the configured PumpSwap shadow guard and legacy worker.
-    if hydration_only {
-        venue_hydration_settings.pumpswap_shadow_limit=usize::MAX;
-    }
-    let mut pump_shadow_seeded=0_usize;
+    let venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
+    // Every unresolved pool, independent of venue, is assigned to one hydration worker.
     let venue_hydration_seed:Vec<(solana_pubkey::Pubkey,Venue)>=restored.iter()
-        .filter_map(|p|{
-            if p.mint_a.is_some() && p.mint_b.is_some(){return None;}
-            if p.venue==Venue::PumpSwap {
-                if pump_shadow_seeded>=venue_hydration_settings.pumpswap_shadow_limit {
-                    return None;
-                }
-                pump_shadow_seeded+=1;
-            }
-            Some((p.address,p.venue))
-        }).collect();
+        .filter(|p|p.mint_a.is_none() || p.mint_b.is_none())
+        .map(|p|(p.address,p.venue)).collect();
     // Finite real-provider checkpoint: only multi-venue Hydration, Registry and
     // Persistence. No REST discovery, Graph, Completion or legacy PumpSwap worker.
     if hydration_only {
@@ -193,9 +180,8 @@ pub async fn run()->Result<()>{
             updates.clone(),done,true));
         let writer_task=tokio::spawn(database.run(db_rx));
         crate::log_event!(Info,
-            "multi venue hydration standalone restored={} requested={} pumpswap_shadow_limit={}",
-            restored_count,venue_hydration_seed.len(),
-            venue_hydration_settings.pumpswap_shadow_limit);
+            "multi venue hydration standalone restored={} requested={}",
+            restored_count,venue_hydration_seed.len());
         let result=identity_hydration_venues::run(venue_hydration_seed,hydrate_rx,
             rpc.clone(),source.clone(),venue_hydration_settings,true).await;
         drop(source);
@@ -216,10 +202,6 @@ pub async fn run()->Result<()>{
     // Check the current signer before seeding the graph with persisted blocks.
     completion_pumpswap::ensure_wallet_cache(
         &restored,completion_pumpswap::Settings::from_env()?.wallet)?;
-    let hydration_seed=restored.iter()
-        .filter(|p|p.venue==Venue::PumpSwap
-            && (p.mint_a.is_none()||p.mint_b.is_none()))
-        .map(|p|p.address).collect::<Vec<_>>();
     let graph_boot:Vec<PoolState>=restored.iter()
         .filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();
     let mut boot:Vec<(Venue,Vec<PoolState>)>=Vec::new();
@@ -342,33 +324,7 @@ pub async fn run()->Result<()>{
         confirmed.await.context("completion failed before startup readiness")?;
     }
     drop(completions);
-    // Full Scan emits address-only records; restored + newly discovered unknown
-    // PumpSwap pools use the same verified hydration path back into Registry.
-    // Subscribe before starting Discovery to avoid losing the initial updates.
-    if !enabled("IDENTITY_HYDRATION_SKIP_LEGACY_PUMPSWAP")? {
-    let hydrate_registry=registry.clone();
-    let hydrate_updates=updates.clone();
-    let hydrate_source=source.clone();
-    let hydrate_rpc=rpc.clone();
-    let mut first_seed=Some(hydration_seed);
-    let mut first_hydrate_rx=Some(updates.subscribe());
-    tasks.spawn(supervise("identity_hydration.pumpswap",stop_rx.clone(),move||{
-        let seed=first_seed.take().unwrap_or_else(||hydrate_registry.snapshot()
-            .into_iter().filter(|p|p.venue==Venue::PumpSwap
-                && (p.mint_a.is_none()||p.mint_b.is_none()))
-            .map(|p|p.address).collect());
-        let input=first_hydrate_rx.take()
-            .unwrap_or_else(||hydrate_updates.subscribe());
-        let output=hydrate_source.clone();
-        let client=hydrate_rpc.clone();
-        async move{
-            identity_hydration_pumpswap::run(seed,input,client,output,
-                identity_hydration_pumpswap::Settings::from_env()?,false).await
-        }
-    }));
-    }
-    // Separate multi-venue identity reader; the existing PumpSwap reader remains
-    // unchanged. Shadow PumpSwap reads are bounded and opt-in for live comparison.
+    // Single continuous hydration consumer for every venue, including PumpSwap.
     let venue_hydrate_registry=registry.clone();
     let venue_hydrate_updates=updates.clone();
     let venue_hydrate_source=source.clone();
@@ -377,17 +333,9 @@ pub async fn run()->Result<()>{
     let mut first_venue_rx=Some(updates.subscribe());
     tasks.spawn(supervise("identity_hydration.venues",stop_rx.clone(),move||{
         let seed=first_venue_seed.take().unwrap_or_else(||{
-            let mut pump_count=0_usize;
-            venue_hydrate_registry.snapshot().into_iter().filter_map(|p|{
-                if p.mint_a.is_some() && p.mint_b.is_some(){return None;}
-                if p.venue==Venue::PumpSwap {
-                    if pump_count>=venue_hydration_settings.pumpswap_shadow_limit {
-                        return None;
-                    }
-                    pump_count+=1;
-                }
-                Some((p.address,p.venue))
-            }).collect()
+            venue_hydrate_registry.snapshot().into_iter()
+                .filter(|p|p.mint_a.is_none() || p.mint_b.is_none())
+                .map(|p|(p.address,p.venue)).collect()
         });
         let live=first_venue_rx.take()
             .unwrap_or_else(||venue_hydrate_updates.subscribe());
