@@ -61,6 +61,11 @@ impl PoolRegistry {
             .get(&address).cloned()
     }
 
+    pub fn live_tvl_count(&self) -> usize {
+        self.entries.read().expect("pool registry lock poisoned")
+            .values().filter(|p|p.tvl_usd.is_some()).count()
+    }
+
     /// Bootstrap complete, previously validated state before any producer starts.
     /// REST observations still own current TVL/freshness; persisted proof is historical.
     pub fn restore(&self, pools: Vec<PoolState>) -> Result<usize> {
@@ -587,6 +592,21 @@ pub async fn run(
     venue_counts.sort_by(|a,b|a.0.cmp(&b.0));
     crate::log_event!(Info,"pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tvl_freshness_tests {
+    use super::*;
+    #[test]
+    fn fresh_protocol_preferred_then_dex_fallback_then_expiry() {
+        let mut state=PoolQuotes::default();
+        state.protocol=Some(Quote{value:800.0,at:100,source:"rest"});
+        state.dex=Some(Quote{value:650.0,at:200,source:DEX_SOURCE});
+        assert_eq!(select_tvl(&state,201).map(|q|q.value),Some(800.0));
+        assert_eq!(select_tvl(&state,TVL_SOURCE_MAX_AGE_MS+101)
+            .map(|q|q.value),Some(650.0));
+        assert!(select_tvl(&state,TVL_SOURCE_MAX_AGE_MS+201).is_none());
+    }
 }
 
 /// Temporary live-test subscriber: proves changed states reach a real consumer.
