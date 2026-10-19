@@ -2,7 +2,8 @@
 
 Basis des Abschlusscheckpoints: `agent/cp2-manifest-lifecycle`, Commit
 `0856fda37184db4b7e508f2fda34f7118b6d4847`.
-Testbranch: `agent/cp2-lifecycle-final`.
+Gemeinsamer Build-/Live-/SQL-Nachweis: `agent/cp2-lifecycle-final`, Commit
+`ddc6f5ec4c35410050f5bb74820181ff702c241d`, am 19.10.2026 abgenommen.
 
 ## Umfang und Grenzen
 
@@ -135,8 +136,8 @@ Mit bestehender PostgreSQL-/RPC-Konfiguration und erreichbaren REST-Quellen
 der ausgewaehlten Protokolle:
 
 ```powershell
-git fetch origin
-git switch --track origin/agent/cp2-lifecycle-final
+git switch main
+git pull --ff-only origin main
 .\scripts\completion_lifecycle_live.ps1 -Venue All -DurationSeconds 600 -PoolLimit 16
 ```
 
@@ -300,12 +301,34 @@ Completion-Auftraege und keinen Prepared-Refresh-Nachweis. Die Migration ist
 strukturell abgeschlossen; TVL-Versorgung und dieser Funktionsnachweis werden
 auf Nutzerentscheidung nicht weiterverfolgt.
 
-Der gemeinsame Abschlusslauf auf dem finalen Testbranch und seine SQL-Auswertung
-stehen noch aus. Die bisherigen Einzellaeufe werden nicht als Nachweis eines
-bereits erfolgten gemeinsamen Laufs oder Main-Merges ausgegeben.
+Der gemeinsame 600-Sekunden-Lauf auf `ddc6f5e` belegt genau eine Lifecycle-Instanz
+mit allen zehn Executoren und wiederholte Prepared-Refreshes fuer jedes der neun
+erforderlichen Protokolle. 2.221 Auftraege ergeben 2.203 akzeptierte terminale
+Pruefstaende (2.119 Prepared, 84 Incomplete) und 18 Retryable-Versuche. Alle 2.203
+terminalen Pruefstaende wurden persistiert; die Registry meldet null abgelehnte
+Completions, null Konflikte und null verlorene Eingangsbatches. Nach Abschluss
+sind keine Auftraege mehr in Bearbeitung oder ueberfaellig. Alle beobachteten
+terminalen Folgepruefungen besitzen steigende Slots und Pruefzeiten.
 
-Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
-Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind
-hier deshalb nicht belegt. Es werden keine Unit-/Mock-/Regressionstests und
-keine Formatierungspruefungen eingefuehrt. Erst der lokale Build, reale Logs und
-die zugehoerige SQL-Auswertung erlauben die Abnahme dieser Stufe.
+Nachgewiesen sind 2.092 erfolgreiche Prepared-Refreshes, davon 1.968 wiederholte
+Refreshes. Ein echter DLMM-Pool wechselte bei einer Refresh-Pruefung von Prepared
+auf Incomplete/MissingExecutionAccounts und wurde danach zweimal erneut als
+Incomplete geprueft. Initial-Auftraege und 17 erfolgreiche Retry/Prepared-
+Auftraege sowie ein TVL-Zulassungsentzug wurden ebenfalls beobachtet. Die
+rein lesende SQL-Auswertung bestaetigt die letzten Pruefstaende aller 144 Pools
+mit `proofs_expected=144`, `exact_matches=144`, `mismatches=0`, einschliesslich
+Manifest-Vorhandensein/-Entfernung und PumpSwap-Wallet-Bindung.
+
+Der Graph verarbeitete 376.640 Pool-Updates und erzeugte 189 Generationen.
+Graph-Verbraucher, Registry, Persistenz und Runtime beendeten den Lauf
+vollstaendig; `lifecycle live complete=true persisted=true` liegt vor. Die
+Quell-Neustarts bei Raydium/Orca und einzelne RPC-Timeouts sowie ein HTTP 401 bei
+`shyft-02/getSlot` sind beobachtete Betriebshinweise. Sie fuehrten in diesem Lauf
+zu keinem abgelehnten Completion-Ergebnis. Manifest blieb mit null Auftraegen
+entsprechend der dokumentierten Zurueckstellung ohne Refresh-Nachweis.
+
+Damit ist CP2 im vereinbarten Umfang fachlich abgenommen. Die Abnahme beruht
+auf dem lokal ausgefuehrten Build, `completion_lifecycle_all_live.log` und der
+zugehoerigen SQL-Auswertung. Die Bearbeitungsumgebung selbst besitzt keine
+Rust-/PowerShell-Toolchain oder Live-Zugangsdaten. Es wurden keine Unit-/Mock-/
+Regressionstests und keine Formatierungspruefungen eingefuehrt.
