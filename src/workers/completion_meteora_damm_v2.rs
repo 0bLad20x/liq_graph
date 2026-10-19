@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    core::{CompletionReason, COMPLETION_MIN_TVL_USD, 
+    core::{CompletionReason, COMPLETION_MIN_TVL_USD,
         AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
         CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
         PoolUpdateBatch, Venue,

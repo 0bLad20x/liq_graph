@@ -139,9 +139,15 @@ impl PoolRegistry {
                     .and_then(Value::as_str);
                 if pool.tvl_usd!=selected.map(|q|q.value)
                     || selected.is_some_and(|q|source!=Some(q.source)) {
+                    let previous_admission=pool.completion_admission;
                     pool.tvl_usd=selected.map(|q|q.value);
                     pool.completion_admission=CompletionAdmission::from_inputs(
                         pool.mint_a,pool.mint_b,pool.tvl_usd);
+                    if pool.completion_admission!=previous_admission {
+                        crate::log_event!(Debug,
+                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
+                            pool.address,pool.venue,pool.completion_admission,pool.tvl_usd,pool.execution_manifest.is_some());
+                    }
                     if let Some(q)=selected {
                         pool.last_observation=Some(Arc::new(json!({
                             "tvl_usd":q.value,"source":q.source,
@@ -277,8 +283,15 @@ impl PoolRegistry {
                     }
 
                     current.last_seen_ms = current.last_seen_ms.max(batch.received_at_ms);
+                    let previous_admission=current.completion_admission;
                     current.completion_admission=CompletionAdmission::from_inputs(
                         current.mint_a,current.mint_b,current.tvl_usd);
+                    if current.completion_admission!=previous_admission {
+                        changed=true;
+                        crate::log_event!(Debug,
+                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
+                            current.address,current.venue,current.completion_admission,current.tvl_usd,current.execution_manifest.is_some());
+                    }
                     if changed {
                         if identity_changed { stats.identity.push(*address); }
                         current.last_changed_ms = batch.received_at_ms;

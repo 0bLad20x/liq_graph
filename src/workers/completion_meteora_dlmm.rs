@@ -329,9 +329,9 @@ fn decode_mint(account: &AccountData) -> Result<MintProof> {
 }
 
 fn mint_failure(pending: PendingMintValidation, status: CompletionStatus,
-    reason: impl Into<String>) -> CompletionResult {
+    code: CompletionReason, reason: impl Into<String>) -> CompletionResult {
     CompletionResult::new(pending.pool,status,Some(pending.slot),Some(reason.into()),
-        Some(evidence(pending.validated.inventory)),None,None)
+        Some(evidence(pending.validated.inventory)),None,None).with_reason_code(code)
 }
 
 async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
@@ -371,24 +371,24 @@ async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
     }
     for item in pending {
         let layout = &item.validated.layout;
-        let check = (|| -> std::result::Result<[MintProof; 2], (CompletionStatus, String)> {
+        let check = (|| -> std::result::Result<[MintProof; 2], (CompletionStatus, CompletionReason, String)> {
             let mut proofs = Vec::new();
             for (key, expected_2022) in [(layout.mint_a, layout.token_2022_a),
                 (layout.mint_b, layout.token_2022_b)] {
                 match observed.get(&key) {
                     Some(MintObservation::Verified(proof)) => {
                         if proof.token_2022 != expected_2022 {
-                            return Err((CompletionStatus::Incomplete, format!(
+                            return Err((CompletionStatus::Incomplete, CompletionReason::UnsupportedConfiguration, format!(
                                 "mint {key} Token-2022 owner differs from LbPair flag expected={expected_2022} actual={}",
                                 proof.token_2022)));
                         }
                         proofs.push(proof.clone());
                     }
                     Some(MintObservation::Invalid(reason)) =>
-                        return Err((CompletionStatus::Incomplete, format!("mint {key}: {reason}"))),
+                        return Err((CompletionStatus::Incomplete, CompletionReason::ValidationFailed, format!("mint {key}: {reason}"))),
                     Some(MintObservation::Unavailable(reason)) =>
-                        return Err((CompletionStatus::Retryable, format!("mint {key}: {reason}"))),
-                    None => return Err((CompletionStatus::Retryable,
+                        return Err((CompletionStatus::Retryable, CompletionReason::TransientFailure, format!("mint {key}: {reason}"))),
+                    None => return Err((CompletionStatus::Retryable, CompletionReason::TransientFailure,
                         format!("mint {key} RPC response missing"))),
                 }
             }
@@ -396,7 +396,7 @@ async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
         })();
         match check {
             Ok(mints) => results.push(prepared(item.pool, item.slot, item.validated, mints)),
-            Err((status, reason)) => results.push(mint_failure(item, status, reason)),
+            Err((status, code, reason)) => results.push(mint_failure(item, status, code, reason)),
         }
     }
 }

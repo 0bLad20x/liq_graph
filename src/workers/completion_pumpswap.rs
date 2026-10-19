@@ -384,9 +384,13 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
             results.insert(pool.address,retry(pool.address,"PumpSwap mint or vault unavailable"));
             continue;
         };
+        let mut failure_code=CompletionReason::ValidationFailed;
         let checked=(||->Result<[MintProof;2]>{
             let p0=proof(m0,spl,token_2022)?;
             let p1=proof(m1,spl,token_2022)?;
+            if !p0.unsupported.is_empty() || !p1.unsupported.is_empty() {
+                failure_code=CompletionReason::UnsupportedConfiguration;
+            }
             ensure!(p0.unsupported.is_empty() && p1.unsupported.is_empty(),
                 "PumpSwap unsupported Token-2022 mint extensions");
             vault(v0,l.mints[0],m0.owner,l.address)?;
@@ -396,7 +400,7 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
         let proofs=match checked {
             Ok(v)=>v,Err(e)=>{
                 results.insert(pool.address,incomplete(pool.address,last_slot,
-                    format!("PumpSwap mint/vault validation: {e:#}")));continue;
+                    format!("PumpSwap mint/vault validation: {e:#}")).with_reason_code(failure_code));continue;
             }
         };
         let Some(candidates)=per_pool.get(&pool.address) else {
@@ -468,6 +472,7 @@ impl Scheduler {
     fn update(&mut self,p:&PoolState,wallet_configured:bool) {
         if p.venue!=Venue::PumpSwap {return;}
         if p.completion_state==CompletionState::Prepared
+            || p.completion_reason_code==Some(CompletionReason::UnsupportedConfiguration)
             || (!wallet_configured && p.completion_evidence.as_ref().is_some_and(|e|
                 e.kind=="pumpswap_pool_validated_v1")) {
             self.candidates.remove(&p.address);
