@@ -251,6 +251,12 @@ pub async fn completion_lifecycle_live()->Result<()> {
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
         registry.clone(),updates.clone(),done,true));
     critical(&mut tasks,"persistence",database.run(updates.subscribe()));
+    if selected=="all" {
+        let (graph_out,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
+        critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
+            updates.subscribe(),graph_out,graph_liquidity::Settings::from_env()?));
+        critical(&mut tasks,"observer.graph_liquidity",graph_liquidity::observe(graph_rx));
+    }
     spawn_completion_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
         (stop.clone(),stop_rx.clone()),rpc.clone(),configured,false,0)?;
     let client=core::http_client()?;

@@ -1,15 +1,15 @@
 # Gemeinsamer Completion Lifecycle
 
-Basis dieser Erweiterung: `agent/cp2-pumpswap-lifecycle`, Commit
-`939d4fc089eca9974c0d9e5f690140fae1797e42`.
-Testbranch: `agent/cp2-manifest-lifecycle`.
+Basis des Abschlusscheckpoints: `agent/cp2-manifest-lifecycle`, Commit
+`0856fda37184db4b7e508f2fda34f7118b6d4847`.
+Testbranch: `agent/cp2-lifecycle-final`.
 
 ## Umfang und Grenzen
 
-CP2.1 plant anhand echter Registry-Snapshots und Updates fuer alle beobachteten,
-aktuell zugelassenen Pools. Die bisherigen neun Worker sind bereits angeschlossen;
-diese Erweiterung schliesst **Manifest als letzten Completion-Worker an dieselbe
-Lifecycle-Instanz** an. Seine lokale Ablaufsteuerung ist entfernt, ebenso die
+Der gemeinsame Lifecycle plant anhand echter Registry-Snapshots und Updates fuer
+alle beobachteten, aktuell zugelassenen Pools. **Alle zehn Completion-Worker sind
+an dieselbe Lifecycle-Instanz angeschlossen.** Auch Manifests lokale Ablaufsteuerung
+ist entfernt, ebenso die
 nur dafuer verbliebene Completion-Weiterleitung mit eigener Start-/Restart-Steuerung
 in der Orchestrierung. Es gibt keinen parallelen Legacy-Completion-Pfad mehr.
 Mint-Regeln und TVL-Quellen bleiben bei ihren vorhandenen CP1-Workern.
@@ -30,10 +30,20 @@ Auch diese Pools werden jetzt nach den gemeinsamen Refresh-Terminen neu geprueft
 der unveraenderte Orca-Pruefpfad erzeugt dabei Evidence v3. Es gibt keine
 Orca-spezifische Faelligkeitsregel oder zweite Upgrade-Steuerung.
 
-Diese Stufe aktualisiert Prepared-Manifeste regelmaessig, fuehrt aber **noch
-keinen Entzug wegen maximalen Pruefalters** ein. Der Graph und seine Logik
-bleiben unveraendert. TVL-Zulassung und TVL-Expiry kommen unveraendert aus der
-Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
+Prepared-Manifeste werden regelmaessig erneut geprueft. Bleiben die Informationen
+gueltig, wird der Pruefzeitstempel auch bei unveraendertem Inhalt erneuert.
+Erfuellen sie die Manifest-Anforderungen nicht mehr, uebernimmt die Registry
+`Incomplete` und entfernt das Manifest; der Graph nimmt diesen Pool heraus.
+Ein technischer Fehler liefert `Retryable`, behaelt den bisherigen Pruefstand
+und fuehrt zentral zu einem neuen Versuch. Es gibt keine zusaetzliche Alters-
+freigabe, keinen neuen Status und keinen automatischen Entzug allein durch
+verstrichene Zeit. TVL-Zulassung und TVL-Expiry bleiben bei der Registry.
+
+Dieser Abschlusscheckpoint verdrahtet im gemeinsamen Live-Lauf auch den bereits
+vorhandenen Graph-Worker samt Verbraucher und vervollstaendigt das gemeinsame
+Pruefskript. Er aendert weder Completion-Pruefpfade noch Status-/Graph-Logik.
+Manifest ist strukturell abgeschlossen; eine verwertbare TVL-Quelle und sein
+Prepared-Refresh-Nachweis sind auf Nutzerentscheidung zurueckgestellt.
 
 ## Vorgang und Regeln
 
@@ -126,15 +136,23 @@ der ausgewaehlten Protokolle:
 
 ```powershell
 git fetch origin
-git switch --track origin/agent/cp2-manifest-lifecycle
-.\scripts\completion_lifecycle_live.ps1 -Venue Manifest -DurationSeconds 600 -PoolLimit 16
+git switch --track origin/agent/cp2-lifecycle-final
+.\scripts\completion_lifecycle_live.ps1 -Venue All -DurationSeconds 600 -PoolLimit 16
 ```
 
 Das Skript prueft Checkout/HEAD, baut mit `cargo build --locked --release` und
 verwendet den echten Logger `LIQ_GRAPH_LOG`. Es startet
 `--completion-lifecycle-live`: die ausgewaehlten REST-Quellen und Executor-Worker,
 einen gemeinsamen Lifecycle, Registry, RPC-Transport und PostgreSQL-Writer.
-`-Venue Manifest` prueft Manifest DEX allein (Standard).
+`-Venue All` ist der Standard: alle zehn Executoren, die bestehenden Quellen und
+zusaetzlich der vorhandene Graph samt Verbraucher. Die Laufzeit ist standardmaessig
+600 Sekunden. Wiederholte Prepared-Refreshes werden fuer die neun Protokolle mit
+nachgewiesener Versorgung verlangt. Manifest startet mit, bleibt aber hinsichtlich
+TVL/Prepared-Refresh ausdruecklich zurueckgestellt. Seine Laufzeitfehler werden
+weiterhin fatal behandelt; tatsaechlich akzeptierte Manifest-Pruefstaende gehen
+ebenfalls in die SQL-Pruefung ein.
+`-Venue Manifest` prueft Manifest DEX allein; dieser gezielte Nachweis verlangt
+weiterhin echte Prepared-Refreshes und wird bei fehlender TVL nicht bestanden.
 `-Venue PumpSwap` prueft PumpSwap allein.
 `-Venue Byreal` prueft Byreal CLMM allein.
 `-Venue PancakeSwap` prueft PancakeSwap CLMM allein.
@@ -145,8 +163,8 @@ einen gemeinsamen Lifecycle, Registry, RPC-Transport und PostgreSQL-Writer.
 Es laeuft genau eine gemeinsame Raydium-REST-Quelle, auch mit drei Raydium-Executoren.
 Der Pool-Limit-Wert gilt je Protokoll; Manifest, PumpSwap, Byreal, PancakeSwap oder Orca
 mit 16 bedeutet maximal 16 Pools, Raydium maximal 48, All maximal 160.
-Andere Completion-Worker und Graph starten in
-diesem isolierten Lauf nicht. `--run` und die bestehenden Einzelmodi verwenden
+Bei einer einzelnen Protokollauswahl starten andere Completion-Worker und Graph
+nicht. `--run` und die bestehenden Einzelmodi verwenden
 denselben Lifecycle-/Executor-Datenfluss. Im kombinierten endlichen Einzelmodus
 begrenzt `--completion-limit` die Gesamtzahl der Lifecycle-Auftraege aller
 angeschlossener Executor-Worker; es gibt keine getrennten Protokoll-Limits.
@@ -228,19 +246,30 @@ Ausgaben:
   gegen die tatsaechlich vom Executor verwendete oeffentliche Adresse geprueft.
 - `scripts/completion_lifecycle_inspect.sql`: zusaetzliche Bestands-/Fehleruebersicht.
 
-Der Skripterfolg verlangt mindestens zwei erfolgreiche Prepared-Refresh-Auftraege
-fuer denselben echten Pool **je ausgewaehltem Protokoll**, keine verbleibenden laufenden Auftraege, saubere
-Registry-Zaehler und Empfang beim Persistenz-Writer. Die SQL-Abfrage belegt die
-konkret akzeptierten abschliessenden Slots, Statuswerte und Zeitstempel in der DB.
+Der Skripterfolg verlangt genau eine Lifecycle-Instanz mit allen ausgewaehlten
+Executoren und mindestens zwei erfolgreiche Prepared-Refresh-Auftraege fuer
+denselben echten Pool je erforderlichem Protokoll. Nur im gemeinsamen `All`-Lauf
+ist Manifests Refresh-Nachweis zurueckgestellt. Hinzu kommen keine verbleibenden
+laufenden Auftraege, saubere Registry-Zaehler, Empfang beim Persistenz-Writer und
+im gemeinsamen Lauf der abgeschlossene Graph-Datenfluss. Die Zahl der aus dem
+Log gelesenen Pruefstaende muss dem terminalen Lifecycle-Abschlusszaehler entsprechen.
+Die SQL-Abfrage belegt die konkret akzeptierten abschliessenden Slots, Statuswerte,
+Zeitstempel und vorhandenen/entfernten Manifeste in der DB. Eine Protokoll-
+Zusammenfassung und beobachtete Refresh-zu-Incomplete-Wechsel stehen am Logende.
+Es werden maximal 160 letzte Pruefstaende erwartet, bei weiterhin inaktivem
+Manifest maximal 144; die tatsaechliche Zahl stammt ausschliesslich aus dem Lauf.
 
-Initial/Recheck/Retry, Reaktivierung, TVL-Entzug und Neustart werden nur dann als
+Initial/Recheck/Retry, Prepared-zu-Incomplete, Reaktivierung, TVL-Entzug und Neustart werden nur dann als
 live nachgewiesen bewertet, wenn sie tatsaechlich beobachtet wurden. Fehlende
 reale Ereignisse werden nicht simuliert oder als bestanden ausgegeben. Ein
 Refresh-Lauf allein nimmt diese weiteren Uebergaenge nicht ab.
 
 Registry-Debug wurde im Skript abgeschaltet. Auftrags-/Ergebnislogs des Lifecycle
 und der ausgewaehlten Executor-Worker sowie die SQL-Abnahme bleiben verfuegbar.
-Alle Protokolle nutzen dasselbe Pruefskript und dieselbe Tabelle.
+Alle Protokolle nutzen dasselbe Pruefskript und dieselbe Tabelle. Das Skript
+akzeptiert einen sauberen, committeten Abschlussbranch und nach dessen Merge
+auch `main`. Vor dem Merge muessen der gemeinsame Live-Lauf und die erzeugte
+SQL-Abfrage nachgewiesen sein; ein beendeter Prozess allein reicht nicht.
 
 ## Stand bei Uebergabe
 
@@ -264,7 +293,16 @@ Der PumpSwap-Lauf auf `939d4fc` belegt 312 akzeptierte/persistierte Prepared-
 Refreshes bei 16 Pools, jeweils 19 bis 20 Aktualisierungen mit steigenden Slots
 und Pruefzeiten, vollstaendigen Abschluss und SQL 16/16/0 einschliesslich Wallet-
 Bindung. Initial/Recheck/Retry und TVL-Entzug wurden dort nicht beobachtet.
-Die Manifest-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
+Der Manifest-Lauf auf `0856fda` belegt Build-Erfolg, Start/Stop der Anbindung und
+386 ueber die Ticker-Quelle erfasste Maerkte je Durchlauf. Die Registry erhielt
+keine frische TVL fuer Manifest, deshalb gab es null zugelassene Pools, null
+Completion-Auftraege und keinen Prepared-Refresh-Nachweis. Die Migration ist
+strukturell abgeschlossen; TVL-Versorgung und dieser Funktionsnachweis werden
+auf Nutzerentscheidung nicht weiterverfolgt.
+
+Der gemeinsame Abschlusslauf auf dem finalen Testbranch und seine SQL-Auswertung
+stehen noch aus. Die bisherigen Einzellaeufe werden nicht als Nachweis eines
+bereits erfolgten gemeinsamen Laufs oder Main-Merges ausgegeben.
 
 Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
 Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind

@@ -1,7 +1,7 @@
 param(
-    [ValidateRange(60, 86400)][int]$DurationSeconds = 300,
+    [ValidateRange(60, 86400)][int]$DurationSeconds = 600,
     [ValidateRange(1, 128)][int]$PoolLimit = 16,
-    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "Byreal", "PumpSwap", "Manifest", "All")][string]$Venue = "Manifest"
+    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "Byreal", "PumpSwap", "Manifest", "All")][string]$Venue = "All"
 )
 
 # Real protocol REST/RPC -> one lifecycle -> Registry -> existing PostgreSQL writer.
@@ -10,8 +10,8 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-manifest-lifecycle" -or $tracked) {
-    throw "Use a clean, committed agent/cp2-manifest-lifecycle checkout."
+if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/cp2-lifecycle-final", "main") -or $tracked) {
+    throw "Use a clean, committed agent/cp2-lifecycle-final checkout, or main after merging this checkpoint."
 }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed." }
@@ -34,7 +34,7 @@ $selector = switch ($Venue) {
     "All" { "all" }
 }
 $venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7; PancakeSwapClmm = 8; ByrealClmm = 9; Manifest = 10; PumpSwap = 11 }
-$requiredVenues = switch ($Venue) {
+$selectedVenues = switch ($Venue) {
     "Dlmm" { @("MeteoraDlmm") }
     "DammV2" { @("MeteoraDammV2") }
     "Both" { @("MeteoraDlmm", "MeteoraDammV2") }
@@ -49,6 +49,10 @@ $requiredVenues = switch ($Venue) {
     "Manifest" { @("Manifest") }
     "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool", "PancakeSwapClmm", "ByrealClmm", "Manifest", "PumpSwap") }
 }
+# Manifest is structurally migrated; its missing live TVL supply is explicitly
+# deferred for the combined checkpoint. Its standalone proof remains strict.
+$deferredVenues = if ($Venue -eq "All") { @("Manifest") } else { @() }
+$requiredVenues = @($selectedVenues | Where-Object { $_ -notin $deferredVenues })
 $settings = @{
     RUN_DURATION_SECONDS = "$DurationSeconds"
     LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug,completion_pancakeswap_clmm=debug,completion_byreal_clmm=debug,completion_manifest=debug,completion_pumpswap=debug"
@@ -78,6 +82,8 @@ try {
     $startMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     "Completion CP2 branch=$branch head=$head start_ms=$startMs venues=$selector pool_limit_per_venue=$PoolLimit duration_s=$DurationSeconds" |
         Tee-Object -FilePath $log
+    "Completion CP2 required_refresh=$($requiredVenues -join ',') deferred_refresh=$($deferredVenues -join ',')" |
+        Tee-Object -FilePath $log -Append
     # Windows PowerShell 5 treats redirected native stderr as ErrorRecord.
     # Keep the real exit code authoritative while preserving the combined log.
     $ErrorActionPreference = "Continue"
@@ -109,6 +115,16 @@ if ($text -notmatch 'persistence complete .*completions_seen=[1-9][0-9]*') {
 if ($text -match 'runtime fatal|level=ERROR|lost [1-9][0-9]* .*batches|completion_lagged') {
     throw "Runtime failure/loss found; inspect $log"
 }
+$managed = [regex]::Matches($text, 'lifecycle started managed=\[([^\]]+)\]')
+if ($managed.Count -ne 1) { throw "Expected exactly one shared lifecycle; inspect $log" }
+$registered = @($managed[0].Groups[1].Value -split ',\s*')
+if (@(Compare-Object $selectedVenues $registered).Count -ne 0) {
+    throw "Lifecycle executor registration differs from the selected protocols; inspect $log"
+}
+if ($Venue -eq "All" -and ($text -notmatch 'module=liq_graph::workers::graph_liquidity complete observed_pool_updates=[1-9][0-9]* '
+    -or $text -notmatch 'liquidity graph consumer complete generations=[1-9][0-9]*')) {
+    throw "Missing Graph consumption and completed drain in combined run; inspect $log"
+}
 
 # Link this run's last accepted proof per pool to a read-only SQL verification.
 $pumpWallet = $null
@@ -120,25 +136,38 @@ if ($requiredVenues -contains "PumpSwap") {
 $pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|Manifest|PumpSwap) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
 $latest = @{}
 $refreshCounts = @{}
-foreach ($match in [regex]::Matches($text, $pattern)) {
+$acceptedCounts = @{}
+$refreshWithdrawals = 0
+$proofMatches = [regex]::Matches($text, $pattern)
+$finalAccepted = [regex]::Match($text, 'lifecycle stats final=true [^\r\n]*\baccepted=([0-9]+) ')
+if (-not $finalAccepted.Success -or $proofMatches.Count -ne [long]$finalAccepted.Groups[1].Value) {
+    throw "Accepted proof records differ from final lifecycle accounting; inspect $log"
+}
+foreach ($match in $proofMatches) {
     $hex = $match.Groups[1].Value
     $protocol = $match.Groups[2].Value
     $status = if ($match.Groups[4].Value -eq "Prepared") { 1 } else { 2 }
     $code = $venueCodes[$protocol]
+    $acceptedCounts[$protocol] = 1 + [int]$acceptedCounts[$protocol]
     $walletSql = if ($protocol -eq "PumpSwap") { "'$pumpWallet'::text" } else { "NULL::text" }
     $latest[$hex] = "(${code}::smallint, '$hex', $($match.Groups[5].Value)::bigint, $($match.Groups[6].Value)::bigint, ${status}::smallint, $walletSql)"
     if ($match.Groups[3].Value -eq "Refresh" -and $status -eq 1) {
         $key = "$protocol|$hex"
         $refreshCounts[$key] = 1 + [int]$refreshCounts[$key]
+    } elseif ($match.Groups[3].Value -eq "Refresh" -and $status -eq 2) {
+        $refreshWithdrawals++
     }
 }
-foreach ($protocol in $requiredVenues) {
+$summary = @()
+foreach ($protocol in $selectedVenues) {
     $repeated = @($refreshCounts.Keys | Where-Object {
         $_.StartsWith("$protocol|") -and $refreshCounts[$_] -ge 2
     })
-    if ($repeated.Count -eq 0) {
+    if ($protocol -in $requiredVenues -and $repeated.Count -eq 0) {
         throw "No repeated successful Prepared refresh for $protocol. Inspect $log; this protocol is not accepted."
     }
+    $required = $protocol -in $requiredVenues
+    $summary += "CP2 protocol=$protocol connected=true accepted=$([int]$acceptedCounts[$protocol]) repeated_refresh_pools=$($repeated.Count) refresh_required=$required"
 }
 if ($latest.Count -eq 0) { throw "No accepted proof records found in $log" }
 $values = ($latest.Values | Sort-Object) -join ",`n    "
@@ -155,9 +184,11 @@ WITH expected(venue, pool_hex, checked_at_ms, validated_slot, status, wallet) AS
         AND (p.descriptor->>'checked_at_ms')::bigint = e.checked_at_ms
         AND (e.venue <> 11 OR e.status <> 1
           OR p.descriptor->'evidence'->'payload'->>'v10_wallet' = e.wallet)
-        AND ((e.status = 1 AND p.descriptor->>'reason_code' IS NULL)
+        AND ((e.status = 1 AND p.descriptor->>'reason_code' IS NULL
+              AND jsonb_typeof(p.descriptor->'manifest') = 'object')
           OR (e.status = 2 AND p.descriptor->>'reason_code' IS NOT NULL
-              AND p.descriptor->>'reason_code' <> 'transient_failure')) AS matches
+              AND p.descriptor->>'reason_code' <> 'transient_failure'
+              AND p.descriptor->>'manifest' IS NULL)) AS matches
     FROM expected e LEFT JOIN public.liq_graph_pool_cache p
       ON p.pool_address = decode(e.pool_hex, 'hex')
 )
@@ -166,5 +197,11 @@ SELECT COUNT(*) AS proofs_expected,
        COUNT(*) FILTER (WHERE matches IS NOT TRUE) AS mismatches
 FROM checks;
 "@ | Set-Content -Encoding UTF8 $verification
+$summary | Tee-Object -FilePath $log -Append
+"CP2 refresh_to_incomplete_observed=$refreshWithdrawals proofs_expected=$($latest.Count) deferred_refresh=$($deferredVenues -join ',')" |
+    Tee-Object -FilePath $log -Append
 Write-Host "CP2 live refresh path passed for head=$head. Run the read-only $verification to verify the exact stored proofs."
+if ($deferredVenues.Count -gt 0) {
+    Write-Host "Manifest TVL/refresh proof is explicitly deferred; runtime errors remain fatal and any accepted Manifest proofs are included in SQL."
+}
 Write-Host "Initial, Recheck, Retry and TVL withdrawal/reactivation count only when actually observed in the log."
