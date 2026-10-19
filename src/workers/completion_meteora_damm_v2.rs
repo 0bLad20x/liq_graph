@@ -200,6 +200,7 @@ fn manifest(layout: PoolLayout, slot: u64, program: Pubkey) -> ExecutionManifest
     ExecutionManifest {
         pool: layout.address, mint_a: layout.mint_a, mint_b: layout.mint_b,
         validated_slot:slot,
+        bound_signer:None,
         base_a:direction(layout.mint_a,true), base_b:direction(layout.mint_b,false),
     }
 }

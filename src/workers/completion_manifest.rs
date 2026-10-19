@@ -223,6 +223,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
         Arc::from(vec![ro(program),ro(base),rw(l.address),rw(mint_vault(x)),rw(mint_vault(base))])
     };
     let manifest=ExecutionManifest{pool:l.address,mint_a:a,mint_b:b,validated_slot:slot,
+        bound_signer:None,
         base_a:block(a,b),base_b:block(b,a)};
     let proofs=if l.mints[0]==a {[mint0,mint1]} else {[mint1,mint0]};
     let evidence=Arc::new(CompletionEvidence{kind:"manifest_market_v10".into(),version:1,

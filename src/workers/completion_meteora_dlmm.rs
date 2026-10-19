@@ -472,6 +472,7 @@ fn manifest(layout: &PoolLayout, slot: u64, arrays: &[Pubkey],
     Ok(ExecutionManifest {
         pool: layout.address, mint_a: layout.mint_a, mint_b: layout.mint_b,
         validated_slot: slot,
+        bound_signer: None,
         base_a: directional(layout.mint_a, true),
         base_b: directional(layout.mint_b, false),
     })

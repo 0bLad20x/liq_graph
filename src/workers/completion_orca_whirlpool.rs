@@ -215,6 +215,7 @@ fn make_manifest(l:Layout,slot:u64,arrays_a:&[Pubkey],arrays_b:&[Pubkey],
     };
     ExecutionManifest {
         pool:l.pool,mint_a:l.mint_a,mint_b:l.mint_b,validated_slot:slot,
+        bound_signer:None,
         // base_a = B->A: upward; base_b = A->B: downward.
         base_a:direction(l.mint_a,true,arrays_a),base_b:direction(l.mint_b,false,arrays_b),
     }

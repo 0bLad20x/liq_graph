@@ -273,6 +273,7 @@ fn make_manifest(l:Layout,slot:u64,up:&[Pubkey],down:&[Pubkey],
     };
     // Base=A means B->A (price upward). Base=B means A->B (down).
     ExecutionManifest{pool:l.pool,mint_a:l.mints[0],mint_b:l.mints[1],validated_slot:slot,
+        bound_signer:None,
         base_a:direction(l.mints[0],l.vaults[1],l.vaults[0],up),
         base_b:direction(l.mints[1],l.vaults[0],l.vaults[1],down)}
 }
@@ -357,6 +358,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let manifest=if swapped {
         ExecutionManifest{pool:manifest.pool,mint_a:pool.mint_a.expect("verified mint A"),
             mint_b:pool.mint_b.expect("verified mint B"),validated_slot:manifest.validated_slot,
+            bound_signer:manifest.bound_signer,
             base_a:manifest.base_b,base_b:manifest.base_a}
     }else{manifest};
     result(pool.address,CompletionStatus::Prepared,Some(slot),None,
