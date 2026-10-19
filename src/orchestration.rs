@@ -335,7 +335,8 @@ fn spawn_sources(
         let receiver = completion_output.subscribe();
         if config.dlmm.is_some() || config.damm_v2.is_some() || config.orca.is_some()
             || config.raydium_amm_v4.is_some() || config.raydium_cpmm.is_some()
-            || config.raydium_clmm.is_some() || config.pancakeswap_clmm.is_some() {
+            || config.raydium_clmm.is_some() || config.pancakeswap_clmm.is_some()
+            || config.byreal_clmm.is_some() {
             if config.dlmm.is_some() && config.damm_v2.is_none()
                 && config.orca.is_none() && config.lifecycle_limit>0 {
                 tasks.spawn(completion_meteora_dlmm::observe(completion_output.subscribe()));
@@ -345,6 +346,7 @@ fn spawn_sources(
                 config.rpc.clone(),runtime::CompletionExecutors {
                     dlmm:config.dlmm,damm_v2:config.damm_v2,orca:config.orca,
                     pancakeswap_clmm:config.pancakeswap_clmm,
+                    byreal_clmm:config.byreal_clmm,
                     raydium_amm_v4:config.raydium_amm_v4,raydium_cpmm:config.raydium_cpmm,
                     raydium_clmm:config.raydium_clmm,
                 },settings.once,config.lifecycle_limit)?;
@@ -356,10 +358,6 @@ fn spawn_sources(
         if let Some(manifest) = config.manifest {
             tasks.spawn(completion_manifest::run(registry_output.subscribe(),
                 source_done_rx.clone(), config.rpc.clone(), manifest, completion_output.clone()));
-        }
-        if let Some(clmm) = config.byreal_clmm {
-            tasks.spawn(completion_byreal_clmm::run(registry_output.subscribe(),
-                source_done_rx, config.rpc, clmm, completion_output.clone()));
         }
         // Registry closes only after every completion producer has finished.
         drop(completion_output);
@@ -746,9 +744,7 @@ pub async fn run() -> Result<()> {
             Some(completion_pancakeswap_clmm::Settings::from_env()?)
         } else { None };
         let byreal_clmm = if cli.byreal_clmm_completion_live {
-            let mut settings=completion_byreal_clmm::Settings::from_env()?;
-            settings.limit=completion_limit;
-            Some(settings)
+            Some(completion_byreal_clmm::Settings::from_env()?)
         } else {None};
         let pumpswap = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
             let mut settings = completion_pumpswap::Settings::from_env()?;

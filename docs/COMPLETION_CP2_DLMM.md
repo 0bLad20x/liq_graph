@@ -1,15 +1,15 @@
-# Completion Lifecycle: Meteora, Raydium, Orca und PancakeSwap
+# Gemeinsamer Completion Lifecycle
 
-Basis dieser Erweiterung: `agent/cp2-orca-lifecycle`, Commit
-`1d096511ce81786b0bca9a43b2158b61d59ef590`.
-Testbranch: `agent/cp2-pancakeswap-lifecycle`.
+Basis dieser Erweiterung: `agent/cp2-pancakeswap-lifecycle`, Commit
+`86afa60757a67da957870f906bd64f52d03f12a1`.
+Testbranch: `agent/cp2-byreal-lifecycle`.
 
 ## Umfang und Grenzen
 
 CP2.1 plant anhand echter Registry-Snapshots und Updates fuer alle beobachteten,
-aktuell zugelassenen Pools. DLMM, DAMM v2, die drei Raydium-Worker und Orca sind
-bereits angeschlossen; diese Erweiterung schliesst **PancakeSwap CLMM an dieselbe
-Lifecycle-Instanz** an. Die anderen drei Completion-Worker behalten ihre bisherige Steuerung; ihre
+aktuell zugelassenen Pools. DLMM, DAMM v2, die drei Raydium-Worker, Orca und
+PancakeSwap sind bereits angeschlossen; diese Erweiterung schliesst **Byreal CLMM
+an dieselbe Lifecycle-Instanz** an. Manifest und PumpSwap behalten ihre bisherige Steuerung; ihre
 Lifecycle-Zusammenfassungen tragen `executing=false`. Keine weiteren Decoder,
 Protokolle, Mint-Regeln oder TVL-Quellen werden umgebaut.
 
@@ -17,10 +17,10 @@ Der Lifecycle liegt in einem Worker, nicht im Core. Der Core enthaelt die
 gemeinsamen Auftrags-/Antwortvertraege. Die Registry bleibt alleiniger
 Pool-State-Writer, PostgreSQL hat weiterhin genau den bestehenden Writer und
 dieselbe Tabelle. Der Lifecycle interpretiert keine protokollspezifische
-Evidence und besitzt keine RPC-Verbindung. Die sieben angeschlossenen Worker erhalten explizite
+Evidence und besitzt keine RPC-Verbindung. Die acht angeschlossenen Worker erhalten explizite
 Auftraege; ihre lokalen Scheduler sind entfernt. Auch die Versuchsgrenze ist aus
 ihren Protokoll-Settings entfernt und wird zentral im Lifecycle gesetzt. Es gibt
-eine gemeinsame Registrierung fuer alle sieben Executor-Receiver und einen gemeinsamen
+eine gemeinsame Registrierung fuer alle acht Executor-Receiver und einen gemeinsamen
 Antwortkanal. Raydium Stable hat keinen Completion-Worker und ist nicht Teil
 dieser Migration.
 
@@ -60,6 +60,9 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    und Evidence v3; ein Refresh liest diese Accounts erneut ueber denselben RPC-Transport.
    PancakeSwap behaelt seinen kohärenten Pool-/Mint-/Vault-/Konfigurations-/
    Observation-/Bitmap-/TickArray-Pruefpfad und seine gerichteten Accountbloecke.
+   Dasselbe gilt fuer Byreals vorhandenen Pruefpfad einschliesslich seiner
+   TickArray-Layouts und Fee-Konfigurationspruefung. Seine Klassifizierung als
+   `unsupported_configuration` bleibt beim Protokoll; die Pause steuert der Lifecycle.
    Ergebnisse werden nach Pool-Adresse den Auftrags-IDs zugeordnet, weil interne
    RPC-Partitionen die Reihenfolge aendern koennen.
 6. Terminale Ergebnisse gehen ueber den bestehenden Ergebnisvertrag zur Registry.
@@ -80,9 +83,9 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    Queue, Auftrags-IDs und transiente Fehlerzaehler sind RAM-Zustand; ihr exakter
    Backoff wird nicht persistiert. Alte Statuswerte werden nicht zurueckgesetzt.
 
-Ein Executor- oder Lifecycle-Fehler ist fuer alle sieben Anbindungen fail-fast. Es
+Ein Executor- oder Lifecycle-Fehler ist fuer alle acht Anbindungen fail-fast. Es
 gibt keinen stillen Rueckfall auf den entfernten lokalen Scheduler. Die anderen
-drei Worker behalten ihren vorhandenen Supervisor. Beim Stoppen werden neue
+beiden Worker behalten ihren vorhandenen Supervisor. Beim Stoppen werden neue
 Auftraege eingestellt und laufende Antworten samt Registry-Uebernahme abgearbeitet.
 
 ## Einstellungen
@@ -110,29 +113,30 @@ der ausgewaehlten Protokolle:
 
 ```powershell
 git fetch origin
-git switch --track origin/agent/cp2-pancakeswap-lifecycle
-.\scripts\completion_lifecycle_live.ps1 -Venue PancakeSwap -DurationSeconds 300 -PoolLimit 16
+git switch --track origin/agent/cp2-byreal-lifecycle
+.\scripts\completion_lifecycle_live.ps1 -Venue Byreal -DurationSeconds 300 -PoolLimit 16
 ```
 
 Das Skript prueft Checkout/HEAD, baut mit `cargo build --locked --release` und
 verwendet den echten Logger `LIQ_GRAPH_LOG`. Es startet
 `--completion-lifecycle-live`: die ausgewaehlten REST-Quellen und Executor-Worker,
 einen gemeinsamen Lifecycle, Registry, RPC-Transport und PostgreSQL-Writer.
-`-Venue PancakeSwap` prueft PancakeSwap CLMM allein (Standard).
+`-Venue Byreal` prueft Byreal CLMM allein (Standard).
+`-Venue PancakeSwap` prueft PancakeSwap CLMM allein.
 `-Venue Orca` prueft Orca Whirlpool allein.
 `-Venue Raydium` prueft die drei Raydium-Worker gemeinsam.
 `RaydiumAmmV4`, `RaydiumCpmm` und `RaydiumClmm` pruefen sie jeweils einzeln.
-`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle sieben.
+`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle acht.
 Es laeuft genau eine gemeinsame Raydium-REST-Quelle, auch mit drei Raydium-Executoren.
-Der Pool-Limit-Wert gilt je Protokoll; PancakeSwap oder Orca mit 16 bedeutet maximal
-16 Pools, Raydium maximal 48, All maximal 112. Andere Completion-Worker und Graph starten in
+Der Pool-Limit-Wert gilt je Protokoll; Byreal, PancakeSwap oder Orca mit 16 bedeutet
+maximal 16 Pools, Raydium maximal 48, All maximal 128. Andere Completion-Worker und Graph starten in
 diesem isolierten Lauf nicht. `--run` und die bestehenden Einzelmodi verwenden
 denselben Lifecycle-/Executor-Datenfluss. Im kombinierten endlichen Einzelmodus
 begrenzt `--completion-limit` die Gesamtzahl der Lifecycle-Auftraege aller
 angeschlossener Executor-Worker; es gibt keine getrennten Protokoll-Limits.
 
 Die Auswahl erfolgt ausschliesslich in der Orchestrierung ueber
-`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|orca|pancakeswap|all`;
+`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|orca|pancakeswap|byreal|all`;
 der Lifecycle enthaelt keine Protokoll-Fallunterscheidung und unveraendert dieselben Zeitregeln.
 
 Die erste reale zugelassene Kohorte ist fuer den Lauf fest; unsupported-Pools
@@ -145,10 +149,10 @@ Orca behaelt ebenfalls 16 parallele Batches mit bis zu 8 Pools pro Batch
 (`RPC_ACCOUNT_BATCH_SIZE / 12`) und TickArray-Radius 2. Es verwendet die bestehende
 REST-Konfiguration `ORCA_API_RPS` und den gemeinsamen RPC-Transport;
 es kommen keine Orca-spezifischen RPC-Variablen hinzu.
-PancakeSwap behaelt 16 parallele Batches mit bis zu 7 Pools pro Batch
-(`RPC_ACCOUNT_BATCH_SIZE / 13`) und TickArray-Radius 2. Seine REST-Quelle
-verwendet unveraendert `PANCAKESWAP_API_RPM` (Standard 57); die Completion
-verwendet denselben gemeinsamen RPC-Transport und dieselben Lifecycle-Zeiten.
+PancakeSwap und Byreal behalten je 16 parallele Batches mit bis zu 7 Pools pro
+Batch (`RPC_ACCOUNT_BATCH_SIZE / 13`) und TickArray-Radius 2. Ihre REST-Quellen
+verwenden unveraendert `PANCAKESWAP_API_RPM` bzw. `BYREAL_API_RPM` (Standard je 57);
+die Completions verwenden denselben gemeinsamen RPC-Transport und dieselben Lifecycle-Zeiten.
 Die feste reale Kohorte begrenzt zusaetzlich die insgesamt laufenden Pools.
 Der Lauf erzeugt
 keine Testpools, resettet keine Statuswerte und sendet keine Transaktionen.
@@ -192,7 +196,9 @@ Refreshes fuer alle drei Raydium-Protokolle, sauberen Shutdown und SQL 48/48/0.
 Der Orca-Lauf auf `1d09651` belegt 161 Auftraege, 160 akzeptierte/persistierte
 Prepared-Ergebnisse, einen erfolgreich wiederaufgenommenen Retryable-Fall,
 wiederholte Refreshes aller 16 Pools, sauberen Shutdown und SQL 16/16/0.
-Die PancakeSwap-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
+Der PancakeSwap-Lauf auf `86afa60` belegt 160 akzeptierte/persistierte
+Prepared-Refreshes aller 16 Pools, sauberen Shutdown und SQL 16/16/0.
+Die Byreal-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
 
 Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
 Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind
