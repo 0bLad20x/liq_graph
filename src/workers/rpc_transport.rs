@@ -46,6 +46,9 @@ pub enum RpcOperation {
     },
     Slot { commitment: String },
     GenesisHash,
+    LatestBlockhash { min_context_slot: Option<u64> },
+    /// Read-only execution. Signature verification is always enabled; never broadcasts.
+    Simulate { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
 }
 
 impl RpcOperation {
@@ -57,6 +60,8 @@ impl RpcOperation {
             Self::ProgramV2 { .. } => "getProgramAccountsV2",
             Self::Slot { .. } => "getSlot",
             Self::GenesisHash => "getGenesisHash",
+            Self::LatestBlockhash { .. } => "getLatestBlockhash",
+            Self::Simulate { .. } => "simulateTransaction",
         }
     }
     fn bit(&self) -> u64 {
@@ -67,6 +72,8 @@ impl RpcOperation {
             Self::ProgramV2 { .. } => 8,
             Self::Slot { .. } => 16,
             Self::GenesisHash => 32,
+            Self::LatestBlockhash { .. } => 64,
+            Self::Simulate { .. } => 128,
         }
     }
     fn params(&self, commitment: &str, account_limit: usize, v2_limit: usize) -> Result<Value> {
@@ -115,6 +122,22 @@ impl RpcOperation {
                 json!([{"commitment":level}])
             }
             Self::GenesisHash => json!([]),
+            Self::LatestBlockhash { min_context_slot } => {
+                let mut cfg=json!({"commitment":commitment});
+                if let Some(slot)=min_context_slot {cfg["minContextSlot"]=json!(slot);}
+                json!([cfg])
+            }
+            Self::Simulate { transaction, min_context_slot, accounts } => {
+                ensure!(!transaction.is_empty() && transaction.len()<=4096,
+                    "simulation transaction exceeds wire limit");
+                ensure!(accounts.len()<=64,"too many simulation account projections");
+                let mut cfg=json!({"encoding":"base64","commitment":commitment,
+                    "sigVerify":true,"replaceRecentBlockhash":false,"innerInstructions":true,
+                    "accounts":{"encoding":"base64",
+                        "addresses":accounts.iter().map(ToString::to_string).collect::<Vec<_>>()}});
+                if let Some(slot)=min_context_slot {cfg["minContextSlot"]=json!(slot);}
+                json!([STANDARD.encode(transaction),cfg])
+            }
         })
     }
 }
@@ -124,6 +147,7 @@ impl RpcOperation {
 pub struct AccountData {
     pub address: Pubkey,
     pub owner: Pubkey,
+    pub executable: bool,
     pub bytes: Vec<u8>,
     pub view: AccountView,
     pub original_len: Option<usize>,
@@ -136,6 +160,8 @@ pub enum RpcAnswer {
     Program { accounts: Vec<AccountData>, next_cursor: Option<String> },
     Slot(u64),
     GenesisHash(String),
+    LatestBlockhash { slot: u64, blockhash: String, last_valid_block_height: u64 },
+    Simulation { slot: u64, value: Value },
 }
 
 #[derive(Debug)]
@@ -269,6 +295,8 @@ pub fn settings_from_env()->Result<Settings> {
                 ("GET_PROGRAM_ACCOUNTS_V2",8,false),
                 ("GET_SLOT",16,true),
                 ("GET_GENESIS_HASH",32,true),
+                ("GET_LATEST_BLOCKHASH",64,true),
+                ("SIMULATE_TRANSACTION",128,true),
             ];
             let mut mask=0_u64;
             for (suffix,bit,default) in capabilities {
@@ -400,7 +428,9 @@ fn decode_account(address:Pubkey,value:&Value,view:AccountView)->Result<Option<A
         }
         AccountView::Slice{..}=>space,
     };
-    Ok(Some(AccountData{address,owner,bytes,view,original_len}))
+    let executable=value.get("executable").and_then(Value::as_bool)
+        .context("RPC executable flag missing")?;
+    Ok(Some(AccountData{address,owner,executable,bytes,view,original_len}))
 }
 
 fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
@@ -453,6 +483,23 @@ fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
         RpcOperation::Slot{..}=>Ok(RpcAnswer::Slot(result.as_u64().context("invalid getSlot value")?)),
         RpcOperation::GenesisHash=>Ok(RpcAnswer::GenesisHash(result.as_str()
             .context("invalid genesis hash")?.to_owned())),
+        RpcOperation::LatestBlockhash{min_context_slot}=>{
+            let slot=response_slot(&result)?;
+            ensure!(min_context_slot.is_none_or(|min|slot>=min),"blockhash context is older than requested");
+            let value=result.get("value").context("blockhash value missing")?;
+            Ok(RpcAnswer::LatestBlockhash{slot,
+                blockhash:value.get("blockhash").and_then(Value::as_str)
+                    .context("blockhash missing")?.to_owned(),
+                last_valid_block_height:value.get("lastValidBlockHeight").and_then(Value::as_u64)
+                    .context("blockhash expiry missing")?})
+        }
+        RpcOperation::Simulate{min_context_slot,..}=>{
+            let slot=response_slot(&result)?;
+            ensure!(min_context_slot.is_none_or(|min|slot>=min),"simulation context is older than requested");
+            let value=result.get("value").filter(|v|v.is_object() && v.get("err").is_some())
+                .context("simulation value/err missing")?.clone();
+            Ok(RpcAnswer::Simulation{slot,value})
+        }
     }
 }
 

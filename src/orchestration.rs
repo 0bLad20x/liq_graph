@@ -3,6 +3,7 @@
 use std::{env, sync::Arc};
 
 mod runtime;
+mod v10_simulation;
 
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
@@ -504,6 +505,17 @@ pub async fn run() -> Result<()> {
     core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str)==Some("--v10-simulate") {
+        ensure!(args.len()==4 && args[2]=="--wallet",
+            "use --v10-simulate REQUEST.json --wallet KEYPAIR.json");
+        return v10_simulation::run(std::path::Path::new(&args[1]),
+            std::path::Path::new(&args[3])).await;
+    }
+    if args.first().map(String::as_str)==Some("--v10-wallet") {
+        ensure!(args.len()==2,"use --v10-wallet KEYPAIR.json");
+        println!("{}",crate::workers::execution_v10::Settings::load(std::path::Path::new(&args[1]))?.wallet());
+        return Ok(());
+    }
     if args.len() == 1 && args[0] == "--run" {
         return runtime::run().await;
     }

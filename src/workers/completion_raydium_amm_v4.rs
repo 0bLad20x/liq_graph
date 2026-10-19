@@ -160,6 +160,7 @@ fn manifest(layout:PoolLayout,pool:&PoolState,slot:u64,program:Pubkey,
     let a=pool.mint_a.expect("validated Registry mint A");
     let b=pool.mint_b.expect("validated Registry mint B");
     ExecutionManifest{pool:layout.address,mint_a:a,mint_b:b,validated_slot:slot,
+        bound_signer:None,
         base_a:block(a,b),base_b:block(b,a)}
 }
 fn decode_final(pool:&PoolState,initial:PoolLayout,slot:u64,

@@ -50,14 +50,11 @@ impl Settings {
 /// Wallet-bound pool blocks are persisted. Never boot a cache of PumpSwap
 /// Prepared accounts against a different signer (or without one).
 pub fn ensure_wallet_cache(pools:&[PoolState],wallet:Option<Pubkey>)->Result<()> {
-    let expected=wallet.map(|key|key.to_string());
     for pool in pools.iter().filter(|pool|
         pool.venue==Venue::PumpSwap
         && pool.completion_state==CompletionState::Prepared) {
-        let stored=pool.completion_evidence.as_ref()
-            .and_then(|e|e.payload.get("v10_wallet"))
-            .and_then(|value|value.as_str());
-        ensure!(stored==expected.as_deref(),
+        let stored=pool.execution_manifest.as_ref().and_then(|m|m.bound_signer);
+        ensure!(stored==wallet,
             "PumpSwap Prepared manifest is bound to another signer or no wallet configured pool={}; use the original PUMPSWAP_V10_WALLET or revalidate the persisted PumpSwap manifests",
             pool.address);
     }
@@ -255,6 +252,7 @@ fn manifest(l:Layout,slot:u64,wallet:Pubkey,recipient:Pubkey,buyback:Pubkey,
     };
     ExecutionManifest{
         pool:l.address,mint_a:l.mints[0],mint_b:l.mints[1],validated_slot:slot,
+        bound_signer:Some(wallet),
         base_a:block(l.mints[0],l.mints[1]),
         base_b:block(l.mints[1],l.mints[0]),
     }

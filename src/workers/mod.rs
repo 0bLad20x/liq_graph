@@ -5,6 +5,7 @@ pub mod source_dexscreener;
 pub mod diagnostic_source;
 pub mod pool_registry;
 pub mod rpc_transport;
+pub mod execution_v10;
 pub mod http_transport;
 pub mod completion_meteora_dlmm;
 pub mod completion_lifecycle;

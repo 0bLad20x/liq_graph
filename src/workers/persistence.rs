@@ -238,6 +238,7 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
     let payload = json!({
         "validated_slot":slot,
         "manifest":manifest,
+        "bound_signer":pool.execution_manifest.as_ref().and_then(|m|m.bound_signer).map(|wallet|wallet.to_string()),
         "evidence":evidence,
         "mints":mints,
         "reason":pool.completion_reason,
@@ -256,8 +257,13 @@ fn decode_descriptor(
         "persisted validated_slot / descriptor mismatch");
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
         let value = &payload["manifest"];
+        // Upgrade the old persisted wallet context once at the storage boundary.
+        let bound_signer=payload.get("bound_signer")
+            .or_else(||payload.pointer("/evidence/payload/v10_wallet"))
+            .filter(|v|!v.is_null()).map(json_key).transpose()?;
         Some(Arc::new(ExecutionManifest {
             pool:address, mint_a:a, mint_b:b, validated_slot:slot,
+            bound_signer,
             base_a:decode_accounts(value,"base_a")?,
             base_b:decode_accounts(value,"base_b")?,
         }))

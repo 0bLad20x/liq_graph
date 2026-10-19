@@ -1,5 +1,6 @@
 //! Shared worker contracts and generic HTTP infrastructure.
 pub mod logging;
+pub mod execution;
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::Result;
@@ -119,18 +120,27 @@ pub enum CompletionStatus {
     Retryable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountMeta {
+    #[serde(with = "execution::pubkey_json")]
     pub address: Pubkey,
     pub writable: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionManifest {
+    #[serde(with = "execution::pubkey_json")]
     pub pool: Pubkey,
+    #[serde(with = "execution::pubkey_json")]
     pub mint_a: Pubkey,
+    #[serde(with = "execution::pubkey_json")]
     pub mint_b: Pubkey,
     pub validated_slot: u64,
+    /// Wallet context of prepared pool accounts, when those accounts depend on a signer.
+    #[serde(default, with = "execution::optional_pubkey_json")]
+    pub bound_signer: Option<Pubkey>,
     pub base_a: Arc<[AccountMeta]>,
     pub base_b: Arc<[AccountMeta]>,
 }
@@ -143,8 +153,10 @@ pub struct CompletionEvidence {
     pub payload: Arc<Value>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MintProof {
+    #[serde(with = "execution::pubkey_json")]
     pub address: Pubkey,
     pub token_2022: bool,
     /// Verified Token-2022 Mint TLV extension type identifiers.
