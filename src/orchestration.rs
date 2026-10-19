@@ -333,7 +333,7 @@ fn spawn_sources(
         let (completion_output, _) =
             broadcast::channel::<Arc<core::CompletionResultBatch>>(256);
         let receiver = completion_output.subscribe();
-        if config.dlmm.is_some() || config.damm_v2.is_some()
+        if config.dlmm.is_some() || config.damm_v2.is_some() || config.orca.is_some()
             || config.raydium_amm_v4.is_some() || config.raydium_cpmm.is_some()
             || config.raydium_clmm.is_some() {
             if config.dlmm.is_some() && config.damm_v2.is_none()
@@ -343,14 +343,10 @@ fn spawn_sources(
             runtime::spawn_completion_lifecycle(tasks,&registry,&registry_output,
                 completion_output.clone(),source_done_rx.clone(),watch::channel(false),
                 config.rpc.clone(),runtime::CompletionExecutors {
-                    dlmm:config.dlmm,damm_v2:config.damm_v2,
+                    dlmm:config.dlmm,damm_v2:config.damm_v2,orca:config.orca,
                     raydium_amm_v4:config.raydium_amm_v4,raydium_cpmm:config.raydium_cpmm,
                     raydium_clmm:config.raydium_clmm,
                 },settings.once,config.lifecycle_limit)?;
-        }
-        if let Some(orca) = config.orca {
-            tasks.spawn(completion_orca_whirlpool::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), orca, completion_output.clone()));
         }
         if let Some(clmm) = config.pancakeswap_clmm {
             tasks.spawn(completion_pancakeswap_clmm::run(registry_output.subscribe(),
@@ -738,9 +734,7 @@ pub async fn run() -> Result<()> {
             Some(completion_meteora_dlmm::Settings::from_env()?)
         } else {None};
         let orca = if cli.orca_completion_live {
-            let mut settings = completion_orca_whirlpool::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_orca_whirlpool::Settings::from_env()?)
         } else {None};
         let raydium_amm_v4 = if cli.raydium_amm_v4_completion_live {
             Some(completion_raydium_amm_v4::Settings::from_env()?)

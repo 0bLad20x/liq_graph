@@ -1,15 +1,15 @@
-# Completion Lifecycle: Meteora und Raydium
+# Completion Lifecycle: Meteora, Raydium und Orca
 
-Basis dieser Erweiterung: `agent/cp2-damm-v2-lifecycle`, Commit
-`5514e21aacb1d31b349bb6dbf0d837393e941e79`.
-Testbranch: `agent/cp2-raydium-lifecycle`.
+Basis dieser Erweiterung: `agent/cp2-raydium-lifecycle`, Commit
+`109620f9ac567bf8424d98366e50c48cf531cc50`.
+Testbranch: `agent/cp2-orca-lifecycle`.
 
 ## Umfang und Grenzen
 
 CP2.1 plant anhand echter Registry-Snapshots und Updates fuer alle beobachteten,
-aktuell zugelassenen Pools. DLMM und DAMM v2 sind bereits angeschlossen;
-diese Erweiterung schliesst **Raydium AMM v4, CPMM und CLMM an dieselbe
-Lifecycle-Instanz** an. Die anderen fuenf Completion-Worker behalten ihre bisherige Steuerung; ihre
+aktuell zugelassenen Pools. DLMM, DAMM v2 und die drei Raydium-Worker sind
+bereits angeschlossen; diese Erweiterung schliesst **Orca Whirlpool an dieselbe
+Lifecycle-Instanz** an. Die anderen vier Completion-Worker behalten ihre bisherige Steuerung; ihre
 Lifecycle-Zusammenfassungen tragen `executing=false`. Keine weiteren Decoder,
 Protokolle, Mint-Regeln oder TVL-Quellen werden umgebaut.
 
@@ -17,12 +17,17 @@ Der Lifecycle liegt in einem Worker, nicht im Core. Der Core enthaelt die
 gemeinsamen Auftrags-/Antwortvertraege. Die Registry bleibt alleiniger
 Pool-State-Writer, PostgreSQL hat weiterhin genau den bestehenden Writer und
 dieselbe Tabelle. Der Lifecycle interpretiert keine protokollspezifische
-Evidence und besitzt keine RPC-Verbindung. Die fuenf angeschlossenen Worker erhalten explizite
+Evidence und besitzt keine RPC-Verbindung. Die sechs angeschlossenen Worker erhalten explizite
 Auftraege; ihre lokalen Scheduler sind entfernt. Auch die Versuchsgrenze ist aus
 ihren Protokoll-Settings entfernt und wird zentral im Lifecycle gesetzt. Es gibt
-eine gemeinsame Registrierung fuer alle fuenf Executor-Receiver und einen gemeinsamen
+eine gemeinsame Registrierung fuer alle sechs Executor-Receiver und einen gemeinsamen
 Antwortkanal. Raydium Stable hat keinen Completion-Worker und ist nicht Teil
 dieser Migration.
+
+Orcas bisherige Sonderwarteschlange fuer Prepared-Evidence v1/v2 ist entfernt.
+Auch diese Pools werden jetzt nach den gemeinsamen Refresh-Terminen neu geprueft;
+der unveraenderte Orca-Pruefpfad erzeugt dabei Evidence v3. Es gibt keine
+Orca-spezifische Faelligkeitsregel oder zweite Upgrade-Steuerung.
 
 Diese Stufe aktualisiert Prepared-Manifeste regelmaessig, fuehrt aber **noch
 keinen Entzug wegen maximalen Pruefalters** ein. Der Graph und seine Logik
@@ -51,6 +56,8 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    und seine vorhandene Manifest-Erstellung. Auch Raydium behaelt seine Decoder,
    Mint-/Vault-/Konfigurationspruefungen und Manifest-Erstellung unveraendert;
    CLMM liest dabei die aktuellen TickArray-/Bitmap-Accounts erneut ein.
+   Orca behaelt Pool-/Mint-/Vault-/Oracle-Pruefungen, gerichtete TickArray-Auswahl
+   und Evidence v3; ein Refresh liest diese Accounts erneut ueber denselben RPC-Transport.
    Ergebnisse werden nach Pool-Adresse den Auftrags-IDs zugeordnet, weil interne
    RPC-Partitionen die Reihenfolge aendern koennen.
 6. Terminale Ergebnisse gehen ueber den bestehenden Ergebnisvertrag zur Registry.
@@ -71,9 +78,9 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    Queue, Auftrags-IDs und transiente Fehlerzaehler sind RAM-Zustand; ihr exakter
    Backoff wird nicht persistiert. Alte Statuswerte werden nicht zurueckgesetzt.
 
-Ein Executor- oder Lifecycle-Fehler ist fuer alle fuenf Anbindungen fail-fast. Es
+Ein Executor- oder Lifecycle-Fehler ist fuer alle sechs Anbindungen fail-fast. Es
 gibt keinen stillen Rueckfall auf den entfernten lokalen Scheduler. Die anderen
-fuenf Worker behalten ihren vorhandenen Supervisor. Beim Stoppen werden neue
+vier Worker behalten ihren vorhandenen Supervisor. Beim Stoppen werden neue
 Auftraege eingestellt und laufende Antworten samt Registry-Uebernahme abgearbeitet.
 
 ## Einstellungen
@@ -101,27 +108,28 @@ der ausgewaehlten Protokolle:
 
 ```powershell
 git fetch origin
-git switch --track origin/agent/cp2-raydium-lifecycle
-.\scripts\completion_lifecycle_live.ps1 -Venue Raydium -DurationSeconds 300 -PoolLimit 16
+git switch --track origin/agent/cp2-orca-lifecycle
+.\scripts\completion_lifecycle_live.ps1 -Venue Orca -DurationSeconds 300 -PoolLimit 16
 ```
 
 Das Skript prueft Checkout/HEAD, baut mit `cargo build --locked --release` und
 verwendet den echten Logger `LIQ_GRAPH_LOG`. Es startet
 `--completion-lifecycle-live`: die ausgewaehlten REST-Quellen und Executor-Worker,
 einen gemeinsamen Lifecycle, Registry, RPC-Transport und PostgreSQL-Writer.
-`-Venue Raydium` prueft die drei Raydium-Worker gemeinsam (Standard).
+`-Venue Orca` prueft Orca Whirlpool allein (Standard).
+`-Venue Raydium` prueft die drei Raydium-Worker gemeinsam.
 `RaydiumAmmV4`, `RaydiumCpmm` und `RaydiumClmm` pruefen sie jeweils einzeln.
-`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle fuenf.
+`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle sechs.
 Es laeuft genau eine gemeinsame Raydium-REST-Quelle, auch mit drei Raydium-Executoren.
-Der Pool-Limit-Wert gilt je Protokoll; Raydium mit 16 bedeutet maximal 48 Pools,
-All maximal 80. Andere Completion-Worker und Graph starten in
+Der Pool-Limit-Wert gilt je Protokoll; Orca mit 16 bedeutet maximal 16 Pools,
+Raydium maximal 48, All maximal 96. Andere Completion-Worker und Graph starten in
 diesem isolierten Lauf nicht. `--run` und die bestehenden Einzelmodi verwenden
 denselben Lifecycle-/Executor-Datenfluss. Im kombinierten endlichen Einzelmodus
 begrenzt `--completion-limit` die Gesamtzahl der Lifecycle-Auftraege aller
 angeschlossener Executor-Worker; es gibt keine getrennten Protokoll-Limits.
 
 Die Auswahl erfolgt ausschliesslich in der Orchestrierung ueber
-`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|all`;
+`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|orca|all`;
 der Lifecycle enthaelt keine Protokoll-Fallunterscheidung und unveraendert dieselben Zeitregeln.
 
 Die erste reale zugelassene Kohorte ist fuer den Lauf fest; unsupported-Pools
@@ -130,6 +138,10 @@ Recheck=45, Retry=5 und Retry-Maximum=30. DLMM und DAMM v2 verwenden dabei
 zwei parallele Batches. Die Raydium-Worker behalten ihre vorhandene technische
 Obergrenze von 16 parallelen Batches und ihre Account-Batchgroessen (AMM v4 bis
 16, CPMM bis 12, CLMM bis 7 Pools, abhaengig von `RPC_ACCOUNT_BATCH_SIZE`).
+Orca behaelt ebenfalls 16 parallele Batches mit bis zu 8 Pools pro Batch
+(`RPC_ACCOUNT_BATCH_SIZE / 12`) und TickArray-Radius 2. Es verwendet die bestehende
+REST-Konfiguration `ORCA_API_RPS` und den gemeinsamen RPC-Transport;
+es kommen keine Orca-spezifischen RPC-Variablen hinzu.
 Die feste reale Kohorte begrenzt zusaetzlich die insgesamt laufenden Pools.
 Der Lauf erzeugt
 keine Testpools, resettet keine Statuswerte und sendet keine Transaktionen.
@@ -167,17 +179,10 @@ Wiederaufnahmen, 142 Prepared-Refreshes und SQL 16/16/0. Dieser Nachweis gilt
 fuer den damaligen Stand. Auf Basiscommit `5514e21` ist auch der gemeinsame
 DLMM-/DAMM-v2-Betrieb live nachgewiesen: 304 akzeptierte und persistierte
 Prepared-Ergebnisse bei 32 Pools, wiederholte Refreshes je Protokoll und
-SQL 32/32/0. Die Raydium-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
-
-Der erste Raydium-Lauf auf `cd2f8d4` belegt Build-Erfolg und 464 von der Registry
-akzeptierte Auftraege: AMM v4 160 Prepared, CPMM 160 Prepared, CLMM 116 Prepared
-und 28 Incomplete-Rechecks. Alle 44 Prepared-Pools wurden mehrfach aktualisiert;
-vier CLMM-Pools blieben Incomplete. Der Lauf scheiterte jedoch beim Shutdown:
-abgetrennte Raydium-Head-Refresh-Tasks hielten Source-Sender offen. Registry und
-Persistenz konnten ihren Abschluss deshalb nicht bestaetigen. Die Head-Refreshs
-gehoeren jetzt einem JoinSet und werden beim Abbruch der Discovery mit beendet.
-Auch der unbenutzte AMM-v4-Import ist entfernt. Fuer diesen Fix ist ein erneuter
-Live-Lauf mit Abschlusszaehlern und anschliessender SQL-Pruefung erforderlich.
+SQL 32/32/0. Der Raydium-Lauf auf `109620f` belegt Build-Erfolg, 408 von Registry
+und Persistenz uebernommene Auftraege (400 Prepared, 8 Incomplete), wiederholte
+Refreshes fuer alle drei Raydium-Protokolle, sauberen Shutdown und SQL 48/48/0.
+Die Orca-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
 
 Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
 Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind
