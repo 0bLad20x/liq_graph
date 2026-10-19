@@ -50,8 +50,10 @@ pub async fn run()->Result<()> {
     let (control,enabled)=watch::channel(true);
     let (prices,price_rx)=broadcast::channel(16384);
     let mut consumer=Task(tokio::spawn(market_state::observe(price_rx,catalog_rx,settings.trace)));
-    let mut worker=Task(tokio::spawn(market_state::run(registry.clone(),updates.subscribe(),rpc,
-        prices,settings,stop_rx,enabled)));
+    // Keep resource roots alive until the producer result has been joined. Otherwise
+    // an errored producer can close the consumer/RPC first and hide its actual error.
+    let mut worker=Task(tokio::spawn(market_state::run(registry.clone(),updates.subscribe(),rpc.clone(),
+        prices.clone(),settings,stop_rx,enabled)));
     updates.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,source:"market_live_restore",
         received_at_ms:0,pools:prepared,persist_identity:Vec::new()}))?;
     let mut registry_task=Task(tokio::spawn(pool_registry::run(source_rx,None,registry.clone(),updates.clone(),done,true)));
@@ -103,6 +105,7 @@ pub async fn run()->Result<()> {
     let _=tokio::join!(&mut dex.0,&mut jupiter.0,&mut qualification.0);
     drop(source);drop(jupiter_out);
     tokio::time::timeout(Duration::from_secs(10),&mut worker.0).await.context("market producer shutdown timeout")???;
+    drop(prices);drop(rpc);
     let report=tokio::time::timeout(Duration::from_secs(10),&mut consumer.0).await.context("market consumer shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(30),&mut registry_task.0).await.context("market Registry shutdown timeout")???;
     drop(updates);

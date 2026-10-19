@@ -18,6 +18,7 @@ The consumer joins prices to the existing generational `WatchCatalog` and report
 - `MARKET_STATE_POOL_LIMIT=1000` by default. `0` removes this pool limit; configured provider/account limits remain in force.
 - Selection is deterministic by unordered mint pair, then address. This keeps pair alternatives together but is not a profitability ranking. It does not guarantee that a capped selection contains every venue or a trade opportunity.
 - The limit counts pools. Required subscriptions count distinct account addresses. Reserve-based venues may require three accounts per pool; shared accounts are deduplicated. Insufficient configured WS capacity fails explicitly with the required and available counts. There is no silent capacity truncation.
+- The initial RPC 5/6 setup uses 24 account subscriptions per provider, 48 total. Use `-PoolLimit 16` for that acceptance run. Raising only the pool limit to 10,000 does not expand provider account capacity. Increase observation scope only with matching configured and provider-permitted capacity.
 - A manifest refresh with unchanged pool identity does not rebuild subscriptions. A changed selection does re-establish a fresh baseline.
 
 ## Output contract
@@ -98,6 +99,8 @@ if ($LASTEXITCODE -ne 0) { throw "Synchronisierung fehlgeschlagen." }
 ```
 
 The script records branch, exact HEAD and working-tree status, runs `cargo build --locked --release`, verifies lockfile hygiene and captures `worker.log`, `checkout.json` and `report.json` under `market_state_live/<UTC timestamp>/`. Default output samples the first 16 baselines, first 16 live pool updates and first 16 unavailable/removal events; counters cover the entire stream. `-TracePrices` prints every event.
+
+Orchestration retains the price sender and RPC handle until the producer result is joined, then releases them for normal consumer/transport shutdown. This prevents an early producer failure from being reported only as an unexpectedly closed consumer or RPC task. A failed startup may have no final `report.json`; inspect the original producer error in `worker.log`.
 
 During startup, expect `mint qualification published qualified=...`, `dexscreener cp1 continuous started=true`, Registry TVL updates, then a non-empty Market-State selection and subscription ACKs. If qualification or proxy initialization produces no usable results, the run must not be accepted merely because it stays alive. `report.json` includes restored Prepared and live TVL counts.
 
