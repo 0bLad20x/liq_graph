@@ -518,7 +518,10 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
     if args.len()==1 && args[0]=="--market-state-live" {
-        return market_state_live::run().await;
+        return market_state_live::run(false).await;
+    }
+    if args.len()==1 && args[0]=="--graph-signals-live" {
+        return market_state_live::run(true).await;
     }
     if args.len() == 1 && args[0] == "--run" {
         return runtime::run().await;

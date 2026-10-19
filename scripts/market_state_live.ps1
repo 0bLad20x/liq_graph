@@ -1,11 +1,18 @@
 param(
     [ValidateRange(30, 86400)][int]$DurationSeconds = 600,
     [ValidateRange(0, 2147483647)][int]$PoolLimit = 1000,
+    [switch]$Signals,
+    [double]$ThresholdBps = 0,
+    [switch]$TraceSignals,
     [switch]$TracePrices,
     [switch]$Rewatch
 )
 
 $ErrorActionPreference = "Stop"
+if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps) -or $ThresholdBps -lt 0) { throw "ThresholdBps must be finite and nonnegative." }
+$label = if ($Signals) { "Graph-Signals" } else { "Market-State" }
+$outputRoot = if ($Signals) { "graph_signals_live" } else { "market_state_live" }
+$runFlag = if ($Signals) { "--graph-signals-live" } else { "--market-state-live" }
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 if ($LASTEXITCODE -ne 0) { throw "Cannot determine branch." }
@@ -15,8 +22,8 @@ $status = git status --short
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect working tree." }
 $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Commit or preserve tracked changes before the live run; nothing was changed by this script." }
-if ($branch -notin @("agent/market-state-stream", "main")) { throw "Use agent/market-state-stream, or main after merge." }
-Write-Host "Market-State branch=$branch head=$head execution=false"
+if ($branch -notin @("agent/market-state-stream", "agent/graph-signals-reference", "main")) { throw "Use a Market-State/Graph-Signals feature branch, or main after merge." }
+Write-Host "$label branch=$branch head=$head signals=$([bool]$Signals) execution=false"
 if ($status) { Write-Host ($status | Out-String) }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed; no live run started." }
@@ -26,13 +33,13 @@ $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Tracked files changed during build; stop and inspect them." }
 
 $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
-$folder = Join-Path (Get-Location) "market_state_live\$stamp"
+$folder = Join-Path (Get-Location) "$outputRoot\$stamp"
 New-Item -ItemType Directory -Path $folder | Out-Null
 $log = Join-Path $folder "worker.log"
 $report = Join-Path $folder "report.json"
 $metadata = Join-Path $folder "checkout.json"
 $utf8 = [System.Text.UTF8Encoding]::new($false)
-$checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch }
+$checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch; signals_enabled = [bool]$Signals; threshold_bps = $ThresholdBps; trace_prices = [bool]$TracePrices; trace_signals = [bool]$TraceSignals }
 [System.IO.File]::WriteAllText($metadata, ($checkout | ConvertTo-Json -Depth 5), $utf8)
 
 $values = @{
@@ -41,6 +48,11 @@ $values = @{
     MARKET_STATE_TRACE = $(if ($TracePrices) { "1" } else { "0" })
     MARKET_STATE_LIVE_REWATCH = $(if ($Rewatch) { "true" } else { "false" })
     MARKET_STATE_REPORT_PATH = $report
+}
+if ($Signals) {
+    $values["GRAPH_SIGNALS_THRESHOLD_BPS"] = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    $values["GRAPH_SIGNALS_SAMPLE_LIMIT"] = "16"
+    $values["GRAPH_SIGNALS_TRACE"] = $(if ($TraceSignals) { "true" } else { "false" })
 }
 # Optional ACK logs demonstrate actual unsubscriptions during a real-pool rewatch.
 if ($Rewatch) {
@@ -60,16 +72,21 @@ try {
     $oldPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $binary --market-state-live 2>&1 | Tee-Object -FilePath $log
+        & $binary $runFlag 2>&1 | Tee-Object -FilePath $log
         $workerExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $oldPreference
     }
-    if ($workerExit -ne 0) { throw "Market-State live run failed (exit $workerExit). Inspect worker.log and report.json if present." }
+    if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Inspect worker.log and report.json if present." }
     if (-not (Test-Path -LiteralPath $report)) { throw "No live evidence report was produced." }
     $evidence = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
     if ($evidence.live_evidence_passed -ne $true) { throw "Live evidence requirements were not fulfilled." }
-    Write-Host "Market-State live evidence passed. Review per-venue coverage in report.json before accepting the checkpoint."
+    if ($Signals) {
+        if ($evidence.signal_calculation_passed -ne $true -or $evidence.signal_candidate_passed -ne $true) { throw "No complete live signal proof; inspect signal_report and worker.log." }
+        Write-Host "Graph-Signals reference live evidence passed. Review per-kind coverage and timing histograms in report.json."
+    } else {
+        Write-Host "Market-State live evidence passed. Review per-venue coverage in report.json before accepting the checkpoint."
+    }
 } finally {
     foreach ($name in $previous.Keys) {
         [Environment]::SetEnvironmentVariable($name, $previous[$name], "Process")
