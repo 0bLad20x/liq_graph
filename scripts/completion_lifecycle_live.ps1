@@ -1,7 +1,7 @@
 param(
     [ValidateRange(60, 86400)][int]$DurationSeconds = 300,
     [ValidateRange(1, 128)][int]$PoolLimit = 16,
-    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "All")][string]$Venue = "Orca"
+    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "All")][string]$Venue = "PancakeSwap"
 )
 
 # Real protocol REST/RPC -> one lifecycle -> Registry -> existing PostgreSQL writer.
@@ -10,8 +10,8 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-orca-lifecycle" -or $tracked) {
-    throw "Use a clean, committed agent/cp2-orca-lifecycle checkout."
+if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-pancakeswap-lifecycle" -or $tracked) {
+    throw "Use a clean, committed agent/cp2-pancakeswap-lifecycle checkout."
 }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed." }
@@ -27,9 +27,10 @@ $selector = switch ($Venue) {
     "RaydiumClmm" { "raydium_clmm" }
     "Raydium" { "raydium" }
     "Orca" { "orca" }
+    "PancakeSwap" { "pancakeswap" }
     "All" { "all" }
 }
-$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7 }
+$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7; PancakeSwapClmm = 8 }
 $requiredVenues = switch ($Venue) {
     "Dlmm" { @("MeteoraDlmm") }
     "DammV2" { @("MeteoraDammV2") }
@@ -39,11 +40,12 @@ $requiredVenues = switch ($Venue) {
     "RaydiumClmm" { @("RaydiumClmm") }
     "Raydium" { @("RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm") }
     "Orca" { @("OrcaWhirlpool") }
-    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool") }
+    "PancakeSwap" { @("PancakeSwapClmm") }
+    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool", "PancakeSwapClmm") }
 }
 $settings = @{
     RUN_DURATION_SECONDS = "$DurationSeconds"
-    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug"
+    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug,completion_pancakeswap_clmm=debug"
     COMPLETION_LIFECYCLE_LIVE_VENUE = $selector
     COMPLETION_LIFECYCLE_POOL_LIMIT = "$PoolLimit"
     COMPLETION_LIFECYCLE_REFRESH_SECONDS = "30"
@@ -103,7 +105,7 @@ if ($text -match 'runtime fatal|level=ERROR|lost [1-9][0-9]* .*batches|completio
 }
 
 # Link this run's last accepted proof per pool to a read-only SQL verification.
-$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
+$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
 $latest = @{}
 $refreshCounts = @{}
 foreach ($match in [regex]::Matches($text, $pattern)) {
