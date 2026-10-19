@@ -502,7 +502,7 @@ pub async fn run()->Result<()>{
     // Price observations are optional. The Registry and graph retain their own eligibility rules.
     let market_enabled=enabled("MARKET_STATE_ENABLED")?;
     let signals_enabled=enabled("GRAPH_SIGNALS_ENABLED")?;
-    ensure!(!signals_enabled || market_enabled,"GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
+    anyhow::ensure!(!signals_enabled || market_enabled,"GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
     let market_control=if market_enabled {
         let settings=market_state::Settings::from_env()?;
         let (control,enabled_rx)=watch::channel(true);
