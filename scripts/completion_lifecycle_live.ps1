@@ -121,8 +121,7 @@ $registered = @($managed[0].Groups[1].Value -split ',\s*')
 if (@(Compare-Object $selectedVenues $registered).Count -ne 0) {
     throw "Lifecycle executor registration differs from the selected protocols; inspect $log"
 }
-if ($Venue -eq "All" -and ($text -notmatch 'module=liq_graph::workers::graph_liquidity complete observed_pool_updates=[1-9][0-9]* '
-    -or $text -notmatch 'liquidity graph consumer complete generations=[1-9][0-9]*')) {
+if ($Venue -eq "All" -and ($text -notmatch 'module=liq_graph::workers::graph_liquidity complete observed_pool_updates=[1-9][0-9]* ' -or $text -notmatch 'liquidity graph consumer complete generations=[1-9][0-9]*')) {
     throw "Missing Graph consumption and completed drain in combined run; inspect $log"
 }
 
