@@ -4,6 +4,7 @@ use std::{env, sync::Arc};
 
 mod runtime;
 mod v10_simulation;
+mod market_state_live;
 
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
@@ -515,6 +516,9 @@ pub async fn run() -> Result<()> {
         ensure!(args.len()==2,"use --v10-wallet KEYPAIR.json");
         println!("{}",crate::workers::execution_v10::Settings::load(std::path::Path::new(&args[1]))?.wallet());
         return Ok(());
+    }
+    if args.len()==1 && args[0]=="--market-state-live" {
+        return market_state_live::run().await;
     }
     if args.len() == 1 && args[0] == "--run" {
         return runtime::run().await;

@@ -28,6 +28,10 @@ pub enum AccountView {
     Slice { offset: usize, length: usize },
 }
 
+/// Requested view of one watched account. No protocol interpretation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountWatch {pub address:Pubkey,pub view:AccountView}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum AccountFilter {
@@ -188,7 +192,10 @@ pub struct RpcHandle {
     targets: watch::Sender<Vec<Pubkey>>,
     events: broadcast::Sender<WsEvent>,
     ws_capacity: usize,
+    account_batch_size: usize,
     capabilities: u64,
+    views:Arc<StdMutex<HashMap<Pubkey,AccountView>>>,
+    ws_messages:Arc<AtomicU64>, ws_text_bytes:Arc<AtomicU64>,
 }
 
 impl RpcHandle {
@@ -200,12 +207,28 @@ impl RpcHandle {
 
     /// One explicit desired account-watch set. Subscriptions are not started at construction.
     pub fn replace_watches(&self, addresses: Vec<Pubkey>) -> Result<()> {
-        let unique:HashSet<Pubkey>=addresses.iter().copied().collect();
-        ensure!(unique.len()==addresses.len(), "duplicate watched account");
-        ensure!(addresses.len()<=self.ws_capacity, "WebSocket subscription capacity exceeded");
-        self.targets.send(addresses).map_err(|_|anyhow!("RPC watch worker stopped"))
+        self.replace_account_watches(addresses.into_iter().map(|address|AccountWatch{address,view:AccountView::Full}).collect())
     }
-
+    pub fn replace_account_watches(&self,watches:Vec<AccountWatch>)->Result<()> {
+        let mut views=HashMap::new();
+        for w in &watches {
+            ensure!(views.insert(w.address,w.view).is_none(),"duplicate watched account");
+            if let AccountView::Slice{offset,length}=w.view {
+                ensure!(length>0 && offset.checked_add(length).is_some(),"invalid watch slice");
+            }
+        }
+        ensure!(watches.len()<=self.ws_capacity,
+            "WebSocket account capacity exceeded: required={} configured={}",watches.len(),self.ws_capacity);
+        *self.views.lock().expect("RPC views lock")=views;
+        self.targets.send(watches.into_iter().map(|w|w.address).collect())
+            .map_err(|_|anyhow!("RPC watch worker stopped"))
+    }
+    pub fn watch_capacity(&self)->usize {self.ws_capacity}
+    pub fn account_batch_size(&self)->usize {self.account_batch_size}
+    /// Text-frame payload bytes, excluding TLS/TCP framing and provider billing rules.
+    pub fn stream_counts(&self)->(u64,u64) {
+        (self.ws_messages.load(Ordering::Relaxed),self.ws_text_bytes.load(Ordering::Relaxed))
+    }
     pub fn subscribe_events(&self) -> broadcast::Receiver<WsEvent> { self.events.subscribe() }
     pub fn supports(&self, operation: &RpcOperation) -> bool {
         self.capabilities & operation.bit() != 0
@@ -421,6 +444,9 @@ fn decode_account(address:Pubkey,value:&Value,view:AccountView)->Result<Option<A
     ensure!(tuple.len()==2 && tuple[1].as_str()==Some("base64"),"unsupported RPC data encoding");
     let bytes=STANDARD.decode(tuple[0].as_str().context("invalid RPC base64 string")?)?;
     let space=value.get("space").and_then(Value::as_u64).map(|n|n as usize);
+    let view=if let AccountView::Slice{length,..}=view {
+        if bytes.len()!=length && space==Some(bytes.len()) && !bytes.is_empty() {AccountView::Full}else{view}
+    }else{view};
     let original_len=match view {
         AccountView::Full=>{
             ensure!(space.is_none_or(|n|n==bytes.len()),"RPC full account length mismatch");
@@ -638,7 +664,10 @@ fn emit(tx:&broadcast::Sender<WsEvent>,event:WsEvent) {
 async fn ws_session(
     name:String,endpoint:String,capacity:usize,spacing_ms:u64,timeout_ms:u64,reconnect_ms:u64,
     commitment:String,mut targets:watch::Receiver<Vec<Pubkey>>,events:broadcast::Sender<WsEvent>,
+    views:Arc<StdMutex<HashMap<Pubkey,AccountView>>>,
+    messages:Arc<AtomicU64>,text_bytes:Arc<AtomicU64>,
 )->Result<()> {
+    let mut slices_enabled=true;
     let mut connected_before=false;
     let mut failures=0_u32;
     loop {
@@ -653,10 +682,7 @@ async fn ws_session(
                 let reason=match &failure {
                     Err(_)=>"connect_timeout",
                     Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
-                        if response.status().as_u16()==429 => {
-                            emit(&events,WsEvent::Gap{provider:name.clone(),reason:"handshake_http_429"});
-                            return Ok(());
-                        }
+                        if response.status().as_u16()==429 => "handshake_http_429",
                     Ok(Err(_))=>"connect_error",
                     Ok(Ok(_))=>unreachable!(),
                 };
@@ -677,6 +703,7 @@ async fn ws_session(
         let mut heartbeat=tokio::time::interval(Duration::from_secs(20));
         heartbeat.tick().await;
         let mut active:HashMap<u64,Pubkey>=HashMap::new();
+        let mut requested_views=HashMap::<Pubkey,AccountView>::new();
         let mut retired:HashSet<u64>=HashSet::new();
         let mut pending:HashMap<u64,Pubkey>=HashMap::new();
         let mut rejected:HashSet<Pubkey>=HashSet::new();
@@ -696,14 +723,18 @@ async fn ws_session(
                 retired.insert(subscription_id);
                 pending_unsub.insert(id,address);
             }
-            let busy:BTreeSet<Pubkey>=active.values().chain(pending.values()).copied().collect();
+            let busy:BTreeSet<Pubkey>=active.values().chain(pending.values()).chain(pending_unsub.values()).copied().collect();
             for address in desired.iter().filter(|address|!busy.contains(address) && !rejected.contains(address))
                 .take(32_usize.saturating_sub(pending.len())).copied().collect::<Vec<_>>() {
                 if active.len()+pending.len()>=capacity {break;}
                 let id=request_id;request_id+=1;
+                let view=if slices_enabled {views.lock().expect("RPC views lock").get(&address).copied().unwrap_or(AccountView::Full)}
+                    else {AccountView::Full};
+                let mut config=json!({"encoding":"base64","commitment":commitment});
+                if let AccountView::Slice{offset,length}=view {config["dataSlice"]=json!({"offset":offset,"length":length});}
+                requested_views.insert(address,view);
                 if ws.send(Message::Text(json!({"jsonrpc":"2.0","id":id,
-                    "method":"accountSubscribe","params":[address.to_string(),
-                    {"encoding":"base64","commitment":commitment}]}).to_string().into()))
+                    "method":"accountSubscribe","params":[address.to_string(),config]}).to_string().into()))
                     .await.is_err(){break 'connected;}
                 pending.insert(id,address);
                 if spacing_ms>0 {sleep(Duration::from_millis(spacing_ms)).await;}
@@ -717,6 +748,9 @@ async fn ws_session(
                 update=targets.changed()=>{
                     if update.is_err(){return Ok(());}
                     desired=targets.borrow().iter().copied().collect();
+                    let changed={let current=views.lock().expect("RPC views lock");
+                        slices_enabled && requested_views.iter().any(|(a,v)|desired.contains(a) && current.get(a)!=Some(v))};
+                    if changed {break 'connected;}
                     rejected.retain(|address|desired.contains(address));
                 }
                 _=sleep(Duration::from_millis(timeout_ms)), if !pending.is_empty()=>{
@@ -730,21 +764,32 @@ async fn ws_session(
                         Some(Ok(_))=>continue,
                         _=>break 'connected,
                     };
+                    messages.fetch_add(1,Ordering::Relaxed);
+                    text_bytes.fetch_add(message.len() as u64,Ordering::Relaxed);
                     let value:Value=match serde_json::from_str(&message) {
                         Ok(v)=>v,Err(_)=>break 'connected,
                     };
                     if let Some(id)=value.get("id").and_then(Value::as_u64) {
                         if let Some(address)=pending.remove(&id) {
                             if let Some(code)=value.pointer("/error/code").and_then(Value::as_i64) {
-                                rejected.insert(address);
-                                emit(&events,WsEvent::Rejected{provider:name.clone(),address,code});
-                                emit(&events,WsEvent::Gap{provider:name.clone(),reason:"subscribe_rejected"});
+                                if slices_enabled && matches!(code,-32600|-32602)
+                                    && matches!(requested_views.get(&address),Some(AccountView::Slice{..})) {
+                                    slices_enabled=false;
+                                    emit(&events,WsEvent::Gap{provider:name.clone(),reason:"slice_rejected_retry_full"});
+                                } else {
+                                    rejected.insert(address);
+                                    emit(&events,WsEvent::Rejected{provider:name.clone(),address,code});
+                                    emit(&events,WsEvent::Gap{provider:name.clone(),reason:"subscribe_rejected"});
+                                }
+                                break 'connected;
                             }else if let Some(subscription)=value.get("result").and_then(Value::as_u64) {
                                 active.insert(subscription,address);
+                                crate::log_event!(Debug,"rpc websocket provider={name} subscribed={address} subscription={subscription}");
                                 emit(&events,WsEvent::Subscribed{provider:name.clone(),address});
                             }else {break 'connected;}
                         } else if let Some(address)=pending_unsub.remove(&id) {
                             if value.get("result").and_then(Value::as_bool)==Some(true) {
+                                crate::log_event!(Debug,"rpc websocket provider={name} unsubscribed={address}");
                                 emit(&events,WsEvent::Unsubscribed{provider:name.clone(),address});
                             } else {
                                 emit(&events,WsEvent::Gap{provider:name.clone(),reason:"unsubscribe_rejected"});
@@ -766,7 +811,7 @@ async fn ws_session(
                             .context("WS notification missing slot")?;
                         let item=value.pointer("/params/result/value")
                             .context("WS notification missing value")?;
-                        Ok((slot,decode_account(address,item,AccountView::Full)?))
+                        Ok((slot,decode_account(address,item,requested_views.get(&address).copied().unwrap_or(AccountView::Full))?))
                     })();
                     match decoded {
                         Ok((slot,payload))=>emit(&events,WsEvent::Account{
@@ -791,7 +836,8 @@ async fn ws_session(
 }
 
 async fn ws_run(settings:Vec<WsSettings>,commitment:String,mut targets:watch::Receiver<Vec<Pubkey>>,
-    events:broadcast::Sender<WsEvent>)->Result<()> {
+    events:broadcast::Sender<WsEvent>,views:Arc<StdMutex<HashMap<Pubkey,AccountView>>>,
+    messages:Arc<AtomicU64>,text_bytes:Arc<AtomicU64>)->Result<()> {
     let mut sockets=Vec::new();
     for provider in settings {
         let mut remaining=provider.max_subscriptions;
@@ -803,8 +849,9 @@ async fn ws_run(settings:Vec<WsSettings>,commitment:String,mut targets:watch::Re
             let name=format!("{}/socket-{}",provider.name,index+1);
             let events=events.clone();let commitment=commitment.clone();let endpoint=provider.url.clone();
             let spacing=provider.spacing_ms;let timeout=provider.timeout_ms;let reconnect=provider.reconnect_ms;
+            let views=views.clone();let messages=messages.clone();let text_bytes=text_bytes.clone();
             let handle=tokio::spawn(async move{
-                ws_session(name,endpoint,capacity,spacing,timeout,reconnect,commitment,rx,events).await
+                ws_session(name,endpoint,capacity,spacing,timeout,reconnect,commitment,rx,events,views,messages,text_bytes).await
             });
             sockets.push((capacity,tx,handle));
         }
@@ -836,7 +883,7 @@ async fn ws_run(settings:Vec<WsSettings>,commitment:String,mut targets:watch::Re
         }
         assignments=next;
         for ((_,tx,_),group) in sockets.iter().zip(groups) {
-            if *tx.borrow()!=group {tx.send(group).ok();}
+            tx.send(group).ok();
         }
         if targets.changed().await.is_err(){break;}
     }
@@ -850,11 +897,14 @@ pub fn spawn(settings:Settings)->Result<(RpcHandle,JoinHandle<Result<()>>)> {
     let (events,_)=broadcast::channel(4096);
     let capacity=settings.ws.iter().map(|cfg|cfg.max_subscriptions).sum();
     let capabilities=settings.http.iter().fold(0_u64,|mask,cfg|mask|cfg.capabilities);
-    let handle=RpcHandle{requests:tx,targets:watch_tx,events:events.clone(),ws_capacity:capacity,capabilities};
+    let views=Arc::new(StdMutex::new(HashMap::new()));
+    let messages=Arc::new(AtomicU64::new(0));let text_bytes=Arc::new(AtomicU64::new(0));
+    let handle=RpcHandle{requests:tx,targets:watch_tx,events:events.clone(),ws_capacity:capacity,account_batch_size:settings.account_batch_size,capabilities,
+        views:views.clone(),ws_messages:messages.clone(),ws_text_bytes:text_bytes.clone()};
     let task=tokio::spawn(async move {
         let commitment=settings.commitment.clone();
         let ws=settings.ws.clone();
-        let ws_task=tokio::spawn(ws_run(ws,commitment,watch_rx,events));
+        let ws_task=tokio::spawn(ws_run(ws,commitment,watch_rx,events,views,messages,text_bytes));
         let result=http_run(settings,rx).await;
         ws_task.abort();
         let _=ws_task.await;
