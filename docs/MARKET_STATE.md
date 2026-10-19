@@ -114,4 +114,26 @@ To exercise removal and resubscription using the same real pools:
 
 At half-time this disables observations for six seconds and enables them again. It does not alter Registry states or invent a pool update. The run requires reselection, removals and subsequent WS prices; `rpc_transport` debug ACK logs additionally expose actual `unsubscribed=...` and `subscribed=...` responses. This verifies observation-control removal, not a live Prepared-to-Incomplete transition. That transition uses the same production selection reconciliation but needs a real Registry lifecycle event for a separate live proof.
 
-A build is only a prerequisite. The user successfully built committed `9364b64` with `cargo build --locked --release`; its live run exposed the missing standalone admission wiring (23,722 persisted Prepared pools, zero admitted identities). The follow-up corrects orchestration using the existing admission producers. This follow-up still needs its own build/live evidence; no Cargo or real credentials are available in the implementation environment. Accept this checkpoint only after reviewing the actual live report/logs.
+## Confirmed live acceptance
+
+The user supplied a successful 600-second `-PoolLimit 16 -Rewatch` run and its `checkout.json`, identifying branch `agent/market-state-stream`, application commit `9ed2e8fa20a4a3fffa967a0af341e135f406cbcd`. The recorded checkout contains only untracked local tools; no tracked modifications are recorded. The live script enforces `cargo build --locked --release` and an unchanged lockfile before starting the worker. This is user-local build/live evidence, not a build performed in the implementation environment.
+
+| Evidence | Result |
+|---|---|
+| Final result | `live_evidence_passed=true`, `error=null`, regular shutdown |
+| Watched pools / active accounts | 16 / 32 |
+| Price observations | 138: 32 baseline observations across both phases, 106 WS observations |
+| WS pool coverage | 7 pools |
+| WS venue coverage | Meteora DLMM 36, Raydium AMM V4 36, Raydium CLMM 6, Raydium CPMM 28 |
+| Actual unsubscribe ACKs | 32: 16 on each of RPC 5 and 6 |
+| Actual subscribe ACKs after re-enable | 32: 16 on each of RPC 5 and 6 |
+| Actual WS observations after re-enable | 78, derived from cumulative counters: 106 final minus 28 before the pause |
+| Maximum price-covered Direct2 pairs | 3; 2 included a real WS observation |
+| Unavailable pools / Registry lag | 0 / 0 |
+| Final fresh TVL / admitted Prepared | 13,441 / 5,075 |
+
+Observation control was disabled at `1792447093773` ms and enabled at `1792447099776` ms. During that pause the consumer had zero prices and the transport had zero active accounts. New baselines and WS price observations followed re-enable. The run completed at `1792447397053` ms. The supplied log excerpt is `Eingefügter Text(20261019-220540).txt` (SHA-256: `33411d18954a4bb95df77e4d116b45b3f883a9b169f9839658df543baca9bdc8`). The separate user-supplied checkout metadata binds this run to the exact application commit above.
+
+This accepts the shared Registry -> RPC accounts -> normalized price stream -> graph-catalog consumer flow and the controlled subscription lifecycle for the observed scope. Other protocol decoders, a real network-disconnect recovery, a real Prepared-to-Incomplete withdrawal, larger observation sets and the complete production `--run` composition remain outside this live proof. There is no claim of arbitrage detection or execution handoff.
+
+Known diagnostic defect: `post_rewatch_websocket_observations` reports 106 because the initial empty startup selection activates its rewatch counter. The correct post-rewatch count is 78, independently established from the ACK timeline and cumulative counters above. This is tracked in [issue #34](https://github.com/0bLad20x/liq_graph/issues/34). Acceptance uses that actual timeline. Application code is kept at the live-tested version; this acceptance record changes documentation only.
