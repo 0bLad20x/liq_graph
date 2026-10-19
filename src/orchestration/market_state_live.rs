@@ -36,7 +36,9 @@ pub async fn run(signals_enabled:bool)->Result<()> {
     let registry=pool_registry::PoolRegistry::default();
     let count=registry.restore(restored)?;
     drop(database);
-    let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+    let rpc_settings=rpc_transport::settings_from_env()?;
+    let websocket_plan=rpc_settings.websocket_plan()?;
+    let (rpc,rpc_task)=rpc_transport::spawn(rpc_settings)?;
     let mut rpc_task=Task(rpc_task);
     let (updates,_)=broadcast::channel::<Arc<PoolUpdateBatch>>(256);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
@@ -145,6 +147,7 @@ pub async fn run(signals_enabled:bool)->Result<()> {
         "signal_calculation_passed":signal_report.as_ref().map(|r|r.ensure_calculation_evidence().is_ok()),
         "signal_candidate_passed":signal_report.as_ref().map(|r|r.ensure_live_evidence().is_ok()),
         "signal_report":signal_report,"execution":false,
+        "websocket_plan":websocket_plan,
         "error":result.as_ref().err().map(|e|format!("{e:#}"))});
     println!("{}",serde_json::to_string(&evidence)?);
     if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH") {

@@ -506,6 +506,11 @@ pub async fn run() -> Result<()> {
     core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.len()==1 && args[0]=="--rpc-ws-plan" {
+        let settings=rpc_transport::settings_from_env()?;
+        println!("{}",serde_json::to_string(&settings.websocket_plan()?)?);
+        return Ok(());
+    }
     if args.first().map(String::as_str)==Some("--v10-simulate") {
         ensure!(args.len()==4 && args[2]=="--wallet",
             "use --v10-simulate REQUEST.json --wallet KEYPAIR.json");

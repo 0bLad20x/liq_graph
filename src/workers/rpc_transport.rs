@@ -245,13 +245,39 @@ struct HttpSettings {
 }
 #[derive(Clone, Debug)]
 struct WsSettings {
-    name:String, url:String, max_connections:usize, max_subscriptions:usize,
+    index:usize, name:String, url:String, max_connections:usize, max_subscriptions:usize,
     per_connection:usize, spacing_ms:u64, timeout_ms:u64, reconnect_ms:u64,
 }
 #[derive(Clone, Debug)]
 pub struct Settings {
     http:Vec<HttpSettings>, ws:Vec<WsSettings>, commitment:String,
     account_batch_size:usize, v2_page_limit:usize,
+    ws_selection:String, ws_account_budget:Option<usize>,
+}
+
+/// Read-only effective transport configuration. Never includes endpoint URLs or credentials.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WsProviderPlan {
+    pub index:usize, pub name:String, pub max_connections:usize, pub max_subscriptions:usize,
+    pub subscriptions_per_connection:usize, pub subscribe_spacing_ms:u64,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WsPlan {
+    pub selection:String, pub account_capacity:usize, pub socket_count:usize,
+    pub test_account_budget:Option<usize>, pub providers:Vec<WsProviderPlan>,
+}
+impl Settings {
+    pub fn websocket_plan(&self)->Result<WsPlan> {
+        let account_capacity=self.ws.iter().try_fold(0_usize,|sum,p|
+            sum.checked_add(p.max_subscriptions).context("WebSocket account capacity overflow"))?;
+        let socket_count=self.ws.iter().try_fold(0_usize,|sum,p|
+            sum.checked_add(p.max_subscriptions.div_ceil(p.per_connection))
+                .context("WebSocket socket count overflow"))?;
+        Ok(WsPlan{selection:self.ws_selection.clone(),account_capacity,socket_count,
+            test_account_budget:self.ws_account_budget,providers:self.ws.iter().map(|p|WsProviderPlan{
+                index:p.index,name:p.name.clone(),max_connections:p.max_connections,max_subscriptions:p.max_subscriptions,
+                subscriptions_per_connection:p.per_connection,subscribe_spacing_ms:p.spacing_ms}).collect()})
+    }
 }
 
 fn valid_commitment(s:&str)->bool {
@@ -285,6 +311,23 @@ pub fn configured()->bool {
 }
 
 pub fn settings_from_env()->Result<Settings> {
+    let requested=env::var("RPC_WS_PROVIDER_SELECTION").unwrap_or_else(|_|"configured".into());
+    let requested=requested.trim().to_ascii_lowercase();
+    let mut selected=BTreeSet::new();
+    if requested!="configured" && requested!="all" {
+        ensure!(!requested.is_empty(),"RPC_WS_PROVIDER_SELECTION must be Configured, All or comma-separated provider indices");
+        for item in requested.split(',') {
+            let index:usize=item.trim().parse().context("invalid RPC_WS_PROVIDER_SELECTION index")?;
+            ensure!(index>0 && selected.insert(index),"RPC_WS_PROVIDER_SELECTION requires distinct positive indices");
+        }
+    }
+    let ws_selection=if selected.is_empty(){requested.clone()}else{
+        selected.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")};
+    let ws_budget:usize=var("RPC_WS_ACCOUNT_BUDGET",0)?;
+    let connections_override:usize=var("RPC_WS_CONNECTIONS_PER_PROVIDER",0)?;
+    ensure!(connections_override<=64 && (connections_override==0 || ws_budget>0),
+        "RPC_WS_CONNECTIONS_PER_PROVIDER must be 0..64; a nonzero value requires RPC_WS_ACCOUNT_BUDGET");
+    let mut selected_found=BTreeSet::new();
     let mut indices=BTreeSet::new();
     for (key,_) in env::vars() {
         if let Some(rest)=key.strip_prefix("RPC_") {
@@ -331,10 +374,15 @@ pub fn settings_from_env()->Result<Settings> {
         }
         if let Some(endpoint)=ws_url {
             ensure!(ws_urls.insert(endpoint.clone()),"duplicate RPC WS URL");
-            if flag(&format!("{prefix}WS_ACCOUNT_SUBSCRIBE"),false)? {
-                let connections:usize=var(&format!("{prefix}WS_MAX_CONNECTIONS"),1)?;
-                let maximum:usize=var(&format!("{prefix}WS_MAX_SUBSCRIPTIONS"),1)?;
-                let per_connection:usize=var(&format!("{prefix}WS_SUBSCRIPTIONS_PER_CONNECTION"),1)?;
+            let enabled=match requested.as_str(){"configured"=>flag(&format!("{prefix}WS_ACCOUNT_SUBSCRIBE"),false)?,
+                "all"=>true,_=>selected.contains(&index)};
+            if enabled {
+                selected_found.insert(index);
+                let connections:usize=if connections_override>0 {connections_override}
+                    else{var(&format!("{prefix}WS_MAX_CONNECTIONS"),1)?};
+                // An explicit aggregate test budget is distributed after all selected providers are known.
+                let maximum:usize=if ws_budget>0 {1}else{var(&format!("{prefix}WS_MAX_SUBSCRIPTIONS"),1)?};
+                let per_connection:usize=if ws_budget>0 {1}else{var(&format!("{prefix}WS_SUBSCRIPTIONS_PER_CONNECTION"),1)?};
                 let spacing_ms:u64=var(&format!("{prefix}WS_SUBSCRIBE_SPACING_MS"),10)?;
                 let timeout_ms:u64=var(&format!("{prefix}WS_TIMEOUT_MS"),45000)?;
                 let reconnect_ms:u64=var(&format!("{prefix}WS_RECONNECT_MS"),1000)?;
@@ -342,9 +390,22 @@ pub fn settings_from_env()->Result<Settings> {
                     && connections.checked_mul(per_connection).is_some_and(|n|n>=maximum)
                     && timeout_ms>0 && reconnect_ms>0,
                     "invalid WebSocket limits for provider {name}");
-                ws.push(WsSettings{name,url:endpoint,max_connections:connections,max_subscriptions:maximum,
+                ws.push(WsSettings{index,name,url:endpoint,max_connections:connections,max_subscriptions:maximum,
                     per_connection,spacing_ms,timeout_ms,reconnect_ms});
             }
+        }
+    }
+    if !selected.is_empty() {
+        let missing:Vec<_>=selected.difference(&selected_found).copied().collect();
+        ensure!(missing.is_empty(),"selected WebSocket providers have no configured WS_URL: {missing:?}");
+    }
+    if ws_budget>0 {
+        ensure!(!ws.is_empty(),"RPC_WS_ACCOUNT_BUDGET requires at least one selected WebSocket provider");
+        ensure!(ws_budget>=ws.len(),"RPC_WS_ACCOUNT_BUDGET must cover at least one account per selected provider");
+        let count=ws.len();
+        for (i,p) in ws.iter_mut().enumerate() {
+            p.max_subscriptions=ws_budget/count+usize::from(i<ws_budget%count);
+            p.per_connection=p.max_subscriptions.div_ceil(p.max_connections);
         }
     }
     ensure!(!http.is_empty() || !ws.is_empty(),"no usable RPC HTTP or WS provider configured");
@@ -354,7 +415,8 @@ pub fn settings_from_env()->Result<Settings> {
     let v2_page_limit:usize=var("RPC_V2_PAGE_LIMIT",5000)?;
     ensure!((1..=100).contains(&account_batch_size),"invalid RPC_ACCOUNT_BATCH_SIZE");
     ensure!((1..=5000).contains(&v2_page_limit),"invalid RPC_V2_PAGE_LIMIT");
-    Ok(Settings{http,ws,commitment,account_batch_size,v2_page_limit})
+    Ok(Settings{http,ws,commitment,account_batch_size,v2_page_limit,ws_selection,
+        ws_account_budget:(ws_budget>0).then_some(ws_budget)})
 }
 
 struct HttpProvider {
@@ -892,10 +954,12 @@ async fn ws_run(settings:Vec<WsSettings>,commitment:String,mut targets:watch::Re
 }
 
 pub fn spawn(settings:Settings)->Result<(RpcHandle,JoinHandle<Result<()>>)> {
+    let ws_plan=settings.websocket_plan()?;
+    crate::log_event!(Info,"rpc websocket effective_plan={}",serde_json::to_string(&ws_plan)?);
     let (tx,rx)=mpsc::channel(256);
     let (watch_tx,watch_rx)=watch::channel(Vec::new());
     let (events,_)=broadcast::channel(4096);
-    let capacity=settings.ws.iter().map(|cfg|cfg.max_subscriptions).sum();
+    let capacity=ws_plan.account_capacity;
     let capabilities=settings.http.iter().fold(0_u64,|mask,cfg|mask|cfg.capabilities);
     let views=Arc::new(StdMutex::new(HashMap::new()));
     let messages=Arc::new(AtomicU64::new(0));let text_bytes=Arc::new(AtomicU64::new(0));

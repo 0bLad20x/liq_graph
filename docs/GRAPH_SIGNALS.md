@@ -79,7 +79,39 @@ The small entry script delegates to `market_state_live.ps1 -Signals`, sharing ch
 
 `signal_calculation_passed` requires complete route calculations triggered by real WebSocket observations. `signal_candidate_passed` additionally requires a real WebSocket-triggered positive candidate to reach the consumer. Overall `live_evidence_passed` requires these and the existing Market-State evidence. If the market produces no candidate above the configured threshold, arithmetic can be demonstrated while candidate delivery remains unproven; the report states that distinction and the script does not claim full acceptance. Early task failures may have only a worker log, rather than a completed report.
 
-Inspect `websocket_scored_by_kind`: a Direct2 observation does not prove the other three forms. Large pool-count performance, unobserved protocol decoders, production-wide runtime composition and the future execution handoff require their own real evidence. Build and live acceptance of this new branch are pending until the local run succeeds.
+Inspect `websocket_scored_by_kind`: a Direct2 observation does not prove the other three forms. Large pool-count performance, unobserved protocol decoders, production-wide runtime composition and the future execution handoff require their own real evidence.
+
+The uploaded 600-second run at `2ecb489ad28f8474d23695e17eed08329fd3ba94` established the Direct2 dataflow with 16 selected pools, 32 active accounts, 17 WebSocket price events, 34 complete WebSocket-triggered route calculations and 17 WebSocket-triggered candidates at the consumer. All 64 printed route calculations were independently recomputed without a mismatch. The other three route shapes were not price-covered. This is the baseline evidence; the expanded provider configuration below still requires its own local build and live run.
+
+## Larger observation scope and provider selection
+
+The existing transport remains the sole owner of RPC configuration. The script exposes these options for both Market-State and Graph-Signals; values are temporary process overrides and are restored after the run:
+
+| Option | Meaning |
+| --- | --- |
+| `-WsProviders Configured` | Default. Only providers with `RPC_N_WS_ACCOUNT_SUBSCRIBE=true`; original per-provider capacities apply without a budget override. |
+| `-WsProviders All` | Select every configured, nonempty `RPC_N_WS_URL`, including providers whose account flag is false. This requests account subscriptions; it does not prove endpoint support. |
+| `-WsProviders "5,6"` | Select only these WebSocket provider indices and require their WS URLs to exist. The individual account flags are overridden for selection. |
+| `-WsAccountBudget 30000` | Explicit aggregate **local test** account budget, shared evenly across selected providers in index order. Overrides their configured account/per-connection capacities for this run. Default 0 preserves per-provider capacities. |
+| `-WsConnectionsPerProvider 1` | Connection limit per selected provider for an explicit account budget. Default 0 preserves each provider's configured connection count; per-connection capacity is calculated from its budget share. |
+| `-PlanOnly` | After the locked build, resolve and save configuration without opening RPC connections or reading the database. |
+
+The corresponding normal-runtime environment keys are `RPC_WS_PROVIDER_SELECTION` (`configured`, `all` or comma-separated indices), `RPC_WS_ACCOUNT_BUDGET` (default 0) and `RPC_WS_CONNECTIONS_PER_PROVIDER` (default 0). Without these overrides the original RPC configuration behavior is retained. HTTP reads continue to use the existing eligible HTTP providers, independently of WebSocket selection. Subscription pacing, timeouts and reconnect settings remain per provider.
+
+Before every live run, `--rpc-ws-plan` resolves the configuration through the same Rust transport parser that the actual runner uses. The script prints index/name/socket/account limits and saves `websocket_plan.json`; the plan is also included in `checkout.json` and the final `report.json`. No endpoint URL or access key is serialized. The plan describes eligibility and local capacity, not successful subscription ACKs; those are measured during the live run.
+
+For the previously used RPC 5/6, a 10,000-pool test can be requested as follows:
+
+```powershell
+.\scripts\graph_signals_live.ps1 -DurationSeconds 600 -PoolLimit 10000 -ThresholdBps 0 `
+    -WsProviders "5,6" -WsAccountBudget 30000 -WsConnectionsPerProvider 1
+```
+
+This sets a local capacity of 15,000 accounts on one socket per selected provider. It is not a verified OrbitFlare service limit. To distribute the same aggregate test budget across every configured WS endpoint, replace `"5,6"` with `All`. To inspect either plan first without subscriptions, append `-PlanOnly`.
+
+Pool count is an upper bound. The runner selects only pools currently admitted by the existing Registry; it does not create additional Prepared pools or bypass admission. Thirty thousand distinct account slots cover the current maximum of three price accounts per selected pool at a 10,000-pool limit, before shared-account deduplication. Only actual selected accounts are subscribed. Providers can reject subscriptions or throttle connections; local budgets do not change their service limits. No automatic migration from a permanently unavailable provider is introduced, and unavailable providers can prevent complete observation coverage.
+
+The route reference calculation, complete enumeration and existing loss detection are unchanged. New multi-hop coverage is accepted only when the corresponding `websocket_scored_by_kind` counters are positive and the real calculation evidence is present. The local plan does not establish throughput or successful large-scope operation.
 
 ## Normal runtime
 

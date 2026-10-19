@@ -5,6 +5,10 @@ param(
     [double]$ThresholdBps = 0,
     [switch]$TraceSignals,
     [switch]$TracePrices,
+    [string]$WsProviders = "Configured",
+    [ValidateRange(0, 2147483647)][int]$WsAccountBudget = 0,
+    [ValidateRange(0, 64)][int]$WsConnectionsPerProvider = 0,
+    [switch]$PlanOnly,
     [switch]$Rewatch
 )
 
@@ -39,7 +43,7 @@ $log = Join-Path $folder "worker.log"
 $report = Join-Path $folder "report.json"
 $metadata = Join-Path $folder "checkout.json"
 $utf8 = [System.Text.UTF8Encoding]::new($false)
-$checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch; signals_enabled = [bool]$Signals; threshold_bps = $ThresholdBps; trace_prices = [bool]$TracePrices; trace_signals = [bool]$TraceSignals }
+$checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch; signals_enabled = [bool]$Signals; threshold_bps = $ThresholdBps; trace_prices = [bool]$TracePrices; trace_signals = [bool]$TraceSignals; ws_providers = $WsProviders; ws_account_budget = $WsAccountBudget; ws_connections_per_provider = $WsConnectionsPerProvider; plan_only = [bool]$PlanOnly }
 [System.IO.File]::WriteAllText($metadata, ($checkout | ConvertTo-Json -Depth 5), $utf8)
 
 $values = @{
@@ -48,6 +52,9 @@ $values = @{
     MARKET_STATE_TRACE = $(if ($TracePrices) { "1" } else { "0" })
     MARKET_STATE_LIVE_REWATCH = $(if ($Rewatch) { "true" } else { "false" })
     MARKET_STATE_REPORT_PATH = $report
+    RPC_WS_PROVIDER_SELECTION = $WsProviders
+    RPC_WS_ACCOUNT_BUDGET = "$WsAccountBudget"
+    RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
 }
 if ($Signals) {
     $values["GRAPH_SIGNALS_THRESHOLD_BPS"] = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
@@ -68,6 +75,20 @@ try {
     Write-Host "Report: $report"
     Write-Host "Log:    $log"
     $binary = Join-Path (Get-Location) "target\release\liq_graph.exe"
+    # The binary loads .env and resolves the same transport configuration as the live run.
+    # This mode opens no RPC connection and reads no database; URLs/credentials are omitted.
+    $planText = & $binary --rpc-ws-plan
+    if ($LASTEXITCODE -ne 0) { throw "WebSocket configuration is invalid; no live run started." }
+    $plan = ($planText -join [Environment]::NewLine) | ConvertFrom-Json
+    $planPath = Join-Path $folder "websocket_plan.json"
+    [System.IO.File]::WriteAllText($planPath, ($plan | ConvertTo-Json -Depth 8), $utf8)
+    $checkout["websocket_plan"] = $plan
+    [System.IO.File]::WriteAllText($metadata, ($checkout | ConvertTo-Json -Depth 10), $utf8)
+    Write-Host "WebSocket selection=$($plan.selection) account_capacity=$($plan.account_capacity) sockets=$($plan.socket_count)"
+    $plan.providers | Format-Table index, name, max_connections, max_subscriptions, subscriptions_per_connection | Out-Host
+    if ($WsAccountBudget -gt 0) { Write-Host "The explicit account budget is a local test setting; provider acceptance is measured by the live run." }
+    if ($PlanOnly) { Write-Host "Plan only: $planPath. No RPC subscriptions or database reads were started."; return }
+    if ($plan.account_capacity -le 0) { throw "No WebSocket account providers selected. Use Configured flags, All, or explicit indices." }
     # stderr contains ordinary Rust log lines. Do not interpret those as PowerShell errors.
     $oldPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
