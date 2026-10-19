@@ -1,7 +1,7 @@
 param(
     [ValidateRange(60, 86400)][int]$DurationSeconds = 300,
     [ValidateRange(1, 128)][int]$PoolLimit = 16,
-    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "Byreal", "PumpSwap", "All")][string]$Venue = "PumpSwap"
+    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "Byreal", "PumpSwap", "Manifest", "All")][string]$Venue = "Manifest"
 )
 
 # Real protocol REST/RPC -> one lifecycle -> Registry -> existing PostgreSQL writer.
@@ -10,8 +10,8 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-pumpswap-lifecycle" -or $tracked) {
-    throw "Use a clean, committed agent/cp2-pumpswap-lifecycle checkout."
+if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-manifest-lifecycle" -or $tracked) {
+    throw "Use a clean, committed agent/cp2-manifest-lifecycle checkout."
 }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed." }
@@ -30,9 +30,10 @@ $selector = switch ($Venue) {
     "PancakeSwap" { "pancakeswap" }
     "Byreal" { "byreal" }
     "PumpSwap" { "pumpswap" }
+    "Manifest" { "manifest" }
     "All" { "all" }
 }
-$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7; PancakeSwapClmm = 8; ByrealClmm = 9; PumpSwap = 11 }
+$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7; PancakeSwapClmm = 8; ByrealClmm = 9; Manifest = 10; PumpSwap = 11 }
 $requiredVenues = switch ($Venue) {
     "Dlmm" { @("MeteoraDlmm") }
     "DammV2" { @("MeteoraDammV2") }
@@ -45,11 +46,12 @@ $requiredVenues = switch ($Venue) {
     "PancakeSwap" { @("PancakeSwapClmm") }
     "Byreal" { @("ByrealClmm") }
     "PumpSwap" { @("PumpSwap") }
-    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool", "PancakeSwapClmm", "ByrealClmm", "PumpSwap") }
+    "Manifest" { @("Manifest") }
+    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool", "PancakeSwapClmm", "ByrealClmm", "Manifest", "PumpSwap") }
 }
 $settings = @{
     RUN_DURATION_SECONDS = "$DurationSeconds"
-    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug,completion_pancakeswap_clmm=debug,completion_byreal_clmm=debug,completion_pumpswap=debug"
+    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug,completion_pancakeswap_clmm=debug,completion_byreal_clmm=debug,completion_manifest=debug,completion_pumpswap=debug"
     COMPLETION_LIFECYCLE_LIVE_VENUE = $selector
     COMPLETION_LIFECYCLE_POOL_LIMIT = "$PoolLimit"
     COMPLETION_LIFECYCLE_REFRESH_SECONDS = "30"
@@ -115,7 +117,7 @@ if ($requiredVenues -contains "PumpSwap") {
     if (-not $walletRecord.Success) { throw "Missing configured PumpSwap wallet in $log" }
     $pumpWallet = $walletRecord.Groups[1].Value
 }
-$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|PumpSwap) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
+$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|Manifest|PumpSwap) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
 $latest = @{}
 $refreshCounts = @{}
 foreach ($match in [regex]::Matches($text, $pattern)) {

@@ -1,5 +1,5 @@
 //! Production task supervision and wiring. No DEX logic in the orchestrator.
-use std::{env, future::Future, io::{self, BufRead}, pin::Pin, sync::Arc, time::Duration};
+use std::{env, future::Future, io::{self, BufRead}, sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
 use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, PoolState,
@@ -113,50 +113,6 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     let _=stop.changed().await;
     Ok(())
 }
-fn candidates(registry:&pool_registry::PoolRegistry,venue:Venue)->Vec<PoolState>{
-    registry.snapshot().into_iter().filter(|p|p.venue==venue
-        && p.mint_a.is_some()&&p.mint_b.is_some()
-        && p.completion_state!=CompletionState::Prepared).collect()
-}
-type CompletionRun=Pin<Box<dyn Future<Output=Result<()>>+Send>>;
-// A restarted completion gets a fresh Registry snapshot plus subsequent live updates;
-// no global replay to unrelated consumers. The feed fails loudly on broadcast lag.
-async fn completion_feed(
-    venue:Venue,seed:Vec<PoolState>,mut live:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    ready:Option<oneshot::Sender<()>>,
-    run:impl FnOnce(broadcast::Receiver<Arc<PoolUpdateBatch>>)->CompletionRun,
-)->Result<()>{
-    let (tx,rx)=broadcast::channel::<Arc<PoolUpdateBatch>>(256);
-    if !seed.is_empty(){
-        tx.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,
-            source:"persistence_restore",received_at_ms:0,
-            pools:seed,persist_identity:Vec::new()}))
-            .map_err(|_|anyhow!("completion startup has no receiver"))?;
-    }
-    let mut relay=AbortOnDrop(tokio::spawn(async move{
-        loop {
-            match live.recv().await{
-                Ok(batch)=>{
-                    if batch.pools.iter().any(|p|p.venue==venue){
-                        tx.send(batch).map_err(|_|anyhow!("completion feed receiver closed"))?;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n))=>
-                    bail!("completion feed venue={venue:?} lost {n} batches"),
-                Err(broadcast::error::RecvError::Closed)=>return Ok(()),
-            }
-        }
-    }));
-    if let Some(ready)=ready{let _=ready.send(());}
-    tokio::select!{
-        result=run(rx)=>result,
-        result=&mut relay.0=>{
-            result.context("completion relay panicked")??;
-            bail!("completion feed venue={venue:?} closed");
-        }
-    }
-}
-
 /// Wiring shared by production, the finite protocol mode and the CP2 live run.
 /// Protocol code and scheduling stay in their respective workers.
 #[derive(Clone, Copy)]
@@ -167,6 +123,7 @@ pub(super) struct CompletionExecutors {
     pub(super) pancakeswap_clmm:Option<completion_pancakeswap_clmm::Settings>,
     pub(super) byreal_clmm:Option<completion_byreal_clmm::Settings>,
     pub(super) pumpswap:Option<completion_pumpswap::Settings>,
+    pub(super) manifest:Option<completion_manifest::Settings>,
     pub(super) raydium_amm_v4:Option<completion_raydium_amm_v4::Settings>,
     pub(super) raydium_cpmm:Option<completion_raydium_cpmm::Settings>,
     pub(super) raydium_clmm:Option<completion_raydium_clmm::Settings>,
@@ -184,7 +141,7 @@ pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
     anyhow::ensure!(configured.dlmm.is_some()||configured.damm_v2.is_some()||configured.orca.is_some()
         ||configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()
         ||configured.raydium_clmm.is_some()||configured.pancakeswap_clmm.is_some()
-        ||configured.byreal_clmm.is_some()||configured.pumpswap.is_some(),
+        ||configured.byreal_clmm.is_some()||configured.pumpswap.is_some()||configured.manifest.is_some(),
         "no lifecycle executor configured");
     let input=updates.subscribe();
     let seed=registry.snapshot();
@@ -214,6 +171,7 @@ pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
     executor!(completion_orca_whirlpool,Venue::OrcaWhirlpool,configured.orca.map(|s|(s,s.pools_per_batch())));
     executor!(completion_pancakeswap_clmm,Venue::PancakeSwapClmm,configured.pancakeswap_clmm.map(|s|(s,s.pools_per_batch())));
     executor!(completion_byreal_clmm,Venue::ByrealClmm,configured.byreal_clmm.map(|s|(s,s.pools_per_batch())));
+    executor!(completion_manifest,Venue::Manifest,configured.manifest.map(|s|(s,s.pools_per_batch())));
     executor!(completion_pumpswap,Venue::PumpSwap,configured.pumpswap.map(|s|(s,s.pools_per_batch())),
         |settings:completion_pumpswap::Settings|settings.wallet.is_some());
     executor!(completion_raydium_amm_v4,Venue::RaydiumAmmV4,configured.raydium_amm_v4.map(|s|(s,s.pools_per_batch())));
@@ -236,8 +194,8 @@ pub async fn completion_lifecycle_live()->Result<()> {
     anyhow::ensure!((30..=86400).contains(&duration),"live duration must be 30..86400");
     let selected=env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").unwrap_or_else(|_|"dlmm".into());
     anyhow::ensure!(matches!(selected.as_str(),"dlmm"|"damm_v2"|"both"|"raydium_amm_v4"
-        |"raydium_cpmm"|"raydium_clmm"|"raydium"|"orca"|"pancakeswap"|"byreal"|"pumpswap"|"all"),
-        "COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2, both, raydium_amm_v4, raydium_cpmm, raydium_clmm, raydium, orca, pancakeswap, byreal, pumpswap or all");
+        |"raydium_cpmm"|"raydium_clmm"|"raydium"|"orca"|"pancakeswap"|"byreal"|"pumpswap"|"manifest"|"all"),
+        "COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2, both, raydium_amm_v4, raydium_cpmm, raydium_clmm, raydium, orca, pancakeswap, byreal, pumpswap, manifest or all");
     let configured=CompletionExecutors {
         dlmm:matches!(selected.as_str(),"dlmm"|"both"|"all")
             .then(completion_meteora_dlmm::Settings::from_env).transpose()?,
@@ -251,6 +209,8 @@ pub async fn completion_lifecycle_live()->Result<()> {
             .then(completion_byreal_clmm::Settings::from_env).transpose()?,
         pumpswap:matches!(selected.as_str(),"pumpswap"|"all")
             .then(completion_pumpswap::Settings::from_env).transpose()?,
+        manifest:matches!(selected.as_str(),"manifest"|"all")
+            .then(completion_manifest::Settings::from_env).transpose()?,
         raydium_amm_v4:matches!(selected.as_str(),"raydium_amm_v4"|"raydium"|"all")
             .then(completion_raydium_amm_v4::Settings::from_env).transpose()?,
         raydium_cpmm:matches!(selected.as_str(),"raydium_cpmm"|"raydium"|"all")
@@ -258,10 +218,12 @@ pub async fn completion_lifecycle_live()->Result<()> {
         raydium_clmm:matches!(selected.as_str(),"raydium_clmm"|"raydium"|"all")
             .then(completion_raydium_clmm::Settings::from_env).transpose()?,
     };
-    let enrichment=if let Some(pump)=configured.pumpswap {
+    if let Some(pump)=configured.pumpswap {
         anyhow::ensure!(pump.wallet.is_some(),
             "PumpSwap Prepared-refresh live proof requires PUMPSWAP_V10_WALLET");
-        Some(jupiter_settings()?.context("PumpSwap live TVL enrichment requires JUPITER_SEARCH_API_KEYS")?)
+    }
+    let enrichment=if configured.pumpswap.is_some()||configured.manifest.is_some() {
+        Some(jupiter_settings()?.context("PumpSwap/Manifest live TVL enrichment requires JUPITER_SEARCH_API_KEYS")?)
     }else{None};
     let mut venues=Vec::new();
     if configured.dlmm.is_some(){venues.push(Venue::MeteoraDlmm);}
@@ -270,6 +232,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
     if configured.pancakeswap_clmm.is_some(){venues.push(Venue::PancakeSwapClmm);}
     if configured.byreal_clmm.is_some(){venues.push(Venue::ByrealClmm);}
     if configured.pumpswap.is_some(){venues.push(Venue::PumpSwap);}
+    if configured.manifest.is_some(){venues.push(Venue::Manifest);}
     if configured.raydium_amm_v4.is_some(){venues.push(Venue::RaydiumAmmV4);}
     if configured.raydium_cpmm.is_some(){venues.push(Venue::RaydiumCpmm);}
     if configured.raydium_clmm.is_some(){venues.push(Venue::RaydiumClmm);}
@@ -303,10 +266,21 @@ pub async fn completion_lifecycle_live()->Result<()> {
             source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
         critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
             source_dexscreener::run_live(qualified_rx,registry.clone(),sources.clone())));
+        crate::log_event!(Info,"lifecycle live enrichment=cp1");
+    }
+    if configured.pumpswap.is_some() {
         critical(&mut tasks,"discovery.pumpswap_rolling",until_stop(stop_rx.clone(),
             discovery_pumpswap::run(rpc.clone(),sources.clone(),
                 discovery_pumpswap::Settings::from_env(false,None)?)));
         crate::log_event!(Info,"lifecycle live enrichment=cp1 rolling_discovery=true wallet_bound=true");
+    }
+    if configured.manifest.is_some() {
+        let client=client.clone();let publisher=sources.clone();
+        tasks.spawn(supervise("discovery.manifest",stop_rx.clone(),move||{
+            let client=client.clone();let output=publisher.clone();
+            async move{discovery_manifest::run(client,output,
+                discovery_manifest::Settings{once:false}).await}
+        }));
     }
     if configured.dlmm.is_some() {
         let client=client.clone();let publisher=sources.clone();
@@ -501,20 +475,9 @@ pub async fn run()->Result<()>{
         &restored,completion_pumpswap::Settings::from_env()?.wallet)?;
     let graph_boot:Vec<PoolState>=restored.iter()
         .filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();
-    let mut boot:Vec<(Venue,Vec<PoolState>)>=Vec::new();
-    for p in &restored {
-        if p.mint_a.is_none()||p.mint_b.is_none()
-            ||p.completion_state==CompletionState::Prepared
-            ||matches!(p.venue,Venue::MeteoraDlmm|Venue::MeteoraDammV2
-                |Venue::RaydiumAmmV4|Venue::RaydiumCpmm|Venue::RaydiumClmm
-                |Venue::OrcaWhirlpool|Venue::PancakeSwapClmm|Venue::ByrealClmm|Venue::PumpSwap){continue;}
-        if let Some((_,list))=boot.iter_mut().find(|(venue,_)|*venue==p.venue){
-            list.push(p.clone());
-        }else{boot.push((p.venue,vec![p.clone()]));}
-    }
     let registry=pool_registry::PoolRegistry::default();
     let count=registry.restore(restored)?;
-    crate::log_event!(Info,"runtime bootstrap restored={count} prepared={} venues={} backpressure_unchanged=true",graph_boot.len(),boot.len());
+    crate::log_event!(Info,"runtime bootstrap restored={count} prepared={} lifecycle_executors=10 backpressure_unchanged=true",graph_boot.len());
 
     let (stop_tx,stop_rx)=watch::channel(false);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(source_capacity);
@@ -605,35 +568,6 @@ pub async fn run()->Result<()>{
             pools:graph_boot,persist_identity:Vec::new()}))
             .map_err(|_|anyhow!("no graph bootstrap subscriber"))?;
     }
-    let mut ready=Vec::new();
-    macro_rules! completion{
-        ($module:ident,$venue:path)=>{
-            {
-                let mut config=$module::Settings::from_env()?;
-                config.limit=0;
-                let reg=registry.clone();let updates=updates.clone();
-                let sink=completions.clone();let client=rpc.clone();
-                let source_done=done_rx.clone();
-                let (ready_tx,ready_rx)=oneshot::channel();
-                ready.push(ready_rx);
-                let mut initial=Some(boot.iter_mut()
-                    .find(|(v,_)|*v==$venue).map(|(_,p)|std::mem::take(p))
-                    .unwrap_or_default());
-                let mut ack=Some(ready_tx);
-                tasks.spawn(supervise(concat!("completion.",stringify!($module)),
-                    stop_rx.clone(),move||{
-                        let live=updates.subscribe();
-                        let seed=initial.take().unwrap_or_else(||candidates(&reg,$venue));let client=client.clone();
-                        let sink=sink.clone();let done=source_done.clone();
-                        let first_ack=ack.take();
-                        async move{
-                            completion_feed($venue,seed,live,first_ack,move|input|
-                                Box::pin($module::run(input,done,client,config,sink))).await
-                        }
-                    }));
-            }
-        };
-    }
     spawn_completion_lifecycle(&mut tasks,&registry,&updates,completions.clone(),done_rx.clone(),
         (stop_tx.clone(),stop_rx.clone()),rpc.clone(),
         CompletionExecutors {
@@ -643,14 +577,11 @@ pub async fn run()->Result<()>{
             pancakeswap_clmm:Some(completion_pancakeswap_clmm::Settings::from_env()?),
             byreal_clmm:Some(completion_byreal_clmm::Settings::from_env()?),
             pumpswap:Some(completion_pumpswap::Settings::from_env()?),
+            manifest:Some(completion_manifest::Settings::from_env()?),
             raydium_amm_v4:Some(completion_raydium_amm_v4::Settings::from_env()?),
             raydium_cpmm:Some(completion_raydium_cpmm::Settings::from_env()?),
             raydium_clmm:Some(completion_raydium_clmm::Settings::from_env()?),
         },false,0)?;
-    completion!(completion_manifest,Venue::Manifest);
-    for confirmed in ready{
-        confirmed.await.context("completion failed before startup readiness")?;
-    }
     drop(completions);
     // Single continuous hydration consumer for every venue, including PumpSwap.
     let venue_hydrate_registry=registry.clone();

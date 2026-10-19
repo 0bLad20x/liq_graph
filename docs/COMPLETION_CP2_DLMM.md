@@ -1,25 +1,27 @@
 # Gemeinsamer Completion Lifecycle
 
-Basis dieser Erweiterung: `agent/cp2-byreal-lifecycle`, Commit
-`2232d681faea47009d50344fad11ee263fe3ba9d`.
-Testbranch: `agent/cp2-pumpswap-lifecycle`.
+Basis dieser Erweiterung: `agent/cp2-pumpswap-lifecycle`, Commit
+`939d4fc089eca9974c0d9e5f690140fae1797e42`.
+Testbranch: `agent/cp2-manifest-lifecycle`.
 
 ## Umfang und Grenzen
 
 CP2.1 plant anhand echter Registry-Snapshots und Updates fuer alle beobachteten,
-aktuell zugelassenen Pools. Die bisherigen acht Worker sind bereits angeschlossen;
-diese Erweiterung schliesst **PumpSwap an dieselbe Lifecycle-Instanz** an.
-Manifest behaelt vorerst seinen lokalen Scheduler und `executing=false`.
+aktuell zugelassenen Pools. Die bisherigen neun Worker sind bereits angeschlossen;
+diese Erweiterung schliesst **Manifest als letzten Completion-Worker an dieselbe
+Lifecycle-Instanz** an. Seine lokale Ablaufsteuerung ist entfernt, ebenso die
+nur dafuer verbliebene Completion-Weiterleitung mit eigener Start-/Restart-Steuerung
+in der Orchestrierung. Es gibt keinen parallelen Legacy-Completion-Pfad mehr.
 Mint-Regeln und TVL-Quellen bleiben bei ihren vorhandenen CP1-Workern.
 
 Der Lifecycle liegt in einem Worker, nicht im Core. Der Core enthaelt die
 gemeinsamen Auftrags-/Antwortvertraege. Die Registry bleibt alleiniger
 Pool-State-Writer, PostgreSQL hat weiterhin genau den bestehenden Writer und
 dieselbe Tabelle. Der Lifecycle interpretiert keine protokollspezifische
-Evidence und besitzt keine RPC-Verbindung. Die neun angeschlossenen Worker erhalten explizite
+Evidence und besitzt keine RPC-Verbindung. Die zehn angeschlossenen Worker erhalten explizite
 Auftraege; ihre lokalen Scheduler sind entfernt. Auch die Versuchsgrenze ist aus
 ihren Protokoll-Settings entfernt und wird zentral im Lifecycle gesetzt. Es gibt
-eine gemeinsame Registrierung fuer alle neun Executor-Receiver und einen gemeinsamen
+eine gemeinsame Registrierung fuer alle zehn Executor-Receiver und einen gemeinsamen
 Antwortkanal. Raydium Stable hat keinen Completion-Worker und ist nicht Teil
 dieser Migration.
 
@@ -46,8 +48,8 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    pausiert, solange die benoetigte Executor-Konfiguration fehlt. Meldet die
    Registrierung beim Prozessstart `configuration_ready=true`, gilt auch hier
    das gemeinsame Recheck-Intervall. PumpSwap leitet diese Bereitschaft aus
-   seiner vorhandenen Wallet-Konfiguration ab; die bisherigen acht Executoren
-   bleiben unveraendert bei `false`. Der Lifecycle liest keine Protokoll-Evidence.
+   seiner vorhandenen Wallet-Konfiguration ab; fuer die anderen neun Executoren
+   ist `false` registriert. Der Lifecycle liest keine Protokoll-Evidence.
 4. Faellige Auftraege laufen nach Faelligkeit und Pool-Adresse. Es gibt pro Pool
    hoechstens einen laufenden Auftrag, begrenzte MPSC-Kanaele und je Executor eine
    Obergrenze fuer laufende Pools. Eine volle Queue blockiert nicht die Annahme
@@ -69,6 +71,11 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    PumpSwap behaelt Pool-/GlobalConfig-/Mint-/Vault-/Fee-Account-Pruefungen und
    seinen bisherigen walletgebundenen V10-Manifest-Aufbau. Ohne Wallet liefert
    der Worker weiterhin Evidence und `Incomplete/ConfigurationRequired`.
+   Manifest behaelt seinen vollstaendigen MarketFixed-/Mint-/Vault-Pruefpfad,
+   den kohaerenten zweiten RPC-Snapshot und die gerichteten V10-Accountbloecke.
+   Auch bei Refresh wird die bestehende Pruefung auf zwei gueltige freie
+   Orderknoten erneut ausgefuehrt. Fehlen sie, liefert der Worker weiterhin
+   `Incomplete/MissingExecutionAccounts`; die Wiederpruefung plant der Lifecycle.
    Ergebnisse werden nach Pool-Adresse den Auftrags-IDs zugeordnet, weil interne
    RPC-Partitionen die Reihenfolge aendern koennen.
 6. Terminale Ergebnisse gehen ueber den bestehenden Ergebnisvertrag zur Registry.
@@ -89,9 +96,9 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    Queue, Auftrags-IDs und transiente Fehlerzaehler sind RAM-Zustand; ihr exakter
    Backoff wird nicht persistiert. Alte Statuswerte werden nicht zurueckgesetzt.
 
-Ein Executor- oder Lifecycle-Fehler ist fuer alle neun Anbindungen fail-fast. Es
-gibt keinen stillen Rueckfall auf den entfernten lokalen Scheduler. Manifest
-behaelt seinen vorhandenen Supervisor. Beim Stoppen werden neue
+Ein Executor- oder Lifecycle-Fehler ist fuer alle zehn Anbindungen fail-fast. Es
+gibt keinen stillen Rueckfall auf einen entfernten lokalen Scheduler.
+Beim Stoppen werden neue
 Auftraege eingestellt und laufende Antworten samt Registry-Uebernahme abgearbeitet.
 
 ## Einstellungen
@@ -119,24 +126,25 @@ der ausgewaehlten Protokolle:
 
 ```powershell
 git fetch origin
-git switch --track origin/agent/cp2-pumpswap-lifecycle
-.\scripts\completion_lifecycle_live.ps1 -Venue PumpSwap -DurationSeconds 600 -PoolLimit 16
+git switch --track origin/agent/cp2-manifest-lifecycle
+.\scripts\completion_lifecycle_live.ps1 -Venue Manifest -DurationSeconds 600 -PoolLimit 16
 ```
 
 Das Skript prueft Checkout/HEAD, baut mit `cargo build --locked --release` und
 verwendet den echten Logger `LIQ_GRAPH_LOG`. Es startet
 `--completion-lifecycle-live`: die ausgewaehlten REST-Quellen und Executor-Worker,
 einen gemeinsamen Lifecycle, Registry, RPC-Transport und PostgreSQL-Writer.
-`-Venue PumpSwap` prueft PumpSwap allein (Standard).
+`-Venue Manifest` prueft Manifest DEX allein (Standard).
+`-Venue PumpSwap` prueft PumpSwap allein.
 `-Venue Byreal` prueft Byreal CLMM allein.
 `-Venue PancakeSwap` prueft PancakeSwap CLMM allein.
 `-Venue Orca` prueft Orca Whirlpool allein.
 `-Venue Raydium` prueft die drei Raydium-Worker gemeinsam.
 `RaydiumAmmV4`, `RaydiumCpmm` und `RaydiumClmm` pruefen sie jeweils einzeln.
-`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle neun.
+`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle zehn.
 Es laeuft genau eine gemeinsame Raydium-REST-Quelle, auch mit drei Raydium-Executoren.
-Der Pool-Limit-Wert gilt je Protokoll; PumpSwap, Byreal, PancakeSwap oder Orca mit
-16 bedeutet maximal 16 Pools, Raydium maximal 48, All maximal 144.
+Der Pool-Limit-Wert gilt je Protokoll; Manifest, PumpSwap, Byreal, PancakeSwap oder Orca
+mit 16 bedeutet maximal 16 Pools, Raydium maximal 48, All maximal 160.
 Andere Completion-Worker und Graph starten in
 diesem isolierten Lauf nicht. `--run` und die bestehenden Einzelmodi verwenden
 denselben Lifecycle-/Executor-Datenfluss. Im kombinierten endlichen Einzelmodus
@@ -144,7 +152,7 @@ begrenzt `--completion-limit` die Gesamtzahl der Lifecycle-Auftraege aller
 angeschlossener Executor-Worker; es gibt keine getrennten Protokoll-Limits.
 
 Die Auswahl erfolgt ausschliesslich in der Orchestrierung ueber
-`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|orca|pancakeswap|byreal|pumpswap|all`;
+`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|orca|pancakeswap|byreal|pumpswap|manifest|all`;
 der Lifecycle enthaelt keine Protokoll-Fallunterscheidung und unveraendert dieselben Zeitregeln.
 
 Die erste reale zugelassene Kohorte ist fuer den Lauf fest; unsupported-Pools
@@ -164,33 +172,47 @@ die Completions verwenden denselben gemeinsamen RPC-Transport und dieselben Life
 PumpSwap behaelt acht parallele Batches mit bis zu zehn Pools pro Batch
 (`(RPC_ACCOUNT_BATCH_SIZE - 1) / 5`). Fuer Prepared-Manifeste verwendet es
 unveraendert `PUMPSWAP_V10_WALLET` als oeffentliche Wallet-Adresse.
+Manifest behaelt 16 parallele Batches mit bis zu zehn Pools pro Batch
+(`RPC_ACCOUNT_BATCH_SIZE / 5`) und verwendet denselben gemeinsamen RPC-Transport.
+Es kommen keine Manifest-spezifischen RPC- oder Lifecycle-Variablen hinzu.
 Die feste reale Kohorte begrenzt zusaetzlich die insgesamt laufenden Pools.
 Der Lauf erzeugt
 keine Testpools, resettet keine Statuswerte und sendet keine Transaktionen.
 Die Environment-Aenderungen des Skripts werden anschliessend wiederhergestellt.
 
-### PumpSwap: frische TVL und Wallet
+### Manifest und PumpSwap: frische TVL
 
-PumpSwap-RPC-Discovery liefert Identitaeten, keine TVL. Deshalb startet der
-isolierte PumpSwap-Lauf zusaetzlich die bestehenden Worker `mint_qualification`,
-`source_jupiter_mint::run_targeted` und `source_dexscreener::run_live`, sowie die
-bestehende rollierende PumpSwap-Discovery. Es gibt keinen Jupiter-Vollbackfill,
+PumpSwap-RPC-Discovery liefert Identitaeten, keine TVL. Auch die Manifest-Ticker-
+Discovery liefert keine verwertbare TVL; ihr gemeldetes `liquidity_in_usd=0`
+wird unveraendert nur im Source-Payload bewahrt. Deshalb startet der isolierte
+Manifest- oder PumpSwap-Lauf zusaetzlich die bestehenden Worker `mint_qualification`,
+`source_jupiter_mint::run_targeted` und `source_dexscreener::run_live`. Auch bei
+`All` laeuft diese gemeinsame Anreicherung genau einmal. Manifest verwendet
+seine bestehende Ticker-Discovery, PumpSwap seine rollierende RPC-Discovery.
+Es gibt keinen Jupiter-Vollbackfill,
 keine zusaetzliche TVL-Berechnung und keine Uebernahme historischer DB-TVL.
 Die Registry entscheidet weiter anhand frischer kanonischer TVL >= 500 USD.
 Der angegebene 600-Sekunden-Lauf laesst auch Zeit fuer diese vorgeschaltete Anreicherung.
 
-Voraussetzungen sind die bestehende `PUMPSWAP_V10_WALLET`,
-`JUPITER_SEARCH_API_KEYS`, erreichbare/verifizierte DexScreener-Proxys und ein
-RPC-Transport mit `getProgramAccountsV2`, `getSlot` und `getMultipleAccounts`.
-Der Prepared-Refresh-Test verlangt eine Wallet; der normale PumpSwap-Executor
+Fuer Manifest sind die bestehende `JUPITER_SEARCH_API_KEYS`, PostgreSQL,
+erreichbare/verifizierte DexScreener-Proxys, der Manifest-Ticker-Endpunkt und
+ein RPC-Transport mit `getMultipleAccounts` erforderlich. Eine Wallet oder
+RPC-V2-Discovery wird fuer den isolierten Manifest-Lauf nicht benoetigt.
+Liefert DexScreener keine frische TVL >= 500 USD fuer einen Markt, bleibt er
+unzulaessig; der Live-Test umgeht diese Grenze nicht. Historische Prepared-
+Eintraege allein sind kein Ersatz fuer aktuelle Zulassung.
+
+PumpSwap benoetigt zusaetzlich die bestehende `PUMPSWAP_V10_WALLET` sowie
+`getProgramAccountsV2` und `getSlot`. Sein Prepared-Refresh-Test verlangt eine Wallet;
+der normale PumpSwap-Executor
 behaelt den walletunabhaengigen Evidence-Modus. Die bestehende Cache-Pruefung
 verhindert, dass Prepared-Manifeste einer anderen Wallet weiterverwendet werden.
 Ein Wallet-Wechsel wird nicht im laufenden Prozess vorgenommen.
 
 In `--run` bleibt die vorhandene CP1-Verdrahtung ueber
-`CP1_MARKET_ENRICHMENT_ENABLED` zustaendig. Die alten PumpSwap-Einzelmodi behalten
-ihre bisherigen Discovery-Eingaenge; ein RPC-Identitaetsfund allein erzeugt dort
-ebenfalls keine TVL-Zulassung. Fuer die isolierte Lifecycle-Abnahme ist der oben
+`CP1_MARKET_ENRICHMENT_ENABLED` zustaendig. Die bisherigen Manifest-/PumpSwap-
+Einzelmodi behalten ihre bisherigen Discovery-Eingaenge; ein Identitaetsfund allein
+erzeugt dort ebenfalls keine TVL-Zulassung. Fuer die isolierte Lifecycle-Abnahme ist der oben
 angegebene gemeinsame Live-Aufruf vorgesehen. Beim Stoppen werden die
 Live-Eingangsproduzenten beendet; Lifecycle, Registry und Persistenz drainieren.
 
@@ -238,7 +260,11 @@ Der PancakeSwap-Lauf auf `86afa60` belegt 160 akzeptierte/persistierte
 Prepared-Refreshes aller 16 Pools, sauberen Shutdown und SQL 16/16/0.
 Der Byreal-Lauf auf `2232d68` belegt 160 akzeptierte/persistierte Prepared-Refreshes
 aller 16 Pools, sauberen Shutdown und SQL 16/16/0.
-Die PumpSwap-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
+Der PumpSwap-Lauf auf `939d4fc` belegt 312 akzeptierte/persistierte Prepared-
+Refreshes bei 16 Pools, jeweils 19 bis 20 Aktualisierungen mit steigenden Slots
+und Pruefzeiten, vollstaendigen Abschluss und SQL 16/16/0 einschliesslich Wallet-
+Bindung. Initial/Recheck/Retry und TVL-Entzug wurden dort nicht beobachtet.
+Die Manifest-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
 
 Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
 Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind
