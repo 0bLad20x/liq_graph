@@ -333,30 +333,24 @@ fn spawn_sources(
         let (completion_output, _) =
             broadcast::channel::<Arc<core::CompletionResultBatch>>(256);
         let receiver = completion_output.subscribe();
-        if config.dlmm.is_some() || config.damm_v2.is_some() {
+        if config.dlmm.is_some() || config.damm_v2.is_some()
+            || config.raydium_amm_v4.is_some() || config.raydium_cpmm.is_some()
+            || config.raydium_clmm.is_some() {
             if config.dlmm.is_some() && config.damm_v2.is_none()
                 && config.orca.is_none() && config.lifecycle_limit>0 {
                 tasks.spawn(completion_meteora_dlmm::observe(completion_output.subscribe()));
             }
             runtime::spawn_completion_lifecycle(tasks,&registry,&registry_output,
                 completion_output.clone(),source_done_rx.clone(),watch::channel(false),
-                config.rpc.clone(),config.dlmm,config.damm_v2,settings.once,config.lifecycle_limit)?;
+                config.rpc.clone(),runtime::CompletionExecutors {
+                    dlmm:config.dlmm,damm_v2:config.damm_v2,
+                    raydium_amm_v4:config.raydium_amm_v4,raydium_cpmm:config.raydium_cpmm,
+                    raydium_clmm:config.raydium_clmm,
+                },settings.once,config.lifecycle_limit)?;
         }
         if let Some(orca) = config.orca {
             tasks.spawn(completion_orca_whirlpool::run(registry_output.subscribe(),
                 source_done_rx.clone(), config.rpc.clone(), orca, completion_output.clone()));
-        }
-        if let Some(raydium) = config.raydium_amm_v4 {
-            tasks.spawn(completion_raydium_amm_v4::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), raydium, completion_output.clone()));
-        }
-        if let Some(cpmm) = config.raydium_cpmm {
-            tasks.spawn(completion_raydium_cpmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), cpmm, completion_output.clone()));
-        }
-        if let Some(clmm) = config.raydium_clmm {
-            tasks.spawn(completion_raydium_clmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), clmm, completion_output.clone()));
         }
         if let Some(clmm) = config.pancakeswap_clmm {
             tasks.spawn(completion_pancakeswap_clmm::run(registry_output.subscribe(),
@@ -749,19 +743,13 @@ pub async fn run() -> Result<()> {
             Some(settings)
         } else {None};
         let raydium_amm_v4 = if cli.raydium_amm_v4_completion_live {
-            let mut settings = completion_raydium_amm_v4::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_raydium_amm_v4::Settings::from_env()?)
         } else { None };
         let raydium_cpmm = if cli.raydium_cpmm_completion_live {
-            let mut settings = completion_raydium_cpmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_raydium_cpmm::Settings::from_env()?)
         } else { None };
         let raydium_clmm = if cli.raydium_clmm_completion_live {
-            let mut settings = completion_raydium_clmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_raydium_clmm::Settings::from_env()?)
         } else { None };
         let pancakeswap_clmm = if cli.pancakeswap_clmm_completion_live {
             let mut settings = completion_pancakeswap_clmm::Settings::from_env()?;

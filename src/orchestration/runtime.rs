@@ -150,17 +150,27 @@ async fn completion_feed(
 
 /// Wiring shared by production, the finite protocol mode and the CP2 live run.
 /// Protocol code and scheduling stay in their respective workers.
+#[derive(Clone, Copy)]
+pub(super) struct CompletionExecutors {
+    pub(super) dlmm:Option<completion_meteora_dlmm::Settings>,
+    pub(super) damm_v2:Option<completion_meteora_damm_v2::Settings>,
+    pub(super) raydium_amm_v4:Option<completion_raydium_amm_v4::Settings>,
+    pub(super) raydium_cpmm:Option<completion_raydium_cpmm::Settings>,
+    pub(super) raydium_clmm:Option<completion_raydium_clmm::Settings>,
+}
+
 pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
     registry:&pool_registry::PoolRegistry,
     updates:&broadcast::Sender<Arc<PoolUpdateBatch>>,
     results:broadcast::Sender<Arc<CompletionResultBatch>>,
     source_done:watch::Receiver<bool>,
     stop:(watch::Sender<bool>,watch::Receiver<bool>),rpc:rpc_transport::RpcHandle,
-    dlmm:Option<completion_meteora_dlmm::Settings>,
-    damm_v2:Option<completion_meteora_damm_v2::Settings>,
+    configured:CompletionExecutors,
     finite:bool,attempt_limit:usize,
 )->Result<()> {
-    anyhow::ensure!(dlmm.is_some()||damm_v2.is_some(),"no lifecycle executor configured");
+    anyhow::ensure!(configured.dlmm.is_some()||configured.damm_v2.is_some()
+        ||configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()
+        ||configured.raydium_clmm.is_some(),"no lifecycle executor configured");
     let input=updates.subscribe();
     let seed=registry.snapshot();
     let settings=completion_lifecycle::Settings::from_env(finite,attempt_limit)?;
@@ -177,8 +187,11 @@ pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
             }
         };
     }
-    executor!(completion_meteora_dlmm,Venue::MeteoraDlmm,dlmm.map(|s|(s,16)));
-    executor!(completion_meteora_damm_v2,Venue::MeteoraDammV2,damm_v2.map(|s|(s,s.pools_per_batch())));
+    executor!(completion_meteora_dlmm,Venue::MeteoraDlmm,configured.dlmm.map(|s|(s,16)));
+    executor!(completion_meteora_damm_v2,Venue::MeteoraDammV2,configured.damm_v2.map(|s|(s,s.pools_per_batch())));
+    executor!(completion_raydium_amm_v4,Venue::RaydiumAmmV4,configured.raydium_amm_v4.map(|s|(s,s.pools_per_batch())));
+    executor!(completion_raydium_cpmm,Venue::RaydiumCpmm,configured.raydium_cpmm.map(|s|(s,s.pools_per_batch())));
+    executor!(completion_raydium_clmm,Venue::RaydiumClmm,configured.raydium_clmm.map(|s|(s,s.pools_per_batch())));
     drop(responses);
     // One lifecycle instance receives every registered executor's responses.
     critical(tasks,"completion_lifecycle",async move{
@@ -195,16 +208,27 @@ pub async fn completion_lifecycle_live()->Result<()> {
     let duration=number("RUN_DURATION_SECONDS",300)?;
     anyhow::ensure!((30..=86400).contains(&duration),"live duration must be 30..86400");
     let selected=env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").unwrap_or_else(|_|"dlmm".into());
-    let (dlmm,damm_v2)=match selected.as_str() {
-        "dlmm"=>(Some(completion_meteora_dlmm::Settings::from_env()?),None),
-        "damm_v2"=>(None,Some(completion_meteora_damm_v2::Settings::from_env()?)),
-        "both"=>(Some(completion_meteora_dlmm::Settings::from_env()?),
-            Some(completion_meteora_damm_v2::Settings::from_env()?)),
-        _=>bail!("COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2 or both"),
+    anyhow::ensure!(matches!(selected.as_str(),"dlmm"|"damm_v2"|"both"|"raydium_amm_v4"
+        |"raydium_cpmm"|"raydium_clmm"|"raydium"|"all"),
+        "COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2, both, raydium_amm_v4, raydium_cpmm, raydium_clmm, raydium or all");
+    let configured=CompletionExecutors {
+        dlmm:matches!(selected.as_str(),"dlmm"|"both"|"all")
+            .then(completion_meteora_dlmm::Settings::from_env).transpose()?,
+        damm_v2:matches!(selected.as_str(),"damm_v2"|"both"|"all")
+            .then(completion_meteora_damm_v2::Settings::from_env).transpose()?,
+        raydium_amm_v4:matches!(selected.as_str(),"raydium_amm_v4"|"raydium"|"all")
+            .then(completion_raydium_amm_v4::Settings::from_env).transpose()?,
+        raydium_cpmm:matches!(selected.as_str(),"raydium_cpmm"|"raydium"|"all")
+            .then(completion_raydium_cpmm::Settings::from_env).transpose()?,
+        raydium_clmm:matches!(selected.as_str(),"raydium_clmm"|"raydium"|"all")
+            .then(completion_raydium_clmm::Settings::from_env).transpose()?,
     };
     let mut venues=Vec::new();
-    if dlmm.is_some(){venues.push(Venue::MeteoraDlmm);}
-    if damm_v2.is_some(){venues.push(Venue::MeteoraDammV2);}
+    if configured.dlmm.is_some(){venues.push(Venue::MeteoraDlmm);}
+    if configured.damm_v2.is_some(){venues.push(Venue::MeteoraDammV2);}
+    if configured.raydium_amm_v4.is_some(){venues.push(Venue::RaydiumAmmV4);}
+    if configured.raydium_cpmm.is_some(){venues.push(Venue::RaydiumCpmm);}
+    if configured.raydium_clmm.is_some(){venues.push(Venue::RaydiumClmm);}
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?.into_iter()
         .filter(|p|venues.contains(&p.venue)).collect();
@@ -221,9 +245,9 @@ pub async fn completion_lifecycle_live()->Result<()> {
         registry.clone(),updates.clone(),done,true));
     critical(&mut tasks,"persistence",database.run(updates.subscribe()));
     spawn_completion_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
-        (stop.clone(),stop_rx.clone()),rpc.clone(),dlmm,damm_v2,false,0)?;
+        (stop.clone(),stop_rx.clone()),rpc.clone(),configured,false,0)?;
     let client=core::http_client()?;
-    if dlmm.is_some() {
+    if configured.dlmm.is_some() {
         let client=client.clone();let publisher=sources.clone();
         tasks.spawn(supervise("discovery.meteora_dlmm",stop_rx.clone(),move||{
             let client=client.clone();let output=publisher.clone();
@@ -231,12 +255,23 @@ pub async fn completion_lifecycle_live()->Result<()> {
                 discovery_meteora_dlmm::Settings{once:false,max_pages:None}).await}
         }));
     }
-    if damm_v2.is_some() {
+    if configured.damm_v2.is_some() {
+        let client=client.clone();
         let publisher=sources.clone();
-        tasks.spawn(supervise("discovery.meteora_damm_v2",stop_rx,move||{
+        tasks.spawn(supervise("discovery.meteora_damm_v2",stop_rx.clone(),move||{
             let client=client.clone();let output=publisher.clone();
             async move{discovery_meteora_damm_v2::run(client,output,
                 discovery_meteora_damm_v2::Settings{once:false,max_pages:None}).await}
+        }));
+    }
+    if configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()
+        ||configured.raydium_clmm.is_some() {
+        let publisher=sources.clone();
+        let rps=u32::try_from(number("RAYDIUM_API_RPS",10)?)?;
+        tasks.spawn(supervise("discovery.raydium",stop_rx,move||{
+            let client=client.clone();let output=publisher.clone();
+            async move{discovery_raydium::run(client,output,
+                discovery_raydium::Settings{once:false,max_pages:None,rps}).await}
         }));
     }
     drop(sources);
@@ -382,7 +417,8 @@ pub async fn run()->Result<()>{
     for p in &restored {
         if p.mint_a.is_none()||p.mint_b.is_none()
             ||p.completion_state==CompletionState::Prepared
-            ||matches!(p.venue,Venue::MeteoraDlmm|Venue::MeteoraDammV2){continue;}
+            ||matches!(p.venue,Venue::MeteoraDlmm|Venue::MeteoraDammV2
+                |Venue::RaydiumAmmV4|Venue::RaydiumCpmm|Venue::RaydiumClmm){continue;}
         if let Some((_,list))=boot.iter_mut().find(|(venue,_)|*venue==p.venue){
             list.push(p.clone());
         }else{boot.push((p.venue,vec![p.clone()]));}
@@ -511,12 +547,14 @@ pub async fn run()->Result<()>{
     }
     spawn_completion_lifecycle(&mut tasks,&registry,&updates,completions.clone(),done_rx.clone(),
         (stop_tx.clone(),stop_rx.clone()),rpc.clone(),
-        Some(completion_meteora_dlmm::Settings::from_env()?),
-        Some(completion_meteora_damm_v2::Settings::from_env()?),false,0)?;
+        CompletionExecutors {
+            dlmm:Some(completion_meteora_dlmm::Settings::from_env()?),
+            damm_v2:Some(completion_meteora_damm_v2::Settings::from_env()?),
+            raydium_amm_v4:Some(completion_raydium_amm_v4::Settings::from_env()?),
+            raydium_cpmm:Some(completion_raydium_cpmm::Settings::from_env()?),
+            raydium_clmm:Some(completion_raydium_clmm::Settings::from_env()?),
+        },false,0)?;
     completion!(completion_orca_whirlpool,Venue::OrcaWhirlpool);
-    completion!(completion_raydium_amm_v4,Venue::RaydiumAmmV4);
-    completion!(completion_raydium_cpmm,Venue::RaydiumCpmm);
-    completion!(completion_raydium_clmm,Venue::RaydiumClmm);
     completion!(completion_pancakeswap_clmm,Venue::PancakeSwapClmm);
     completion!(completion_byreal_clmm,Venue::ByrealClmm);
     completion!(completion_manifest,Venue::Manifest);

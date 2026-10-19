@@ -1,22 +1,21 @@
-//! Raydium CPMM execution completion: Registry candidates -> coherent RPC -> V10 manifests.
-//! Owns CPMM binary decoding, token-program/mint/vault checks, scheduling and evidence.
+//! Raydium CPMM execution completion: Lifecycle requests -> coherent RPC -> V10 manifests.
+//! Owns CPMM binary decoding, token-program/mint/vault checks and evidence.
 //! No direct DB, REST parsing, graph mutations or provider-specific RPC code.
-use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde_json::json;
 use solana_pubkey::Pubkey;
 use tokio::{
-    sync::{broadcast, watch},
+    sync::mpsc,
     task::JoinSet,
-    time::{Instant, MissedTickBehavior},
 };
 
 use crate::{
-    core::{CompletionReason, COMPLETION_MIN_TVL_USD,
-        AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
-        CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
-        PoolUpdateBatch, Venue,
+    core::{CompletionReason,
+        AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
+        CompletionStatus, ExecutionManifest, MintProof, PoolState,
+        Venue,
     },
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
@@ -33,13 +32,11 @@ const CONFIG_LEN: usize = 236;
 const OBS_LEN: usize = 4075;
 const POOLS_PER_BATCH: usize = 12;
 const PARALLEL_BATCHES: usize = 16;
-const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 pub struct Settings {
-    pub limit: usize,
     account_batch_size: usize,
-    parallel_batches: usize,
+    pub parallel_batches: usize,
 }
 impl Settings {
     pub fn from_env() -> Result<Self> {
@@ -49,9 +46,9 @@ impl Settings {
             .context("invalid RPC_ACCOUNT_BATCH_SIZE")?;
         ensure!((7..=100).contains(&account_batch_size),
             "Raydium CPMM requires RPC_ACCOUNT_BATCH_SIZE in 7..=100");
-        Ok(Self {limit:0, account_batch_size, parallel_batches:PARALLEL_BATCHES})
+        Ok(Self {account_batch_size, parallel_batches:PARALLEL_BATCHES})
     }
-    fn pools_per_batch(self) -> usize {
+    pub fn pools_per_batch(self) -> usize {
         POOLS_PER_BATCH.min(self.account_batch_size / 7)
     }
 }
@@ -384,173 +381,60 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
     results.into_iter().map(|r|r.expect("pool result")).collect()
 }
 
-#[derive(Default)]
-struct Scheduler {
-    candidates: HashMap<Pubkey,PoolState>,
-    attempts: HashMap<Pubkey,u8>,
-    retry_after: HashMap<Pubkey,Instant>,
-}
-impl Scheduler {
-    fn update(&mut self, pool: &PoolState) {
-        if pool.venue != Venue::RaydiumCpmm {return;}
-        if pool.completion_state==CompletionState::Prepared {
-            self.candidates.remove(&pool.address);
-            self.retry_after.remove(&pool.address);
-        } else if !pool.completion_admission.is_admitted() {
-            self.candidates.remove(&pool.address);
-        } else {
-            self.candidates.insert(pool.address,pool.clone());
-        }
-    }
-    fn eligible(&self, pool: &PoolState, now: Instant) -> Option<u8> {
-        match self.attempts.get(&pool.address).copied() {
-            None=>match pool.completion_state {
-                CompletionState::Unknown=>Some(1),
-                CompletionState::Incomplete if pool.completion_reason_code.is_none_or(CompletionReason::recheckable)=>Some(2),
-                _=>None,
-            },
-            Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),
-            _=>None,
-        }
-    }
-    fn next(&self, max:usize, now:Instant)->(u8,Vec<PoolState>) {
-        let mut tier=0;
-        let mut selected=Vec::new();
-        for p in self.candidates.values() {
-            let Some(level)=self.eligible(p,now) else {continue;};
-            if tier==0 || level<tier { tier=level; selected.clear(); }
-            if level==tier {selected.push(p.clone());}
-        }
-        selected.sort_unstable_by(|a,b|
-            b.tvl_usd.unwrap_or_default().total_cmp(&a.tvl_usd.unwrap_or_default())
-                .then_with(||a.address.to_bytes().cmp(&b.address.to_bytes())));
-        selected.truncate(max);
-        (tier,selected)
-    }
-    fn pending_retry(&self)->bool {
-        self.retry_after.iter().any(|(pool,_)|
-            self.candidates.contains_key(pool) && self.attempts.get(pool)==Some(&1))
-    }
-    fn counts(&self,now:Instant)->(usize,usize,usize) {
-        let mut a=0;let mut b=0;let mut c=0;
-        for pool in self.candidates.values() {
-            match self.eligible(pool,now) {
-                Some(1)=>a+=1,Some(2)=>b+=1,Some(3)=>c+=1,_=>(),
-            }
-        }
-        (a,b,c)
-    }
-}
-
-pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    source_done:watch::Receiver<bool>, rpc:RpcHandle, settings:Settings,
-    output:broadcast::Sender<Arc<CompletionResultBatch>>) -> Result<()> {
-    let mut scheduler=Scheduler::default();
+/// Protocol executor only. The shared lifecycle owns admission scheduling,
+/// retry/backoff, reactivation and Prepared refresh.
+pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
+    rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
-    let mut source_open=true;
-    let mut seen=HashSet::new();
-    let mut received_updates=0_usize;
-    let mut attempts=0_usize;
-    let mut first_attempts=0_usize;
-    let mut retries=0_usize;
-    let mut prepared=0_usize;
-    let mut incomplete=0_usize;
-    let mut retryable=0_usize;
-    let mut pulse=tokio::time::interval(Duration::from_secs(5));
-    pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let started=Instant::now();
-    crate::log_event!(Info,"raydium cpmm completion started min_tvl_usd={} limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
-        COMPLETION_MIN_TVL_USD,settings.limit,settings.parallel_batches,settings.pools_per_batch(),
-        RETRY_COOLDOWN.as_secs());
-    loop {
-        while tasks.len()<settings.parallel_batches
-            && (settings.limit==0 || attempts<settings.limit) {
-            let remaining=if settings.limit==0 {settings.pools_per_batch()}
-                else {settings.pools_per_batch().min(settings.limit-attempts)};
-            if remaining==0 {break;}
-            let (tier,selected)=scheduler.next(remaining,Instant::now());
-            if selected.is_empty() {break;}
-            for pool in &selected {
-                let next=scheduler.attempts.get(&pool.address).copied().unwrap_or(0)+1;
-                scheduler.attempts.insert(pool.address,next);
-                scheduler.retry_after.remove(&pool.address);
-            }
-            attempts+=selected.len();
-            if tier==3 {retries+=selected.len();} else {first_attempts+=selected.len();}
-            let rpc=rpc.clone();
-            tasks.spawn(async move {
-                let results=process(&rpc,selected,settings).await;
-                (tier,results)
-            });
-        }
-        let stopped=settings.limit>0 && attempts>=settings.limit;
-        let done=!source_open || *source_done.borrow();
-        if tasks.is_empty() && (stopped || (done && input.len()==0
-            && !scheduler.pending_retry() && scheduler.next(1,Instant::now()).1.is_empty())) {
-            break;
-        }
+    let mut open=true;
+    let mut processed=0_usize;
+    crate::log_event!(Info,"raydium_cpmm executor started parallel={} pools_per_batch={} scheduler=completion_lifecycle",
+        settings.parallel_batches,settings.pools_per_batch());
+    while open || !tasks.is_empty() {
         tokio::select! {
-            event=input.recv(),if source_open=>match event {
-                Ok(batch)=>{
-                    received_updates+=batch.pools.len();
-                    for pool in &batch.pools {
-                        if pool.venue==Venue::RaydiumCpmm {seen.insert(pool.address);}
-                        scheduler.update(pool);
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n))=>
-                    bail!("Raydium CPMM completion lost {n} Registry batches"),
-                Err(broadcast::error::RecvError::Closed)=>source_open=false,
+            batch=input.recv(),if open && tasks.len()<settings.parallel_batches=>match batch {
+                Some(batch)=>{
+                    ensure!(!batch.requests.is_empty() && batch.requests.len()<=settings.pools_per_batch(),
+                        "invalid Raydium CPMM request batch size");
+                    ensure!(batch.requests.iter().all(|r|r.pool.venue==Venue::RaydiumCpmm
+                        && r.pool.completion_admission.is_admitted()),
+                        "Raydium CPMM request has wrong venue or missing admission");
+                    let rpc=rpc.clone();
+                    tasks.spawn(async move {
+                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
+                        let results=match tokio::time::timeout(batch.timeout,
+                            process(&rpc,pools,settings)).await {
+                            Ok(results)=>results,
+                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
+                                "Raydium CPMM lifecycle request timed out")).collect(),
+                        };
+                        (batch.requests,results)
+                    });
+                },
+                None=>open=false,
             },
-            done_batch=tasks.join_next(),if !tasks.is_empty()=>{
-                let (tier,results)=done_batch.context("missing Raydium CPMM partition")?
-                    .context("Raydium CPMM completion task panicked")?;
-                let mut p=0;let mut i=0;let mut r=0;
-                for item in &results {
-                    match item.status {
-                        CompletionStatus::Prepared=>{
-                            p+=1;scheduler.candidates.remove(&item.pool);
-                            scheduler.retry_after.remove(&item.pool);
-                        }
-                        CompletionStatus::Incomplete=>i+=1,
-                        CompletionStatus::Retryable=>{
-                            r+=1;
-                            if scheduler.attempts.get(&item.pool)==Some(&1)
-                                && scheduler.candidates.contains_key(&item.pool) {
-                                scheduler.retry_after.insert(item.pool,Instant::now()+RETRY_COOLDOWN);
-                            }
-                        }
-                    }
+            done=tasks.join_next(),if !tasks.is_empty()=>{
+                let (requests,results)=done.context("missing Raydium CPMM request task")?
+                    .context("Raydium CPMM request task panicked")?;
+                ensure!(requests.len()==results.len(),"Raydium CPMM request/result count mismatch");
+                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                ensure!(by_pool.len()==requests.len(),"duplicate Raydium CPMM pool result");
+                let mut responses=Vec::with_capacity(requests.len());
+                for request in requests {
+                    let result=by_pool.remove(&request.pool.address)
+                        .context("Raydium CPMM request has no matching pool result")?;
+                    crate::log_event!(Debug,
+                        "raydium_cpmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
+                        request.id,result.pool,request.work,result.status,result.reason_code,
+                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
+                    responses.push(CompletionResponse{id:request.id,result});
                 }
-                prepared+=p;incomplete+=i;retryable+=r;
-                crate::log_event!(Debug,"raydium cpmm completion batch tier={tier} attempts={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
-                    results.len(),started.elapsed().as_millis());
-                for result in results.iter().filter(|r|r.status==CompletionStatus::Prepared).take(2) {
-                    if let Some(manifest)=&result.manifest {
-                        crate::log_event!(Debug,"raydium cpmm manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
-                            manifest.pool,manifest.validated_slot,manifest.base_a.len(),manifest.base_b.len(),
-                            manifest.base_a.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
-                                .collect::<Vec<_>>(),
-                            manifest.base_b.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
-                                .collect::<Vec<_>>());
-                    }
-                }
-                for result in results.iter().filter(|r|r.status!=CompletionStatus::Prepared).take(3) {
-                    crate::log_event!(Debug,"raydium cpmm completion result pool={} status={:?} reason={}",
-                        result.pool,result.status,result.reason.as_deref().unwrap_or("-"));
-                }
-                output.send(Arc::new(CompletionResultBatch {source:SOURCE,results}))
-                    .map_err(|_|anyhow!("Raydium CPMM completion has no Registry consumer"))?;
+                processed+=responses.len();
+                output.send(CompletionResponseBatch{source:SOURCE,responses}).await
+                    .map_err(|_|anyhow!("Raydium CPMM lifecycle response consumer closed"))?;
             },
-            _=pulse.tick()=>{
-                let (a,b,c)=scheduler.counts(Instant::now());
-                crate::log_event!(Debug,"raydium cpmm completion backlog seen={} candidate_unknown={a} candidate_incomplete={b} eligible_retry={c} candidates_in_ram={} active_batches={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable} registry_updates={received_updates}",
-                    seen.len(),scheduler.candidates.len(),tasks.len());
-            }
         }
     }
-    let (a,b,c)=scheduler.counts(Instant::now());
-    crate::log_event!(Info,"raydium cpmm completion complete min_tvl_usd={COMPLETION_MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
-        seen.len(),started.elapsed().as_millis());
+    crate::log_event!(Info,"raydium_cpmm executor complete requests={processed}");
     Ok(())
 }

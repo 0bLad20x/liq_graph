@@ -1,7 +1,7 @@
 param(
     [ValidateRange(60, 86400)][int]$DurationSeconds = 300,
     [ValidateRange(1, 128)][int]$PoolLimit = 16,
-    [ValidateSet("Dlmm", "DammV2", "Both")][string]$Venue = "DammV2"
+    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "All")][string]$Venue = "Raydium"
 )
 
 # Real protocol REST/RPC -> one lifecycle -> Registry -> existing PostgreSQL writer.
@@ -10,8 +10,8 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-damm-v2-lifecycle" -or $tracked) {
-    throw "Use a clean, committed agent/cp2-damm-v2-lifecycle checkout."
+if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-raydium-lifecycle" -or $tracked) {
+    throw "Use a clean, committed agent/cp2-raydium-lifecycle checkout."
 }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed." }
@@ -22,16 +22,26 @@ $selector = switch ($Venue) {
     "Dlmm" { "dlmm" }
     "DammV2" { "damm_v2" }
     "Both" { "both" }
+    "RaydiumAmmV4" { "raydium_amm_v4" }
+    "RaydiumCpmm" { "raydium_cpmm" }
+    "RaydiumClmm" { "raydium_clmm" }
+    "Raydium" { "raydium" }
+    "All" { "all" }
 }
-$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2 }
+$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5 }
 $requiredVenues = switch ($Venue) {
     "Dlmm" { @("MeteoraDlmm") }
     "DammV2" { @("MeteoraDammV2") }
     "Both" { @("MeteoraDlmm", "MeteoraDammV2") }
+    "RaydiumAmmV4" { @("RaydiumAmmV4") }
+    "RaydiumCpmm" { @("RaydiumCpmm") }
+    "RaydiumClmm" { @("RaydiumClmm") }
+    "Raydium" { @("RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm") }
+    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm") }
 }
 $settings = @{
     RUN_DURATION_SECONDS = "$DurationSeconds"
-    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug"
+    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug"
     COMPLETION_LIFECYCLE_LIVE_VENUE = $selector
     COMPLETION_LIFECYCLE_POOL_LIMIT = "$PoolLimit"
     COMPLETION_LIFECYCLE_REFRESH_SECONDS = "30"
@@ -91,7 +101,7 @@ if ($text -match 'runtime fatal|level=ERROR|lost [1-9][0-9]* .*batches|completio
 }
 
 # Link this run's last accepted proof per pool to a read-only SQL verification.
-$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
+$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
 $latest = @{}
 $refreshCounts = @{}
 foreach ($match in [regex]::Matches($text, $pattern)) {

@@ -1,14 +1,15 @@
-# Completion Lifecycle: DLMM und DAMM v2
+# Completion Lifecycle: Meteora und Raydium
 
-Basis dieser Erweiterung: `agent/cp2-dlmm-lifecycle`, Commit
-`1dc0b96c55b4ebfba457dc7a967a2c129829ed89`.
-Testbranch: `agent/cp2-damm-v2-lifecycle`.
+Basis dieser Erweiterung: `agent/cp2-damm-v2-lifecycle`, Commit
+`5514e21aacb1d31b349bb6dbf0d837393e941e79`.
+Testbranch: `agent/cp2-raydium-lifecycle`.
 
 ## Umfang und Grenzen
 
 CP2.1 plant anhand echter Registry-Snapshots und Updates fuer alle beobachteten,
-aktuell zugelassenen Pools. CP2.2 hat DLMM angeschlossen; diese Erweiterung schliesst **DAMM v2 an dieselbe
-Lifecycle-Instanz** an. Die anderen acht Completion-Worker behalten ihre bisherige Steuerung; ihre
+aktuell zugelassenen Pools. DLMM und DAMM v2 sind bereits angeschlossen;
+diese Erweiterung schliesst **Raydium AMM v4, CPMM und CLMM an dieselbe
+Lifecycle-Instanz** an. Die anderen fuenf Completion-Worker behalten ihre bisherige Steuerung; ihre
 Lifecycle-Zusammenfassungen tragen `executing=false`. Keine weiteren Decoder,
 Protokolle, Mint-Regeln oder TVL-Quellen werden umgebaut.
 
@@ -16,11 +17,12 @@ Der Lifecycle liegt in einem Worker, nicht im Core. Der Core enthaelt die
 gemeinsamen Auftrags-/Antwortvertraege. Die Registry bleibt alleiniger
 Pool-State-Writer, PostgreSQL hat weiterhin genau den bestehenden Writer und
 dieselbe Tabelle. Der Lifecycle interpretiert keine protokollspezifische
-Evidence und besitzt keine RPC-Verbindung. Die beiden Meteora-Worker erhalten explizite
+Evidence und besitzt keine RPC-Verbindung. Die fuenf angeschlossenen Worker erhalten explizite
 Auftraege; ihre lokalen Scheduler sind entfernt. Auch die Versuchsgrenze ist aus
 ihren Protokoll-Settings entfernt und wird zentral im Lifecycle gesetzt. Es gibt
-eine gemeinsame Registrierung fuer beide Executor-Receiver und einen gemeinsamen
-Antwortkanal, keine zweite Lifecycle-Instanz fuer DAMM v2.
+eine gemeinsame Registrierung fuer alle fuenf Executor-Receiver und einen gemeinsamen
+Antwortkanal. Raydium Stable hat keinen Completion-Worker und ist nicht Teil
+dieser Migration.
 
 Diese Stufe aktualisiert Prepared-Manifeste regelmaessig, fuehrt aber **noch
 keinen Entzug wegen maximalen Pruefalters** ein. Der Graph und seine Logik
@@ -46,7 +48,10 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
 5. DLMM fuehrt seinen vorhandenen vollstaendigen Pruefpfad aus: LbPair, Bitmap,
    ausgewaehlte BinArrays, Mint-Pruefung, Evidence und gerichtete Accountbloecke.
    DAMM v2 verwendet unveraendert seinen kohärenten Pool-/Mint-/Vault-Pruefpfad
-   und seine vorhandene Manifest-Erstellung. Ergebnisse werden nach Pool-Adresse den Auftrags-IDs zugeordnet, weil interne
+   und seine vorhandene Manifest-Erstellung. Auch Raydium behaelt seine Decoder,
+   Mint-/Vault-/Konfigurationspruefungen und Manifest-Erstellung unveraendert;
+   CLMM liest dabei die aktuellen TickArray-/Bitmap-Accounts erneut ein.
+   Ergebnisse werden nach Pool-Adresse den Auftrags-IDs zugeordnet, weil interne
    RPC-Partitionen die Reihenfolge aendern koennen.
 6. Terminale Ergebnisse gehen ueber den bestehenden Ergebnisvertrag zur Registry.
    Erst deren passender Slot-/Zeitstempel-/Status-Update bestaetigt den Auftrag.
@@ -66,9 +71,9 @@ Registry. Eine Frischefreigabe ist Teil des spaeteren CP2-Abschlusses.
    Queue, Auftrags-IDs und transiente Fehlerzaehler sind RAM-Zustand; ihr exakter
    Backoff wird nicht persistiert. Alte Statuswerte werden nicht zurueckgesetzt.
 
-Ein Executor- oder Lifecycle-Fehler ist fuer beide Anbindungen fail-fast. Es
+Ein Executor- oder Lifecycle-Fehler ist fuer alle fuenf Anbindungen fail-fast. Es
 gibt keinen stillen Rueckfall auf den entfernten lokalen Scheduler. Die anderen
-acht Worker behalten ihren vorhandenen Supervisor. Beim Stoppen werden neue
+fuenf Worker behalten ihren vorhandenen Supervisor. Beim Stoppen werden neue
 Auftraege eingestellt und laufende Antworten samt Registry-Uebernahme abgearbeitet.
 
 ## Einstellungen
@@ -96,29 +101,37 @@ der ausgewaehlten Protokolle:
 
 ```powershell
 git fetch origin
-git switch --track origin/agent/cp2-damm-v2-lifecycle
-.\scripts\completion_lifecycle_live.ps1 -Venue Both -DurationSeconds 300 -PoolLimit 16
+git switch --track origin/agent/cp2-raydium-lifecycle
+.\scripts\completion_lifecycle_live.ps1 -Venue Raydium -DurationSeconds 300 -PoolLimit 16
 ```
 
 Das Skript prueft Checkout/HEAD, baut mit `cargo build --locked --release` und
 verwendet den echten Logger `LIQ_GRAPH_LOG`. Es startet
 `--completion-lifecycle-live`: die ausgewaehlten REST-Quellen und Executor-Worker,
 einen gemeinsamen Lifecycle, Registry, RPC-Transport und PostgreSQL-Writer.
-`-Venue DammV2` prueft DAMM v2 allein (Standard), `-Venue Dlmm` DLMM allein,
-`-Venue Both` beide zugleich. Der Pool-Limit-Wert gilt je Protokoll; Both mit
-16 bedeutet maximal 32 Pools. Andere Completion-Worker und Graph starten in
+`-Venue Raydium` prueft die drei Raydium-Worker gemeinsam (Standard).
+`RaydiumAmmV4`, `RaydiumCpmm` und `RaydiumClmm` pruefen sie jeweils einzeln.
+`Dlmm`, `DammV2` und `Both` bleiben verfuegbar; `All` startet alle fuenf.
+Es laeuft genau eine gemeinsame Raydium-REST-Quelle, auch mit drei Raydium-Executoren.
+Der Pool-Limit-Wert gilt je Protokoll; Raydium mit 16 bedeutet maximal 48 Pools,
+All maximal 80. Andere Completion-Worker und Graph starten in
 diesem isolierten Lauf nicht. `--run` und die bestehenden Einzelmodi verwenden
 denselben Lifecycle-/Executor-Datenfluss. Im kombinierten endlichen Einzelmodus
-begrenzt `--completion-limit` die Gesamtzahl der Lifecycle-Auftraege beider
+begrenzt `--completion-limit` die Gesamtzahl der Lifecycle-Auftraege aller
 angeschlossener Executor-Worker; es gibt keine getrennten Protokoll-Limits.
 
 Die Auswahl erfolgt ausschliesslich in der Orchestrierung ueber
-`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both`; der Lifecycle enthaelt keine
-DAMM-/DLMM-Fallunterscheidung und unveraendert dieselben Zeitregeln.
+`COMPLETION_LIFECYCLE_LIVE_VENUE=dlmm|damm_v2|both|raydium_amm_v4|raydium_cpmm|raydium_clmm|raydium|all`;
+der Lifecycle enthaelt keine Protokoll-Fallunterscheidung und unveraendert dieselben Zeitregeln.
 
 Die erste reale zugelassene Kohorte ist fuer den Lauf fest; unsupported-Pools
 belegen beim Eintritt keinen Platz. Der Live-Aufruf verwendet Refresh=30,
-Recheck=45, Retry=5, Retry-Maximum=30 und zwei parallele Batches je Protokoll. Er erzeugt
+Recheck=45, Retry=5 und Retry-Maximum=30. DLMM und DAMM v2 verwenden dabei
+zwei parallele Batches. Die Raydium-Worker behalten ihre vorhandene technische
+Obergrenze von 16 parallelen Batches und ihre Account-Batchgroessen (AMM v4 bis
+16, CPMM bis 12, CLMM bis 7 Pools, abhaengig von `RPC_ACCOUNT_BATCH_SIZE`).
+Die feste reale Kohorte begrenzt zusaetzlich die insgesamt laufenden Pools.
+Der Lauf erzeugt
 keine Testpools, resettet keine Statuswerte und sendet keine Transaktionen.
 Die Environment-Aenderungen des Skripts werden anschliessend wiederhergestellt.
 
@@ -143,16 +156,18 @@ reale Ereignisse werden nicht simuliert oder als bestanden ausgegeben. Ein
 Refresh-Lauf allein nimmt diese weiteren Uebergaenge nicht ab.
 
 Registry-Debug wurde im Skript abgeschaltet. Auftrags-/Ergebnislogs des Lifecycle
-und der beiden Executor-Worker sowie die SQL-Abnahme bleiben verfuegbar. Es werden
-keine separaten DAMM-v2-Pruefskripte oder Tabellen eingefuehrt.
+und der ausgewaehlten Executor-Worker sowie die SQL-Abnahme bleiben verfuegbar.
+Alle Protokolle nutzen dasselbe Pruefskript und dieselbe Tabelle.
 
 ## Stand bei Uebergabe
 
 DLMM ist auf Basiscommit `1dc0b96` bereits live nachgewiesen: 160 Auftraege,
 155 akzeptierte/persistierte terminale Ergebnisse, fuenf erfolgreiche Retry-
 Wiederaufnahmen, 142 Prepared-Refreshes und SQL 16/16/0. Dieser Nachweis gilt
-fuer den damaligen Stand. Die DAMM-v2-Erweiterung und der gemeinsame Betrieb
-beider Executor-Worker brauchen den neuen Build-/Live-/SQL-Nachweis.
+fuer den damaligen Stand. Auf Basiscommit `5514e21` ist auch der gemeinsame
+DLMM-/DAMM-v2-Betrieb live nachgewiesen: 304 akzeptierte und persistierte
+Prepared-Ergebnisse bei 32 Pools, wiederholte Refreshes je Protokoll und
+SQL 32/32/0. Die Raydium-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
 
 Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
 Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind
