@@ -3,7 +3,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    env,
     hint::black_box,
     mem::size_of,
     sync::Arc,
@@ -23,21 +22,14 @@ const V10_MAX_DECLARATIONS: usize = 16;
 type Pair = (Pubkey, Pubkey);
 
 #[derive(Clone, Copy, Debug)]
-pub struct Settings {
-    /// None means no economic TVL cutoff; readiness is always mandatory.
-    pub min_tvl_usd: Option<f64>,
-}
+pub struct Settings;
 
 impl Settings {
     pub fn from_env() -> Result<Self> {
-        let min_tvl_usd = env::var("GRAPH_MIN_TVL_USD")
-            .ok()
-            .map(|value| value.parse::<f64>().context("invalid GRAPH_MIN_TVL_USD"))
-            .transpose()?;
-        if let Some(value) = min_tvl_usd {
-            ensure!(value.is_finite() && value >= 0.0, "GRAPH_MIN_TVL_USD must be nonnegative and finite");
+        if std::env::var_os("GRAPH_MIN_TVL_USD").is_some() {
+            crate::log_event!(Warn,"GRAPH_MIN_TVL_USD is ignored; Registry completion admission owns the common TVL gate");
         }
-        Ok(Self { min_tvl_usd })
+        Ok(Self)
     }
 }
 
@@ -85,26 +77,21 @@ struct PreparedPool {
     address: Pubkey,
     a: Pubkey,
     b: Pubkey,
-    tvl_usd: Option<f64>,
 }
 
-fn eligible(pool: &PoolState, min_tvl_usd: Option<f64>) -> Option<PreparedPool> {
+fn eligible(pool: &PoolState) -> Option<PreparedPool> {
     let (Some(a), Some(b), Some(slot), Some(manifest)) =
         (pool.mint_a, pool.mint_b, pool.completion_validated_slot,
          pool.execution_manifest.as_ref()) else { return None };
-    if pool.completion_state != CompletionState::Prepared || a == b
+    if !pool.completion_admission.is_admitted()
+        || pool.completion_state != CompletionState::Prepared || a == b
         || a == Pubkey::default() || b == Pubkey::default()
         || manifest.pool != pool.address || manifest.mint_a != a
         || manifest.mint_b != b || manifest.validated_slot != slot
         || manifest.base_a.is_empty() || manifest.base_b.is_empty() {
         return None;
     }
-    if let Some(threshold) = min_tvl_usd {
-        if !pool.tvl_usd.is_some_and(|v| v.is_finite() && v >= threshold) {
-            return None;
-        }
-    }
-    Some(PreparedPool { address: pool.address, a, b, tvl_usd: pool.tvl_usd })
+    Some(PreparedPool { address: pool.address, a, b })
 }
 
 fn pair(a: Pubkey, b: Pubkey) -> Pair {
@@ -418,7 +405,7 @@ const REBUILD_SPACING: Duration = Duration::from_secs(3);
 pub async fn run(
     mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     output: watch::Sender<Arc<GraphSnapshot>>,
-    settings: Settings,
+    _settings: Settings,
 ) -> Result<()> {
     let mut prepared: HashMap<Pubkey, PreparedPool> = HashMap::new();
     let mut changed_batches = 0_u64;
@@ -439,7 +426,7 @@ pub async fn run(
                     observed += batch.pools.len();
                     let mut changes = 0_usize;
                     for pool in &batch.pools {
-                        let candidate = eligible(pool, settings.min_tvl_usd);
+                        let candidate = eligible(pool);
                         match candidate {
                             Some(p) => {
                                 // TVL and slot changes in an existing edge do not
@@ -503,20 +490,6 @@ pub async fn run(
         observed,changed_batches,final_graph.generation,
         final_graph.qualified_pools,final_graph.groups.len());
 
-    // Retain the original finite-run threshold probes when this module is
-    // explicitly in DEBUG. Never perform these extra builds in normal --run.
-    if crate::core::logging::enabled(crate::core::logging::Level::Debug,module_path!())
-        && settings.min_tvl_usd.is_none() && !prepared.is_empty() {
-        for threshold in [10.0_f64,100.0,1000.0] {
-            let started=Instant::now();
-            let graph=build(prepared.values().copied().filter(|p|
-                p.tvl_usd.is_some_and(|v|v>=threshold)),generation)?;
-            crate::log_event!(Debug,
-                "scenario min_tvl_usd={} qualified={} groups={} trade_paths={} approx_index_bytes={} build_us={}",
-                threshold,graph.qualified_pools,graph.groups.len(),graph.route_options,
-                graph.approx_index_bytes,started.elapsed().as_micros());
-        }
-    }
     Ok(())
 }
 

@@ -615,8 +615,6 @@ pub async fn run() -> Result<()> {
         let restored = registry.restore(database.restore().await?)?;
         ensure!(restored > 0, "--jupiter-only requires persisted pools for graph bootstrap");
         let graph_settings = graph_liquidity::Settings::from_env()?;
-        ensure!(graph_settings.min_tvl_usd.is_none(),
-            "--jupiter-only restore cannot use GRAPH_MIN_TVL_USD without fresh TVL");
         let (updates, graph_input) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
         let (graph_tx, graph_rx) =
             watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
@@ -656,8 +654,6 @@ pub async fn run() -> Result<()> {
         let restored = registry.restore(database.restore().await?)?;
         ensure!(restored > 0, "persistence restore-live requires stored pools");
         let graph_settings = graph_liquidity::Settings::from_env()?;
-        ensure!(graph_settings.min_tvl_usd.is_none(),
-            "restore-live cannot use GRAPH_MIN_TVL_USD without a fresh TVL source");
         let (updates, receiver) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
         let (graph_tx, graph_rx) = watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
         let mut tasks = JoinSet::new();
@@ -701,14 +697,6 @@ pub async fn run() -> Result<()> {
             || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
             || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {
             let graph_settings=graph_liquidity::Settings::from_env()?;
-            if cli.manifest_completion_live {
-                ensure!(graph_settings.min_tvl_usd.is_none(),
-                    "--manifest-completion-live requires GRAPH_MIN_TVL_USD unset (Manifest TVL is None)");
-            }
-            if cli.pumpswap_completion_live || cli.pumpswap_rolling {
-                ensure!(graph_settings.min_tvl_usd.is_none(),
-                    "PumpSwap completion requires GRAPH_MIN_TVL_USD unset until reserve/TVL worker exists");
-            }
             Some(graph_settings)
         } else {None};
         let (registry, writer) = if cli.persistence_write_live

@@ -9,7 +9,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant, MissedTickBehavior}};
 
 use crate::{
-    core::{AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
+    core::{CompletionReason, COMPLETION_MIN_TVL_USD, AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
         CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
         PoolUpdateBatch, Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -31,7 +31,6 @@ const OBS_LEN: usize = 4483;
 const BITMAP_LEN: usize = 1832;
 const ARRAY_LEN: usize = 10240;
 const ARRAY_RADIUS: i32 = 2; // Matches public V10 array_candidates max radius
-const MIN_TVL_USD: f64 = 500.0;
 const POOLS_PER_BATCH: usize = 7;
 const PARALLEL_BATCHES: usize = 16;
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
@@ -274,7 +273,7 @@ fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>)->CompletionResult{
-    CompletionResult{pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult{
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -363,7 +362,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
                 if initialized {present.insert(start,address);}
             }
             None if initialized =>return incomplete(pool.address,slot,
-                format!("Raydium CLMM initialized TickArray missing at {start}")),
+                format!("Raydium CLMM initialized TickArray missing at {start}")).with_reason_code(CompletionReason::MissingExecutionAccounts),
             None=>{}
         }
     }
@@ -375,7 +374,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
         .filter_map(|index|present.get(&index).copied()).collect::<Vec<_>>();
     if up.is_empty()||down.is_empty(){
         return incomplete(pool.address,slot,
-            "Raydium CLMM requires initialized TickArrays in both V10 directions within radius 2");
+            "Raydium CLMM requires initialized TickArrays in both V10 directions within radius 2").with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     let proofs=if pool.mint_a==Some(l.mints[0]){[mint0,mint1]}else{[mint1,mint0]};
     let ev=Arc::new(CompletionEvidence{
@@ -397,7 +396,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
         return result(pool.address,CompletionStatus::Incomplete,Some(slot),
             Some(format!("V10 unsupported Token-2022 mint extensions: {:?} {:?}",
                 proofs[0].unsupported,proofs[1].unsupported)),
-            Some(ev),Some(proofs),None);
+            Some(ev),Some(proofs),None).with_reason_code(CompletionReason::UnsupportedConfiguration);
     }
     let is_v2=ma.owner==token_2022||mb.owner==token_2022;
     let manifest=make_manifest(l,slot,&up,&down,is_v2,owner);
@@ -477,8 +476,7 @@ impl Scheduler {
         if pool.completion_state==CompletionState::Prepared {
             self.candidates.remove(&pool.address);
             self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
-            || !pool.tvl_usd.is_some_and(|v|v.is_finite() && v>=MIN_TVL_USD) {
+        } else if !pool.completion_admission.is_admitted() {
             self.candidates.remove(&pool.address);
         } else {
             self.candidates.insert(pool.address,pool.clone());
@@ -488,8 +486,7 @@ impl Scheduler {
         match self.attempts.get(&pool.address).copied() {
             None=>match pool.completion_state {
                 CompletionState::Unknown=>Some(1),
-                CompletionState::Incomplete if !pool.completion_reason.as_deref()
-                    .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(2),
+                CompletionState::Incomplete if pool.completion_reason_code.is_none_or(CompletionReason::recheckable)=>Some(2),
                 _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),
@@ -543,7 +540,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started=Instant::now();
     crate::log_event!(Info,"raydium clmm completion started min_tvl_usd={} limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
-        MIN_TVL_USD,settings.limit,settings.parallel_batches,settings.pools_per_batch(),
+        COMPLETION_MIN_TVL_USD,settings.limit,settings.parallel_batches,settings.pools_per_batch(),
         RETRY_COOLDOWN.as_secs());
     loop {
         while tasks.len()<settings.parallel_batches
@@ -633,7 +630,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
         }
     }
     let (a,b,c)=scheduler.counts(Instant::now());
-    crate::log_event!(Info,"raydium clmm completion complete min_tvl_usd={MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
+    crate::log_event!(Info,"raydium clmm completion complete min_tvl_usd={COMPLETION_MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }

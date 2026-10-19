@@ -7,7 +7,7 @@ use serde_json::json;
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast,watch}, task::JoinSet, time::{Instant,MissedTickBehavior}};
 use crate::{
-    core::{AccountMeta,CompletionEvidence,CompletionResult,CompletionResultBatch,
+    core::{CompletionReason, AccountMeta,CompletionEvidence,CompletionResult,CompletionResultBatch,
         CompletionState,CompletionStatus,ExecutionManifest,MintProof,PoolState,PoolUpdateBatch,Venue},
     workers::rpc_transport::{AccountData,AccountView,RpcAnswer,RpcHandle,RpcOperation},
 };
@@ -196,7 +196,7 @@ async fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>)->CompletionResult {
-    CompletionResult{pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -452,7 +452,7 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
             results.insert(pool.address,result(pool.address,
                 CompletionStatus::Incomplete,Some(pool_slot),
                 Some("wallet-independent PumpSwap pool validated; set PUMPSWAP_V10_WALLET for V10 account blocks".into()),
-                Some(evidence),Some(proofs),None));
+                Some(evidence),Some(proofs),None).with_reason_code(CompletionReason::ConfigurationRequired));
         }
     }
     pools.iter().map(|p|results.remove(&p.address)
@@ -472,8 +472,10 @@ impl Scheduler {
                 e.kind=="pumpswap_pool_validated_v1")) {
             self.candidates.remove(&p.address);
             self.retry_after.remove(&p.address);
-        } else if p.mint_a.is_some() && p.mint_b.is_some() {
+        } else if p.completion_admission.is_admitted() {
             self.candidates.insert(p.address,p.clone());
+        } else {
+            self.candidates.remove(&p.address);
         }
     }
     fn next(&self,max:usize,now:Instant)->Vec<PoolState> {

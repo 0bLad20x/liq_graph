@@ -9,7 +9,7 @@ use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
-    core::{AccountMeta, CompletionEvidence, ExecutionManifest, MintProof, Venue,
+    core::{AccountMeta, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue,
         CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
 };
 
@@ -241,6 +241,8 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
         "evidence":evidence,
         "mints":mints,
         "reason":pool.completion_reason,
+        "reason_code":pool.completion_reason_code,
+        "checked_at_ms":pool.completion_checked_at_ms,
     });
     Ok(serde_json::to_string(&payload)?)
 }
@@ -249,7 +251,7 @@ fn decode_descriptor(
     address: Pubkey, a: Pubkey, b: Pubkey, status: CompletionState, slot: u64,
     descriptor_version: i32, payload: &Value
 ) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
-             Option<[MintProof;2]>, Option<String>)> {
+             Option<[MintProof;2]>, Option<String>, Option<CompletionReason>, Option<u64>)> {
     ensure!(payload.get("validated_slot").and_then(Value::as_u64)==Some(slot),
         "persisted validated_slot / descriptor mismatch");
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
@@ -315,7 +317,23 @@ fn decode_descriptor(
     let reason = payload.get("reason").filter(|v|!v.is_null())
         .map(|v|v.as_str().context("invalid persisted reason").map(str::to_owned))
         .transpose()?;
-    Ok((manifest, evidence, mints, reason))
+    let reason_code=payload.get("reason_code").filter(|v|!v.is_null())
+        .map(|v|serde_json::from_value::<CompletionReason>(v.clone())).transpose()?;
+    let reason_code=if status==CompletionState::Incomplete {
+        Some(reason_code.unwrap_or_else(||{
+            if mints.as_ref().is_some_and(|m|m.iter().any(|p|!p.unsupported.is_empty())) {
+                CompletionReason::UnsupportedConfiguration
+            } else {CompletionReason::LegacyUnclassified}
+        }))
+    } else {reason_code};
+    let checked_at_ms=payload.get("checked_at_ms").filter(|v|!v.is_null())
+        .map(|v|v.as_u64().filter(|at|*at>0).context("invalid completion check timestamp"))
+        .transpose()?;
+    ensure!(status!=CompletionState::Prepared || reason_code.is_none(),
+        "Prepared descriptor has a failure code");
+    ensure!(reason_code!=Some(CompletionReason::TransientFailure),
+        "transient attempt is not a durable completion proof");
+    Ok((manifest, evidence, mints, reason, reason_code, checked_at_ms))
 }
 
 #[derive(Clone, Copy)]
@@ -427,9 +445,9 @@ impl Persistence {
                 ensure!((1..=DESCRIPTOR_VERSION).contains(&version) && planner==PLANNER_VERSION,
                     "unsupported persisted descriptor/planner version pool={address}");
                 let raw_descriptor:Option<String>=row.get("payload");
-                let (manifest,evidence,mints,reason)=match (status,slot,raw_descriptor) {
+                let (manifest,evidence,mints,reason,reason_code,checked_at_ms)=match (status,slot,raw_descriptor) {
                     (CompletionState::Unknown,None,None) => {
-                        unknown+=1; (None,None,None,None)
+                        unknown+=1; (None,None,None,None,None,None)
                     }
                     (CompletionState::Prepared|CompletionState::Incomplete,Some(slot),Some(raw))=>{
                         let a=a.context("completed pool mint A missing")?;
@@ -461,10 +479,12 @@ impl Persistence {
                 pools.push(PoolState{
                     address,venue,mint_a:a,mint_b:b,source:"persistence_restore",
                     first_seen_ms,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
+                    completion_admission:CompletionAdmission::from_inputs(a,b,None),
                     pool_config,last_observation,
                     completion_state:status,completion_validated_slot:slot,
                     execution_manifest:manifest,completion_evidence:evidence,
                     mint_proofs:mints,completion_reason:reason,
+                    completion_reason_code:reason_code,completion_checked_at_ms:checked_at_ms,
                 });
                 after=Some(raw_address);
             }

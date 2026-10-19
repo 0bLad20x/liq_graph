@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    core::{
+    core::{CompletionReason, COMPLETION_MIN_TVL_USD, 
         AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
         CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
         PoolUpdateBatch, Venue,
@@ -31,7 +31,6 @@ const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const STATE_LEN: usize = 637;
 const CONFIG_LEN: usize = 236;
 const OBS_LEN: usize = 4075;
-const MIN_TVL_USD: f64 = 500.0;
 const POOLS_PER_BATCH: usize = 12;
 const PARALLEL_BATCHES: usize = 16;
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
@@ -229,7 +228,7 @@ async fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)->Result
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>)->CompletionResult {
-    CompletionResult{pool,status,validated_slot:slot,manifest,reason,evidence,mints}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -323,7 +322,7 @@ fn decode_final(pool:&PoolState,initial:PoolLayout,slot:u64,
         return result(pool.address,CompletionStatus::Incomplete,Some(slot),
             Some(format!("V10 unsupported Token-2022 mint extensions: {:?} {:?}",
                 proofs[0].unsupported,proofs[1].unsupported)),
-            Some(evidence),Some(proofs),None);
+            Some(evidence),Some(proofs),None).with_reason_code(CompletionReason::UnsupportedConfiguration);
     }
     result(pool.address,CompletionStatus::Prepared,Some(slot),None,
         Some(evidence),Some(proofs),
@@ -397,8 +396,7 @@ impl Scheduler {
         if pool.completion_state==CompletionState::Prepared {
             self.candidates.remove(&pool.address);
             self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
-            || !pool.tvl_usd.is_some_and(|v|v.is_finite() && v>=MIN_TVL_USD) {
+        } else if !pool.completion_admission.is_admitted() {
             self.candidates.remove(&pool.address);
         } else {
             self.candidates.insert(pool.address,pool.clone());
@@ -408,8 +406,7 @@ impl Scheduler {
         match self.attempts.get(&pool.address).copied() {
             None=>match pool.completion_state {
                 CompletionState::Unknown=>Some(1),
-                CompletionState::Incomplete if !pool.completion_reason.as_deref()
-                    .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(2),
+                CompletionState::Incomplete if pool.completion_reason_code.is_none_or(CompletionReason::recheckable)=>Some(2),
                 _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),
@@ -463,7 +460,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started=Instant::now();
     crate::log_event!(Info,"raydium cpmm completion started min_tvl_usd={} limit={} parallel={} pools_per_batch={} retry_cooldown_s={}",
-        MIN_TVL_USD,settings.limit,settings.parallel_batches,settings.pools_per_batch(),
+        COMPLETION_MIN_TVL_USD,settings.limit,settings.parallel_batches,settings.pools_per_batch(),
         RETRY_COOLDOWN.as_secs());
     loop {
         while tasks.len()<settings.parallel_batches
@@ -553,7 +550,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
         }
     }
     let (a,b,c)=scheduler.counts(Instant::now());
-    crate::log_event!(Info,"raydium cpmm completion complete min_tvl_usd={MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
+    crate::log_event!(Info,"raydium cpmm completion complete min_tvl_usd={COMPLETION_MIN_TVL_USD} pools_seen={} registry_updates={received_updates} first_attempts={first_attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} eligible_unknown_left={a} eligible_incomplete_left={b} eligible_retry_left={c} elapsed_ms={}",
         seen.len(),started.elapsed().as_millis());
     Ok(())
 }

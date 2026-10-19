@@ -7,7 +7,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant, MissedTickBehavior}};
 
 use crate::{
-    core::{AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
+    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
         CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
         PoolUpdateBatch, Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -170,7 +170,7 @@ async fn read_rpc(rpc: &RpcHandle, addresses: Vec<Pubkey>, min_slot: Option<u64>
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>)->CompletionResult {
-    CompletionResult{pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -211,7 +211,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     }
     let Some((free,next))=spare_node(&market.bytes) else {
         return incomplete(pool.address,slot,
-            "V10 Manifest requires at least two valid free-list nodes (no spare order node)");
+            "V10 Manifest requires at least two valid free-list nodes (no spare order node)").with_reason_code(CompletionReason::MissingExecutionAccounts);
     };
     let mint_vault=|mint:Pubkey|->Pubkey {
         if l.mints[0]==mint {l.vaults[0]} else {l.vaults[1]}
@@ -304,7 +304,7 @@ impl Scheduler {
         if pool.completion_state==CompletionState::Prepared {
             self.candidates.remove(&pool.address);
             self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none() {
+        } else if !pool.completion_admission.is_admitted() {
             self.candidates.remove(&pool.address);
         } else {
             self.candidates.insert(pool.address,pool.clone());
@@ -314,7 +314,7 @@ impl Scheduler {
         match self.attempts.get(&pool.address).copied() {
             None=>match pool.completion_state {
                 CompletionState::Unknown=>Some(1),
-                CompletionState::Incomplete=>Some(2),
+                CompletionState::Incomplete if pool.completion_reason_code.is_none_or(CompletionReason::recheckable)=>Some(2),
                 _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(3),

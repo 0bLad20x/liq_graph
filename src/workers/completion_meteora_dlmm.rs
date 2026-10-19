@@ -9,7 +9,7 @@ use serde_json::json;
 use tokio::{sync::{broadcast,watch}, task::JoinSet};
 
 use crate::{
-    core::{Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
+    core::{CompletionReason, COMPLETION_MIN_TVL_USD, Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
         CompletionStatus, CompletionResult, CompletionResultBatch,
         CompletionState, PoolState, PoolUpdateBatch},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -330,9 +330,8 @@ fn decode_mint(account: &AccountData) -> Result<MintProof> {
 
 fn mint_failure(pending: PendingMintValidation, status: CompletionStatus,
     reason: impl Into<String>) -> CompletionResult {
-    CompletionResult { pool: pending.pool, status, validated_slot: Some(pending.slot),
-        manifest: None, reason: Some(reason.into()),
-        evidence: Some(evidence(pending.validated.inventory)), mints: None }
+    CompletionResult::new(pending.pool,status,Some(pending.slot),Some(reason.into()),
+        Some(evidence(pending.validated.inventory)),None,None)
 }
 
 async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
@@ -403,13 +402,18 @@ async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
 }
 
 fn retryable(pool: Pubkey, reason: impl Into<String>) -> CompletionResult {
-    CompletionResult { pool, status: CompletionStatus::Retryable, validated_slot: None,
-        manifest: None, reason: Some(reason.into()), evidence: None, mints: None }
+    CompletionResult::new(pool,CompletionStatus::Retryable,None,
+        Some(reason.into()),None,None,None)
 }
 
 fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]) -> CompletionResult {
     let unsupported: Vec<String> = mints.iter().filter(|mint| !mint.unsupported.is_empty())
         .map(|mint| format!("{}:{:?}", mint.address, mint.unsupported)).collect();
+    let reason_code = if !unsupported.is_empty() {
+        Some(CompletionReason::UnsupportedConfiguration)
+    } else if validated.manifest.is_none() {
+        Some(CompletionReason::MissingExecutionAccounts)
+    } else {None};
     let reason = if !unsupported.is_empty() {
         Some(format!("V10 unsupported Token-2022 mint extensions: {}", unsupported.join(", ")))
     } else if validated.manifest.is_none() {
@@ -418,11 +422,11 @@ fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]
             validated.inventory.selected_indices.len(), validated.inventory.validated_indices.len()))
     } else { None };
     let status = if reason.is_some() { CompletionStatus::Incomplete } else { CompletionStatus::Prepared };
-    CompletionResult {
-        pool, status, validated_slot: Some(slot),
-        manifest: if status == CompletionStatus::Prepared { validated.manifest.map(Arc::new) } else { None },
-        reason, evidence: Some(evidence(validated.inventory)), mints: Some(mints),
-    }
+    let manifest=if status==CompletionStatus::Prepared {validated.manifest.map(Arc::new)} else {None};
+    let mut result=CompletionResult::new(pool,status,Some(slot),reason,
+        Some(evidence(validated.inventory)),Some(mints),manifest);
+    result.reason_code=reason_code;
+    result
 }
 
 struct Validated {
@@ -659,7 +663,6 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
 
 /// This is a worker-local attempt scheduler, not an economic signal engine.
 /// It uses only fresh Registry TVL; historic SQL observations never qualify a pool.
-const MIN_COMPLETION_TVL_USD: f64 = 500.0;
 const POOLS_PER_WORK_BATCH: usize = 16;
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -679,8 +682,7 @@ impl CandidateScheduler {
         if pool.completion_state == CompletionState::Prepared {
             self.candidates.remove(&pool.address);
             self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
-            || !pool.tvl_usd.is_some_and(|v| v.is_finite() && v > MIN_COMPLETION_TVL_USD)
+        } else if !pool.completion_admission.is_admitted()
         {
             // TVL is only a temporary eligibility filter. Keep the attempt and
             // transient retry history if the pool later re-enters the threshold.
@@ -691,10 +693,7 @@ impl CandidateScheduler {
     }
 
     fn repeatable_incomplete(pool: &PoolState) -> bool {
-        // Re-reading cannot cure a verified V10-incompatible mint.
-        !pool.completion_reason.as_deref().is_some_and(|reason|
-            reason.contains("V10 unsupported Token-2022 mint extensions")
-            || reason.contains("Token-2022 owner differs from LbPair flag"))
+        pool.completion_reason_code.is_none_or(CompletionReason::recheckable)
     }
 
     fn tier(&self, pool: &PoolState, now: Instant) -> Option<u8> {
@@ -779,7 +778,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
     let mut pulse=tokio::time::interval(Duration::from_secs(5));
     pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     crate::log_event!(Info,"dlmm completion started min_tvl_usd={} limit={} (0=unbounded) parallel={} pools_per_batch={} retry_cooldown_s={}",
-        MIN_COMPLETION_TVL_USD,settings.limit,settings.parallel_batches,
+        COMPLETION_MIN_TVL_USD,settings.limit,settings.parallel_batches,
         POOLS_PER_WORK_BATCH,RETRY_COOLDOWN.as_secs());
 
     loop {
@@ -839,10 +838,8 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
                 let mut prep=0_usize;let mut inc=0_usize;let mut retry=0_usize;
                 let mut missing_arrays=0_usize;let mut unsupported_mints=0_usize;
                 for result in &results {
-                    if let Some(reason)=result.reason.as_deref() {
-                        if reason.contains("no bitmap-initialized BinArrays") {missing_arrays+=1;}
-                        if reason.contains("V10 unsupported Token-2022 mint extensions") {unsupported_mints+=1;}
-                    }
+                    if result.reason_code==Some(CompletionReason::MissingExecutionAccounts) {missing_arrays+=1;}
+                    if result.reason_code==Some(CompletionReason::UnsupportedConfiguration) {unsupported_mints+=1;}
                     match result.status {
                         CompletionStatus::Prepared=>{
                             prep+=1; scheduler.candidates.remove(&result.pool);
@@ -878,7 +875,7 @@ pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
 
     let (unknown,incomplete,retryable,blocked)=scheduler.classify();
     crate::log_event!(Info,"dlmm completion complete min_tvl_usd={} distinct_dlmm_seen={} observed_updates={} first_attempts={} retries={} prepared={} incomplete={} retryable={} eligible_unknown_left={} eligible_incomplete_left={} eligible_retryable_left={} blocked_incompatible={} elapsed_ms={}",
-        MIN_COMPLETION_TVL_USD,unique_dlmm_seen.len(),observed,initial_attempts,repeated_attempts,
+        COMPLETION_MIN_TVL_USD,unique_dlmm_seen.len(),observed,initial_attempts,repeated_attempts,
         prepared_count,incomplete_count,retryable_count,unknown,incomplete,retryable,
         blocked,started.elapsed().as_millis());
     Ok(())

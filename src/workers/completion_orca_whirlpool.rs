@@ -6,7 +6,7 @@ use serde_json::json;
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant, MissedTickBehavior}};
 use crate::{
-    core::{AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
+    core::{CompletionReason, COMPLETION_MIN_TVL_USD, AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
         CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
         PoolUpdateBatch, Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -28,7 +28,6 @@ const DYNAMIC_MAX_LEN: usize = 8 + 4 + 32 + 16 + 88 * 113;
 const ORACLE_LEN: usize = 8 + 32 + 8 + 34 + 44 + 128;
 const POOLS_PER_BATCH: usize = 8; // second pass <= 12 addresses per pool
 const PARALLEL_BATCHES: usize = 16;
-const MIN_TVL_USD: f64 = 500.0;
 const ARRAY_RADIUS: i32 = 2;
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
@@ -37,7 +36,6 @@ pub struct Settings {
     pub limit: usize,
     account_batch_size: usize,
     parallel_batches: usize,
-    min_tvl_usd: f64,
     radius: i32,
 }
 impl Settings {
@@ -50,7 +48,7 @@ impl Settings {
         ensure!((12..=100).contains(&account_batch_size),
             "Orca requires RPC_ACCOUNT_BATCH_SIZE in 12..=100 for its coherent account snapshot");
         Ok(Self { limit:0, account_batch_size, parallel_batches:PARALLEL_BATCHES,
-            min_tvl_usd:MIN_TVL_USD, radius:ARRAY_RADIUS })
+            radius:ARRAY_RADIUS })
     }
     fn pools_per_batch(self) -> usize {
         POOLS_PER_BATCH.min(self.account_batch_size / 12)
@@ -195,7 +193,7 @@ fn read(rpc:&RpcHandle, addresses:Vec<Pubkey>, min_slot:Option<u64>)
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>) -> CompletionResult {
-    CompletionResult {pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -272,10 +270,10 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let shifted = layout.tick_current + layout.tick_spacing >= center + width;
     let up_center = if shifted { center + width } else { center };
     if !present.contains_key(&center) {
-        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized");
+        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     if !present.contains_key(&up_center) {
-        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized");
+        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     // Keep only consecutive initialized arrays starting at each direction's first array.
     let down=(0..=radius).map(|distance|center-distance*width)
@@ -308,7 +306,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     if mints.iter().any(|m|!m.unsupported.is_empty()) {
         return result(pool.address,CompletionStatus::Incomplete,Some(slot),
             Some(format!("V10 unsupported Token-2022 mint extensions: {:?} {:?}",
-                mints[0].unsupported,mints[1].unsupported)),Some(ev),Some(mints),None);
+                mints[0].unsupported,mints[1].unsupported)),Some(ev),Some(mints),None).with_reason_code(CompletionReason::UnsupportedConfiguration);
     }
     let manifest=make_manifest(layout,slot,&arrays_a,&arrays_b,owner);
     result(pool.address,CompletionStatus::Prepared,Some(slot),None,
@@ -381,16 +379,15 @@ struct Scheduler {
     retry_after:HashMap<Pubkey,Instant>,
 }
 impl Scheduler {
-    fn update(&mut self,pool:&PoolState,min_tvl:f64) {
+    fn update(&mut self,pool:&PoolState) {
         if pool.venue!=Venue::OrcaWhirlpool {return;}
-        if needs_evidence_upgrade(pool) {
-            // Old Prepared manifests must be rechecked even without fresh REST TVL.
+        if needs_evidence_upgrade(pool) && pool.completion_admission.is_admitted() {
+            // Evidence upgrades follow the same canonical TVL admission as every completion.
             self.candidates.insert(pool.address,pool.clone());
         } else if pool.completion_state==CompletionState::Prepared {
             self.candidates.remove(&pool.address);
             self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
-            || !pool.tvl_usd.is_some_and(|v|v.is_finite() && v>=min_tvl) {
+        } else if !pool.completion_admission.is_admitted() {
             self.candidates.remove(&pool.address);
         } else {
             self.candidates.insert(pool.address,pool.clone());
@@ -401,8 +398,7 @@ impl Scheduler {
             None=>match pool.completion_state {
                 CompletionState::Prepared if needs_evidence_upgrade(pool)=>Some(1),
                 CompletionState::Unknown=>Some(2),
-                CompletionState::Incomplete if !pool.completion_reason.as_deref()
-                    .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(3),
+                CompletionState::Incomplete if pool.completion_reason_code.is_none_or(CompletionReason::recheckable)=>Some(3),
                 _=>None,
             },
             Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(4),
@@ -455,7 +451,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started=Instant::now();
     crate::log_event!(Info,"orca completion started min_tvl_usd={} limit={} radius={} parallel={} pools_per_batch={}",
-        settings.min_tvl_usd,settings.limit,settings.radius,
+        COMPLETION_MIN_TVL_USD,settings.limit,settings.radius,
         settings.parallel_batches,settings.pools_per_batch());
     loop {
         while tasks.len()<settings.parallel_batches
@@ -487,7 +483,7 @@ pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
                     registry_updates+=batch.pools.len();
                     for pool in &batch.pools {
                         if pool.venue==Venue::OrcaWhirlpool {seen.insert(pool.address);}
-                        scheduler.update(pool,settings.min_tvl_usd);
+                        scheduler.update(pool);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n))=>
