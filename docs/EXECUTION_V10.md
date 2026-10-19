@@ -1,13 +1,16 @@
-# V10 simulation draft
+# V10 transaction simulation
 
 The user generated `Cargo.lock` with Cargo's online resolver. The exact supplied
 diff adds only `ring` to the root package dependencies; its Git blob starts with
 `3b8ba46`. Dependency versions are unchanged. That generated result is committed
-with the signing dependency. The user built committed HEAD `c494fb8` successfully
-with `cargo build --locked --release`. A real-chain direct SOL/USDC simulation
-returned executor `Custom:1` with `no_failure=false`; the same supplied manifests
-with `no_failure=true` returned success without DEX calls. This demonstrates the
-signed simulation path, not a successful swap or all V10 route shapes.
+with the signing dependency. The user built committed HEAD `830ad06`, tree
+`208441b073ac38767b4fce4d6d5d082a42c693d2`, successfully with
+`cargo build --locked --release`. The subsequent live diagnostic run completed
+18 cases, including successful signed direct SOL/USDC simulations without DEX
+calls. The cleanup after that run changes only documentation and removes its
+temporary diagnostic files; the application code and dependencies are unchanged.
+The implemented scope is transaction building, signing and simulation. Sending
+and the production Signal -> Graph -> ExecutionRequest connection remain open.
 
 `ExecutionRequest` describes exactly one transaction. Its producer selects all groups,
 pool alternatives and any conversion pool before handing the job to `execution_v10`.
@@ -47,14 +50,14 @@ Profit/size are settlement base units; priority fee is absolute lamports.
 No parameter is overwritten by a capacity-test mode.
 
 The worker validates four groups / sixteen declarations including conversion,
-the exact resulting account set (this draft uses a 64-account boundary), instruction
+the exact resulting account set (this worker uses a 64-account boundary), instruction
 references and 4096-byte v1 wire size. Shared pools across groups are allowed with
 consistent proof versions and count once per declaration. An oversized request is
 rejected unchanged. Account blocks are never shortened or rebuilt.
 
 ## Local real-chain simulation
 
-Use a clean committed draft branch and a funded mainnet wallet (or the explicit
+Use a clean committed checkout and a funded mainnet wallet (or the explicit
 flashloan option), with existing `RPC_*` settings in `.env`. New generic transport
 capabilities are `RPC_N_GET_LATEST_BLOCKHASH` and `RPC_N_SIMULATE_TRANSACTION`;
 both default true like the other ordinary RPC reads. No provider-specific V10 client.
@@ -102,10 +105,19 @@ proof of a swap or profit; observed DEX calls are not a net-profit guarantee eit
 Build success is a prerequisite. Functional acceptance requires a real request that
 reaches the executor with the expected accounts, and inspection of the simulation
 report. Failure reports remain evidence for diagnosis, not successful acceptance.
-The direct-group evidence above is the current live record. Swaps, bridge and
-conversion routes, flashloans and other DEX paths remain unproven. Sending is not
-implemented. The user-requested controlled error probes are documented in
-`docs/EXECUTION_V10_DIAGNOSTICS.md` and run through `scripts/v10_diagnostics_live.ps1`.
+The direct-group evidence above is the current live record. The diagnostic run
+also demonstrated local identity rejection, executor InvalidAccountData responses
+to the four tested account mutations, and ComputationalBudgetExceeded at 1000 CU.
+Unchanged references before/after and the high-profit-threshold case returned
+Custom:1 with no_failure=false and success without trading with no_failure=true.
+This supports the No-Trade interpretation for the tested case, not a universal
+Custom:1 mapping. The detailed observations and remaining execution evidence are
+tracked in [issue #32](https://github.com/0bLad20x/liq_graph/issues/32).
+
+Swaps, bridge/conversion routes, flashloans and other DEX paths remain unproven.
+The temporary diagnostic script and its separate guide were removed at the user's
+request; the issue links their historical committed version. The ordinary
+`scripts/v10_simulation_live.ps1` and native simulation command remain available.
 
 Primary references:
 - https://www.solanamevbot.com/docs/onchain-bot/onchain-program/v10
