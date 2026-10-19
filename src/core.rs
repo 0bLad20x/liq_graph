@@ -1,6 +1,7 @@
 //! Shared worker contracts and generic HTTP infrastructure.
 pub mod logging;
 pub mod execution;
+pub mod market_state;
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::Result;

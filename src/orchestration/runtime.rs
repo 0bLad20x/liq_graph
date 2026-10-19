@@ -11,7 +11,7 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
         diagnostic_source, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
-        identity_hydration_venues, persistence, pool_registry,
+        identity_hydration_venues, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint}};
 use super::jupiter_settings;
 
@@ -499,6 +499,22 @@ pub async fn run()->Result<()>{
     critical(&mut tasks,"persistence",database.run(updates.subscribe()));
     critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
         updates.subscribe(),graph_tx,graph_settings));
+    // Price observations are optional. The Registry and graph retain their own eligibility rules.
+    let market_enabled=enabled("MARKET_STATE_ENABLED")?;
+    let market_control=if market_enabled {
+        let settings=market_state::Settings::from_env()?;
+        let (control,enabled_rx)=watch::channel(true);
+        let (prices,price_rx)=broadcast::channel(16384);
+        critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),
+            rpc.clone(),prices,settings,stop_rx.clone(),enabled_rx));
+        let market_catalog=catalog_rx.clone();
+        critical(&mut tasks,"market_state.consumer",async move {
+            market_state::observe(price_rx,market_catalog,settings.trace).await.map(|_|())
+        });
+        Some(control)
+    } else {None};
+    // Keep the observation-control sender alive for the worker lifetime.
+    let _market_control=market_control;
     // Observers must not take down the state-owning runtime on diagnostic lag.
     tasks.spawn(supervise("observer.graph_watch_catalog",stop_rx.clone(),move||{
         let input=catalog_rx.clone();
