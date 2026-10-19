@@ -3,9 +3,11 @@
 The user generated `Cargo.lock` with Cargo's online resolver. The exact supplied
 diff adds only `ring` to the root package dependencies; its Git blob starts with
 `3b8ba46`. Dependency versions are unchanged. That generated result is committed
-with the signing dependency. Rust build and real-chain simulation remain pending;
-this environment has no Rust/Cargo toolchain. The next step is the documented
-`cargo build --locked --release` on the committed draft branch.
+with the signing dependency. The user built committed HEAD `c494fb8` successfully
+with `cargo build --locked --release`. A real-chain direct SOL/USDC simulation
+returned executor `Custom:1` with `no_failure=false`; the same supplied manifests
+with `no_failure=true` returned success without DEX calls. This demonstrates the
+signed simulation path, not a successful swap or all V10 route shapes.
 
 `ExecutionRequest` describes exactly one transaction. Its producer selects all groups,
 pool alternatives and any conversion pool before handing the job to `execution_v10`.
@@ -100,7 +102,10 @@ proof of a swap or profit; observed DEX calls are not a net-profit guarantee eit
 Build success is a prerequisite. Functional acceptance requires a real request that
 reaches the executor with the expected accounts, and inspection of the simulation
 report. Failure reports remain evidence for diagnosis, not successful acceptance.
-No execution live test or Rust build has yet been recorded for this draft.
+The direct-group evidence above is the current live record. Swaps, bridge and
+conversion routes, flashloans and other DEX paths remain unproven. Sending is not
+implemented. The user-requested controlled error probes are documented in
+`docs/EXECUTION_V10_DIAGNOSTICS.md` and run through `scripts/v10_diagnostics_live.ps1`.
 
 Primary references:
 - https://www.solanamevbot.com/docs/onchain-bot/onchain-program/v10
