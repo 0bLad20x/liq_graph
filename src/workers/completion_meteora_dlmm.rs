@@ -67,8 +67,6 @@ fn evidence(inventory: BinArrayInventory) -> Arc<CompletionEvidence> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    /// Zero means continuous/unbounded; positive limits cap finite live runs.
-    pub limit: usize,
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
@@ -93,7 +91,7 @@ impl Settings {
             .context("invalid DLMM_COMPLETION_PARALLEL_BATCHES")?;
         ensure!((1..=64).contains(&parallel_batches),
             "DLMM_COMPLETION_PARALLEL_BATCHES must be 1..=64");
-        Ok(Self { limit: 100, account_batch_size, below, above, parallel_batches })
+        Ok(Self { account_batch_size, below, above, parallel_batches })
     }
 }
 

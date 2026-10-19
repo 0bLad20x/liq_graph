@@ -150,39 +150,64 @@ async fn completion_feed(
 
 /// Wiring shared by production, the finite protocol mode and the CP2 live run.
 /// Protocol code and scheduling stay in their respective workers.
-pub(super) fn spawn_dlmm_lifecycle(tasks:&mut JoinSet<Result<()>>,
+pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
     registry:&pool_registry::PoolRegistry,
     updates:&broadcast::Sender<Arc<PoolUpdateBatch>>,
     results:broadcast::Sender<Arc<CompletionResultBatch>>,
     source_done:watch::Receiver<bool>,
-    stop:(watch::Sender<bool>,watch::Receiver<bool>),
-    rpc:rpc_transport::RpcHandle,config:completion_meteora_dlmm::Settings,finite:bool,
+    stop:(watch::Sender<bool>,watch::Receiver<bool>),rpc:rpc_transport::RpcHandle,
+    dlmm:Option<completion_meteora_dlmm::Settings>,
+    damm_v2:Option<completion_meteora_damm_v2::Settings>,
+    finite:bool,attempt_limit:usize,
 )->Result<()> {
+    anyhow::ensure!(dlmm.is_some()||damm_v2.is_some(),"no lifecycle executor configured");
     let input=updates.subscribe();
     let seed=registry.snapshot();
-    let settings=completion_lifecycle::Settings::from_env(finite,config.limit)?;
-    let (jobs,job_rx)=tokio::sync::mpsc::channel(4);
+    let settings=completion_lifecycle::Settings::from_env(finite,attempt_limit)?;
     let (responses,response_rx)=tokio::sync::mpsc::channel(4);
-    let executor=completion_lifecycle::Executor{venue:Venue::MeteoraDlmm,
-        requests:jobs,batch_size:16,max_in_flight:config.parallel_batches*16};
-    critical(tasks,"completion.meteora_dlmm",completion_meteora_dlmm::run(
-        job_rx,rpc,config,responses));
+    let mut executors=Vec::new();
+    macro_rules! executor {
+        ($module:ident,$venue:path,$configured:expr)=>{
+            if let Some((config,batch_size))=$configured {
+                let (jobs,job_rx)=tokio::sync::mpsc::channel(4);
+                executors.push(completion_lifecycle::Executor{venue:$venue,requests:jobs,
+                    batch_size,max_in_flight:config.parallel_batches*batch_size});
+                critical(tasks,concat!("completion.",stringify!($module)),
+                    $module::run(job_rx,rpc.clone(),config,responses.clone()));
+            }
+        };
+    }
+    executor!(completion_meteora_dlmm,Venue::MeteoraDlmm,dlmm.map(|s|(s,16)));
+    executor!(completion_meteora_damm_v2,Venue::MeteoraDammV2,damm_v2.map(|s|(s,s.pools_per_batch())));
+    drop(responses);
+    // One lifecycle instance receives every registered executor's responses.
     critical(tasks,"completion_lifecycle",async move{
         let _stop_owner=stop.0;
-        completion_lifecycle::run(seed,input,response_rx,vec![executor],results,
+        completion_lifecycle::run(seed,input,response_rx,executors,results,
             source_done,stop.1,settings).await
     });
     Ok(())
 }
 
-/// Bounded real-provider proof for the DLMM lifecycle only. Uses the same
+/// Bounded real-provider proof for selected migrated executors. Uses the same
 /// dispatch, execution, Registry and single-writer path as --run.
 pub async fn completion_lifecycle_live()->Result<()> {
     let duration=number("RUN_DURATION_SECONDS",300)?;
     anyhow::ensure!((30..=86400).contains(&duration),"live duration must be 30..86400");
+    let selected=env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").unwrap_or_else(|_|"dlmm".into());
+    let (dlmm,damm_v2)=match selected.as_str() {
+        "dlmm"=>(Some(completion_meteora_dlmm::Settings::from_env()?),None),
+        "damm_v2"=>(None,Some(completion_meteora_damm_v2::Settings::from_env()?)),
+        "both"=>(Some(completion_meteora_dlmm::Settings::from_env()?),
+            Some(completion_meteora_damm_v2::Settings::from_env()?)),
+        _=>bail!("COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2 or both"),
+    };
+    let mut venues=Vec::new();
+    if dlmm.is_some(){venues.push(Venue::MeteoraDlmm);}
+    if damm_v2.is_some(){venues.push(Venue::MeteoraDammV2);}
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?.into_iter()
-        .filter(|p|p.venue==Venue::MeteoraDlmm).collect();
+        .filter(|p|venues.contains(&p.venue)).collect();
     let registry=pool_registry::PoolRegistry::default();
     let restored_count=registry.restore(restored)?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
@@ -195,18 +220,29 @@ pub async fn completion_lifecycle_live()->Result<()> {
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
         registry.clone(),updates.clone(),done,true));
     critical(&mut tasks,"persistence",database.run(updates.subscribe()));
-    let mut config=completion_meteora_dlmm::Settings::from_env()?;config.limit=0;
-    spawn_dlmm_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
-        (stop.clone(),stop_rx.clone()),rpc.clone(),config,false)?;
+    spawn_completion_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
+        (stop.clone(),stop_rx.clone()),rpc.clone(),dlmm,damm_v2,false,0)?;
     let client=core::http_client()?;
-    tasks.spawn(supervise("discovery.meteora_dlmm",stop_rx,move||{
-        let client=client.clone();let output=sources.clone();
-        async move{discovery_meteora_dlmm::run(client,output,
-            discovery_meteora_dlmm::Settings{once:false,max_pages:None}).await}
-    }));
+    if dlmm.is_some() {
+        let client=client.clone();let publisher=sources.clone();
+        tasks.spawn(supervise("discovery.meteora_dlmm",stop_rx.clone(),move||{
+            let client=client.clone();let output=publisher.clone();
+            async move{discovery_meteora_dlmm::run(client,output,
+                discovery_meteora_dlmm::Settings{once:false,max_pages:None}).await}
+        }));
+    }
+    if damm_v2.is_some() {
+        let publisher=sources.clone();
+        tasks.spawn(supervise("discovery.meteora_damm_v2",stop_rx,move||{
+            let client=client.clone();let output=publisher.clone();
+            async move{discovery_meteora_damm_v2::run(client,output,
+                discovery_meteora_damm_v2::Settings{once:false,max_pages:None}).await}
+        }));
+    }
+    drop(sources);
     critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
     drop(updates);drop(rpc);
-    crate::log_event!(Info,"lifecycle live started restored={restored_count} duration_s={duration} executors=1 venue=MeteoraDlmm");
+    crate::log_event!(Info,"lifecycle live started restored={restored_count} duration_s={duration} executors={} venues={venues:?}",venues.len());
     tokio::select! {
         _=tokio::time::sleep(Duration::from_secs(duration))=>{},
         result=tasks.join_next()=>{
@@ -345,7 +381,8 @@ pub async fn run()->Result<()>{
     let mut boot:Vec<(Venue,Vec<PoolState>)>=Vec::new();
     for p in &restored {
         if p.mint_a.is_none()||p.mint_b.is_none()
-            ||p.completion_state==CompletionState::Prepared{continue;}
+            ||p.completion_state==CompletionState::Prepared
+            ||matches!(p.venue,Venue::MeteoraDlmm|Venue::MeteoraDammV2){continue;}
         if let Some((_,list))=boot.iter_mut().find(|(venue,_)|*venue==p.venue){
             list.push(p.clone());
         }else{boot.push((p.venue,vec![p.clone()]));}
@@ -472,10 +509,10 @@ pub async fn run()->Result<()>{
             }
         };
     }
-    let mut dlmm=completion_meteora_dlmm::Settings::from_env()?;dlmm.limit=0;
-    spawn_dlmm_lifecycle(&mut tasks,&registry,&updates,completions.clone(),done_rx.clone(),
-        (stop_tx.clone(),stop_rx.clone()),rpc.clone(),dlmm,false)?;
-    completion!(completion_meteora_damm_v2,Venue::MeteoraDammV2);
+    spawn_completion_lifecycle(&mut tasks,&registry,&updates,completions.clone(),done_rx.clone(),
+        (stop_tx.clone(),stop_rx.clone()),rpc.clone(),
+        Some(completion_meteora_dlmm::Settings::from_env()?),
+        Some(completion_meteora_damm_v2::Settings::from_env()?),false,0)?;
     completion!(completion_orca_whirlpool,Venue::OrcaWhirlpool);
     completion!(completion_raydium_amm_v4,Venue::RaydiumAmmV4);
     completion!(completion_raydium_cpmm,Venue::RaydiumCpmm);

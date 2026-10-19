@@ -28,7 +28,7 @@ pub struct Settings {
     /// A finite standalone pass stops after source drain or this attempt limit.
     pub finite: bool,
     pub attempt_limit: usize,
-    /// Optional fixed real-pool cohort for bounded live inspection. Zero: all.
+    /// Optional fixed real-pool cohort per executor for live inspection. Zero: all.
     pub pool_limit: usize,
 }
 fn seconds(key:&str,default:u64)->Result<u64> {
@@ -88,14 +88,14 @@ struct Counters {
 struct Scheduler {
     entries:HashMap<Pubkey,Entry>,
     due:BTreeSet<(u64,Pubkey)>,
-    selected:HashSet<Pubkey>,
+    selected:Vec<(Venue,HashSet<Pubkey>)>,
     refreshed:HashSet<Pubkey>,
     next_id:u64,
     counters:Counters,
 }
 impl Scheduler {
     fn new()->Self {
-        Self{entries:HashMap::new(),due:BTreeSet::new(),selected:HashSet::new(),
+        Self{entries:HashMap::new(),due:BTreeSet::new(),selected:Vec::new(),
             refreshed:HashSet::new(),next_id:0,counters:Counters::default()}
     }
     fn plan(pool:&PoolState,settings:Settings,now:u64)->(CompletionWork,Option<u64>) {
@@ -120,11 +120,18 @@ impl Scheduler {
         let key=pool.address;
         if !self.entries.contains_key(&key) {
             if !pool.completion_admission.is_admitted(){return;}
-            if managed && settings.pool_limit>0 && !self.selected.contains(&key) {
+            if managed && settings.pool_limit>0 {
+                if !self.selected.iter().any(|(venue,_)|*venue==pool.venue) {
+                    self.selected.push((pool.venue,HashSet::new()));
+                }
+                let selected=&mut self.selected.iter_mut()
+                    .find(|(venue,_)|*venue==pool.venue).expect("registered cohort").1;
                 // A paused unsupported pool must not consume the finite cohort.
-                if pool.completion_reason_code.is_some_and(|r|!r.recheckable())
-                    || self.selected.len()>=settings.pool_limit{return;}
-                self.selected.insert(key);
+                if !selected.contains(&key) {
+                    if pool.completion_reason_code.is_some_and(|r|!r.recheckable())
+                        || selected.len()>=settings.pool_limit{return;}
+                    selected.insert(key);
+                }
             }
             let (work,due)=Self::plan(pool,settings,now);
             crate::log_event!(Debug,"lifecycle plan pool={} venue={:?} executing={managed} work={work:?} due_at_ms={due:?}",key,pool.venue);

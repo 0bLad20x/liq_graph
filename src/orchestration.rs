@@ -14,6 +14,7 @@ use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpoo
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
 
 struct CompletionConfig {
+    lifecycle_limit: usize,
     rpc: rpc_transport::RpcHandle,
     dlmm: Option<completion_meteora_dlmm::Settings>,
     damm_v2: Option<completion_meteora_damm_v2::Settings>,
@@ -332,19 +333,14 @@ fn spawn_sources(
         let (completion_output, _) =
             broadcast::channel::<Arc<core::CompletionResultBatch>>(256);
         let receiver = completion_output.subscribe();
-        if let Some(dlmm) = config.dlmm {
-            // Verbose DLMM proof only in its original bounded standalone mode.
-            if config.damm_v2.is_none() && config.orca.is_none() && dlmm.limit > 0 {
+        if config.dlmm.is_some() || config.damm_v2.is_some() {
+            if config.dlmm.is_some() && config.damm_v2.is_none()
+                && config.orca.is_none() && config.lifecycle_limit>0 {
                 tasks.spawn(completion_meteora_dlmm::observe(completion_output.subscribe()));
             }
-            let stop=watch::channel(false);
-            runtime::spawn_dlmm_lifecycle(tasks,&registry,&registry_output,
-                completion_output.clone(),source_done_rx.clone(),stop,config.rpc.clone(),
-                dlmm,settings.once)?;
-        }
-        if let Some(damm_v2) = config.damm_v2 {
-            tasks.spawn(completion_meteora_damm_v2::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), damm_v2, completion_output.clone()));
+            runtime::spawn_completion_lifecycle(tasks,&registry,&registry_output,
+                completion_output.clone(),source_done_rx.clone(),watch::channel(false),
+                config.rpc.clone(),config.dlmm,config.damm_v2,settings.once,config.lifecycle_limit)?;
         }
         if let Some(orca) = config.orca {
             tasks.spawn(completion_orca_whirlpool::run(registry_output.subscribe(),
@@ -738,18 +734,14 @@ pub async fn run() -> Result<()> {
             if cli.completion_live { SourceSet::DlmmDammV2 } else { SourceSet::DammV2 }
         } else { SourceSet::Dlmm };
         let damm_v2 = if cli.damm_v2_completion_live {
-            let mut settings = completion_meteora_damm_v2::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_meteora_damm_v2::Settings::from_env()?)
         } else { None };
         let dlmm = if !cli.orca_completion_live && !cli.raydium_amm_v4_completion_live
             && !cli.raydium_cpmm_completion_live && !cli.raydium_clmm_completion_live
             && !cli.pancakeswap_clmm_completion_live && !cli.byreal_clmm_completion_live
             && !cli.manifest_completion_live && !cli.pumpswap_completion_live && !cli.pumpswap_rolling
             && (!cli.damm_v2_completion_live || cli.completion_live) {
-            let mut settings = completion_meteora_dlmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_meteora_dlmm::Settings::from_env()?)
         } else {None};
         let orca = if cli.orca_completion_live {
             let mut settings = completion_orca_whirlpool::Settings::from_env()?;
@@ -793,7 +785,7 @@ pub async fn run() -> Result<()> {
         } else {None};
         let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
         spawn_sources(&mut tasks, cli.meteora,
-            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest, pumpswap}),
+            Some(CompletionConfig {lifecycle_limit:completion_limit,rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest, pumpswap}),
             graph, jupiter, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);
