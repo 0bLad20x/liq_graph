@@ -13,7 +13,8 @@ The consumer joins prices to the existing generational `WatchCatalog` and report
 ## Input and selection
 
 - Production `--run`: current Registry snapshot, followed by Registry notifications. A five-second reconciliation rechecks selected pools; a lagged notification stream rebuilds the derived identity index from the current Registry. Losing Prepared/admitted status removes a selected pool and its derived price. Newly eligible pools enter the bounded selection.
-- `--market-state-live`: persisted Registry seed and a real RPC/WebSocket stream. It starts neither discovery nor Completion and does not write completion results. Existing persistence startup/schema initialization is unchanged. This isolated mode does not establish fresh Registry admission or refresh cached manifests.
+- `--market-state-live`: persisted Registry proof seed, the existing CP1 mint qualification/Jupiter/DexScreener admission flow, and a real RPC/WebSocket price stream. PostgreSQL restore intentionally leaves live TVL unknown, so cached Prepared status alone cannot enter the admitted watch set or graph. The single Registry writer establishes current admission from real enrichment results; the common gate remains unchanged. Startup logs distinguish `persisted_prepared` from the admitted Prepared count in `Selection.prepared`. An initial empty selection is expected during enrichment warmup; it must advance once qualified pools receive current TVL.
+- This finite mode starts no protocol pool discovery, Completion, execution or pool-cache persistence writer. It does not refresh cached manifests. Existing targeted Jupiter processing may update its mint catalogue; existing persistence schema initialization is unchanged. Historic TVL is never promoted to current TVL.
 - `MARKET_STATE_POOL_LIMIT=1000` by default. `0` removes this pool limit; configured provider/account limits remain in force.
 - Selection is deterministic by unordered mint pair, then address. This keeps pair alternatives together but is not a profitability ranking. It does not guarantee that a capped selection contains every venue or a trade opportunity.
 - The limit counts pools. Required subscriptions count distinct account addresses. Reserve-based venues may require three accounts per pool; shared accounts are deduplicated. Insufficient configured WS capacity fails explicitly with the required and available counts. There is no silent capacity truncation.
@@ -61,7 +62,7 @@ Provider assignment preserves existing addresses and balances new accounts acros
 
 ## Configuration
 
-Use the existing `DATABASE_URL` and `RPC_N_*` configuration. No signer or wallet is needed. An RPC WebSocket URL alone does not enable account subscriptions. Each provider used for WS must have explicitly configured account capabilities and capacity, for example:
+Use the existing `DATABASE_URL` (or `LIQ_GRAPH_DATABASE_URL`), `JUPITER_SEARCH_API_KEYS`, CP1 mint-catalogue/HTTP-proxy configuration and `RPC_N_*` configuration. The standalone entrypoint now runs the same existing admission producers that production uses; DexScreener requires verified working proxies. No signer or wallet is needed. An RPC WebSocket URL alone does not enable account subscriptions. Each provider used for WS must have explicitly configured account capabilities and capacity, for example:
 
 ```dotenv
 RPC_1_WS_ACCOUNT_SUBSCRIBE=true
@@ -98,6 +99,8 @@ if ($LASTEXITCODE -ne 0) { throw "Synchronisierung fehlgeschlagen." }
 
 The script records branch, exact HEAD and working-tree status, runs `cargo build --locked --release`, verifies lockfile hygiene and captures `worker.log`, `checkout.json` and `report.json` under `market_state_live/<UTC timestamp>/`. Default output samples the first 16 baselines, first 16 live pool updates and first 16 unavailable/removal events; counters cover the entire stream. `-TracePrices` prints every event.
 
+During startup, expect `mint qualification published qualified=...`, `dexscreener cp1 continuous started=true`, Registry TVL updates, then a non-empty Market-State selection and subscription ACKs. If qualification or proxy initialization produces no usable results, the run must not be accepted merely because it stays alive. `report.json` includes restored Prepared and live TVL counts.
+
 A successful finite run requires real WS price updates and at least one actual graph Direct2 pair with prices for two selected pools, including a WS observation on that pair. Lack of an arbitrage opportunity is irrelevant here. Inspect `websocket_venues` to see which protocol decoders received real live updates; unobserved venues remain unproven.
 
 To exercise removal and resubscription using the same real pools:
@@ -108,4 +111,4 @@ To exercise removal and resubscription using the same real pools:
 
 At half-time this disables observations for six seconds and enables them again. It does not alter Registry states or invent a pool update. The run requires reselection, removals and subsequent WS prices; `rpc_transport` debug ACK logs additionally expose actual `unsubscribed=...` and `subscribed=...` responses. This verifies observation-control removal, not a live Prepared-to-Incomplete transition. That transition uses the same production selection reconciliation but needs a real Registry lifecycle event for a separate live proof.
 
-A build is only a prerequisite. Accept this checkpoint only after reviewing the actual live report/logs. No successful build or live run was available in the implementation environment.
+A build is only a prerequisite. The user successfully built committed `9364b64` with `cargo build --locked --release`; its live run exposed the missing standalone admission wiring (23,722 persisted Prepared pools, zero admitted identities). The follow-up corrects orchestration using the existing admission producers. This follow-up still needs its own build/live evidence; no Cargo or real credentials are available in the implementation environment. Accept this checkpoint only after reviewing the actual live report/logs.
