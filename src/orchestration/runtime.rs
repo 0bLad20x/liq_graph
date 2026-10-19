@@ -77,6 +77,15 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
         }
     }
 }
+// Cancel input producers on operator stop; state-owning consumers drain normally.
+async fn until_stop<F>(mut stop:watch::Receiver<bool>,run:F)->Result<()>
+where F:Future<Output=Result<()>> {
+    if *stop.borrow(){return Ok(());}
+    tokio::select! {
+        result=run=>result,
+        _=stop.changed()=>Ok(()),
+    }
+}
 async fn once<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     crate::log_event!(Info,"runtime worker={name} policy=once started=true");
@@ -157,6 +166,7 @@ pub(super) struct CompletionExecutors {
     pub(super) orca:Option<completion_orca_whirlpool::Settings>,
     pub(super) pancakeswap_clmm:Option<completion_pancakeswap_clmm::Settings>,
     pub(super) byreal_clmm:Option<completion_byreal_clmm::Settings>,
+    pub(super) pumpswap:Option<completion_pumpswap::Settings>,
     pub(super) raydium_amm_v4:Option<completion_raydium_amm_v4::Settings>,
     pub(super) raydium_cpmm:Option<completion_raydium_cpmm::Settings>,
     pub(super) raydium_clmm:Option<completion_raydium_clmm::Settings>,
@@ -174,19 +184,26 @@ pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
     anyhow::ensure!(configured.dlmm.is_some()||configured.damm_v2.is_some()||configured.orca.is_some()
         ||configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()
         ||configured.raydium_clmm.is_some()||configured.pancakeswap_clmm.is_some()
-        ||configured.byreal_clmm.is_some(),
+        ||configured.byreal_clmm.is_some()||configured.pumpswap.is_some(),
         "no lifecycle executor configured");
     let input=updates.subscribe();
     let seed=registry.snapshot();
+    if let Some(pump)=configured.pumpswap {
+        completion_pumpswap::ensure_wallet_cache(&seed,pump.wallet)?;
+    }
     let settings=completion_lifecycle::Settings::from_env(finite,attempt_limit)?;
     let (responses,response_rx)=tokio::sync::mpsc::channel(4);
     let mut executors=Vec::new();
     macro_rules! executor {
         ($module:ident,$venue:path,$configured:expr)=>{
+            executor!($module,$venue,$configured,|_|false);
+        };
+        ($module:ident,$venue:path,$configured:expr,$configuration_ready:expr)=>{
             if let Some((config,batch_size))=$configured {
                 let (jobs,job_rx)=tokio::sync::mpsc::channel(4);
                 executors.push(completion_lifecycle::Executor{venue:$venue,requests:jobs,
-                    batch_size,max_in_flight:config.parallel_batches*batch_size});
+                    batch_size,max_in_flight:config.parallel_batches*batch_size,
+                    configuration_ready:($configuration_ready)(config)});
                 critical(tasks,concat!("completion.",stringify!($module)),
                     $module::run(job_rx,rpc.clone(),config,responses.clone()));
             }
@@ -197,6 +214,8 @@ pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
     executor!(completion_orca_whirlpool,Venue::OrcaWhirlpool,configured.orca.map(|s|(s,s.pools_per_batch())));
     executor!(completion_pancakeswap_clmm,Venue::PancakeSwapClmm,configured.pancakeswap_clmm.map(|s|(s,s.pools_per_batch())));
     executor!(completion_byreal_clmm,Venue::ByrealClmm,configured.byreal_clmm.map(|s|(s,s.pools_per_batch())));
+    executor!(completion_pumpswap,Venue::PumpSwap,configured.pumpswap.map(|s|(s,s.pools_per_batch())),
+        |settings:completion_pumpswap::Settings|settings.wallet.is_some());
     executor!(completion_raydium_amm_v4,Venue::RaydiumAmmV4,configured.raydium_amm_v4.map(|s|(s,s.pools_per_batch())));
     executor!(completion_raydium_cpmm,Venue::RaydiumCpmm,configured.raydium_cpmm.map(|s|(s,s.pools_per_batch())));
     executor!(completion_raydium_clmm,Venue::RaydiumClmm,configured.raydium_clmm.map(|s|(s,s.pools_per_batch())));
@@ -217,8 +236,8 @@ pub async fn completion_lifecycle_live()->Result<()> {
     anyhow::ensure!((30..=86400).contains(&duration),"live duration must be 30..86400");
     let selected=env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").unwrap_or_else(|_|"dlmm".into());
     anyhow::ensure!(matches!(selected.as_str(),"dlmm"|"damm_v2"|"both"|"raydium_amm_v4"
-        |"raydium_cpmm"|"raydium_clmm"|"raydium"|"orca"|"pancakeswap"|"byreal"|"all"),
-        "COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2, both, raydium_amm_v4, raydium_cpmm, raydium_clmm, raydium, orca, pancakeswap, byreal or all");
+        |"raydium_cpmm"|"raydium_clmm"|"raydium"|"orca"|"pancakeswap"|"byreal"|"pumpswap"|"all"),
+        "COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2, both, raydium_amm_v4, raydium_cpmm, raydium_clmm, raydium, orca, pancakeswap, byreal, pumpswap or all");
     let configured=CompletionExecutors {
         dlmm:matches!(selected.as_str(),"dlmm"|"both"|"all")
             .then(completion_meteora_dlmm::Settings::from_env).transpose()?,
@@ -230,6 +249,8 @@ pub async fn completion_lifecycle_live()->Result<()> {
             .then(completion_pancakeswap_clmm::Settings::from_env).transpose()?,
         byreal_clmm:matches!(selected.as_str(),"byreal"|"all")
             .then(completion_byreal_clmm::Settings::from_env).transpose()?,
+        pumpswap:matches!(selected.as_str(),"pumpswap"|"all")
+            .then(completion_pumpswap::Settings::from_env).transpose()?,
         raydium_amm_v4:matches!(selected.as_str(),"raydium_amm_v4"|"raydium"|"all")
             .then(completion_raydium_amm_v4::Settings::from_env).transpose()?,
         raydium_cpmm:matches!(selected.as_str(),"raydium_cpmm"|"raydium"|"all")
@@ -237,12 +258,18 @@ pub async fn completion_lifecycle_live()->Result<()> {
         raydium_clmm:matches!(selected.as_str(),"raydium_clmm"|"raydium"|"all")
             .then(completion_raydium_clmm::Settings::from_env).transpose()?,
     };
+    let enrichment=if let Some(pump)=configured.pumpswap {
+        anyhow::ensure!(pump.wallet.is_some(),
+            "PumpSwap Prepared-refresh live proof requires PUMPSWAP_V10_WALLET");
+        Some(jupiter_settings()?.context("PumpSwap live TVL enrichment requires JUPITER_SEARCH_API_KEYS")?)
+    }else{None};
     let mut venues=Vec::new();
     if configured.dlmm.is_some(){venues.push(Venue::MeteoraDlmm);}
     if configured.damm_v2.is_some(){venues.push(Venue::MeteoraDammV2);}
     if configured.orca.is_some(){venues.push(Venue::OrcaWhirlpool);}
     if configured.pancakeswap_clmm.is_some(){venues.push(Venue::PancakeSwapClmm);}
     if configured.byreal_clmm.is_some(){venues.push(Venue::ByrealClmm);}
+    if configured.pumpswap.is_some(){venues.push(Venue::PumpSwap);}
     if configured.raydium_amm_v4.is_some(){venues.push(Venue::RaydiumAmmV4);}
     if configured.raydium_cpmm.is_some(){venues.push(Venue::RaydiumCpmm);}
     if configured.raydium_clmm.is_some(){venues.push(Venue::RaydiumClmm);}
@@ -264,6 +291,23 @@ pub async fn completion_lifecycle_live()->Result<()> {
     spawn_completion_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
         (stop.clone(),stop_rx.clone()),rpc.clone(),configured,false,0)?;
     let client=core::http_client()?;
+    if let Some(enrichment)=enrichment {
+        // Reuse the existing CP1 mint rules and TVL provider. Historical DB
+        // observations and RPC vault balances never substitute canonical TVL.
+        let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+        let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+        let (jupiter_out,jupiter_rx)=broadcast::channel(256);
+        critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
+            mint_qualification::run(updates.subscribe(),jupiter_rx,qualified_tx,target_tx)));
+        critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
+            source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
+        critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
+            source_dexscreener::run_live(qualified_rx,registry.clone(),sources.clone())));
+        critical(&mut tasks,"discovery.pumpswap_rolling",until_stop(stop_rx.clone(),
+            discovery_pumpswap::run(rpc.clone(),sources.clone(),
+                discovery_pumpswap::Settings::from_env(false,None)?)));
+        crate::log_event!(Info,"lifecycle live enrichment=cp1 rolling_discovery=true wallet_bound=true");
+    }
     if configured.dlmm.is_some() {
         let client=client.clone();let publisher=sources.clone();
         tasks.spawn(supervise("discovery.meteora_dlmm",stop_rx.clone(),move||{
@@ -463,7 +507,7 @@ pub async fn run()->Result<()>{
             ||p.completion_state==CompletionState::Prepared
             ||matches!(p.venue,Venue::MeteoraDlmm|Venue::MeteoraDammV2
                 |Venue::RaydiumAmmV4|Venue::RaydiumCpmm|Venue::RaydiumClmm
-                |Venue::OrcaWhirlpool|Venue::PancakeSwapClmm|Venue::ByrealClmm){continue;}
+                |Venue::OrcaWhirlpool|Venue::PancakeSwapClmm|Venue::ByrealClmm|Venue::PumpSwap){continue;}
         if let Some((_,list))=boot.iter_mut().find(|(venue,_)|*venue==p.venue){
             list.push(p.clone());
         }else{boot.push((p.venue,vec![p.clone()]));}
@@ -598,12 +642,12 @@ pub async fn run()->Result<()>{
             orca:Some(completion_orca_whirlpool::Settings::from_env()?),
             pancakeswap_clmm:Some(completion_pancakeswap_clmm::Settings::from_env()?),
             byreal_clmm:Some(completion_byreal_clmm::Settings::from_env()?),
+            pumpswap:Some(completion_pumpswap::Settings::from_env()?),
             raydium_amm_v4:Some(completion_raydium_amm_v4::Settings::from_env()?),
             raydium_cpmm:Some(completion_raydium_cpmm::Settings::from_env()?),
             raydium_clmm:Some(completion_raydium_clmm::Settings::from_env()?),
         },false,0)?;
     completion!(completion_manifest,Venue::Manifest);
-    completion!(completion_pumpswap,Venue::PumpSwap);
     for confirmed in ready{
         confirmed.await.context("completion failed before startup readiness")?;
     }

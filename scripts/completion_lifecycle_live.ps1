@@ -1,7 +1,7 @@
 param(
     [ValidateRange(60, 86400)][int]$DurationSeconds = 300,
     [ValidateRange(1, 128)][int]$PoolLimit = 16,
-    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "Byreal", "All")][string]$Venue = "Byreal"
+    [ValidateSet("Dlmm", "DammV2", "Both", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "Raydium", "Orca", "PancakeSwap", "Byreal", "PumpSwap", "All")][string]$Venue = "PumpSwap"
 )
 
 # Real protocol REST/RPC -> one lifecycle -> Registry -> existing PostgreSQL writer.
@@ -10,8 +10,8 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-byreal-lifecycle" -or $tracked) {
-    throw "Use a clean, committed agent/cp2-byreal-lifecycle checkout."
+if ($LASTEXITCODE -ne 0 -or $branch -ne "agent/cp2-pumpswap-lifecycle" -or $tracked) {
+    throw "Use a clean, committed agent/cp2-pumpswap-lifecycle checkout."
 }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed." }
@@ -29,9 +29,10 @@ $selector = switch ($Venue) {
     "Orca" { "orca" }
     "PancakeSwap" { "pancakeswap" }
     "Byreal" { "byreal" }
+    "PumpSwap" { "pumpswap" }
     "All" { "all" }
 }
-$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7; PancakeSwapClmm = 8; ByrealClmm = 9 }
+$venueCodes = @{ MeteoraDlmm = 1; MeteoraDammV2 = 2; RaydiumAmmV4 = 3; RaydiumCpmm = 4; RaydiumClmm = 5; OrcaWhirlpool = 7; PancakeSwapClmm = 8; ByrealClmm = 9; PumpSwap = 11 }
 $requiredVenues = switch ($Venue) {
     "Dlmm" { @("MeteoraDlmm") }
     "DammV2" { @("MeteoraDammV2") }
@@ -43,11 +44,12 @@ $requiredVenues = switch ($Venue) {
     "Orca" { @("OrcaWhirlpool") }
     "PancakeSwap" { @("PancakeSwapClmm") }
     "Byreal" { @("ByrealClmm") }
-    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool", "PancakeSwapClmm", "ByrealClmm") }
+    "PumpSwap" { @("PumpSwap") }
+    "All" { @("MeteoraDlmm", "MeteoraDammV2", "RaydiumAmmV4", "RaydiumCpmm", "RaydiumClmm", "OrcaWhirlpool", "PancakeSwapClmm", "ByrealClmm", "PumpSwap") }
 }
 $settings = @{
     RUN_DURATION_SECONDS = "$DurationSeconds"
-    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug,completion_pancakeswap_clmm=debug,completion_byreal_clmm=debug"
+    LIQ_GRAPH_LOG = "info,completion_lifecycle=debug,completion_meteora_dlmm=debug,completion_meteora_damm_v2=debug,completion_raydium_amm_v4=debug,completion_raydium_cpmm=debug,completion_raydium_clmm=debug,completion_orca_whirlpool=debug,completion_pancakeswap_clmm=debug,completion_byreal_clmm=debug,completion_pumpswap=debug"
     COMPLETION_LIFECYCLE_LIVE_VENUE = $selector
     COMPLETION_LIFECYCLE_POOL_LIMIT = "$PoolLimit"
     COMPLETION_LIFECYCLE_REFRESH_SECONDS = "30"
@@ -107,7 +109,13 @@ if ($text -match 'runtime fatal|level=ERROR|lost [1-9][0-9]* .*batches|completio
 }
 
 # Link this run's last accepted proof per pool to a read-only SQL verification.
-$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
+$pumpWallet = $null
+if ($requiredVenues -contains "PumpSwap") {
+    $walletRecord = [regex]::Match($text, 'pumpswap executor started .*wallet_configured=true wallet=([1-9A-HJ-NP-Za-km-z]{32,44}) ')
+    if (-not $walletRecord.Success) { throw "Missing configured PumpSwap wallet in $log" }
+    $pumpWallet = $walletRecord.Groups[1].Value
+}
+$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|PumpSwap) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
 $latest = @{}
 $refreshCounts = @{}
 foreach ($match in [regex]::Matches($text, $pattern)) {
@@ -115,7 +123,8 @@ foreach ($match in [regex]::Matches($text, $pattern)) {
     $protocol = $match.Groups[2].Value
     $status = if ($match.Groups[4].Value -eq "Prepared") { 1 } else { 2 }
     $code = $venueCodes[$protocol]
-    $latest[$hex] = "(${code}::smallint, '$hex', $($match.Groups[5].Value)::bigint, $($match.Groups[6].Value)::bigint, ${status}::smallint)"
+    $walletSql = if ($protocol -eq "PumpSwap") { "'$pumpWallet'::text" } else { "NULL::text" }
+    $latest[$hex] = "(${code}::smallint, '$hex', $($match.Groups[5].Value)::bigint, $($match.Groups[6].Value)::bigint, ${status}::smallint, $walletSql)"
     if ($match.Groups[3].Value -eq "Refresh" -and $status -eq 1) {
         $key = "$protocol|$hex"
         $refreshCounts[$key] = 1 + [int]$refreshCounts[$key]
@@ -135,13 +144,15 @@ $values = ($latest.Values | Sort-Object) -join ",`n    "
 -- CP2 branch=$branch head=$head start_ms=$startMs
 -- Read-only. Run against the same database immediately after this live run.
 -- Expected: proofs_expected = exact_matches; mismatches = 0.
-WITH expected(venue, pool_hex, checked_at_ms, validated_slot, status) AS (
+WITH expected(venue, pool_hex, checked_at_ms, validated_slot, status, wallet) AS (
     VALUES $values
 ), checks AS (
     SELECT e.*, p.pool_address IS NOT NULL
         AND p.venue = e.venue AND p.status = e.status
         AND p.validated_slot = e.validated_slot
         AND (p.descriptor->>'checked_at_ms')::bigint = e.checked_at_ms
+        AND (e.venue <> 11 OR e.status <> 1
+          OR p.descriptor->'evidence'->'payload'->>'v10_wallet' = e.wallet)
         AND ((e.status = 1 AND p.descriptor->>'reason_code' IS NULL)
           OR (e.status = 2 AND p.descriptor->>'reason_code' IS NOT NULL
               AND p.descriptor->>'reason_code' <> 'transient_failure')) AS matches

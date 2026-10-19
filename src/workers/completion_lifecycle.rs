@@ -15,6 +15,9 @@ pub struct Executor {
     pub requests: mpsc::Sender<CompletionRequestBatch>,
     pub batch_size: usize,
     pub max_in_flight: usize,
+    /// Required executor configuration is present in this process. This can
+    /// reactivate historical ConfigurationRequired proofs without decoding evidence.
+    pub configuration_ready: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -98,7 +101,11 @@ impl Scheduler {
         Self{entries:HashMap::new(),due:BTreeSet::new(),selected:Vec::new(),
             refreshed:HashSet::new(),next_id:0,counters:Counters::default()}
     }
-    fn plan(pool:&PoolState,settings:Settings,now:u64)->(CompletionWork,Option<u64>) {
+    fn recheckable(reason:Option<CompletionReason>,configuration_ready:bool)->bool {
+        reason.is_none_or(|reason|reason.recheckable()
+            || (reason==CompletionReason::ConfigurationRequired && configuration_ready))
+    }
+    fn plan(pool:&PoolState,configuration_ready:bool,settings:Settings,now:u64)->(CompletionWork,Option<u64>) {
         if !pool.completion_admission.is_admitted() {
             return (CompletionWork::Recheck,None);
         }
@@ -107,7 +114,7 @@ impl Scheduler {
             CompletionState::Prepared=>(CompletionWork::Refresh,
                 Some(pool.completion_checked_at_ms.map_or(now,|at|at.saturating_add(settings.refresh_ms)))),
             CompletionState::Incomplete=>{
-                if pool.completion_reason_code.is_some_and(|r|!r.recheckable()) {
+                if !Self::recheckable(pool.completion_reason_code,configuration_ready) {
                     (CompletionWork::Recheck,None)
                 } else {
                     (CompletionWork::Recheck,Some(pool.completion_checked_at_ms
@@ -116,7 +123,9 @@ impl Scheduler {
             },
         }
     }
-    fn observe(&mut self,pool:&PoolState,managed:bool,settings:Settings,now:u64) {
+    fn observe(&mut self,pool:&PoolState,executor:Option<&Executor>,settings:Settings,now:u64) {
+        let managed=executor.is_some();
+        let configuration_ready=executor.is_some_and(|executor|executor.configuration_ready);
         let key=pool.address;
         if !self.entries.contains_key(&key) {
             if !pool.completion_admission.is_admitted(){return;}
@@ -128,12 +137,12 @@ impl Scheduler {
                     .find(|(venue,_)|*venue==pool.venue).expect("registered cohort").1;
                 // A paused unsupported pool must not consume the finite cohort.
                 if !selected.contains(&key) {
-                    if pool.completion_reason_code.is_some_and(|r|!r.recheckable())
+                    if !Self::recheckable(pool.completion_reason_code,configuration_ready)
                         || selected.len()>=settings.pool_limit{return;}
                     selected.insert(key);
                 }
             }
-            let (work,due)=Self::plan(pool,settings,now);
+            let (work,due)=Self::plan(pool,configuration_ready,settings,now);
             crate::log_event!(Debug,"lifecycle plan pool={} venue={:?} executing={managed} work={work:?} due_at_ms={due:?}",key,pool.venue);
             self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None});
             if managed {if let Some(at)=due{self.due.insert((at,key));}}
@@ -187,7 +196,7 @@ impl Scheduler {
         if entry.flight.is_none() {
             if reactivated || proof_changed {entry.failures=0;}
             if acknowledged || proof_changed || reactivated || (policy_changed && entry.failures==0) {
-                (entry.work,entry.due)=Self::plan(pool,settings,now);
+                (entry.work,entry.due)=Self::plan(pool,configuration_ready,settings,now);
             }
             if !pool.completion_admission.is_admitted() {
                 self.entries.remove(&key);
@@ -322,8 +331,12 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
     }
     let mut scheduler=Scheduler::new();
     let now=now_unix_ms()?;
-    for pool in seed {scheduler.observe(&pool,registered.contains(&pool.venue),settings,now);}
-    crate::log_event!(Info,"lifecycle started managed={registered:?} refresh_ms={} recheck_ms={} retry_ms={} retry_max_ms={} pool_limit={} attempt_limit={} finite={} max_age_enforced=false",
+    for pool in seed {
+        scheduler.observe(&pool,executors.iter().find(|e|e.venue==pool.venue),settings,now);
+    }
+    let configuration_ready=executors.iter().filter(|e|e.configuration_ready)
+        .map(|e|e.venue).collect::<Vec<_>>();
+    crate::log_event!(Info,"lifecycle started managed={registered:?} configuration_ready={configuration_ready:?} refresh_ms={} recheck_ms={} retry_ms={} retry_max_ms={} pool_limit={} attempt_limit={} finite={} max_age_enforced=false",
         settings.refresh_ms,settings.recheck_ms,settings.retry_ms,settings.retry_max_ms,
         settings.pool_limit,settings.attempt_limit,settings.finite);
     let mut input_open=true;
@@ -355,7 +368,7 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
                 Ok(batch)=>{
                     let now=now_unix_ms()?;
                     for pool in &batch.pools {
-                        scheduler.observe(pool,registered.contains(&pool.venue),settings,now);
+                        scheduler.observe(pool,executors.iter().find(|e|e.venue==pool.venue),settings,now);
                     }
                 },
                 Err(broadcast::error::RecvError::Lagged(n))=>bail!("lifecycle lost {n} Registry batches"),
