@@ -1,14 +1,14 @@
-//! PumpSwap V10 completion: verified RPC state and optional signer-wallet account blocks.
+//! PumpSwap V10 completion: lifecycle requests -> verified RPC state -> account blocks.
 //! When PUMPSWAP_V10_WALLET is unset, preserve wallet-independent evidence mode.
-//! No perpetual TVL or vault polling in this checkpoint.
-use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
+//! The shared lifecycle owns admission scheduling, retries, rechecks and refresh.
+use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde_json::json;
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast,watch}, task::JoinSet, time::{Instant,MissedTickBehavior}};
+use tokio::{sync::mpsc, task::JoinSet};
 use crate::{
-    core::{AccountMeta,CompletionEvidence,CompletionResult,CompletionResultBatch,
-        CompletionState,CompletionStatus,ExecutionManifest,MintProof,PoolState,PoolUpdateBatch,Venue},
+    core::{CompletionReason, AccountMeta,CompletionEvidence,CompletionResult,CompletionRequestBatch,CompletionResponse,CompletionResponseBatch,
+        CompletionState,CompletionStatus,ExecutionManifest,MintProof,PoolState,Venue},
     workers::rpc_transport::{AccountData,AccountView,RpcAnswer,RpcHandle,RpcOperation},
 };
 
@@ -21,13 +21,11 @@ const TOKEN:&str="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022:&str="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED:&str="ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const DISC:[u8;8]=[241,154,109,4,17,177,109,188];
-const RETRY_COOLDOWN:Duration=Duration::from_secs(60);
 
 #[derive(Clone,Copy)]
 pub struct Settings {
-    pub limit:usize,
     account_batch_size:usize,
-    parallel_batches:usize,
+    pub parallel_batches:usize,
     pub wallet:Option<Pubkey>,
 }
 impl Settings {
@@ -42,9 +40,9 @@ impl Settings {
             .transpose()?;
         ensure!(wallet!=Some(Pubkey::default()),
             "PUMPSWAP_V10_WALLET must be a nonzero public key");
-        Ok(Self {limit:0,account_batch_size,parallel_batches:8,wallet})
+        Ok(Self {account_batch_size,parallel_batches:8,wallet})
     }
-    fn pools_per_batch(self)->usize {
+    pub fn pools_per_batch(self)->usize {
         10_usize.min((self.account_batch_size-1)/5)
     }
 }
@@ -196,7 +194,7 @@ async fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>)->CompletionResult {
-    CompletionResult{pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -384,9 +382,13 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
             results.insert(pool.address,retry(pool.address,"PumpSwap mint or vault unavailable"));
             continue;
         };
+        let mut failure_code=CompletionReason::ValidationFailed;
         let checked=(||->Result<[MintProof;2]>{
             let p0=proof(m0,spl,token_2022)?;
             let p1=proof(m1,spl,token_2022)?;
+            if !p0.unsupported.is_empty() || !p1.unsupported.is_empty() {
+                failure_code=CompletionReason::UnsupportedConfiguration;
+            }
             ensure!(p0.unsupported.is_empty() && p1.unsupported.is_empty(),
                 "PumpSwap unsupported Token-2022 mint extensions");
             vault(v0,l.mints[0],m0.owner,l.address)?;
@@ -396,7 +398,7 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
         let proofs=match checked {
             Ok(v)=>v,Err(e)=>{
                 results.insert(pool.address,incomplete(pool.address,last_slot,
-                    format!("PumpSwap mint/vault validation: {e:#}")));continue;
+                    format!("PumpSwap mint/vault validation: {e:#}")).with_reason_code(failure_code));continue;
             }
         };
         let Some(candidates)=per_pool.get(&pool.address) else {
@@ -452,141 +454,67 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
             results.insert(pool.address,result(pool.address,
                 CompletionStatus::Incomplete,Some(pool_slot),
                 Some("wallet-independent PumpSwap pool validated; set PUMPSWAP_V10_WALLET for V10 account blocks".into()),
-                Some(evidence),Some(proofs),None));
+                Some(evidence),Some(proofs),None).with_reason_code(CompletionReason::ConfigurationRequired));
         }
     }
     pools.iter().map(|p|results.remove(&p.address)
         .expect("every PumpSwap pool has a result")).collect()
 }
-#[derive(Default)]
-struct Scheduler {
-    candidates:HashMap<Pubkey,PoolState>,
-    attempts:HashMap<Pubkey,u8>,
-    retry_after:HashMap<Pubkey,Instant>,
-}
-impl Scheduler {
-    fn update(&mut self,p:&PoolState,wallet_configured:bool) {
-        if p.venue!=Venue::PumpSwap {return;}
-        if p.completion_state==CompletionState::Prepared
-            || (!wallet_configured && p.completion_evidence.as_ref().is_some_and(|e|
-                e.kind=="pumpswap_pool_validated_v1")) {
-            self.candidates.remove(&p.address);
-            self.retry_after.remove(&p.address);
-        } else if p.mint_a.is_some() && p.mint_b.is_some() {
-            self.candidates.insert(p.address,p.clone());
-        }
-    }
-    fn next(&self,max:usize,now:Instant)->Vec<PoolState> {
-        let mut pools=self.candidates.values().filter(|p|{
-            match self.attempts.get(&p.address).copied() {
-                None=>true,
-                Some(1)=>self.retry_after.get(&p.address).is_some_and(|t|*t<=now),
-                _=>false,
-            }
-        }).cloned().collect::<Vec<_>>();
-        pools.sort_unstable_by_key(|p|p.address.to_bytes());
-        pools.truncate(max);
-        pools
-    }
-    fn pending_retry(&self)->bool {
-        self.retry_after.iter().any(|(key,_)|
-            self.candidates.contains_key(key) && self.attempts.get(key)==Some(&1))
-    }
-}
-pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    source_done:watch::Receiver<bool>,rpc:RpcHandle,settings:Settings,
-    output:broadcast::Sender<Arc<CompletionResultBatch>>)->Result<()> {
-    let mut scheduler=Scheduler::default();
+/// Protocol executor only. The shared lifecycle owns admission scheduling,
+/// retry/backoff, reactivation and Prepared refresh.
+pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
+    rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
-    let mut source_open=true;
-    let mut attempts=0_usize;
-    let mut prepared=0_usize;
-    let mut incomplete=0_usize;
-    let mut retryable=0_usize;
-    let mut pulse=tokio::time::interval(Duration::from_secs(5));
-    pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    crate::log_event!(Info,"pumpswap completion started wallet_configured={} limit={} batch={} parallel={}",
-        settings.wallet.is_some(),settings.limit,settings.pools_per_batch(),
-        settings.parallel_batches);
-    loop {
-        while tasks.len()<settings.parallel_batches &&
-            (settings.limit==0 || attempts<settings.limit) {
-            let count=if settings.limit==0 {settings.pools_per_batch()}
-                else {settings.pools_per_batch().min(settings.limit-attempts)};
-            let selected=scheduler.next(count,Instant::now());
-            if selected.is_empty() {break;}
-            for pool in &selected {
-                let n=scheduler.attempts.get(&pool.address).copied().unwrap_or(0)+1;
-                scheduler.attempts.insert(pool.address,n);
-                scheduler.retry_after.remove(&pool.address);
-            }
-            attempts+=selected.len();
-            let rpc=rpc.clone();
-            tasks.spawn(async move {process(&rpc,selected,settings).await});
-        }
-        let done=!source_open || *source_done.borrow();
-        let stopped=settings.limit>0 && attempts>=settings.limit;
-        if tasks.is_empty() && (stopped || (done && input.len()==0
-            && !scheduler.pending_retry() && scheduler.next(1,Instant::now()).is_empty())) {
-            break;
-        }
+    let mut open=true;
+    let mut processed=0_usize;
+    crate::log_event!(Info,"pumpswap executor started parallel={} pools_per_batch={} wallet_configured={} wallet={} scheduler=completion_lifecycle",
+        settings.parallel_batches,settings.pools_per_batch(),settings.wallet.is_some(),
+        settings.wallet.map(|wallet|wallet.to_string()).unwrap_or_else(||"-".into()));
+    while open || !tasks.is_empty() {
         tokio::select! {
-            event=input.recv(),if source_open=>match event {
-                Ok(batch)=>for p in &batch.pools {
-                    scheduler.update(p,settings.wallet.is_some());
+            batch=input.recv(),if open && tasks.len()<settings.parallel_batches=>match batch {
+                Some(batch)=>{
+                    ensure!(!batch.requests.is_empty() && batch.requests.len()<=settings.pools_per_batch(),
+                        "invalid PumpSwap request batch size");
+                    ensure!(batch.requests.iter().all(|r|r.pool.venue==Venue::PumpSwap
+                        && r.pool.completion_admission.is_admitted()),
+                        "PumpSwap request has wrong venue or missing admission");
+                    let rpc=rpc.clone();
+                    tasks.spawn(async move {
+                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
+                        let results=match tokio::time::timeout(batch.timeout,
+                            process(&rpc,pools,settings)).await {
+                            Ok(results)=>results,
+                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
+                                "PumpSwap lifecycle request timed out")).collect(),
+                        };
+                        (batch.requests,results)
+                    });
                 },
-                Err(broadcast::error::RecvError::Lagged(n))=>
-                    bail!("PumpSwap completion lost {n} Registry batches"),
-                Err(broadcast::error::RecvError::Closed)=>source_open=false,
+                None=>open=false,
             },
-            finished=tasks.join_next(),if !tasks.is_empty()=>{
-                let results=finished.context("missing PumpSwap partition")?
-                    .context("PumpSwap completion task panicked")?;
-                for r in &results {
-                    match r.status {
-                        CompletionStatus::Prepared=>{
-                            prepared+=1;
-                            scheduler.candidates.remove(&r.pool);
-                            scheduler.retry_after.remove(&r.pool);
-                            if prepared<=3 {
-                                if let Some(m)=&r.manifest {
-                                    crate::log_event!(Debug,"pumpswap manifest pool={} slot={} base_a={} base_b={}",
-                                        m.pool,m.validated_slot,m.base_a.len(),m.base_b.len());
-                                }
-                            }
-                        }
-                        CompletionStatus::Incomplete=>{
-                            incomplete+=1;
-                            if r.evidence.as_ref().is_some_and(|e|e.kind=="pumpswap_pool_validated_v1") {
-                                scheduler.candidates.remove(&r.pool);
-                                scheduler.retry_after.remove(&r.pool);
-                                crate::log_event!(Debug,"pumpswap pool_completed pool={} validated_slot={} v10_wallet_manifest=false",
-                                    r.pool,r.validated_slot.unwrap_or_default());
-                            }
-                        }
-                        CompletionStatus::Retryable=>{
-                            retryable+=1;
-                            if scheduler.attempts.get(&r.pool)==Some(&1) {
-                                scheduler.retry_after.insert(r.pool,Instant::now()+RETRY_COOLDOWN);
-                            }
-                        }
-                    }
-                    if r.status!=CompletionStatus::Prepared {
-                        crate::log_event!(Debug,"pumpswap completion result pool={} status={:?} reason={}",
-                            r.pool,r.status,r.reason.as_deref().unwrap_or("-"));
-                    }
+            done=tasks.join_next(),if !tasks.is_empty()=>{
+                let (requests,results)=done.context("missing PumpSwap request task")?
+                    .context("PumpSwap request task panicked")?;
+                ensure!(requests.len()==results.len(),"PumpSwap request/result count mismatch");
+                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                ensure!(by_pool.len()==requests.len(),"duplicate PumpSwap pool result");
+                let mut responses=Vec::with_capacity(requests.len());
+                for request in requests {
+                    let result=by_pool.remove(&request.pool.address)
+                        .context("PumpSwap request has no matching pool result")?;
+                    crate::log_event!(Debug,
+                        "pumpswap executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
+                        request.id,result.pool,request.work,result.status,result.reason_code,
+                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
+                    responses.push(CompletionResponse{id:request.id,result});
                 }
-                crate::log_event!(Debug,"pumpswap completion batch results={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}",
-                    results.len());
-                output.send(Arc::new(CompletionResultBatch{source:SOURCE,results}))
-                    .map_err(|_|anyhow!("PumpSwap completion has no Registry receiver"))?;
+                processed+=responses.len();
+                output.send(CompletionResponseBatch{source:SOURCE,responses}).await
+                    .map_err(|_|anyhow!("PumpSwap lifecycle response consumer closed"))?;
             },
-            _=pulse.tick()=>{
-                crate::log_event!(Debug,"pumpswap completion backlog={} in_flight={} attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}",
-                    scheduler.candidates.len(),tasks.len());
-            }
         }
     }
-    crate::log_event!(Info,"pumpswap completion complete attempts={attempts} prepared={prepared} incomplete={incomplete} retryable={retryable}");
+    crate::log_event!(Info,"pumpswap executor complete requests={processed}");
     Ok(())
 }

@@ -14,6 +14,7 @@ use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpoo
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
 
 struct CompletionConfig {
+    lifecycle_limit: usize,
     rpc: rpc_transport::RpcHandle,
     dlmm: Option<completion_meteora_dlmm::Settings>,
     damm_v2: Option<completion_meteora_damm_v2::Settings>,
@@ -332,49 +333,25 @@ fn spawn_sources(
         let (completion_output, _) =
             broadcast::channel::<Arc<core::CompletionResultBatch>>(256);
         let receiver = completion_output.subscribe();
-        if let Some(dlmm) = config.dlmm {
-            // Verbose DLMM proof only in its original bounded standalone mode.
-            if config.damm_v2.is_none() && config.orca.is_none() && dlmm.limit > 0 {
+        if config.dlmm.is_some() || config.damm_v2.is_some() || config.orca.is_some()
+            || config.raydium_amm_v4.is_some() || config.raydium_cpmm.is_some()
+            || config.raydium_clmm.is_some() || config.pancakeswap_clmm.is_some()
+            || config.byreal_clmm.is_some() || config.pumpswap.is_some() || config.manifest.is_some() {
+            if config.dlmm.is_some() && config.damm_v2.is_none()
+                && config.orca.is_none() && config.lifecycle_limit>0 {
                 tasks.spawn(completion_meteora_dlmm::observe(completion_output.subscribe()));
             }
-            tasks.spawn(completion_meteora_dlmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), dlmm, completion_output.clone()));
-        }
-        if let Some(damm_v2) = config.damm_v2 {
-            tasks.spawn(completion_meteora_damm_v2::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), damm_v2, completion_output.clone()));
-        }
-        if let Some(orca) = config.orca {
-            tasks.spawn(completion_orca_whirlpool::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), orca, completion_output.clone()));
-        }
-        if let Some(raydium) = config.raydium_amm_v4 {
-            tasks.spawn(completion_raydium_amm_v4::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), raydium, completion_output.clone()));
-        }
-        if let Some(cpmm) = config.raydium_cpmm {
-            tasks.spawn(completion_raydium_cpmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), cpmm, completion_output.clone()));
-        }
-        if let Some(clmm) = config.raydium_clmm {
-            tasks.spawn(completion_raydium_clmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), clmm, completion_output.clone()));
-        }
-        if let Some(clmm) = config.pancakeswap_clmm {
-            tasks.spawn(completion_pancakeswap_clmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), clmm, completion_output.clone()));
-        }
-        if let Some(pump) = config.pumpswap {
-            tasks.spawn(completion_pumpswap::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), pump, completion_output.clone()));
-        }
-        if let Some(manifest) = config.manifest {
-            tasks.spawn(completion_manifest::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), manifest, completion_output.clone()));
-        }
-        if let Some(clmm) = config.byreal_clmm {
-            tasks.spawn(completion_byreal_clmm::run(registry_output.subscribe(),
-                source_done_rx, config.rpc, clmm, completion_output.clone()));
+            runtime::spawn_completion_lifecycle(tasks,&registry,&registry_output,
+                completion_output.clone(),source_done_rx.clone(),watch::channel(false),
+                config.rpc.clone(),runtime::CompletionExecutors {
+                    dlmm:config.dlmm,damm_v2:config.damm_v2,orca:config.orca,
+                    pancakeswap_clmm:config.pancakeswap_clmm,
+                    byreal_clmm:config.byreal_clmm,
+                    pumpswap:config.pumpswap,
+                    manifest:config.manifest,
+                    raydium_amm_v4:config.raydium_amm_v4,raydium_cpmm:config.raydium_cpmm,
+                    raydium_clmm:config.raydium_clmm,
+                },settings.once,config.lifecycle_limit)?;
         }
         // Registry closes only after every completion producer has finished.
         drop(completion_output);
@@ -533,6 +510,9 @@ pub async fn run() -> Result<()> {
     if args.len()==1 && args[0]=="--cp1-live" {
         return runtime::cp1_live().await;
     }
+    if args.len()==1 && args[0]=="--completion-lifecycle-live" {
+        return runtime::completion_lifecycle_live().await;
+    }
     // Finite standalone Jupiter catalog import. No Graph/Registry/Completion is started.
     if (args.len() == 1 && args[0] == "--jupiter-mint-backfill")
         || (args.len() == 2 && args[0] == "--test" && args[1] == "jupiter_mint_backfill")
@@ -615,8 +595,6 @@ pub async fn run() -> Result<()> {
         let restored = registry.restore(database.restore().await?)?;
         ensure!(restored > 0, "--jupiter-only requires persisted pools for graph bootstrap");
         let graph_settings = graph_liquidity::Settings::from_env()?;
-        ensure!(graph_settings.min_tvl_usd.is_none(),
-            "--jupiter-only restore cannot use GRAPH_MIN_TVL_USD without fresh TVL");
         let (updates, graph_input) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
         let (graph_tx, graph_rx) =
             watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
@@ -656,8 +634,6 @@ pub async fn run() -> Result<()> {
         let restored = registry.restore(database.restore().await?)?;
         ensure!(restored > 0, "persistence restore-live requires stored pools");
         let graph_settings = graph_liquidity::Settings::from_env()?;
-        ensure!(graph_settings.min_tvl_usd.is_none(),
-            "restore-live cannot use GRAPH_MIN_TVL_USD without a fresh TVL source");
         let (updates, receiver) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(32);
         let (graph_tx, graph_rx) = watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
         let mut tasks = JoinSet::new();
@@ -701,14 +677,6 @@ pub async fn run() -> Result<()> {
             || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
             || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {
             let graph_settings=graph_liquidity::Settings::from_env()?;
-            if cli.manifest_completion_live {
-                ensure!(graph_settings.min_tvl_usd.is_none(),
-                    "--manifest-completion-live requires GRAPH_MIN_TVL_USD unset (Manifest TVL is None)");
-            }
-            if cli.pumpswap_completion_live || cli.pumpswap_rolling {
-                ensure!(graph_settings.min_tvl_usd.is_none(),
-                    "PumpSwap completion requires GRAPH_MIN_TVL_USD unset until reserve/TVL worker exists");
-            }
             Some(graph_settings)
         } else {None};
         let (registry, writer) = if cli.persistence_write_live
@@ -745,62 +713,42 @@ pub async fn run() -> Result<()> {
             if cli.completion_live { SourceSet::DlmmDammV2 } else { SourceSet::DammV2 }
         } else { SourceSet::Dlmm };
         let damm_v2 = if cli.damm_v2_completion_live {
-            let mut settings = completion_meteora_damm_v2::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_meteora_damm_v2::Settings::from_env()?)
         } else { None };
         let dlmm = if !cli.orca_completion_live && !cli.raydium_amm_v4_completion_live
             && !cli.raydium_cpmm_completion_live && !cli.raydium_clmm_completion_live
             && !cli.pancakeswap_clmm_completion_live && !cli.byreal_clmm_completion_live
             && !cli.manifest_completion_live && !cli.pumpswap_completion_live && !cli.pumpswap_rolling
             && (!cli.damm_v2_completion_live || cli.completion_live) {
-            let mut settings = completion_meteora_dlmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_meteora_dlmm::Settings::from_env()?)
         } else {None};
         let orca = if cli.orca_completion_live {
-            let mut settings = completion_orca_whirlpool::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_orca_whirlpool::Settings::from_env()?)
         } else {None};
         let raydium_amm_v4 = if cli.raydium_amm_v4_completion_live {
-            let mut settings = completion_raydium_amm_v4::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_raydium_amm_v4::Settings::from_env()?)
         } else { None };
         let raydium_cpmm = if cli.raydium_cpmm_completion_live {
-            let mut settings = completion_raydium_cpmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_raydium_cpmm::Settings::from_env()?)
         } else { None };
         let raydium_clmm = if cli.raydium_clmm_completion_live {
-            let mut settings = completion_raydium_clmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_raydium_clmm::Settings::from_env()?)
         } else { None };
         let pancakeswap_clmm = if cli.pancakeswap_clmm_completion_live {
-            let mut settings = completion_pancakeswap_clmm::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_pancakeswap_clmm::Settings::from_env()?)
         } else { None };
         let byreal_clmm = if cli.byreal_clmm_completion_live {
-            let mut settings=completion_byreal_clmm::Settings::from_env()?;
-            settings.limit=completion_limit;
-            Some(settings)
+            Some(completion_byreal_clmm::Settings::from_env()?)
         } else {None};
         let pumpswap = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
-            let mut settings = completion_pumpswap::Settings::from_env()?;
-            settings.limit = completion_limit;
-            Some(settings)
+            Some(completion_pumpswap::Settings::from_env()?)
         } else {None};
         let manifest = if cli.manifest_completion_live {
-            let mut settings=completion_manifest::Settings::from_env()?;
-            settings.limit=completion_limit;
-            Some(settings)
+            Some(completion_manifest::Settings::from_env()?)
         } else {None};
         let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
         spawn_sources(&mut tasks, cli.meteora,
-            Some(CompletionConfig {rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest, pumpswap}),
+            Some(CompletionConfig {lifecycle_limit:completion_limit,rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest, pumpswap}),
             graph, jupiter, registry, writer, source_set, false)?;
         // Completion owns the last handle. The HTTP transport terminates once it completes.
         drop(rpc);

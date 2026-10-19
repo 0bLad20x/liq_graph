@@ -14,7 +14,7 @@ use tokio::sync::{broadcast,watch};
 
 use crate::core::{
     now_unix_ms, CompletionResultBatch, CompletionStatus, DataBatch, RecordIdentity,
-    CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind,
+    CompletionState, CompletionAdmission, PoolState, PoolUpdateBatch, PoolUpdateKind,
 };
 
 /// Per-pool provenance. REST has priority while fresh; DexScreener fills missing
@@ -73,7 +73,9 @@ impl PoolRegistry {
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
         ensure!(entries.is_empty(), "Registry restore requires an empty RAM state");
         let mut restored = HashMap::with_capacity(pools.len());
-        for pool in pools {
+        for mut pool in pools {
+            pool.completion_admission=CompletionAdmission::from_inputs(
+                pool.mint_a,pool.mint_b,pool.tvl_usd);
             ensure!(pool.address != Pubkey::default(), "invalid restored pool address");
             let a = pool.mint_a;
             let b = pool.mint_b;
@@ -137,7 +139,15 @@ impl PoolRegistry {
                     .and_then(Value::as_str);
                 if pool.tvl_usd!=selected.map(|q|q.value)
                     || selected.is_some_and(|q|source!=Some(q.source)) {
+                    let previous_admission=pool.completion_admission;
                     pool.tvl_usd=selected.map(|q|q.value);
+                    pool.completion_admission=CompletionAdmission::from_inputs(
+                        pool.mint_a,pool.mint_b,pool.tvl_usd);
+                    if pool.completion_admission!=previous_admission {
+                        crate::log_event!(Debug,
+                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
+                            pool.address,pool.venue,pool.completion_admission,pool.tvl_usd,pool.execution_manifest.is_some());
+                    }
                     if let Some(q)=selected {
                         pool.last_observation=Some(Arc::new(json!({
                             "tvl_usd":q.value,"source":q.source,
@@ -194,6 +204,8 @@ impl PoolRegistry {
                         last_seen_ms: batch.received_at_ms,
                         last_changed_ms: batch.received_at_ms,
                         tvl_usd: selected.map(|v|v.value),
+                        completion_admission: CompletionAdmission::from_inputs(
+                            *mint_a,*mint_b,selected.map(|v|v.value)),
                         pool_config: None,
                         last_observation: selected.map(|v|Arc::new(json!({
                             "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
@@ -205,6 +217,8 @@ impl PoolRegistry {
                         completion_evidence: None,
                         mint_proofs: None,
                         completion_reason: None,
+                        completion_reason_code: None,
+                        completion_checked_at_ms: None,
                     };
                     updates.push(state.clone());
                     stats.identity.push(*address);
@@ -269,6 +283,15 @@ impl PoolRegistry {
                     }
 
                     current.last_seen_ms = current.last_seen_ms.max(batch.received_at_ms);
+                    let previous_admission=current.completion_admission;
+                    current.completion_admission=CompletionAdmission::from_inputs(
+                        current.mint_a,current.mint_b,current.tvl_usd);
+                    if current.completion_admission!=previous_admission {
+                        changed=true;
+                        crate::log_event!(Debug,
+                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
+                            current.address,current.venue,current.completion_admission,current.tvl_usd,current.execution_manifest.is_some());
+                    }
                     if changed {
                         if identity_changed { stats.identity.push(*address); }
                         current.last_changed_ms = batch.received_at_ms;
@@ -301,11 +324,17 @@ impl PoolRegistry {
             // Retryable does not advance a validated slot. Account for the
             // accepted no-op before checking stale terminal completion proofs.
             if result.status == CompletionStatus::Retryable {
+                if result.reason_code != Some(crate::core::CompletionReason::TransientFailure)
+                    || result.checked_at_ms.is_some() || result.manifest.is_some() {
+                    stats.invalid += 1;
+                    continue;
+                }
                 // Transient RPC/validation failures must not overwrite previously
                 // validated manifests or turn an Unknown pool into a terminal state.
                 stats.retryable += 1;
                 if pool.completion_state == CompletionState::Unknown {
                     pool.completion_reason = result.reason.clone();
+                    pool.completion_reason_code = result.reason_code;
                     pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
                     stats.updates.push(pool.clone());
                     stats.applied += 1;
@@ -329,6 +358,15 @@ impl PoolRegistry {
                 stats.invalid += 1;
                 continue;
             };
+            if !result.checked_at_ms.is_some_and(|at|at>0 && at<=changed_at_ms)
+                || (result.status==CompletionStatus::Prepared
+                    && (result.reason_code.is_some() || result.reason.is_some()))
+                || (result.status==CompletionStatus::Incomplete
+                    && (result.reason_code.is_none()
+                        || result.reason_code==Some(crate::core::CompletionReason::TransientFailure))) {
+                stats.invalid += 1;
+                continue;
+            }
             if result.status == CompletionStatus::Prepared {
                 let Some(manifest) = result.manifest.as_ref() else {
                     stats.invalid += 1;
@@ -337,7 +375,9 @@ impl PoolRegistry {
                 if manifest.pool != result.pool || manifest.validated_slot != slot
                     || pool.mint_a != Some(manifest.mint_a)
                     || pool.mint_b != Some(manifest.mint_b)
-                    || result.evidence.is_none() || result.mints.is_none() {
+                    || manifest.base_a.is_empty() || manifest.base_b.is_empty()
+                    || result.evidence.is_none() || result.mints.as_ref().is_none_or(|m|
+                        pool.mint_a!=Some(m[0].address) || pool.mint_b!=Some(m[1].address)) {
                     stats.invalid += 1;
                     continue;
                 }
@@ -376,6 +416,12 @@ impl PoolRegistry {
             pool.completion_evidence = result.evidence.clone();
             pool.mint_proofs = result.mints.clone();
             pool.completion_reason = result.reason.clone();
+            pool.completion_reason_code = result.reason_code;
+            pool.completion_checked_at_ms = result.checked_at_ms;
+            crate::log_event!(Debug,
+                "completion_contract pool={} venue={:?} state={:?} reason_code={:?} checked_at_ms={:?} slot={slot} admission={:?}",
+                pool.address,pool.venue,pool.completion_state,pool.completion_reason_code,
+                pool.completion_checked_at_ms,pool.completion_admission);
             pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
             stats.applied += 1;
             match result.status {
@@ -564,6 +610,12 @@ pub async fn run(
     let incomplete = snapshot.iter().filter(|p| p.completion_state == CompletionState::Incomplete).count();
     let manifests = snapshot.iter().filter(|p| p.execution_manifest.is_some()).count();
     let evidences = snapshot.iter().filter(|p| p.completion_evidence.is_some()).count();
+    let admitted=snapshot.iter().filter(|p|p.completion_admission.is_admitted()).count();
+    let prepared_admitted=snapshot.iter().filter(|p|p.completion_admission.is_admitted()
+        && p.completion_state==CompletionState::Prepared).count();
+    crate::log_event!(Info,
+        "completion_contracts min_tvl_usd={} admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
+        crate::core::COMPLETION_MIN_TVL_USD);
     crate::log_event!(Info,
         "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",
         snapshot.len(),

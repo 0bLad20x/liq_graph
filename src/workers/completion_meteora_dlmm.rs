@@ -1,17 +1,16 @@
-//! DLMM execution completion: registry candidate -> RPC account observations -> V10 manifest.
+//! DLMM execution completion: lifecycle request -> RPC observations -> V10 manifest.
 //! No persistence, no writes to Pool Registry, and no hidden RPC clients.
 
-use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
-use tokio::time::Instant;
+use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
 use serde_json::json;
-use tokio::{sync::{broadcast,watch}, task::JoinSet};
+use tokio::{sync::{broadcast,mpsc}, task::JoinSet};
 
 use crate::{
-    core::{Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
+    core::{CompletionReason, Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
         CompletionStatus, CompletionResult, CompletionResultBatch,
-        CompletionState, PoolState, PoolUpdateBatch},
+        CompletionRequestBatch, CompletionResponse, CompletionResponseBatch, PoolState},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
@@ -68,8 +67,6 @@ fn evidence(inventory: BinArrayInventory) -> Arc<CompletionEvidence> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    /// Zero means continuous/unbounded; positive limits cap finite live runs.
-    pub limit: usize,
     pub account_batch_size: usize,
     pub below: usize,
     pub above: usize,
@@ -94,7 +91,7 @@ impl Settings {
             .context("invalid DLMM_COMPLETION_PARALLEL_BATCHES")?;
         ensure!((1..=64).contains(&parallel_batches),
             "DLMM_COMPLETION_PARALLEL_BATCHES must be 1..=64");
-        Ok(Self { limit: 100, account_batch_size, below, above, parallel_batches })
+        Ok(Self { account_batch_size, below, above, parallel_batches })
     }
 }
 
@@ -329,10 +326,9 @@ fn decode_mint(account: &AccountData) -> Result<MintProof> {
 }
 
 fn mint_failure(pending: PendingMintValidation, status: CompletionStatus,
-    reason: impl Into<String>) -> CompletionResult {
-    CompletionResult { pool: pending.pool, status, validated_slot: Some(pending.slot),
-        manifest: None, reason: Some(reason.into()),
-        evidence: Some(evidence(pending.validated.inventory)), mints: None }
+    code: CompletionReason, reason: impl Into<String>) -> CompletionResult {
+    CompletionResult::new(pending.pool,status,Some(pending.slot),Some(reason.into()),
+        Some(evidence(pending.validated.inventory)),None,None).with_reason_code(code)
 }
 
 async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
@@ -372,24 +368,24 @@ async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
     }
     for item in pending {
         let layout = &item.validated.layout;
-        let check = (|| -> std::result::Result<[MintProof; 2], (CompletionStatus, String)> {
+        let check = (|| -> std::result::Result<[MintProof; 2], (CompletionStatus, CompletionReason, String)> {
             let mut proofs = Vec::new();
             for (key, expected_2022) in [(layout.mint_a, layout.token_2022_a),
                 (layout.mint_b, layout.token_2022_b)] {
                 match observed.get(&key) {
                     Some(MintObservation::Verified(proof)) => {
                         if proof.token_2022 != expected_2022 {
-                            return Err((CompletionStatus::Incomplete, format!(
+                            return Err((CompletionStatus::Incomplete, CompletionReason::UnsupportedConfiguration, format!(
                                 "mint {key} Token-2022 owner differs from LbPair flag expected={expected_2022} actual={}",
                                 proof.token_2022)));
                         }
                         proofs.push(proof.clone());
                     }
                     Some(MintObservation::Invalid(reason)) =>
-                        return Err((CompletionStatus::Incomplete, format!("mint {key}: {reason}"))),
+                        return Err((CompletionStatus::Incomplete, CompletionReason::ValidationFailed, format!("mint {key}: {reason}"))),
                     Some(MintObservation::Unavailable(reason)) =>
-                        return Err((CompletionStatus::Retryable, format!("mint {key}: {reason}"))),
-                    None => return Err((CompletionStatus::Retryable,
+                        return Err((CompletionStatus::Retryable, CompletionReason::TransientFailure, format!("mint {key}: {reason}"))),
+                    None => return Err((CompletionStatus::Retryable, CompletionReason::TransientFailure,
                         format!("mint {key} RPC response missing"))),
                 }
             }
@@ -397,19 +393,24 @@ async fn complete_mint_verification(rpc: &RpcHandle, account_limit: usize,
         })();
         match check {
             Ok(mints) => results.push(prepared(item.pool, item.slot, item.validated, mints)),
-            Err((status, reason)) => results.push(mint_failure(item, status, reason)),
+            Err((status, code, reason)) => results.push(mint_failure(item, status, code, reason)),
         }
     }
 }
 
 fn retryable(pool: Pubkey, reason: impl Into<String>) -> CompletionResult {
-    CompletionResult { pool, status: CompletionStatus::Retryable, validated_slot: None,
-        manifest: None, reason: Some(reason.into()), evidence: None, mints: None }
+    CompletionResult::new(pool,CompletionStatus::Retryable,None,
+        Some(reason.into()),None,None,None)
 }
 
 fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]) -> CompletionResult {
     let unsupported: Vec<String> = mints.iter().filter(|mint| !mint.unsupported.is_empty())
         .map(|mint| format!("{}:{:?}", mint.address, mint.unsupported)).collect();
+    let reason_code = if !unsupported.is_empty() {
+        Some(CompletionReason::UnsupportedConfiguration)
+    } else if validated.manifest.is_none() {
+        Some(CompletionReason::MissingExecutionAccounts)
+    } else {None};
     let reason = if !unsupported.is_empty() {
         Some(format!("V10 unsupported Token-2022 mint extensions: {}", unsupported.join(", ")))
     } else if validated.manifest.is_none() {
@@ -418,11 +419,11 @@ fn prepared(pool: Pubkey, slot: u64, validated: Validated, mints: [MintProof; 2]
             validated.inventory.selected_indices.len(), validated.inventory.validated_indices.len()))
     } else { None };
     let status = if reason.is_some() { CompletionStatus::Incomplete } else { CompletionStatus::Prepared };
-    CompletionResult {
-        pool, status, validated_slot: Some(slot),
-        manifest: if status == CompletionStatus::Prepared { validated.manifest.map(Arc::new) } else { None },
-        reason, evidence: Some(evidence(validated.inventory)), mints: Some(mints),
-    }
+    let manifest=if status==CompletionStatus::Prepared {validated.manifest.map(Arc::new)} else {None};
+    let mut result=CompletionResult::new(pool,status,Some(slot),reason,
+        Some(evidence(validated.inventory)),Some(mints),manifest);
+    result.reason_code=reason_code;
+    result
 }
 
 struct Validated {
@@ -657,230 +658,67 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
     Ok(Validated {layout: latest, inventory, manifest})
 }
 
-/// This is a worker-local attempt scheduler, not an economic signal engine.
-/// It uses only fresh Registry TVL; historic SQL observations never qualify a pool.
-const MIN_COMPLETION_TVL_USD: f64 = 500.0;
-const POOLS_PER_WORK_BATCH: usize = 16;
-const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
-
-#[derive(Default)]
-struct CandidateScheduler {
-    /// Latest qualifying Registry state. Keyed for deduplication and TVL reprioritization.
-    candidates: HashMap<Pubkey, PoolState>,
-    /// 1 = first completion attempt finished/started; 2 = one delayed technical retry.
-    attempts: HashMap<Pubkey, u8>,
-    /// Only transient validation/RPC failures may enter the third priority tier.
-    retry_after: HashMap<Pubkey, Instant>,
-}
-
-impl CandidateScheduler {
-    fn update(&mut self, pool: &PoolState) {
-        if pool.venue != Venue::MeteoraDlmm { return; }
-        if pool.completion_state == CompletionState::Prepared {
-            self.candidates.remove(&pool.address);
-            self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
-            || !pool.tvl_usd.is_some_and(|v| v.is_finite() && v > MIN_COMPLETION_TVL_USD)
-        {
-            // TVL is only a temporary eligibility filter. Keep the attempt and
-            // transient retry history if the pool later re-enters the threshold.
-            self.candidates.remove(&pool.address);
-        } else {
-            self.candidates.insert(pool.address, pool.clone());
-        }
-    }
-
-    fn repeatable_incomplete(pool: &PoolState) -> bool {
-        // Re-reading cannot cure a verified V10-incompatible mint.
-        !pool.completion_reason.as_deref().is_some_and(|reason|
-            reason.contains("V10 unsupported Token-2022 mint extensions")
-            || reason.contains("Token-2022 owner differs from LbPair flag"))
-    }
-
-    fn tier(&self, pool: &PoolState, now: Instant) -> Option<u8> {
-        match self.attempts.get(&pool.address).copied() {
-            None => match pool.completion_state {
-                CompletionState::Unknown => Some(1),
-                CompletionState::Incomplete if Self::repeatable_incomplete(pool) => Some(2),
-                _ => None,
-            },
-            Some(1) if self.retry_after.get(&pool.address).is_some_and(|due| *due <= now) =>
-                Some(3),
-            _ => None,
-        }
-    }
-
-    /// Always consume currently known tier-1 before tier-2, and tier-2 before tier-3.
-    /// Within a tier, highest current TVL wins (never an inferred profit metric).
-    fn next(&self, capacity: usize, now: Instant) -> (u8, Vec<PoolState>) {
-        let mut tier=0;
-        let mut sorted=Vec::new();
-        for pool in self.candidates.values() {
-            let Some(available)=self.tier(pool,now) else {continue;};
-            if tier==0 || available < tier {
-                tier=available;
-                sorted.clear();
-            }
-            if available==tier {sorted.push(pool.clone());}
-        }
-        sorted.sort_unstable_by(|a,b|{
-            b.tvl_usd.unwrap_or_default().total_cmp(&a.tvl_usd.unwrap_or_default())
-                .then_with(||a.address.to_bytes().cmp(&b.address.to_bytes()))
-        });
-        sorted.truncate(capacity);
-        (tier,sorted)
-    }
-
-    fn pending_retry(&self) -> bool {
-        self.retry_after.iter().any(|(address,_)|
-            self.candidates.contains_key(address)
-            && self.attempts.get(address)==Some(&1))
-    }
-
-    fn classify(&self) -> (usize,usize,usize,usize) {
-        let mut unknown=0; let mut incomplete=0; let mut retryable=0; let mut blocked=0;
-        for pool in self.candidates.values() {
-            if self.attempts.get(&pool.address)==Some(&1)
-                && self.retry_after.contains_key(&pool.address) {
-                retryable+=1;
-            } else if !self.attempts.contains_key(&pool.address) {
-                match pool.completion_state {
-                    CompletionState::Unknown => unknown+=1,
-                    CompletionState::Incomplete if Self::repeatable_incomplete(pool) => incomplete+=1,
-                    CompletionState::Incomplete => blocked+=1,
-                    CompletionState::Prepared => (),
-                }
-            }
-        }
-        (unknown,incomplete,retryable,blocked)
-    }
-}
-
-/// Standalone DLMM consumer. First attempts are never interrupted by retry loops.
-/// Each finished partition is published immediately; no 5,000-pool accumulation.
-pub async fn run(mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    source_done: watch::Receiver<bool>,
+/// Execute explicit lifecycle requests. Protocol decoding/validation remains local;
+/// scheduling, retries and Prepared refresh decisions belong to the lifecycle.
+pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
     rpc: RpcHandle, settings: Settings,
-    output: broadcast::Sender<Arc<CompletionResultBatch>>) -> Result<()> {
+    output: mpsc::Sender<CompletionResponseBatch>) -> Result<()> {
     ensure!(settings.account_batch_size > 0 && settings.parallel_batches > 0,
-        "invalid Completion settings");
-    let mut scheduler=CandidateScheduler::default();
+        "invalid DLMM execution settings");
     let mut tasks=JoinSet::new();
-    let mut source_open=true;
-    let mut observed=0_u64;
-    let mut unique_dlmm_seen=HashSet::new();
-    let mut total_attempts=0_usize;
-    let mut initial_attempts=0_usize;
-    let mut repeated_attempts=0_usize;
-    let mut prepared_count=0_usize;
-    let mut incomplete_count=0_usize;
-    let mut retryable_count=0_usize;
-    let started=Instant::now();
-    let mut pulse=tokio::time::interval(Duration::from_secs(5));
-    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    crate::log_event!(Info,"dlmm completion started min_tvl_usd={} limit={} (0=unbounded) parallel={} pools_per_batch={} retry_cooldown_s={}",
-        MIN_COMPLETION_TVL_USD,settings.limit,settings.parallel_batches,
-        POOLS_PER_WORK_BATCH,RETRY_COOLDOWN.as_secs());
-
-    loop {
-        // Limit launch concurrency and provide enough headroom for the single Registry writer.
-        while tasks.len()<settings.parallel_batches
-            && (settings.limit==0 || total_attempts<settings.limit) {
-            let capacity=if settings.limit==0 {POOLS_PER_WORK_BATCH}
-                else {POOLS_PER_WORK_BATCH.min(settings.limit-total_attempts)};
-            if capacity==0 {break;}
-            let (tier,selected)=scheduler.next(capacity,Instant::now());
-            if selected.is_empty(){break;}
-            for pool in &selected {
-                let prior=scheduler.attempts.get(&pool.address).copied().unwrap_or(0);
-                scheduler.attempts.insert(pool.address,prior+1);
-                scheduler.retry_after.remove(&pool.address);
-            }
-            total_attempts+=selected.len();
-            if tier==3 {repeated_attempts+=selected.len();}
-            else {initial_attempts+=selected.len();}
-            let rpc=rpc.clone();
-            tasks.spawn(async move {
-                let result=process(&rpc,&selected,settings).await;
-                (tier,selected,result)
-            });
-        }
-
-        let limit_reached=settings.limit>0 && total_attempts>=settings.limit;
-        // The Registry cannot close its broadcast while the Completion producer
-        // is still alive. Use its independent source-drained signal instead.
-        let discovery_finished = !source_open || *source_done.borrow();
-        if tasks.is_empty() && (limit_reached || (discovery_finished
-            && input.len()==0 && !scheduler.pending_retry()
-            && scheduler.next(1,Instant::now()).1.is_empty())) {
-            break;
-        }
-
+    let mut open=true;
+    let mut processed=0_usize;
+    crate::log_event!(Info,"dlmm executor started parallel={} scheduler=completion_lifecycle",
+        settings.parallel_batches);
+    while open || !tasks.is_empty() {
         tokio::select! {
-            event=input.recv(),if source_open => match event {
-                Ok(batch)=>{
-                    observed+=batch.pools.len() as u64;
-                    for pool in &batch.pools {
-                        if pool.venue==Venue::MeteoraDlmm {
-                            unique_dlmm_seen.insert(pool.address);
-                        }
-                        scheduler.update(pool);
-                    }
+            batch=input.recv(), if open && tasks.len()<settings.parallel_batches => {
+                match batch {
+                    Some(batch)=>{
+                        ensure!(!batch.requests.is_empty(),"empty DLMM request batch");
+                        ensure!(batch.requests.iter().all(|r|
+                            r.pool.venue==Venue::MeteoraDlmm
+                            && r.pool.completion_admission.is_admitted()),
+                            "DLMM request has wrong venue or missing admission");
+                        let rpc=rpc.clone();
+                        tasks.spawn(async move {
+                            let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
+                            let results=match tokio::time::timeout(batch.timeout,
+                                process(&rpc,&pools,settings)).await {
+                                Ok(results)=>results,
+                                Err(_)=>pools.iter().map(|p|retryable(p.address,
+                                    "DLMM lifecycle request timed out")).collect(),
+                            };
+                            (batch.requests,results)
+                        });
+                    },
+                    None=>open=false,
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) =>
-                    bail!("DLMM completion lost {n} Registry update batches"),
-                Err(broadcast::error::RecvError::Closed)=>source_open=false,
             },
-            result=tasks.join_next(),if !tasks.is_empty()=>{
-                let (tier,selected,results)=result.context("missing completion partition")?
-                    .context("DLMM completion partition panicked")?;
-                ensure!(results.len()==selected.len(),
-                    "DLMM completion partition lost pool results");
-                let mut prep=0_usize;let mut inc=0_usize;let mut retry=0_usize;
-                let mut missing_arrays=0_usize;let mut unsupported_mints=0_usize;
-                for result in &results {
-                    if let Some(reason)=result.reason.as_deref() {
-                        if reason.contains("no bitmap-initialized BinArrays") {missing_arrays+=1;}
-                        if reason.contains("V10 unsupported Token-2022 mint extensions") {unsupported_mints+=1;}
-                    }
-                    match result.status {
-                        CompletionStatus::Prepared=>{
-                            prep+=1; scheduler.candidates.remove(&result.pool);
-                            scheduler.retry_after.remove(&result.pool);
-                        }
-                        CompletionStatus::Incomplete=>{inc+=1;}
-                        CompletionStatus::Retryable=>{
-                            retry+=1;
-                            if scheduler.attempts.get(&result.pool)==Some(&1)
-                                && scheduler.candidates.contains_key(&result.pool) {
-                                scheduler.retry_after.insert(result.pool,Instant::now()+RETRY_COOLDOWN);
-                            }
-                        }
-                    }
+            done=tasks.join_next(), if !tasks.is_empty()=>{
+                let (requests,results)=done.context("missing DLMM request task")?
+                    .context("DLMM request task panicked")?;
+                ensure!(requests.len()==results.len(),"DLMM request/result count mismatch");
+                // process() partitions its output internally; correlate by address,
+                // never by the order in which RPC partitions completed.
+                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                ensure!(by_pool.len()==requests.len(),"duplicate DLMM pool result");
+                let mut responses=Vec::with_capacity(requests.len());
+                for request in requests {
+                    let result=by_pool.remove(&request.pool.address)
+                        .context("DLMM request has no matching pool result")?;
+                    crate::log_event!(Debug,
+                        "dlmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?}",
+                        request.id,result.pool,request.work,result.status,result.reason_code,result.validated_slot);
+                    responses.push(CompletionResponse{id:request.id,result});
                 }
-                prepared_count+=prep;incomplete_count+=inc;retryable_count+=retry;
-                crate::log_event!(Warn,"dlmm completion batch tier={} attempts={} prepared={} incomplete={} retryable={} missing_arrays={} unsupported_mints={} total_attempts={} first_attempts={} retries={} elapsed_ms={}",
-                    tier,results.len(),prep,inc,retry,missing_arrays,unsupported_mints,
-                    total_attempts,initial_attempts,repeated_attempts,started.elapsed().as_millis());
-                // Small, fully evaluated batches flow to Registry/Persistence/Graph at once.
-                output.send(Arc::new(CompletionResultBatch {
-                    source:"dlmm_execution_completion",results
-                })).map_err(|_|anyhow!("DLMM completion results have no consumer"))?;
+                processed+=responses.len();
+                output.send(CompletionResponseBatch{source:"dlmm_execution_completion",responses})
+                    .await.map_err(|_|anyhow!("DLMM lifecycle response consumer closed"))?;
             },
-            _=pulse.tick()=>{
-                let (unknown,incomplete,retryable,blocked)=scheduler.classify();
-                crate::log_event!(Debug,"dlmm completion backlog distinct_dlmm_seen={} eligible_unknown={} eligible_incomplete={} cooldown_retryable={} blocked_incompatible={} candidates_in_ram={} active_batches={} first_attempts={} retries={} prepared={} incomplete={} retryable={} observed_updates={}",
-                    unique_dlmm_seen.len(),unknown,incomplete,retryable,blocked,scheduler.candidates.len(),tasks.len(),
-                    initial_attempts,repeated_attempts,prepared_count,incomplete_count,retryable_count,observed);
-            }
         }
     }
-
-    let (unknown,incomplete,retryable,blocked)=scheduler.classify();
-    crate::log_event!(Info,"dlmm completion complete min_tvl_usd={} distinct_dlmm_seen={} observed_updates={} first_attempts={} retries={} prepared={} incomplete={} retryable={} eligible_unknown_left={} eligible_incomplete_left={} eligible_retryable_left={} blocked_incompatible={} elapsed_ms={}",
-        MIN_COMPLETION_TVL_USD,unique_dlmm_seen.len(),observed,initial_attempts,repeated_attempts,
-        prepared_count,incomplete_count,retryable_count,unknown,incomplete,retryable,
-        blocked,started.elapsed().as_millis());
+    crate::log_event!(Info,"dlmm executor complete requests={processed}");
     Ok(())
 }
 

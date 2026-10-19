@@ -1,14 +1,14 @@
-//! Orca Whirlpool completion: registry candidates -> coherent RPC reads -> V10 accounts.
+//! Orca Whirlpool completion: lifecycle requests -> coherent RPC reads -> V10 accounts.
 //! No DB, direct RPC client, graph mutation, or REST dependency.
-use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde_json::json;
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant, MissedTickBehavior}};
+use tokio::{sync::mpsc, task::JoinSet};
 use crate::{
-    core::{AccountMeta, CompletionEvidence, CompletionResult, CompletionResultBatch,
-        CompletionState, CompletionStatus, ExecutionManifest, MintProof, PoolState,
-        PoolUpdateBatch, Venue},
+    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
+        CompletionStatus, ExecutionManifest, MintProof, PoolState,
+        Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
@@ -28,16 +28,12 @@ const DYNAMIC_MAX_LEN: usize = 8 + 4 + 32 + 16 + 88 * 113;
 const ORACLE_LEN: usize = 8 + 32 + 8 + 34 + 44 + 128;
 const POOLS_PER_BATCH: usize = 8; // second pass <= 12 addresses per pool
 const PARALLEL_BATCHES: usize = 16;
-const MIN_TVL_USD: f64 = 500.0;
 const ARRAY_RADIUS: i32 = 2;
-const RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 pub struct Settings {
-    pub limit: usize,
     account_batch_size: usize,
-    parallel_batches: usize,
-    min_tvl_usd: f64,
+    pub parallel_batches: usize,
     radius: i32,
 }
 impl Settings {
@@ -49,10 +45,10 @@ impl Settings {
             .context("invalid RPC_ACCOUNT_BATCH_SIZE")?;
         ensure!((12..=100).contains(&account_batch_size),
             "Orca requires RPC_ACCOUNT_BATCH_SIZE in 12..=100 for its coherent account snapshot");
-        Ok(Self { limit:0, account_batch_size, parallel_batches:PARALLEL_BATCHES,
-            min_tvl_usd:MIN_TVL_USD, radius:ARRAY_RADIUS })
+        Ok(Self { account_batch_size, parallel_batches:PARALLEL_BATCHES,
+            radius:ARRAY_RADIUS })
     }
-    fn pools_per_batch(self) -> usize {
+    pub fn pools_per_batch(self) -> usize {
         POOLS_PER_BATCH.min(self.account_batch_size / 12)
     }
 }
@@ -195,7 +191,7 @@ fn read(rpc:&RpcHandle, addresses:Vec<Pubkey>, min_slot:Option<u64>)
 fn result(pool:Pubkey,status:CompletionStatus,slot:Option<u64>,
     reason:Option<String>,evidence:Option<Arc<CompletionEvidence>>,
     mints:Option<[MintProof;2]>,manifest:Option<Arc<ExecutionManifest>>) -> CompletionResult {
-    CompletionResult {pool,status,validated_slot:slot,reason,evidence,mints,manifest}
+    CompletionResult::new(pool,status,slot,reason,evidence,mints,manifest)
 }
 fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult {
     result(pool,CompletionStatus::Retryable,None,Some(reason.into()),None,None,None)
@@ -272,10 +268,10 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let shifted = layout.tick_current + layout.tick_spacing >= center + width;
     let up_center = if shifted { center + width } else { center };
     if !present.contains_key(&center) {
-        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized");
+        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     if !present.contains_key(&up_center) {
-        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized");
+        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     // Keep only consecutive initialized arrays starting at each direction's first array.
     let down=(0..=radius).map(|distance|center-distance*width)
@@ -308,7 +304,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     if mints.iter().any(|m|!m.unsupported.is_empty()) {
         return result(pool.address,CompletionStatus::Incomplete,Some(slot),
             Some(format!("V10 unsupported Token-2022 mint extensions: {:?} {:?}",
-                mints[0].unsupported,mints[1].unsupported)),Some(ev),Some(mints),None);
+                mints[0].unsupported,mints[1].unsupported)),Some(ev),Some(mints),None).with_reason_code(CompletionReason::UnsupportedConfiguration);
     }
     let manifest=make_manifest(layout,slot,&arrays_a,&arrays_b,owner);
     result(pool.address,CompletionStatus::Prepared,Some(slot),None,
@@ -365,185 +361,60 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 }
 
 
-// Evidence v1 had reversed directions; v2 missed the B->A boundary shift
-// and accepted frozen vaults. Revalidate persisted Prepared v1/v2 proofs.
-fn needs_evidence_upgrade(pool: &PoolState) -> bool {
-    pool.venue == Venue::OrcaWhirlpool
-        && pool.completion_state == CompletionState::Prepared
-        && pool.completion_evidence.as_ref().is_some_and(|e|
-            e.kind == "orca_whirlpool_tick_arrays" && e.version < 3)
-}
-
-#[derive(Default)]
-struct Scheduler {
-    candidates:HashMap<Pubkey,PoolState>,
-    attempts:HashMap<Pubkey,u8>,
-    retry_after:HashMap<Pubkey,Instant>,
-}
-impl Scheduler {
-    fn update(&mut self,pool:&PoolState,min_tvl:f64) {
-        if pool.venue!=Venue::OrcaWhirlpool {return;}
-        if needs_evidence_upgrade(pool) {
-            // Old Prepared manifests must be rechecked even without fresh REST TVL.
-            self.candidates.insert(pool.address,pool.clone());
-        } else if pool.completion_state==CompletionState::Prepared {
-            self.candidates.remove(&pool.address);
-            self.retry_after.remove(&pool.address);
-        } else if pool.mint_a.is_none() || pool.mint_b.is_none()
-            || !pool.tvl_usd.is_some_and(|v|v.is_finite() && v>=min_tvl) {
-            self.candidates.remove(&pool.address);
-        } else {
-            self.candidates.insert(pool.address,pool.clone());
-        }
-    }
-    fn eligible(&self,pool:&PoolState,now:Instant)->Option<u8> {
-        match self.attempts.get(&pool.address).copied() {
-            None=>match pool.completion_state {
-                CompletionState::Prepared if needs_evidence_upgrade(pool)=>Some(1),
-                CompletionState::Unknown=>Some(2),
-                CompletionState::Incomplete if !pool.completion_reason.as_deref()
-                    .is_some_and(|reason|reason.contains("V10 unsupported Token-2022 mint extensions"))=>Some(3),
-                _=>None,
-            },
-            Some(1) if self.retry_after.get(&pool.address).is_some_and(|t|*t<=now)=>Some(4),
-            _=>None,
-        }
-    }
-    fn next(&self,max:usize,now:Instant)->(u8,Vec<PoolState>) {
-        let mut tier=0;
-        let mut candidates=Vec::new();
-        for pool in self.candidates.values() {
-            let Some(level)=self.eligible(pool,now) else {continue};
-            if tier==0 || level<tier {tier=level;candidates.clear();}
-            if tier==level {candidates.push(pool.clone());}
-        }
-        candidates.sort_unstable_by(|a,b|
-            b.tvl_usd.unwrap_or_default().total_cmp(&a.tvl_usd.unwrap_or_default())
-                .then_with(||a.address.to_bytes().cmp(&b.address.to_bytes())));
-        candidates.truncate(max);
-        (tier,candidates)
-    }
-    fn pending_retry(&self)->bool {
-        self.retry_after.iter().any(|(pool,_)|
-            self.candidates.contains_key(pool) && self.attempts.get(pool)==Some(&1))
-    }
-    fn counts(&self,now:Instant)->(usize,usize,usize,usize) {
-        let mut upgrade=0;let mut unknown=0;let mut incomplete=0;let mut retry=0;
-        for pool in self.candidates.values() {
-            match self.eligible(pool,now) {
-                Some(1)=>upgrade+=1,Some(2)=>unknown+=1,Some(3)=>incomplete+=1,
-                Some(4)=>retry+=1,_=>(),
-            }
-        }
-        (upgrade,unknown,incomplete,retry)
-    }
-}
-pub async fn run(mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    source_done:watch::Receiver<bool>,rpc:RpcHandle,settings:Settings,
-    output:broadcast::Sender<Arc<CompletionResultBatch>>)->Result<()> {
-    let mut scheduler=Scheduler::default();
+/// Protocol executor only. The shared lifecycle owns admission scheduling,
+/// retry/backoff, reactivation and Prepared refresh.
+pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
+    rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
-    let mut source_open=true;
-    let mut seen=HashSet::new();
-    let mut registry_updates=0_usize;
-    let mut attempts=0_usize;
-    let mut prepared=0_usize;
-    let mut incomplete=0_usize;
-    let mut retryable=0_usize;
-    let mut retries=0_usize;
-    let mut pulse=tokio::time::interval(Duration::from_secs(5));
-    pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let started=Instant::now();
-    crate::log_event!(Info,"orca completion started min_tvl_usd={} limit={} radius={} parallel={} pools_per_batch={}",
-        settings.min_tvl_usd,settings.limit,settings.radius,
-        settings.parallel_batches,settings.pools_per_batch());
-    loop {
-        while tasks.len()<settings.parallel_batches
-            && (settings.limit==0 || attempts<settings.limit) {
-            let remaining=if settings.limit==0 {settings.pools_per_batch()}
-                else {settings.pools_per_batch().min(settings.limit-attempts)};
-            if remaining==0 {break;}
-            let (tier,selected)=scheduler.next(remaining,Instant::now());
-            if selected.is_empty(){break;}
-            for pool in &selected {
-                let next=scheduler.attempts.get(&pool.address).copied().unwrap_or(0)+1;
-                scheduler.attempts.insert(pool.address,next);
-                scheduler.retry_after.remove(&pool.address);
-            }
-            attempts+=selected.len();
-            if tier==4 {retries+=selected.len();}
-            let rpc=rpc.clone();
-            tasks.spawn(async move {(tier,process(&rpc,selected,settings).await)});
-        }
-        let stopped=settings.limit>0 && attempts>=settings.limit;
-        let done=!source_open || *source_done.borrow();
-        if tasks.is_empty() && (stopped || (done && input.len()==0
-            && !scheduler.pending_retry() && scheduler.next(1,Instant::now()).1.is_empty())) {
-            break;
-        }
+    let mut open=true;
+    let mut processed=0_usize;
+    crate::log_event!(Info,"orca executor started parallel={} pools_per_batch={} radius={} scheduler=completion_lifecycle",
+        settings.parallel_batches,settings.pools_per_batch(),settings.radius);
+    while open || !tasks.is_empty() {
         tokio::select! {
-            event=input.recv(),if source_open=>match event {
-                Ok(batch)=>{
-                    registry_updates+=batch.pools.len();
-                    for pool in &batch.pools {
-                        if pool.venue==Venue::OrcaWhirlpool {seen.insert(pool.address);}
-                        scheduler.update(pool,settings.min_tvl_usd);
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n))=>
-                    bail!("Orca completion lost {n} Registry batches"),
-                Err(broadcast::error::RecvError::Closed)=>source_open=false,
+            batch=input.recv(),if open && tasks.len()<settings.parallel_batches=>match batch {
+                Some(batch)=>{
+                    ensure!(!batch.requests.is_empty() && batch.requests.len()<=settings.pools_per_batch(),
+                        "invalid Orca Whirlpool request batch size");
+                    ensure!(batch.requests.iter().all(|r|r.pool.venue==Venue::OrcaWhirlpool
+                        && r.pool.completion_admission.is_admitted()),
+                        "Orca Whirlpool request has wrong venue or missing admission");
+                    let rpc=rpc.clone();
+                    tasks.spawn(async move {
+                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
+                        let results=match tokio::time::timeout(batch.timeout,
+                            process(&rpc,pools,settings)).await {
+                            Ok(results)=>results,
+                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
+                                "Orca Whirlpool lifecycle request timed out")).collect(),
+                        };
+                        (batch.requests,results)
+                    });
+                },
+                None=>open=false,
             },
-            done_batch=tasks.join_next(),if !tasks.is_empty()=>{
-                let (tier,results)=done_batch.context("Orca completion missing task")?
-                    .context("Orca completion task panicked")?;
-                let mut p=0;let mut i=0;let mut r=0;
-                for item in &results {
-                    match item.status {
-                        CompletionStatus::Prepared=>{
-                            p+=1;scheduler.candidates.remove(&item.pool);
-                            scheduler.retry_after.remove(&item.pool);
-                        }
-                        CompletionStatus::Incomplete=>i+=1,
-                        CompletionStatus::Retryable=>{
-                            r+=1;
-                            if scheduler.attempts.get(&item.pool)==Some(&1)
-                                && scheduler.candidates.contains_key(&item.pool) {
-                                scheduler.retry_after.insert(item.pool,Instant::now()+RETRY_AFTER);
-                            }
-                        }
-                    }
+            done=tasks.join_next(),if !tasks.is_empty()=>{
+                let (requests,results)=done.context("missing Orca Whirlpool request task")?
+                    .context("Orca Whirlpool request task panicked")?;
+                ensure!(requests.len()==results.len(),"Orca Whirlpool request/result count mismatch");
+                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                ensure!(by_pool.len()==requests.len(),"duplicate Orca Whirlpool pool result");
+                let mut responses=Vec::with_capacity(requests.len());
+                for request in requests {
+                    let result=by_pool.remove(&request.pool.address)
+                        .context("Orca Whirlpool request has no matching pool result")?;
+                    crate::log_event!(Debug,
+                        "orca executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
+                        request.id,result.pool,request.work,result.status,result.reason_code,
+                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
+                    responses.push(CompletionResponse{id:request.id,result});
                 }
-                prepared+=p;incomplete+=i;retryable+=r;
-                crate::log_event!(Debug,"orca completion batch tier={tier} pools={} prepared={p} incomplete={i} retryable={r} total_attempts={attempts} elapsed_ms={}",
-                    results.len(),started.elapsed().as_millis());
-                for item in results.iter().filter(|v|v.status==CompletionStatus::Prepared).take(2) {
-                    if let Some(manifest)=&item.manifest {
-                        crate::log_event!(Debug,"orca manifest pool={} slot={} a_accounts={} b_accounts={} base_a={:?} base_b={:?}",
-                            manifest.pool,manifest.validated_slot,manifest.base_a.len(),
-                            manifest.base_b.len(),
-                            manifest.base_a.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
-                                .collect::<Vec<_>>(),
-                            manifest.base_b.iter().map(|a|format!("{}:{}",a.address,if a.writable {"rw"} else {"ro"}))
-                                .collect::<Vec<_>>());
-                    }
-                }
-                for item in results.iter().filter(|v|v.status!=CompletionStatus::Prepared).take(3) {
-                    crate::log_event!(Debug,"orca completion result pool={} status={:?} reason={}",
-                        item.pool,item.status,item.reason.as_deref().unwrap_or("-"));
-                }
-                output.send(Arc::new(CompletionResultBatch{source:SOURCE,results}))
-                    .map_err(|_|anyhow!("Orca completion has no Registry consumer"))?;
+                processed+=responses.len();
+                output.send(CompletionResponseBatch{source:SOURCE,responses}).await
+                    .map_err(|_|anyhow!("Orca Whirlpool lifecycle response consumer closed"))?;
             },
-            _=pulse.tick()=>{
-                let (upgrade,a,b,c)=scheduler.counts(Instant::now());
-                crate::log_event!(Debug,"orca completion backlog seen={} evidence_upgrade={upgrade} unknown={a} incomplete={b} retry_due={c} candidates={} active_batches={} attempts={attempts} prepared={prepared} incomplete_total={incomplete} retryable={retryable} registry_updates={registry_updates}",
-                    seen.len(),scheduler.candidates.len(),tasks.len());
-            }
         }
     }
-    let (upgrade,a,b,c)=scheduler.counts(Instant::now());
-    crate::log_event!(Info,"orca completion complete pools_seen={} registry_updates={registry_updates} attempts={attempts} retries={retries} prepared={prepared} incomplete={incomplete} retryable={retryable} left_evidence_upgrade={upgrade} left_unknown={a} left_incomplete={b} left_retry_due={c} elapsed_ms={}",
-        seen.len(),started.elapsed().as_millis());
+    crate::log_event!(Info,"orca executor complete requests={processed}");
     Ok(())
 }

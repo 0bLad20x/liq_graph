@@ -6,6 +6,54 @@ use anyhow::Result;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 
+/// Shared completion contract. TVL is the Registry's current canonical value;
+/// callers must never substitute a historical observation or provider payload.
+pub const COMPLETION_MIN_TVL_USD: f64 = 500.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionAdmission {
+    Admitted,
+    MissingIdentity,
+    TvlUnavailable,
+    BelowMinimumTvl,
+}
+
+impl CompletionAdmission {
+    pub fn from_inputs(a: Option<Pubkey>, b: Option<Pubkey>, tvl: Option<f64>) -> Self {
+        let (Some(a), Some(b)) = (a, b) else { return Self::MissingIdentity };
+        if a == b || a == Pubkey::default() || b == Pubkey::default() {
+            return Self::MissingIdentity;
+        }
+        match tvl {
+            Some(v) if v.is_finite() && v >= COMPLETION_MIN_TVL_USD => Self::Admitted,
+            Some(v) if v.is_finite() && v >= 0.0 => Self::BelowMinimumTvl,
+            _ => Self::TvlUnavailable,
+        }
+    }
+
+    pub fn is_admitted(self) -> bool { self == Self::Admitted }
+}
+
+/// Stable machine-readable reasons; the diagnostic message is never a policy key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionReason {
+    TransientFailure,
+    ValidationFailed,
+    MissingExecutionAccounts,
+    UnsupportedConfiguration,
+    ConfigurationRequired,
+    LegacyUnclassified,
+}
+
+impl CompletionReason {
+    /// These reasons require a relevant configuration/support change, not an
+    /// unchanged account retry. CP2 will own the actual retry schedule.
+    pub fn recheckable(self) -> bool {
+        !matches!(self, Self::UnsupportedConfiguration | Self::ConfigurationRequired)
+    }
+}
+
 /// Only venues actually emitted by implemented source workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Venue {
@@ -111,14 +159,69 @@ pub struct CompletionResult {
     pub validated_slot: Option<u64>,
     pub manifest: Option<Arc<ExecutionManifest>>,
     pub reason: Option<String>,
+    pub reason_code: Option<CompletionReason>,
+    /// Completion finished at this wall-clock time. Retryable attempts do not
+    /// establish or renew a validated proof timestamp.
+    pub checked_at_ms: Option<u64>,
     pub evidence: Option<Arc<CompletionEvidence>>,
     pub mints: Option<[MintProof; 2]>,
+}
+
+impl CompletionResult {
+    pub fn new(pool: Pubkey, status: CompletionStatus, validated_slot: Option<u64>,
+        reason: Option<String>, evidence: Option<Arc<CompletionEvidence>>,
+        mints: Option<[MintProof; 2]>, manifest: Option<Arc<ExecutionManifest>>) -> Self {
+        let reason_code = match status {
+            CompletionStatus::Prepared => None,
+            CompletionStatus::Incomplete => Some(CompletionReason::ValidationFailed),
+            CompletionStatus::Retryable => Some(CompletionReason::TransientFailure),
+        };
+        let checked_at_ms = if status == CompletionStatus::Retryable { None }
+            else { now_unix_ms().ok() };
+        Self { pool, status, validated_slot, manifest, reason, reason_code,
+            checked_at_ms, evidence, mints }
+    }
+
+    pub fn with_reason_code(mut self, reason: CompletionReason) -> Self {
+        self.reason_code = Some(reason);
+        self
+    }
 }
 
 #[derive(Debug)]
 pub struct CompletionResultBatch {
     pub source: &'static str,
     pub results: Vec<CompletionResult>,
+}
+
+/// Why the lifecycle requested a protocol check. These are attempt intents,
+/// separate from the durable Unknown/Prepared/Incomplete state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionWork { Initial, Recheck, Refresh, Retry }
+
+#[derive(Debug)]
+pub struct CompletionRequest {
+    pub id: u64,
+    pub work: CompletionWork,
+    pub pool: PoolState,
+}
+
+#[derive(Debug)]
+pub struct CompletionRequestBatch {
+    pub requests: Vec<CompletionRequest>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug)]
+pub struct CompletionResponse {
+    pub id: u64,
+    pub result: CompletionResult,
+}
+
+#[derive(Debug)]
+pub struct CompletionResponseBatch {
+    pub source: &'static str,
+    pub responses: Vec<CompletionResponse>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +243,8 @@ pub struct PoolState {
     pub last_seen_ms: u64,
     pub last_changed_ms: u64,
     pub tvl_usd: Option<f64>,
+    /// Derived once by the Registry. Consumers use this decision, not a local TVL gate.
+    pub completion_admission: CompletionAdmission,
     /// Durable, validated protocol configuration, not arbitrary REST JSON.
     pub pool_config: Option<Arc<Value>>,
     /// Historical persisted observation; never treat as a fresh live quote.
@@ -150,6 +255,10 @@ pub struct PoolState {
     pub completion_evidence: Option<Arc<CompletionEvidence>>,
     pub mint_proofs: Option<[MintProof; 2]>,
     pub completion_reason: Option<String>,
+    pub completion_reason_code: Option<CompletionReason>,
+    /// None for historic descriptors without a recorded check time. Refresh
+    /// scheduling is external; this timestamp alone does not imply a TTL.
+    pub completion_checked_at_ms: Option<u64>,
 }
 
 /// Distinguish source observations from completed execution metadata without

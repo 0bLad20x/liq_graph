@@ -360,12 +360,14 @@ pub async fn run(
     let gate = Arc::new(Mutex::new(Instant::now()));
     crate::log_event!(Info,"raydium discovery routes=10 head_refresh_seconds={refresh_seconds} liquidity_overlap_min_common={OVERLAP_CONFIRM_ADDRESSES} rps={}",settings.rps);
 
-    let mut refresh_tasks = Vec::with_capacity(ROUTES.len());
+    // Owned tasks: cancelling discovery must also stop every head refresh and
+    // release its source sender so Registry and persistence can finish draining.
+    let mut refresh_tasks = JoinSet::new();
     for (sort, direction) in ROUTES {
-        refresh_tasks.push(tokio::spawn(refresh_head(
+        refresh_tasks.spawn(refresh_head(
             client.clone(), gate.clone(), spacing, output.clone(),
             Duration::from_secs(refresh_seconds), sort, direction,
-        )));
+        ));
     }
     let mut tasks = JoinSet::new();
     for (sort, direction) in ROUTES {
@@ -404,7 +406,7 @@ pub async fn run(
             }
         }
     }
-    for task in refresh_tasks { task.abort(); }
+    refresh_tasks.shutdown().await;
     if let Some(error) = first_error { return Err(error); }
     if !settings.once { bail!("all Raydium API routes stopped"); }
     Ok(())
