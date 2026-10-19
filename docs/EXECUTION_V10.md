@@ -1,15 +1,11 @@
 # V10 simulation draft
 
-**Build prerequisite still blocked:** this environment has no Rust/Cargo toolchain
-and cannot download one. `ring = 0.17.14` is already a transitive locked package but
-is now also a direct signing dependency; the root lockfile entry must be regenerated
-by Cargo. `Cargo.lock` has deliberately not been edited by hand. This draft is not
-yet a local-test handoff. On `agent/v10-simulation-worker`, generate the lockfile
-using `cargo update -p ring --precise 0.17.14 --config net.offline=false`, then commit
-the generated file before the documented `--locked` build and simulation run.
-The resolver must be online: the locked `wasm-bindgen-futures 0.4.79` requires
-`js-sys 0.3.106`, which may be missing from a native Windows build's local cache.
-Offline resolution can therefore fail even though `ring` itself is cached.
+The user generated `Cargo.lock` with Cargo's online resolver. The exact supplied
+diff adds only `ring` to the root package dependencies; its Git blob starts with
+`3b8ba46`. Dependency versions are unchanged. That generated result is committed
+with the signing dependency. Rust build and real-chain simulation remain pending;
+this environment has no Rust/Cargo toolchain. The next step is the documented
+`cargo build --locked --release` on the committed draft branch.
 
 `ExecutionRequest` describes exactly one transaction. Its producer selects all groups,
 pool alternatives and any conversion pool before handing the job to `execution_v10`.
