@@ -7,6 +7,7 @@ pub mod pool_registry;
 pub mod rpc_transport;
 pub mod http_transport;
 pub mod completion_meteora_dlmm;
+pub mod completion_lifecycle;
 pub mod completion_meteora_damm_v2;
 pub mod completion_orca_whirlpool;
 pub mod completion_raydium_amm_v4;

@@ -337,8 +337,10 @@ fn spawn_sources(
             if config.damm_v2.is_none() && config.orca.is_none() && dlmm.limit > 0 {
                 tasks.spawn(completion_meteora_dlmm::observe(completion_output.subscribe()));
             }
-            tasks.spawn(completion_meteora_dlmm::run(registry_output.subscribe(),
-                source_done_rx.clone(), config.rpc.clone(), dlmm, completion_output.clone()));
+            let stop=watch::channel(false);
+            runtime::spawn_dlmm_lifecycle(tasks,&registry,&registry_output,
+                completion_output.clone(),source_done_rx.clone(),stop,config.rpc.clone(),
+                dlmm,settings.once)?;
         }
         if let Some(damm_v2) = config.damm_v2 {
             tasks.spawn(completion_meteora_damm_v2::run(registry_output.subscribe(),
@@ -532,6 +534,9 @@ pub async fn run() -> Result<()> {
     }
     if args.len()==1 && args[0]=="--cp1-live" {
         return runtime::cp1_live().await;
+    }
+    if args.len()==1 && args[0]=="--completion-lifecycle-live" {
+        return runtime::completion_lifecycle_live().await;
     }
     // Finite standalone Jupiter catalog import. No Graph/Registry/Completion is started.
     if (args.len() == 1 && args[0] == "--jupiter-mint-backfill")

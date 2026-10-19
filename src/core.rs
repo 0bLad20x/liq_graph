@@ -194,6 +194,36 @@ pub struct CompletionResultBatch {
     pub results: Vec<CompletionResult>,
 }
 
+/// Why the lifecycle requested a protocol check. These are attempt intents,
+/// separate from the durable Unknown/Prepared/Incomplete state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionWork { Initial, Recheck, Refresh, Retry }
+
+#[derive(Debug)]
+pub struct CompletionRequest {
+    pub id: u64,
+    pub work: CompletionWork,
+    pub pool: PoolState,
+}
+
+#[derive(Debug)]
+pub struct CompletionRequestBatch {
+    pub requests: Vec<CompletionRequest>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug)]
+pub struct CompletionResponse {
+    pub id: u64,
+    pub result: CompletionResult,
+}
+
+#[derive(Debug)]
+pub struct CompletionResponseBatch {
+    pub source: &'static str,
+    pub responses: Vec<CompletionResponse>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionState {
     Unknown,
@@ -226,8 +256,8 @@ pub struct PoolState {
     pub mint_proofs: Option<[MintProof; 2]>,
     pub completion_reason: Option<String>,
     pub completion_reason_code: Option<CompletionReason>,
-    /// None for historic descriptors without a recorded check time. No TTL or
-    /// periodic refresh is implied; the refresh lifecycle is the next checkpoint.
+    /// None for historic descriptors without a recorded check time. Refresh
+    /// scheduling is external; this timestamp alone does not imply a TTL.
     pub completion_checked_at_ms: Option<u64>,
 }
 

@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
 use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, PoolState,
         PoolUpdateBatch, PoolUpdateKind, Venue},
-    workers::{completion_meteora_dlmm, completion_meteora_damm_v2, completion_orca_whirlpool,
+    workers::{completion_lifecycle, completion_meteora_dlmm, completion_meteora_damm_v2, completion_orca_whirlpool,
         completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm,
         completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest,
         completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
@@ -146,6 +146,85 @@ async fn completion_feed(
             bail!("completion feed venue={venue:?} closed");
         }
     }
+}
+
+/// Wiring shared by production, the finite protocol mode and the CP2 live run.
+/// Protocol code and scheduling stay in their respective workers.
+pub(super) fn spawn_dlmm_lifecycle(tasks:&mut JoinSet<Result<()>>,
+    registry:&pool_registry::PoolRegistry,
+    updates:&broadcast::Sender<Arc<PoolUpdateBatch>>,
+    results:broadcast::Sender<Arc<CompletionResultBatch>>,
+    source_done:watch::Receiver<bool>,
+    stop:(watch::Sender<bool>,watch::Receiver<bool>),
+    rpc:rpc_transport::RpcHandle,config:completion_meteora_dlmm::Settings,finite:bool,
+)->Result<()> {
+    let input=updates.subscribe();
+    let seed=registry.snapshot();
+    let settings=completion_lifecycle::Settings::from_env(finite,config.limit)?;
+    let (jobs,job_rx)=tokio::sync::mpsc::channel(4);
+    let (responses,response_rx)=tokio::sync::mpsc::channel(4);
+    let executor=completion_lifecycle::Executor{venue:Venue::MeteoraDlmm,
+        requests:jobs,batch_size:16,max_in_flight:config.parallel_batches*16};
+    critical(tasks,"completion.meteora_dlmm",completion_meteora_dlmm::run(
+        job_rx,rpc,config,responses));
+    critical(tasks,"completion_lifecycle",async move{
+        let _stop_owner=stop.0;
+        completion_lifecycle::run(seed,input,response_rx,vec![executor],results,
+            source_done,stop.1,settings).await
+    });
+    Ok(())
+}
+
+/// Bounded real-provider proof for the DLMM lifecycle only. Uses the same
+/// dispatch, execution, Registry and single-writer path as --run.
+pub async fn completion_lifecycle_live()->Result<()> {
+    let duration=number("RUN_DURATION_SECONDS",300)?;
+    anyhow::ensure!((30..=86400).contains(&duration),"live duration must be 30..86400");
+    let database=persistence::Persistence::connect().await?;
+    let restored=database.restore().await?.into_iter()
+        .filter(|p|p.venue==Venue::MeteoraDlmm).collect();
+    let registry=pool_registry::PoolRegistry::default();
+    let restored_count=registry.restore(restored)?;
+    let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+    let (sources,source_rx)=broadcast::channel(256);
+    let (updates,_)=broadcast::channel(256);
+    let (results,result_rx)=broadcast::channel(256);
+    let (done,done_rx)=watch::channel(false);
+    let (stop,stop_rx)=watch::channel(false);
+    let mut tasks=JoinSet::new();
+    critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
+        registry.clone(),updates.clone(),done,true));
+    critical(&mut tasks,"persistence",database.run(updates.subscribe()));
+    let mut config=completion_meteora_dlmm::Settings::from_env()?;config.limit=0;
+    spawn_dlmm_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
+        (stop.clone(),stop_rx.clone()),rpc.clone(),config,false)?;
+    let client=core::http_client()?;
+    tasks.spawn(supervise("discovery.meteora_dlmm",stop_rx,move||{
+        let client=client.clone();let output=sources.clone();
+        async move{discovery_meteora_dlmm::run(client,output,
+            discovery_meteora_dlmm::Settings{once:false,max_pages:None}).await}
+    }));
+    critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
+    drop(updates);drop(rpc);
+    crate::log_event!(Info,"lifecycle live started restored={restored_count} duration_s={duration} executors=1 venue=MeteoraDlmm");
+    tokio::select! {
+        _=tokio::time::sleep(Duration::from_secs(duration))=>{},
+        result=tasks.join_next()=>{
+            let result=result.context("all lifecycle live tasks ended")?;
+            result.context("lifecycle live task panicked")??;
+            bail!("lifecycle live worker ended before duration");
+        },
+    }
+    stop.send_replace(true);
+    // Drain active real requests, Registry acceptance and database writes.
+    // The outer bound permits the configured executor request timeout.
+    let drain_ms=number("COMPLETION_LIFECYCLE_ATTEMPT_SECONDS",180)?*1000+150000;
+    tokio::time::timeout(Duration::from_millis(drain_ms),async {
+        while let Some(result)=tasks.join_next().await{result??;}
+        Ok::<(),anyhow::Error>(())
+    }).await.context("lifecycle live drain timed out")??;
+    crate::log_event!(Info,"lifecycle live complete=true persisted=true");
+    Ok(())
 }
 
 /// Isolated CP1 live checkpoint: real Jupiter and DexScreener, restored
@@ -393,7 +472,9 @@ pub async fn run()->Result<()>{
             }
         };
     }
-    completion!(completion_meteora_dlmm,Venue::MeteoraDlmm);
+    let mut dlmm=completion_meteora_dlmm::Settings::from_env()?;dlmm.limit=0;
+    spawn_dlmm_lifecycle(&mut tasks,&registry,&updates,completions.clone(),done_rx.clone(),
+        (stop_tx.clone(),stop_rx.clone()),rpc.clone(),dlmm,false)?;
     completion!(completion_meteora_damm_v2,Venue::MeteoraDammV2);
     completion!(completion_orca_whirlpool,Venue::OrcaWhirlpool);
     completion!(completion_raydium_amm_v4,Venue::RaydiumAmmV4);

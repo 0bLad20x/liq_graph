@@ -614,7 +614,7 @@ pub async fn run(
     let prepared_admitted=snapshot.iter().filter(|p|p.completion_admission.is_admitted()
         && p.completion_state==CompletionState::Prepared).count();
     crate::log_event!(Info,
-        "completion_contracts min_tvl_usd={} admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} periodic_refresh=false",
+        "completion_contracts min_tvl_usd={} admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
         crate::core::COMPLETION_MIN_TVL_USD);
     crate::log_event!(Info,
         "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",

@@ -25,7 +25,7 @@ if ($LASTEXITCODE -ne 0) { throw "Cargo.lock changed during build." }
 $env:CP1_MARKET_ENRICHMENT_ENABLED = "true"
 $env:JUPITER_BACKFILL_ON_START = "false"
 $env:RUN_DURATION_SECONDS = "$DurationSeconds"
-$env:RUST_LOG = "info,liq_graph::workers::pool_registry=debug"
+$env:LIQ_GRAPH_LOG = "info,pool_registry=debug"
 $log = "completion_contracts_live.log"
 cargo run --locked --release -- --run 2>&1 | Tee-Object -FilePath $log
 if ($LASTEXITCODE -ne 0) { throw "Runtime failed: $LASTEXITCODE; inspect $log" }
