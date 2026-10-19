@@ -169,6 +169,16 @@ DLMM-/DAMM-v2-Betrieb live nachgewiesen: 304 akzeptierte und persistierte
 Prepared-Ergebnisse bei 32 Pools, wiederholte Refreshes je Protokoll und
 SQL 32/32/0. Die Raydium-Erweiterung braucht ihren eigenen Build-/Live-/SQL-Nachweis.
 
+Der erste Raydium-Lauf auf `cd2f8d4` belegt Build-Erfolg und 464 von der Registry
+akzeptierte Auftraege: AMM v4 160 Prepared, CPMM 160 Prepared, CLMM 116 Prepared
+und 28 Incomplete-Rechecks. Alle 44 Prepared-Pools wurden mehrfach aktualisiert;
+vier CLMM-Pools blieben Incomplete. Der Lauf scheiterte jedoch beim Shutdown:
+abgetrennte Raydium-Head-Refresh-Tasks hielten Source-Sender offen. Registry und
+Persistenz konnten ihren Abschluss deshalb nicht bestaetigen. Die Head-Refreshs
+gehoeren jetzt einem JoinSet und werden beim Abbruch der Discovery mit beendet.
+Auch der unbenutzte AMM-v4-Import ist entfernt. Fuer diesen Fix ist ein erneuter
+Live-Lauf mit Abschlusszaehlern und anschliessender SQL-Pruefung erforderlich.
+
 Die Bearbeitungsumgebung hat keine Rust-Toolchain und keine bereitgestellten
 Live-Zugangsdaten. Ein erfolgreicher Build und die fachliche Live-Abnahme sind
 hier deshalb nicht belegt. Es werden keine Unit-/Mock-/Regressionstests und

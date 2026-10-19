@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use crate::{
-    core::{CompletionReason,
+    core::{
         AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue,
