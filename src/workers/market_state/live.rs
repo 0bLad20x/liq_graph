@@ -63,6 +63,8 @@ async fn observe(mut input:PriceEventStream,phase:watch::Receiver<Phase>,progres
                 },
                 MarketStateEvent::Stats{pools,ready,accounts,active,..}=>{
                     state=Progress{selected:*pools,ready:*ready,accounts:*accounts,active:*active};progress.send_replace(state);
+                    let index=phase.borrow().index;let m=&measurements[index];
+                    crate::log_event!(Info,"market decode consumer phase={index} selected={pools} ready={ready} accounts={accounts} active={active} baseline={baseline} websocket={websocket} market_max_ns={} frame_to_consumer_max_ns={}",m.market.max,m.frame.max);
                 },
                 MarketStateEvent::Unavailable{..}=>unavailable+=1,
                 _=>{},
