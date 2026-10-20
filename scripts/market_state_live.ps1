@@ -28,7 +28,6 @@ $status = git status --short
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect working tree." }
 $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Commit or preserve tracked changes before the live run; nothing was changed by this script." }
-if ($branch -notin @("agent/market-state-stream", "agent/graph-signals-reference", "main")) { throw "Use a Market-State/Graph-Signals feature branch, or main after merge." }
 Write-Host "$label branch=$branch head=$head signals=$([bool]$Signals) execution=false"
 if ($status) { Write-Host ($status | Out-String) }
 cargo build --locked --release

@@ -15,13 +15,13 @@ pub struct AccountData {
 }
 
 /// Account bytes are immutable and shared; receiving an event never clones its byte buffer.
-/// Sequence is local to a source/session, not a blockchain write version or global slot order.
+/// Source gap and per-account slot are explicit; timestamps measure local processing only.
 #[derive(Clone,Debug)]
 pub enum AccountEvent {
     Subscribed {provider:String,address:Pubkey},
     Unsubscribed {provider:String,address:Pubkey},
-    Account {provider:String,address:Pubkey,slot:u64,session:u64,sequence:u64,
-        received_at_ms:u64,frame_received_at_us:u64,decoded_at_us:u64,
+    Account {provider:String,address:Pubkey,slot:u64,
+        frame_received_at_us:u64,decoded_at_us:u64,
         value:Option<Arc<AccountData>>},
     Gap {provider:String,reason:&'static str},
     Rejected {provider:String,address:Pubkey,code:i64},

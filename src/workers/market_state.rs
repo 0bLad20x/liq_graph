@@ -818,35 +818,6 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     Ok(wanted.into_iter().map(|(address,view)|AccountWatch{address,view}).collect())
 }
 
-/// Real transport input only: persisted Prepared proofs are not live Registry admission.
-/// Reuse the production account discovery and slice planner; do not publish prices.
-pub async fn account_stream_plan(registry:&PoolRegistry,rpc:&RpcHandle)->Result<Vec<AccountWatch>> {
-    let started=time::Instant::now();let limit=Settings::from_env()?.pool_limit;
-    let candidates=registry.snapshot().iter().filter_map(PoolInput::prepared).map(|p|(p.address,p)).collect();
-    let selected=select(&candidates,limit);
-    ensure!(!selected.is_empty(),"no persisted Prepared pools for the account transport plan");
-    crate::log_event!(Info,"market account plan preparing=true prepared={} selected={} pool_limit={limit} admission=historical_proof_only prices=false",candidates.len(),selected.len());
-    let (output,_)=broadcast::channel(16);
-    let (engine,failed)=hydrate(&selected,rpc,&output,false).await?;
-    let wanted=watches(&engine,&[])?;
-    let failures:Vec<_>=failed.iter().map(|(p,reason)|serde_json::json!({"pool":p.address.to_string(),"reason":reason})).collect();
-    let mut venues=BTreeMap::<&str,usize>::new();
-    for pool in &engine.pools {*venues.entry(pool.venue.label()).or_default()+=1;}
-    let capacity=rpc.account_stream().0.capacity();
-    let report=serde_json::json!({"source":"persisted_prepared_proofs","live_admission_established":false,
-        "pool_limit":limit,"prepared_candidates":candidates.len(),"selected_pools":selected.len(),
-        "planned_pools":engine.pools.len(),"failed_pools":failed.iter().map(|(p,_)|p.address.to_string()).collect::<Vec<_>>(),
-        "failures":failures,"pools_by_venue":venues,"account_references":engine.subs.len(),
-        "unique_accounts":wanted.len(),"account_capacity":capacity,"capacity_sufficient":wanted.len()<=capacity,
-        "preparation_seconds":started.elapsed().as_secs_f64(),
-        "pools":selected.iter().map(|p|p.address.to_string()).collect::<Vec<_>>()});
-    let path=env::var("MARKET_STATE_ACCOUNT_PLAN_PATH").context("MARKET_STATE_ACCOUNT_PLAN_PATH is required")?;
-    std::fs::write(path,serde_json::to_vec_pretty(&report)?).context("write market account plan")?;
-    ensure!(failed.is_empty(),"account plan failed for {} of {} pools; inspect preparation.json",failed.len(),selected.len());
-    ensure!(wanted.len()<=capacity,"{} pools require {} distinct accounts; ENV WebSocket capacity is {}; no subscriptions were opened",selected.len(),wanted.len(),capacity);
-    crate::log_event!(Info,"market account plan complete=true pools={} accounts={} seconds={:.3}",engine.pools.len(),wanted.len(),started.elapsed().as_secs_f64());
-    Ok(wanted)
-}
 fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
     engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))
 }
