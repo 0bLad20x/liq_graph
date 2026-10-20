@@ -2,6 +2,7 @@ param(
     [ValidateRange(60,86400)][int]$DurationSeconds = 600,
     [ValidateRange(0,2147483647)][int]$PoolLimit = 1000,
     [string]$AccountsPath = "",
+    [switch]$DecodePrices,
     [ValidateRange(1,86400)][int]$TransitionTimeoutSeconds = 600
 )
 $ErrorActionPreference = "Stop"
@@ -14,7 +15,8 @@ $status = @(git status --short)
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect checkout." }
 $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Tracked changes must be committed before this live run." }
-$runFlag = "--rpc-account-stream-prepared-live"
+$runFlag = if ($DecodePrices) { "--market-state-decode-live" } else { "--rpc-account-stream-prepared-live" }
+if ($DecodePrices -and $AccountsPath) { throw "Price decoding requires Prepared pool identities; omit AccountsPath." }
 $accountText = $null
 if ($AccountsPath) {
     $AccountsPath = (Resolve-Path -LiteralPath $AccountsPath).Path
@@ -22,7 +24,7 @@ if ($AccountsPath) {
     if (@($accountText | ConvertFrom-Json).Count -lt 4) { throw "Provide at least four real accounts." }
     $runFlag = "--rpc-account-stream-live"
 }
-Write-Host "Account-Stream CP1.2 branch=$branch head=$head pool_limit=$PoolLimit input=$runFlag execution=false"
+Write-Host "Account/Price-Stream decode_prices=$([bool]$DecodePrices) branch=$branch head=$head pool_limit=$PoolLimit input=$runFlag execution=false"
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "Locked build failed; no live run started." }
 git diff --exit-code -- Cargo.lock
@@ -31,7 +33,8 @@ $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Tracked checkout changed during build." }
 
 $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
-$folder = Join-Path (Get-Location) "rpc_account_stream_live\$stamp"
+$outputRoot = if ($DecodePrices) { "market_state_live" } else { "rpc_account_stream_live" }
+$folder = Join-Path (Get-Location) "$outputRoot\$stamp"
 New-Item -ItemType Directory -Path $folder | Out-Null
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 $inputCopy = Join-Path $folder "accounts.json"
@@ -41,7 +44,7 @@ $report = Join-Path $folder "report.json"
 $log = Join-Path $folder "worker.log"
 $metadata = Join-Path $folder "checkout.json"
 $checkout = @{ branch=$branch; head=$head; status=$status; measured_seconds=$DurationSeconds; pool_limit=$PoolLimit;
-    transition_timeout_seconds=$TransitionTimeoutSeconds; input=$runFlag; transport_config="RPC_N_ENV" }
+    transition_timeout_seconds=$TransitionTimeoutSeconds; input=$runFlag; transport_config="RPC_N_ENV"; decode_prices=[bool]$DecodePrices }
 # ENV provider flags and limits are authoritative. Disable the older aggregate test overrides.
 # The file supplies provider values; old shell overrides must not shadow its WS keys.
 $values = @{
@@ -50,6 +53,9 @@ $values = @{
     RPC_ACCOUNT_STREAM_DURATION_SECONDS="$DurationSeconds"
     RPC_ACCOUNT_STREAM_TRANSITION_TIMEOUT_SECONDS="$TransitionTimeoutSeconds"
     MARKET_STATE_POOL_LIMIT="$PoolLimit"
+    MARKET_STATE_DURATION_SECONDS="$DurationSeconds"
+    MARKET_STATE_TRANSITION_TIMEOUT_SECONDS="$TransitionTimeoutSeconds"
+    MARKET_STATE_REPORT_PATH=$report
     MARKET_STATE_ACCOUNT_PLAN_PATH=$preparation
     RPC_WS_PROVIDER_SELECTION="configured"
     RPC_WS_ACCOUNT_BUDGET="0"
@@ -107,16 +113,26 @@ try {
         Write-Host "Prepared plan: selected=$($prepared.selected_pools) planned=$($prepared.planned_pools) distinct_accounts=$($prepared.unique_accounts) capacity=$($prepared.account_capacity) preparation_seconds=$($prepared.preparation_seconds)"
     }
     if (-not (Test-Path -LiteralPath $report)) {
-        $partial = @{ run_complete=$false; live_evidence_passed=$false; worker_exit=$workerExit; error="Worker produced no transport report; inspect preparation.json and worker.log." }
+        $partial = @{ run_complete=$false; live_evidence_passed=$false; worker_exit=$workerExit; error="Worker produced no account/price report; inspect preparation.json and worker.log." }
         [System.IO.File]::WriteAllText($report,($partial | ConvertTo-Json),$utf8)
     }
     $evidence = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-    Write-Host "Complete=$($evidence.run_complete) passed=$($evidence.live_evidence_passed) retained_activity_during_transitions=$($evidence.transition_activity_observed)"
-    $evidence.phases | Select-Object name,requested_accounts,transition_seconds,steady_seconds,
-        @{Name="steady_updates_s";Expression={$_.steady.updates_per_second}},
-        @{Name="steady_max_ns";Expression={$_.steady.frame_to_consumer.max_ns}},
-        continuing_updates_during_transition | Format-Table | Out-Host
-    if ($workerExit -ne 0 -or $evidence.live_evidence_passed -ne $true) { throw "Account-Stream CP1.2 failed. Inspect report.json, preparation.json and worker.log." }
+    if ($DecodePrices) {
+        Write-Host "Decoder passed=$($evidence.decoding_evidence_passed) transport continuity=$($evidence.continuity_passed)"
+        Write-Host "Prices published=$($evidence.producer.websocket_prices) consumed=$($evidence.consumer.websocket_prices) account updates=$($evidence.producer.account_updates)"
+        foreach ($phase in $evidence.consumer.phases.PSObject.Properties) {
+            $m = $phase.Value
+            Write-Host "$($phase.Name): prices=$($m.websocket_prices) replay=$($m.initialization_replays) market_mean_ms=$($m.market_to_publish.mean_ns / 1000000) market_max_ms=$($m.market_to_publish.max_ns / 1000000) frame_to_consumer_max_ms=$($m.frame_to_consumer.max_ns / 1000000)"
+        }
+        if ($workerExit -ne 0 -or $evidence.decoding_evidence_passed -ne $true) { throw "Market-State decode run failed. Inspect report.json and worker.log." }
+    } else {
+        Write-Host "Complete=$($evidence.run_complete) passed=$($evidence.live_evidence_passed) retained_activity_during_transitions=$($evidence.transition_activity_observed)"
+        $evidence.phases | Select-Object name,requested_accounts,transition_seconds,steady_seconds,
+            @{Name="steady_updates_s";Expression={$_.steady.updates_per_second}},
+            @{Name="steady_max_ns";Expression={$_.steady.frame_to_consumer.max_ns}},
+            continuing_updates_during_transition | Format-Table | Out-Host
+        if ($workerExit -ne 0 -or $evidence.live_evidence_passed -ne $true) { throw "Account-Stream CP1.2 failed. Inspect report.json, preparation.json and worker.log." }
+    }
 } finally {
     foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name,$previous[$name],"Process") }
 }

@@ -17,6 +17,10 @@ pub enum PriceOrigin { Baseline, Websocket }
 pub struct PricePipelineTiming {
     pub frame_received_at_us:u64, pub transport_decoded_at_us:u64,
     pub market_received_at_us:u64, pub price_published_at_us:u64,
+    /// Monotonic durations: protocol field decode, then normalized price calculation.
+    pub market_decode_ns:u64, pub market_compute_ns:u64,
+    /// Catch-up after initialization/resync; excluded from steady-state latency.
+    pub initialization_replay:bool,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PoolPriceObservation {
@@ -52,7 +56,7 @@ pub enum MarketStateEvent {
     Gap {reason:String, sequence:u64},
     Removed {pool:String, sequence:u64},
     Selection {prepared:usize, selected:Vec<String>, accounts:usize, sequence:u64},
-    Stats {pools:usize, available:usize, accounts:usize, active:usize,
+    Stats {pools:usize, ready:usize, available:usize, accounts:usize, active:usize,
         ws_messages:u64, ws_text_bytes:u64, sequence:u64},
 }
 /// An event stream is not a durable event log: lagging consumers receive RecvError::Lagged.

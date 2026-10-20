@@ -522,15 +522,18 @@ pub async fn run() -> Result<()> {
         println!("{}",crate::workers::execution_v10::Settings::load(std::path::Path::new(&args[1]))?.wallet());
         return Ok(());
     }
-    if args.len()==1 && matches!(args[0].as_str(),"--rpc-account-stream-live"|"--rpc-account-stream-prepared-live") {
+    if args.len()==1 && matches!(args[0].as_str(),"--rpc-account-stream-live"|"--rpc-account-stream-prepared-live"|"--market-state-decode-live") {
         let (handle,mut task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         let work=async {
-            let planned=if args[0]=="--rpc-account-stream-prepared-live" {
+            let planned=if args[0]!="--rpc-account-stream-live" {
                 let database=persistence::Persistence::connect().await?;
                 let restored=database.restore().await?;
                 drop(database);
                 let registry=pool_registry::PoolRegistry::default();
                 registry.restore(restored)?;
+                if args[0]=="--market-state-decode-live" {
+                    return crate::workers::market_state::decode_live(registry,handle.clone()).await;
+                }
                 Some(crate::workers::market_state::account_stream_plan(&registry,&handle).await?)
             }else{None};
             rpc_transport::account_stream_live(&handle,planned).await
