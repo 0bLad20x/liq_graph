@@ -549,7 +549,7 @@ pub async fn run(
                         }
                     }
                     if batches == 1 || batches % 25 == 0 {
-                        crate::log_event!(Warn,
+                        crate::log_event!(Debug,
                             "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
                             batch.source, stats.total, stats.ignored_mints,
                         );

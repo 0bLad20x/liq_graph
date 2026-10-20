@@ -924,7 +924,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 selected=next;current=next_map;replan=true;engine.metrics.selection_changes+=1;
                 engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
-                crate::log_event!(Info,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
+                crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
             }
             rebuild=false;
         }
@@ -1105,20 +1105,24 @@ pub async fn observe(mut input:PriceEventStream,mut catalog:watch::Receiver<Arc<
                         }
                         let first=prices.insert(p.pool.clone(),p.origin).is_none();
                         let first_live=matches!(p.origin,PriceOrigin::Websocket) && first_ws.insert(p.pool.clone());
-                        if trace || (first && observed<=16) || (first_live && first_ws.len()<=16) {println!("{}",serde_json::to_string(event.as_ref())?);}
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else if (first && observed<=16) || (first_live && first_ws.len()<=16) {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     },
                     MarketStateEvent::Unavailable{pool,..}=>{
                         prices.remove(pool);
                         let first=unavailable.insert(pool.clone());
-                        if trace || (first && unavailable.len()<=16){println!("{}",serde_json::to_string(event.as_ref())?);}
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else if first && unavailable.len()<=16 {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     },
                     MarketStateEvent::Removed{pool,..}=>{removals+=1;prices.remove(pool);
-                        if trace || removals<=16 {println!("{}",serde_json::to_string(event.as_ref())?);}},
-                    MarketStateEvent::Gap{..}=>{gaps+=1;prices.clear();println!("{}",serde_json::to_string(event.as_ref())?);},
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else if removals<=16 {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}},
+                    MarketStateEvent::Gap{reason,sequence}=>{gaps+=1;prices.clear();crate::log_event!(Warn,"market state gap reason={reason} sequence={sequence}");},
                     MarketStateEvent::Selection{selected,..}=>{selections+=1;
                         if selected.is_empty(){cleared=true;}else if cleared{rewatching=true;}
                         let current:HashSet<_>=selected.iter().cloned().collect();prices.retain(|p,_|current.contains(p));
-                        println!("{}",serde_json::to_string(event.as_ref())?);
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     },
                     MarketStateEvent::Stats{active,..}=>{
                         max_active=max_active.max(*active);
@@ -1130,7 +1134,8 @@ pub async fn observe(mut input:PriceEventStream,mut catalog:watch::Receiver<Arc<
                             .any(|p|matches!(prices.get(&p.to_string()),Some(PriceOrigin::Websocket)))).count();
                         pairs_max=pairs_max.max(direct_pairs);live_pairs_max=live_pairs_max.max(live_pairs);
                         crate::log_event!(Info,"market state consumer prices={} observations={observed} websocket={websocket} graph_generation={} priced_pairs={direct_pairs} live_priced_pairs={live_pairs}",prices.len(),graph.generation);
-                        println!("{}",serde_json::to_string(event.as_ref())?);
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     }
                 }
             },

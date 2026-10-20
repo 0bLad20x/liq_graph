@@ -26,7 +26,8 @@ pub async fn run(signals_enabled:bool)->Result<()> {
     if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH") {
         std::fs::write(path,serde_json::to_vec_pretty(&evidence)?).context("write market live evidence")?;
     }
-    println!("{}",serde_json::to_string(&evidence)?);
+    crate::log_event!(Info,"market state live evidence run_complete={} live_evidence_passed={} signals_enabled={} error={}",
+        evidence["run_complete"],evidence["live_evidence_passed"],signals_enabled,evidence["error"]);
     result
 }
 
