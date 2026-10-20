@@ -87,6 +87,12 @@ notifications, subscription/unsubscription ACKs, rejected requests, decode error
 The consumer reports source totals, sequence/lag/clock errors, observed queue depth and bounded real
 payload examples. Producer publication totals must equal consumer account totals.
 
+Socket read termination is logged with source/session and retained in `producer.sources[].last_read_end`:
+close status/reason, read error, stream end without a close frame, or an unexpected frame. A null value
+means no read termination was recorded; it does not exclude another gap cause. The generic gap still
+invalidates continuity. Reconnection does not prove that the provider delivered updates missed while
+disconnected, and matching local publication/consumption totals cannot establish that.
+
 Times are nanoseconds; percentile fields are histogram bucket upper bounds:
 
 * `producer.sources[].decode`: text read through transport decode and payload creation.
@@ -105,6 +111,14 @@ network, TLS/OS buffering and time before the socket yields a text message are n
 `live_evidence_passed` proves continuity/activity in the observed run; latency values and the
 tested input volume must be assessed separately before scaling. This is not a full pipeline proof.
 
-Agent verification: Cargo/Rust and PowerShell are unavailable in the editing environment.
-The local locked build and real live run are pending. No formatter, automated test suite,
-dependency change or manual lockfile change is included.
+Uploaded Windows evidence for `2beb99d7` (2026-10-20): locked release build succeeded with one
+unused-field warning; 15 accounts, two sockets and 300 seconds produced/consumed 218 account updates,
+with zero local lag or sequence errors. Frame-to-consumer mean was 0.097321 ms and maximum 0.275 ms.
+Both sockets disconnected after approximately 136 seconds and reconnected, so continuity failed.
+The old reader discarded the termination details; the cause is not established. No updates were
+observed during the short subscription ACK transitions, and this is not a large-load proof.
+
+The follow-up preserves read termination details and checks unsubscribe source ownership in the
+audit, which also uses the formerly unread provider field. It does not claim to fix the disconnect.
+Cargo/Rust and PowerShell are unavailable in the editing environment; the follow-up build/live
+run are pending. No formatter, automated test suite, dependency or lockfile change is included.

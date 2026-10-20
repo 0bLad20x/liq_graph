@@ -31,7 +31,10 @@ impl Audit {
     fn receive(&mut self,event:std::result::Result<AccountEvent,broadcast::error::RecvError>,phase:&mut Phase,continuing:&HashSet<Pubkey>)->Result<()> {
         match event {
             Ok(AccountEvent::Subscribed{provider,address})=>{self.active.insert(address,provider);self.subscribe_acks+=1;},
-            Ok(AccountEvent::Unsubscribed{address,..})=>{self.active.remove(&address);self.unsubscribe_acks+=1;},
+            Ok(AccountEvent::Unsubscribed{provider,address})=>{
+                if self.active.get(&address)==Some(&provider){self.active.remove(&address);}
+                self.unsubscribe_acks+=1;
+            },
             Ok(AccountEvent::Gap{provider,reason})=>{
                 self.gaps+=1;self.active.retain(|_,p|p!=&provider);
                 crate::log_event!(Warn,"account stream gap source={provider} reason={reason}");

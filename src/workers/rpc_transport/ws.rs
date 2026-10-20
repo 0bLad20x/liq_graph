@@ -38,6 +38,7 @@ impl Latency {
 pub(super) struct SourceStats {
     sessions:u64,frames:u64,notifications:u64,published:u64,retired:u64,subscribe_acks:u64,
     unsubscribe_acks:u64,rejections:u64,gaps:u64,decode_errors:u64,no_receiver:u64,
+    last_read_end:Option<String>,
     decode:Latency,forward:Latency,write_wait:Latency,write:Latency,reconcile:Latency,enqueue:Latency,
 }
 pub(super) type Metrics=Arc<Mutex<BTreeMap<String,SourceStats>>>;
@@ -47,6 +48,7 @@ pub(super) fn report(metrics:&Metrics)->Value {
         "text_frames":s.frames,"account_notifications":s.notifications,"account_published":s.published,
         "retired_notifications":s.retired,"subscribe_acks":s.subscribe_acks,"unsubscribe_acks":s.unsubscribe_acks,
         "rejections":s.rejections,"gaps":s.gaps,"decode_errors":s.decode_errors,"no_receiver":s.no_receiver,
+        "last_read_end":s.last_read_end,
         "decode":s.decode.report(),"publication":s.forward.report(),"control_pacing":s.write_wait.report(),"control_write":s.write.report(),"watch_reconcile":s.reconcile.report(),"control_enqueue":s.enqueue.report()})).collect();
     json!({"layout":"independent_socket_reader_v1","sources":sources})
 }
@@ -190,7 +192,17 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
                             continue;
                         },
                         Some(Ok(Message::Pong(_)))=>continue,
-                        _=>break,
+                        other=>{
+                            let reason=match other {
+                                Some(Ok(Message::Close(Some(frame))))=>format!("close code={} reason={:?}",frame.code,frame.reason),
+                                Some(Ok(Message::Close(None)))=>"close without status".into(),
+                                Some(Err(error))=>format!("read error: {error}"),
+                                None=>"read stream ended without close frame".into(),
+                                _=>"unexpected non-text WebSocket frame".into(),
+                            };
+                            crate::log_event!(Warn,"rpc websocket read ended source={name} session={session} reason={reason}");
+                            stats.last_read_end=Some(reason);break;
+                        },
                     };
                     let frame_received_at_us=now_us();let started=Instant::now();
                     stats.frames+=1;control.messages.fetch_add(1,Ordering::Relaxed);control.text_bytes.fetch_add(text.len() as u64,Ordering::Relaxed);
