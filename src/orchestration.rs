@@ -522,6 +522,19 @@ pub async fn run() -> Result<()> {
         println!("{}",crate::workers::execution_v10::Settings::load(std::path::Path::new(&args[1]))?.wallet());
         return Ok(());
     }
+    if args.len()==1 && args[0]=="--rpc-account-stream-live" {
+        let (handle,mut task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+        let result=tokio::select! {
+            result=rpc_transport::account_stream_live(&handle)=>result,
+            result=&mut task=>{
+                result.context("RPC transport task panicked")??;
+                bail!("RPC transport ended before account stream proof")
+            },
+        };
+        drop(handle);
+        let shutdown=task.await.context("RPC transport task panicked")?;
+        return result.and(shutdown);
+    }
     if args.len()==1 && args[0]=="--market-state-live" {
         return market_state_live::run(false).await;
     }

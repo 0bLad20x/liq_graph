@@ -4,3 +4,4 @@ jupiter_mints.txt
 /v10_live/
 /market_state_live/
 /graph_signals_live/
+/rpc_account_stream_live/

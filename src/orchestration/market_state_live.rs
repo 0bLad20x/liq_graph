@@ -86,8 +86,9 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let mut consumer=Task(tokio::spawn(market_state::observe(price_rx,catalog_rx,settings.trace)));
     // Keep resource roots alive until the producer result has been joined. Otherwise
     // an errored producer can close the consumer/RPC first and hide its actual error.
+    let (account_control,account_events)=rpc.account_stream();
     let mut worker=Task(tokio::spawn(market_state::run(registry.clone(),updates.subscribe(),rpc.clone(),
-        prices.clone(),settings,stop_rx,enabled)));
+        account_control,account_events,prices.clone(),settings,stop_rx,enabled)));
     updates.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,source:"market_live_restore",
         received_at_ms:0,pools:prepared,persist_identity:Vec::new()}))?;
     let mut registry_task=Task(tokio::spawn(pool_registry::run(source_rx,None,registry.clone(),updates.clone(),done,true)));

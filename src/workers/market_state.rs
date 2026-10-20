@@ -6,8 +6,9 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
     market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
-use super::{pool_registry::PoolRegistry, rpc_transport::{AccountView, AccountWatch, RpcAnswer, RpcHandle, RpcOperation, WsEvent},
+use super::{pool_registry::PoolRegistry, rpc_transport::{RpcAnswer, RpcHandle, RpcOperation},
     graph_watch_catalog::{WatchCatalog,RouteKind}};
+use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
 const DLMM_PROGRAM:&str="LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const PUMP_PROGRAM:&str="pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const DAMM_V2_PROGRAM:&str="cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
@@ -749,7 +750,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
 // Consume transport notifications while HTTP hydration is pending. A baseline deliberately
 // replaces intermediate notifications; it is never used until all required ACKs are present.
 async fn baseline(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,
-    events:&mut broadcast::Receiver<WsEvent>,active:&mut HashMap<Pubkey,String>,last_ack:&mut time::Instant)
+    events:&mut AccountEventStream,active:&mut HashMap<Pubkey,String>,last_ack:&mut time::Instant)
     ->Result<(Engine,Vec<Pubkey>,bool)> {
     let future=hydrate(pools,rpc,out,sequence);tokio::pin!(future);
     let mut changed=false;
@@ -797,10 +798,9 @@ fn invalidate(engine:&mut Engine,reason:&str) {
 /// All Registry entries enter here; selection only limits observations, never Prepared admission.
 /// `enabled` is an explicit observation control (also used by the finite rewatch proof).
 async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    rpc:RpcHandle,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
+    rpc:RpcHandle,control:AccountStreamControl,mut events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
     mut stop:watch::Receiver<bool>,mut enabled:watch::Receiver<bool>)->Result<()> {
-    ensure!(rpc.can_watch(),"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
-    let mut events=rpc.subscribe_events();
+    ensure!(control.capacity()>0,"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
     let mut candidates=identities(&registry);
     let mut selected:Vec<PoolInput>=Vec::new();let mut engine=Engine::empty(out.clone(),0);
     let mut failed=Vec::new();let mut wanted=Vec::<AccountWatch>::new();
@@ -826,18 +826,18 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 let (next_engine,next_failed,_)=baseline(&next,&rpc,&out,sequence,&mut events,&mut active,&mut last_ack).await?;
                 engine=next_engine;failed=next_failed;
                 wanted=watches(&engine,&failed)?;
-                ensure!(wanted.len()<=rpc.watch_capacity(),
-                    "market state selected {} pools require {} accounts; configured WS capacity={}",next.len(),wanted.len(),rpc.watch_capacity());
+                ensure!(wanted.len()<=control.capacity(),
+                    "market state selected {} pools require {} accounts; configured WS capacity={}",next.len(),wanted.len(),control.capacity());
                 // Do not use pre-subscription prices. ACKs trigger a fresh baseline.
                 for p in &mut engine.pools {p.available=false;}
-                rpc.replace_account_watches(wanted.clone())?;
+                control.replace(wanted.clone())?;
                 active.retain(|a,_|wanted.iter().any(|w|w.address==*a));
                 selected=next;ready=false;resync=true;last_ack=time::Instant::now();
                 engine.sequence+=1;
                 let prepared=candidates.len();
                 send(&out,MarketStateEvent::Selection{prepared,selected:selected.iter().map(|p|p.address.to_string()).collect(),
                     accounts:wanted.len(),sequence:engine.sequence});
-                crate::log_event!(Info,"market state selection prepared={prepared} selected={} accounts={} capacity={}",selected.len(),wanted.len(),rpc.watch_capacity());
+                crate::log_event!(Info,"market state selection prepared={prepared} selected={} accounts={} capacity={}",selected.len(),wanted.len(),control.capacity());
             }
             rebuild=false;
         }
@@ -863,7 +863,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     active.remove(&address);ready=false;resync=true;
                     crate::log_event!(Warn,"market state subscription rejected provider={provider} account={address} code={code}");
                 },
-                Ok(WsEvent::Account{address,provider,slot,received_at_ms,frame_received_at_us,decoded_at_us,value})=>{
+                Ok(WsEvent::Account{address,provider,slot,received_at_ms,frame_received_at_us,decoded_at_us,value,..})=>{
                     let pipeline=PricePipelineTiming{frame_received_at_us,transport_decoded_at_us:decoded_at_us,
                         market_received_at_us:timestamp_us(),price_published_at_us:0};
                     if !ready || active.get(&address)!=Some(&provider) {continue;}
@@ -927,9 +927,9 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     if changed {resync=true;last_ack=time::Instant::now();continue;}
                     let next_watches=watches(&engine,&failed)?;
                     if next_watches!=wanted {
-                        ensure!(next_watches.len()<=rpc.watch_capacity(),"market resync requires {} accounts; configured WS capacity={}",next_watches.len(),rpc.watch_capacity());
+                        ensure!(next_watches.len()<=control.capacity(),"market resync requires {} accounts; configured WS capacity={}",next_watches.len(),control.capacity());
                         active.retain(|a,_|next_watches.iter().any(|w|w.address==*a));
-                        wanted=next_watches;rpc.replace_account_watches(wanted.clone())?;
+                        wanted=next_watches;control.replace(wanted.clone())?;
                         ready=false;resync=true;last_ack=time::Instant::now();
                         invalidate(&mut engine,"account requirements changed; awaiting subscriptions");
                         continue;
@@ -947,14 +947,14 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 }
                 if ticks%30==0 && !failed.is_empty(){resync=true;}
                 if ticks%5==0 {
-                    let (ws_messages,ws_text_bytes)=rpc.stream_counts();engine.sequence+=1;
+                    let (ws_messages,ws_text_bytes)=control.stream_counts();engine.sequence+=1;
                     send(&out,MarketStateEvent::Stats{pools:selected.len(),available:engine.pools.iter().filter(|p|p.available).count(),
                         accounts:wanted.len(),active:active.len(),ws_messages,ws_text_bytes,sequence:engine.sequence});
                 }
             }
         }
     }
-    rpc.replace_watches(Vec::new())?;
+    control.replace(Vec::new())?;
     for p in &selected {engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true");
     Ok(())
@@ -983,14 +983,14 @@ impl ObservationReport {
 
 /// Cancels hydration as well as idle streaming, then releases the sole desired watch set.
 pub async fn run(registry:PoolRegistry,input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    rpc:RpcHandle,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
+    rpc:RpcHandle,control:AccountStreamControl,events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
     stop:watch::Receiver<bool>,enabled:watch::Receiver<bool>)->Result<()> {
     let mut cancel=stop.clone();
     let result=tokio::select! {
-        result=produce(registry,input,rpc.clone(),out,settings,stop,enabled)=>result,
+        result=produce(registry,input,rpc,control.clone(),events,out,settings,stop,enabled)=>result,
         _=cancel.wait_for(|v|*v)=>Ok(()),
     };
-    let cleanup=rpc.replace_watches(Vec::new());
+    let cleanup=control.replace(Vec::new());
     crate::log_event!(Info,"market state released_watches=true");
     result.and(cleanup)
 }

@@ -518,8 +518,9 @@ pub async fn run()->Result<()>{
                 crate::workers::graph_signals::observe(signal_rx,cfg).await?.ensure_integrity()
             });
         }
+        let (account_control,account_events)=rpc.account_stream();
         critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),
-            rpc.clone(),prices,settings,stop_rx.clone(),enabled_rx));
+            rpc.clone(),account_control,account_events,prices,settings,stop_rx.clone(),enabled_rx));
         let market_catalog=catalog_rx.clone();
         critical(&mut tasks,"market_state.consumer",async move {
             market_state::observe(price_rx,market_catalog,settings.trace).await.map(|_|())
