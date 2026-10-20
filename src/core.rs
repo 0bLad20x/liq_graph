@@ -2,6 +2,8 @@
 pub mod logging;
 pub mod execution;
 pub mod market_state;
+pub mod signals;
+pub mod account_stream;
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::Result;

@@ -1,13 +1,16 @@
 //! Indicative market state: Prepared pool inputs -> account watches -> typed prices.
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
+mod live;
+pub use live::decode_live;
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
-    market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin}};
-use super::{pool_registry::PoolRegistry, rpc_transport::{AccountView, AccountWatch, RpcAnswer, RpcHandle, RpcOperation, WsEvent},
+    market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
+use super::{pool_registry::PoolRegistry, rpc_transport::{RpcAnswer, RpcHandle, RpcOperation},
     graph_watch_catalog::{WatchCatalog,RouteKind}};
+use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
 const DLMM_PROGRAM:&str="LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const PUMP_PROGRAM:&str="pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const DAMM_V2_PROGRAM:&str="cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
@@ -54,6 +57,7 @@ fn i32_le(d:&[u8],i:usize)->Result<i32>{Ok(i32::from_le_bytes(bytes(d,i,4)?.try_
 fn i128_le(d:&[u8],i:usize)->Result<i128>{Ok(i128::from_le_bytes(bytes(d,i,16)?.try_into()?))}
 fn u128_le(d:&[u8],i:usize)->Result<u128>{Ok(u128::from_le_bytes(bytes(d,i,16)?.try_into()?))}
 fn key(d:&[u8],i:usize)->Result<String>{Ok(bs58::encode(bytes(d,i,32)?).into_string())}
+fn nanos(start:Instant)->u64{start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 fn timestamp_us()->u64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64}
 fn bps(old:f64,new:f64)->f64 {(new/old-1.0)*10_000.0}
 fn env_parse<T:std::str::FromStr>(key:&str,default:T)->Result<T>
@@ -245,7 +249,7 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
         pool_slot:u64,base_slot:u64,quote_slot:u64},
 }
 struct Pool{
-    id:String,venue:Venue,a:String,b:String,da:u8,db:u8,
+    key:Pubkey,ready:bool,id:String,venue:Venue,a:String,b:String,da:u8,db:u8,
     canon_base:String,canon_quote:String,state:State,
     price:f64,available:bool,slot:u64,received_us:u64,updates:u64,
 }
@@ -323,15 +327,85 @@ impl Field{
         Self::ManifestBook=>(0,0) // full variable-length market account; no dataSlice
     }}
 }
-struct Subscription{pool:usize,field:Field,address:String,owner:String}
+struct Subscription{pool:usize,field:Field,address:String,key:Pubkey,owner:Pubkey,
+    slot:u64,received_us:u64,floor:Option<u64>,valid:bool}
+// Fixed-size counters/histograms; no per-update logging or sample serialization.
+#[derive(Default)]
+struct Latency {count:u64,total:u128,max:u64,bins:[u64;32]}
+impl Latency {
+    fn add(&mut self,ns:u64){self.count+=1;self.total+=u128::from(ns);self.max=self.max.max(ns);self.bins[(64-ns.leading_zeros() as usize).min(31)]+=1;}
+    fn report(&self)->serde_json::Value {
+        let upper=|percent:u64|{let target=(self.count*percent).div_ceil(100);let mut count=0;
+            self.bins.iter().enumerate().find_map(|(i,n)|{count+=n;(count>=target && target>0).then(||if i==31{self.max}else{((1_u64<<i)-1).min(self.max)})})};
+        serde_json::json!({"count":self.count,"mean_ns":(self.count>0).then(||self.total as f64/self.count as f64),
+            "max_ns":(self.count>0).then_some(self.max),"p95_upper_ns":upper(95),"p99_upper_ns":upper(99)})
+    }
+}
+#[derive(Default)]
+struct VenueTiming {decode:Latency,compute:Latency,publish:Latency,prices:u64,unavailable:u64,decode_errors:u64}
+#[derive(Default)]
+struct Metrics {
+    received:u64,unmapped:u64,inactive:u64,initializing:u64,buffer_replaced:u64,replayed:u64,
+    baseline_skipped:u64,stale:u64,bindings:u64,deleted:u64,gaps:u64,lost:u64,rejections:u64,
+    baseline_prices:u64,websocket_prices:u64,no_receiver:u64,max_queue_depth:usize,
+    selection_changes:u64,hydration_jobs:u64,discarded_results:u64,hydration_failures:u64,
+    processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,venues:[VenueTiming;10],
+}
+impl Metrics {
+    fn report(&self)->serde_json::Value {
+        let names=["meteora_dlmm","pumpswap","meteora_damm_v2","raydium_amm_v4","raydium_clmm","raydium_cpmm","orca_whirlpool","pancakeswap_clmm","manifest","byreal_clmm"];
+        let venues:BTreeMap<_,_>=names.into_iter().zip(&self.venues).map(|(name,v)|(name,serde_json::json!({
+            "prices":v.prices,"unavailable":v.unavailable,"decode_errors":v.decode_errors,
+            "protocol_decode":v.decode.report(),"price_compute":v.compute.report(),"price_publish":v.publish.report()}))).collect();
+        serde_json::json!({"account_updates":self.received,"unmapped_updates":self.unmapped,"inactive_updates":self.inactive,
+            "initializing_bindings":self.initializing,"initialization_buffer_replacements":self.buffer_replaced,"replayed_updates":self.replayed,
+            "baseline_floor_skipped_bindings":self.baseline_skipped,"stale_bindings":self.stale,"processed_bindings":self.bindings,
+            "deleted_accounts":self.deleted,"gaps":self.gaps,"lost_events":self.lost,"rejections":self.rejections,
+            "baseline_prices":self.baseline_prices,"websocket_prices":self.websocket_prices,"no_receiver":self.no_receiver,
+            "max_queue_depth":self.max_queue_depth,"selection_changes":self.selection_changes,"hydration_jobs":self.hydration_jobs,
+            "discarded_preparation_pools":self.discarded_results,"hydration_failures":self.hydration_failures,
+            "account_processing":self.processing.report(),"transport_to_market":self.queue.report(),
+            "preparation_install":self.install.report(),"watch_reconcile":self.watch_plan.report(),"by_venue":venues})
+    }
+}
 struct Engine {
-    pools: Vec<Pool>, subs: Vec<Subscription>,
+    pools: Vec<Pool>, subs: Vec<Subscription>, metrics:Metrics,
     events: broadcast::Sender<Arc<MarketStateEvent>>, sequence: u64,
-    observed: HashMap<String,(u64,u64)>,
-    invalid: HashSet<String>,
+    account_ranges:HashMap<Pubkey,std::ops::Range<usize>>, account_bindings:Vec<usize>,
+    pool_subs:Vec<Vec<usize>>,
 }
 impl Engine{
-    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Result<Self>{
+    fn empty(events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Self {
+        Self{pools:Vec::new(),subs:Vec::new(),metrics:Metrics::default(),events,sequence,
+            account_ranges:HashMap::new(),account_bindings:Vec::new(),pool_subs:Vec::new()}
+    }
+    fn index(&mut self) {
+        let mut by_account=HashMap::<Pubkey,Vec<usize>>::new();
+        self.pool_subs=vec![Vec::new();self.pools.len()];
+        for (i,s) in self.subs.iter().enumerate() {
+            by_account.entry(s.key).or_default().push(i);self.pool_subs[s.pool].push(i);
+        }
+        self.account_ranges.clear();self.account_bindings.clear();
+        for (key,indices) in by_account {
+            let start=self.account_bindings.len();self.account_bindings.extend(indices);
+            self.account_ranges.insert(key,start..self.account_bindings.len());
+        }
+    }
+    fn retain(&mut self,keep:&HashSet<Pubkey>) {
+        let mut remap=vec![None;self.pools.len()];let mut next=0;
+        for (i,p) in self.pools.iter().enumerate(){if keep.contains(&p.key){remap[i]=Some(next);next+=1;}}
+        self.pools.retain(|p|keep.contains(&p.key));
+        self.subs.retain_mut(|s|match remap[s.pool]{Some(pi)=>{s.pool=pi;true},None=>false});
+        self.index();
+    }
+    fn install(&mut self,mut part:Engine) {
+        let replaced:HashSet<_>=part.pools.iter().map(|p|p.key).collect();
+        let keep=self.pools.iter().filter(|p|!replaced.contains(&p.key)).map(|p|p.key).collect();
+        self.retain(&keep);
+        let offset=self.pools.len();for sub in &mut part.subs{sub.pool+=offset;}
+        self.pools.extend(part.pools);self.subs.extend(part.subs);self.index();
+    }
+    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
         let pool_records=fetch_batch(rpc,&pool_addrs).await?;
         let mut raw_pools=Vec::new();let mut details=Vec::<String>::new();
@@ -474,61 +548,58 @@ impl Engine{
                 State::RaydiumCpmm{base_slot,quote_slot,..}=>pool_slot.max(*base_slot).max(*quote_slot),
                 _=>pool_slot,
             };
-            let mut pool=Pool{id:watch.address.clone(),venue:watch.venue,a,b,da,db,
+            let mut pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
                 price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,
             };
-            if !matches!(&pool.state,State::Manifest{available:false,..}) {
-                pool.price=pool.compute_price()?;
-                pool.available=true;
+            if prices {
+                if let Ok(price)=pool.compute_price(){pool.price=price;pool.available=true;}
             }
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
-            subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),owner:pool_records[idx].owner.clone()});
+            subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),key:watch.address.parse()?,owner:pool_records[idx].owner.parse()?,slot:pool_slot,received_us:pool_records[idx].received_us,floor:Some(pool_slot),valid:true});
             if let State::Pump{base_vault,quote_vault,..}=&pool.state{
                 for (field,address) in [(Field::BaseVault,base_vault),(Field::QuoteVault,quote_vault)]{
                     let acc=dict.get(address).context("vault not found")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),owner:acc.owner.clone()});
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
                 }
             }
             if let State::RaydiumAmmV4{base_vault,quote_vault,..}=&pool.state {
                 for (field,address) in [(Field::RaydiumV4BaseVault,base_vault),
                     (Field::RaydiumV4QuoteVault,quote_vault)] {
                     let acc=dict.get(address).context("Raydium vault not found")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),owner:acc.owner.clone()});
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
                 }
             }
             if let State::RaydiumCpmm{base_vault,quote_vault,..}=&pool.state {
                 for (field,address) in [(Field::RaydiumCpmmBaseVault,base_vault),
                     (Field::RaydiumCpmmQuoteVault,quote_vault)] {
                     let acc=dict.get(address).context("Raydium CPMM vault missing")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),owner:acc.owner.clone()});
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
                 }
             }
             pools.push(pool);
         }
 
-        let mut observed=HashMap::new();
-        for (watch,acc) in cfg.watches.iter().zip(&pool_records) {
-            observed.insert(watch.address.clone(),(acc.slot,acc.received_us));
-        }
-        for (address,acc) in &dict {observed.insert(address.clone(),(acc.slot,acc.received_us));}
-        let engine=Self{pools,subs,events,sequence,observed,invalid:HashSet::new()};
+        let mut engine=Self::empty(events,sequence);
+        engine.pools=pools;engine.subs=subs;engine.index();
         Ok(engine)
     }
     fn next_sequence(&mut self)->u64 {
         self.sequence=self.sequence.saturating_add(1);
         self.sequence
     }
-    fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>) {
+    fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>,mut pipeline:Option<PricePipelineTiming>) {
         let sequence=self.next_sequence();
         let pool=&self.pools[pi];
         let (best_bid,best_ask)=pool.manifest_quotes().map_or((None,None),|(bid,ask)|(Some(bid),Some(ask)));
-        let components:Vec<(u64,u64)>=self.subs.iter().filter(|s|s.pool==pi)
-            .filter_map(|s|self.observed.get(&s.address).copied()).collect();
-        let component_slot_min=components.iter().map(|v|v.0).min().unwrap_or(pool.slot);
-        let component_slot_max=components.iter().map(|v|v.0).max().unwrap_or(pool.slot);
-        let component_received_at_us_min=components.iter().map(|v|v.1).min().unwrap_or(pool.received_us);
-        let component_received_at_us_max=components.iter().map(|v|v.1).max().unwrap_or(pool.received_us);
+        let mut extrema=None::<(u64,u64,u64,u64)>;
+        for &i in &self.pool_subs[pi] {
+            let s=&self.subs[i];let (slot,at)=(s.slot,s.received_us);
+            extrema=Some(match extrema {Some((a,b,c,d))=>(a.min(slot),b.max(slot),c.min(at),d.max(at)),
+                None=>(slot,slot,at,at)});
+        }
+        let (component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max)=
+            extrema.unwrap_or((pool.slot,pool.slot,pool.received_us,pool.received_us));
         let event=PoolPriceObservation {
             origin,pool:pool.id.clone(),venue:pool.venue.label(),
             mint_a:pool.a.clone(),mint_b:pool.b.clone(),
@@ -540,9 +611,15 @@ impl Engine{
             best_bid_quote_per_base:best_bid,best_ask_quote_per_base:best_ask,
             consistency:pool.consistency(),slot:pool.slot,received_at_us:component_received_at_us_max,
             sequence,component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max,trigger_field:field.map(Field::label),
+            pipeline:None,
         };
-        // A slow consumer must not block the price hotpath.
-        let _=self.events.send(Arc::new(MarketStateEvent::Price(event)));
+        let mut event=event;
+        if let Some(t)=pipeline.as_mut(){t.price_published_at_us=timestamp_us();}
+        event.pipeline=pipeline;
+        let started=Instant::now();
+        if self.events.send(Arc::new(MarketStateEvent::Price(event))).is_err(){self.metrics.no_receiver+=1;}
+        let v=&mut self.metrics.venues[self.pools[pi].venue as usize];v.publish.add(nanos(started));
+        if matches!(origin,PriceOrigin::Websocket){v.prices+=1;self.metrics.websocket_prices+=1;}else{self.metrics.baseline_prices+=1;}
     }
     fn publish_unavailable(&mut self,pi:usize,slot:u64,recv_us:u64,reason:String) {
         let sequence=self.next_sequence();
@@ -552,15 +629,16 @@ impl Engine{
             received_at_us:recv_us,sequence,reason,
         }));
     }
-    fn update(&mut self,index:usize,slot:u64,owner:&str,data:&[u8],recv_us:u64)->Result<()> {
+    fn update(&mut self,index:usize,slot:u64,owner:Pubkey,data:&[u8],recv_us:u64,pipeline:PricePipelineTiming)->Result<()> {
+        let decode_started=Instant::now();
+        let mut pipeline=pipeline;
         let (pi,field,expected_owner,expected_len)={let s=&self.subs[index];
-            (s.pool,s.field,s.owner.as_str(),s.field.slice().1)};
+            (s.pool,s.field,s.owner,s.field.slice().1)};
         ensure!(owner==expected_owner,"{} owner mismatch",self.subs[index].address);
         ensure!(field==Field::ManifestBook || data.len()==expected_len ||
             (field==Field::VirtualQuote && data.is_empty()),
             "slice length mismatch: {} expected {} got {}",field.label(),expected_len,data.len());
-        self.invalid.remove(&self.subs[index].address);
-        let blocked=self.subs.iter().any(|s|s.pool==pi && self.invalid.contains(&s.address));
+        let newest=self.pool_subs[pi].iter().map(|&i|self.subs[i].slot).max().unwrap_or(slot);
         let pool=&mut self.pools[pi];
         let old=pool.price;
         let was_available=pool.available;
@@ -615,29 +693,37 @@ impl Engine{
             },
             _=>bail!("wrong field {:?} for pool {}",field,pool.id),
         }
-        pool.slot=self.subs.iter().filter(|s|s.pool==pi)
-            .filter_map(|s|self.observed.get(&s.address).map(|v|v.0)).max().unwrap_or(slot);
+        pipeline.market_decode_ns=nanos(decode_started);
+        self.metrics.venues[pool.venue as usize].decode.add(pipeline.market_decode_ns);
+        self.subs[index].valid=true;
+        pool.slot=newest;
         pool.received_us=recv_us;pool.updates+=1;
-        if blocked {pool.available=false;return Ok(());}
+        if self.pool_subs[pi].iter().any(|&i|!self.subs[i].valid) {pool.available=false;return Ok(());}
         if let Some(reason)=unavailable_reason {
+            self.metrics.venues[pool.venue as usize].unavailable+=1;
             pool.available=false;
             self.publish_unavailable(pi,slot,recv_us,reason);
             return Ok(());
         }
+        let compute_started=Instant::now();
         let price=match pool.compute_price() {
             Ok(price)=>price,
             Err(error)=>{
+                self.metrics.venues[pool.venue as usize].compute.add(nanos(compute_started));
+                self.metrics.venues[pool.venue as usize].unavailable+=1;
                 pool.available=false;
                 self.publish_unavailable(pi,slot,recv_us,error.to_string());
                 return Ok(());
             }
         };
+        pipeline.market_compute_ns=nanos(compute_started);
+        self.metrics.venues[pool.venue as usize].compute.add(pipeline.market_compute_ns);
         pool.price=price;
         pool.available=true;
         // After any unavailable state, the next valid observation has no
         // adjacent previous price. This applies to every venue, not just Manifest.
         let previous=if was_available{Some(old)}else{None};
-        self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field));
+        self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field),Some(pipeline));
         Ok(())
     }
 
@@ -659,12 +745,13 @@ impl Settings {
 struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey}
 impl PoolInput {
     fn of(p:&PoolState)->Option<Self> {
-        if p.completion_state!=CompletionState::Prepared || !p.completion_admission.is_admitted(){return None;}
+        if !p.completion_admission.is_admitted(){return None;}
+        Self::prepared(p)
+    }
+    fn prepared(p:&PoolState)->Option<Self> {
+        if p.completion_state!=CompletionState::Prepared{return None;}
         Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?})
     }
-}
-fn identities(registry:&PoolRegistry)->HashMap<Pubkey,PoolInput> {
-    registry.snapshot().iter().filter_map(PoolInput::of).map(|p|(p.address,p)).collect()
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
     let current=registry.get(address).as_ref().and_then(PoolInput::of);
@@ -681,17 +768,18 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,limit:usize)->Vec<PoolInput> {
 fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
     let _=out.send(Arc::new(event));
 }
+// Preparation never publishes or borrows the running engine. Only the event loop
+// installs results, after checking that identities and resync revisions still match.
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
-    mut sequence:u64)->Result<(Engine,Vec<Pubkey>)> {
-    let mut engine=Engine{pools:Vec::new(),subs:Vec::new(),events:out.clone(),sequence,observed:HashMap::new(),invalid:HashSet::new()};
-    // Bisect failing batches to isolate a bad pool without one RPC round-trip per healthy pool.
+    prices:bool)->Result<(Engine,Vec<(PoolInput,String)>)> {
+    let mut engine=Engine::empty(out.clone(),0);
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
             Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?}))
             .collect::<Result<Vec<_>>>()?})})();
-        let result=match config {Ok(cfg)=>Engine::hydrate(cfg,rpc,out.clone(),sequence).await,Err(e)=>Err(e)};
+        let result=match config {Ok(cfg)=>Engine::hydrate(cfg,rpc,out.clone(),0,prices).await,Err(e)=>Err(e)};
         let result=result.and_then(|part| {
             for (actual,expected) in part.pools.iter().zip(&batch) {
                 ensure!(actual.a==expected.mint_a.to_string()
@@ -703,49 +791,22 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
             Ok(mut part)=>{
                 let offset=engine.pools.len();
                 for sub in &mut part.subs {sub.pool+=offset;}
-                engine.pools.extend(part.pools);engine.subs.extend(part.subs);engine.observed.extend(part.observed);
+                engine.pools.extend(part.pools);engine.subs.extend(part.subs);
             },
             Err(error) if batch.len()>1=>{
                 let middle=batch.len()/2;pending.push(batch[middle..].to_vec());pending.push(batch[..middle].to_vec());
                 crate::log_event!(Debug,"market state split failed batch pools={} error={error:#}",batch.len());
             },
-            Err(error)=>{
-                let p=&batch[0];sequence+=1;failed.push(p.address);
-                send(out,MarketStateEvent::Unavailable{pool:p.address.to_string(),
-                    venue:Venue::from_core(p.venue).map_or("unsupported",Venue::label),slot:0,
-                    received_at_us:timestamp_us(),sequence,reason:format!("hydrate: {error:#}")});
-            }
+            Err(error)=>failed.push((batch[0],format!("hydrate: {error:#}"))),
         }
     }
-    engine.sequence=sequence;
+    engine.index();
     Ok((engine,failed))
-}
-// Consume transport notifications while HTTP hydration is pending. A baseline deliberately
-// replaces intermediate notifications; it is never used until all required ACKs are present.
-async fn baseline(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,
-    events:&mut broadcast::Receiver<WsEvent>,active:&mut HashMap<Pubkey,String>,last_ack:&mut time::Instant)
-    ->Result<(Engine,Vec<Pubkey>,bool)> {
-    let future=hydrate(pools,rpc,out,sequence);tokio::pin!(future);
-    let mut changed=false;
-    loop {tokio::select! {
-        result=&mut future=>{let (engine,failed)=result?;return Ok((engine,failed,changed));},
-        event=events.recv()=>match event {
-            Ok(WsEvent::Subscribed{address,provider})=>{active.insert(address,provider);*last_ack=time::Instant::now();changed=true;},
-            Ok(WsEvent::Unsubscribed{address,..})=>{active.remove(&address);changed=true;},
-            Ok(WsEvent::Gap{provider,..})=>{active.retain(|_,p|p!=&provider);changed=true;},
-            Ok(WsEvent::Rejected{address,provider,code})=>{
-                active.remove(&address);changed=true;
-                crate::log_event!(Warn,"market baseline subscription rejected provider={provider} account={address} code={code}");
-            },
-            Ok(WsEvent::Account{..})=>{},
-            Err(error)=>bail!("market account baseline lost transport continuity: {error}"),
-        }
-    }}
 }
 fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     let mut wanted=BTreeMap::<Pubkey,AccountView>::new();
     for s in &engine.subs {
-        let address=s.address.parse()?;let (offset,length)=s.field.slice();
+        let address=s.key;let (offset,length)=s.field.slice();
         let view=if s.field==Field::ManifestBook {AccountView::Full}else{AccountView::Slice{offset,length}};
         let combined=match (wanted.get(&address).copied(),view) {
             (None,v)=>v,(Some(AccountView::Full),_)|(_,AccountView::Full)=>AccountView::Full,
@@ -758,179 +819,269 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     for &address in failed {wanted.insert(address,AccountView::Full);}
     Ok(wanted.into_iter().map(|(address,view)|AccountWatch{address,view}).collect())
 }
-fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
-    engine.subs.iter().filter(|s|s.pool==pi).all(|s|
-        s.address.parse::<Pubkey>().is_ok_and(|a|active.contains_key(&a)))
+
+/// Real transport input only: persisted Prepared proofs are not live Registry admission.
+/// Reuse the production account discovery and slice planner; do not publish prices.
+pub async fn account_stream_plan(registry:&PoolRegistry,rpc:&RpcHandle)->Result<Vec<AccountWatch>> {
+    let started=time::Instant::now();let limit=Settings::from_env()?.pool_limit;
+    let candidates=registry.snapshot().iter().filter_map(PoolInput::prepared).map(|p|(p.address,p)).collect();
+    let selected=select(&candidates,limit);
+    ensure!(!selected.is_empty(),"no persisted Prepared pools for the account transport plan");
+    crate::log_event!(Info,"market account plan preparing=true prepared={} selected={} pool_limit={limit} admission=historical_proof_only prices=false",candidates.len(),selected.len());
+    let (output,_)=broadcast::channel(16);
+    let (engine,failed)=hydrate(&selected,rpc,&output,false).await?;
+    let wanted=watches(&engine,&[])?;
+    let failures:Vec<_>=failed.iter().map(|(p,reason)|serde_json::json!({"pool":p.address.to_string(),"reason":reason})).collect();
+    let mut venues=BTreeMap::<&str,usize>::new();
+    for pool in &engine.pools {*venues.entry(pool.venue.label()).or_default()+=1;}
+    let capacity=rpc.account_stream().0.capacity();
+    let report=serde_json::json!({"source":"persisted_prepared_proofs","live_admission_established":false,
+        "pool_limit":limit,"prepared_candidates":candidates.len(),"selected_pools":selected.len(),
+        "planned_pools":engine.pools.len(),"failed_pools":failed.iter().map(|(p,_)|p.address.to_string()).collect::<Vec<_>>(),
+        "failures":failures,"pools_by_venue":venues,"account_references":engine.subs.len(),
+        "unique_accounts":wanted.len(),"account_capacity":capacity,"capacity_sufficient":wanted.len()<=capacity,
+        "preparation_seconds":started.elapsed().as_secs_f64(),
+        "pools":selected.iter().map(|p|p.address.to_string()).collect::<Vec<_>>()});
+    let path=env::var("MARKET_STATE_ACCOUNT_PLAN_PATH").context("MARKET_STATE_ACCOUNT_PLAN_PATH is required")?;
+    std::fs::write(path,serde_json::to_vec_pretty(&report)?).context("write market account plan")?;
+    ensure!(failed.is_empty(),"account plan failed for {} of {} pools; inspect preparation.json",failed.len(),selected.len());
+    ensure!(wanted.len()<=capacity,"{} pools require {} distinct accounts; ENV WebSocket capacity is {}; no subscriptions were opened",selected.len(),wanted.len(),capacity);
+    crate::log_event!(Info,"market account plan complete=true pools={} accounts={} seconds={:.3}",engine.pools.len(),wanted.len(),started.elapsed().as_secs_f64());
+    Ok(wanted)
 }
-fn invalidate(engine:&mut Engine,reason:&str) {
-    for pi in 0..engine.pools.len() {
-        engine.pools[pi].available=false;
-        engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),reason.to_owned());
+fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
+    engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))
+}
+// The source session owns continuity. Invalidate only pools using affected accounts.
+fn invalidate_accounts(engine:&mut Engine,keys:&HashSet<Pubkey>,versions:&mut HashMap<Pubkey,u64>,revision:&mut u64,reason:&str) {
+    let pools:HashSet<_>=keys.iter().filter_map(|key|engine.account_ranges.get(key))
+        .flat_map(|range|range.clone().map(|i|engine.subs[engine.account_bindings[i]].pool)).collect();
+    for pi in pools {
+        let p=&mut engine.pools[pi];p.ready=false;p.available=false;
+        *revision+=1;versions.insert(p.key,*revision);
+        engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),reason.into());
     }
 }
 
-/// All Registry entries enter here; selection only limits observations, never Prepared admission.
-/// `enabled` is an explicit observation control (also used by the finite rewatch proof).
+impl Engine {
+    // One address lookup -> contiguous subscription bindings. Never scan the pool catalog.
+    // Returns whether an initializing pool still needs the latest account for catch-up.
+    fn account(&mut self,event:&WsEvent,active:&HashMap<Pubkey,String>,market_us:u64,replay:bool,only:Option<&HashSet<Pubkey>>)->bool {
+        let WsEvent::Account{address,provider,slot,frame_received_at_us,decoded_at_us,value,..}=event else{return false;};
+        let started=Instant::now();
+        if !replay {
+            self.metrics.received+=1;
+            if let Some(us)=market_us.checked_sub(*decoded_at_us){self.metrics.queue.add(us.saturating_mul(1000));}
+            if value.is_none(){self.metrics.deleted+=1;}
+        }else{self.metrics.replayed+=1;}
+        if active.get(address)!=Some(provider){if !replay{self.metrics.inactive+=1;}return false;}
+        let Some(range)=self.account_ranges.get(address).cloned() else{if !replay{self.metrics.unmapped+=1;}return false;};
+        let mut initializing=false;
+        for position in range {
+            let index=self.account_bindings[position];let pi=self.subs[index].pool;
+            if !self.pools[pi].ready {self.metrics.initializing+=1;initializing=true;continue;}
+            if only.is_some_and(|keys|!keys.contains(&self.pools[pi].key)){continue;}
+            let sub=&mut self.subs[index];
+            // HTTP gives no write ordering inside one slot. Accept the first strictly
+            // newer slot, then preserve all subsequent same-slot WebSocket writes.
+            if sub.floor.is_some_and(|floor|*slot<=floor){self.metrics.baseline_skipped+=1;continue;}
+            sub.floor=None;
+            if *slot<sub.slot{self.metrics.stale+=1;continue;}
+            sub.slot=*slot;sub.received_us=*frame_received_at_us;
+            self.metrics.bindings+=1;
+            let decoded=(||->Result<(Pubkey,&[u8])>{
+                let account=value.as_ref().context("account deleted")?;
+                ensure!(account.address==*address,"account envelope identity mismatch");
+                let (offset,length)=self.subs[index].field.slice();
+                let data=if self.subs[index].field==Field::ManifestBook {
+                    ensure!(account.view==AccountView::Full,"orderbook requires full account");account.bytes.as_slice()
+                }else {match account.view {
+                    AccountView::Full=>{
+                        if self.subs[index].field==Field::VirtualQuote && account.bytes.len()<offset+length{&[]}
+                        else{bytes(&account.bytes,offset,length)?}
+                    },
+                    AccountView::Slice{offset:start,..}=>{
+                        let begin=offset.checked_sub(start).context("account slice starts after requested field")?;
+                        if self.subs[index].field==Field::VirtualQuote && account.bytes.is_empty(){&[]}
+                        else{bytes(&account.bytes,begin,length)?}
+                    }
+                }};
+                Ok((account.owner,data))
+            })();
+            let pipeline=PricePipelineTiming{frame_received_at_us:*frame_received_at_us,transport_decoded_at_us:*decoded_at_us,
+                market_received_at_us:market_us,price_published_at_us:0,market_decode_ns:0,market_compute_ns:0,initialization_replay:replay};
+            let updated=match decoded {
+                Ok((owner,data))=>self.update(index,*slot,owner,data,*frame_received_at_us,pipeline),Err(e)=>Err(e),
+            };
+            if let Err(error)=updated {
+                self.metrics.venues[self.pools[pi].venue as usize].decode_errors+=1;
+                self.subs[index].valid=false;self.pools[pi].available=false;
+                self.publish_unavailable(pi,*slot,*frame_received_at_us,format!("account update: {error:#}"));
+            }
+        }
+        if !replay{self.metrics.processing.add(nanos(started));}
+        initializing
+    }
+}
+
+/// Registry identities select observations, never establish market prices.
+/// Exactly one bounded preparation job may run while live events continue on this task.
 async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    rpc:RpcHandle,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
-    mut stop:watch::Receiver<bool>,mut enabled:watch::Receiver<bool>)->Result<()> {
-    ensure!(rpc.can_watch(),"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
-    let mut events=rpc.subscribe_events();
-    let mut candidates=identities(&registry);
-    let mut selected:Vec<PoolInput>=Vec::new();let mut engine=Engine{pools:Vec::new(),subs:Vec::new(),events:out.clone(),sequence:0,observed:HashMap::new(),invalid:HashSet::new()};
-    let mut failed=Vec::new();let mut wanted=Vec::<AccountWatch>::new();
-    let mut active=HashMap::<Pubkey,String>::new();
-    let mut ready=false;let mut rebuild=true;let mut resync=false;
-    let mut input_open=true;let mut tick=time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut ticks=0_u64;let mut last_ack=time::Instant::now();let mut initialized=false;
-    let mut baseline_floor=HashMap::<String,u64>::new();
+    rpc:RpcHandle,control:AccountStreamControl,mut events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,
+    mut stop:watch::Receiver<bool>,mut enabled:watch::Receiver<bool>,mut limit:watch::Receiver<usize>,persisted:bool)->Result<serde_json::Value> {
+    ensure!(control.capacity()>0,"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
+    let snapshot=|registry:&PoolRegistry|->HashMap<Pubkey,PoolInput>{registry.snapshot().iter()
+        .filter_map(|p|if persisted{PoolInput::prepared(p)}else{PoolInput::of(p)}).map(|p|(p.address,p)).collect()};
+    let mut candidates=snapshot(&registry);
+    let mut selected=Vec::<PoolInput>::new();let mut current=HashMap::<Pubkey,PoolInput>::new();
+    let mut engine=Engine::empty(out.clone(),0);let mut wanted=Vec::<AccountWatch>::new();
+    let mut active=HashMap::<Pubkey,String>::new();let mut versions=HashMap::<Pubkey,u64>::new();let mut revision=0;
+    let mut retry=HashMap::<Pubkey,time::Instant>::new();
+    let mut cached=HashMap::<Pubkey,(WsEvent,u64)>::new();
+    let mut jobs=tokio::task::JoinSet::new();
+    let mut rebuild=true;let mut replan=false;let mut schedule=true;let mut input_open=true;let mut ticks=0;
+    let mut tick=time::interval(Duration::from_secs(1));tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         if *stop.borrow(){break;}
         if rebuild {
-            let next=if *enabled.borrow(){select(&candidates,settings.pool_limit)}else{Vec::new()};
-            if next!=selected || !initialized {
-                initialized=true;
-                engine.sequence+=1;send(&out,MarketStateEvent::Gap{reason:"observation selection changed; awaiting baseline".into(),sequence:engine.sequence});
-                for p in &selected {
-                    if !next.iter().any(|n|n.address==p.address) {
-                        engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});
-                    }
-                }
-                let sequence=engine.sequence;
-                let (next_engine,next_failed,_)=baseline(&next,&rpc,&out,sequence,&mut events,&mut active,&mut last_ack).await?;
-                engine=next_engine;failed=next_failed;
-                wanted=watches(&engine,&failed)?;
-                ensure!(wanted.len()<=rpc.watch_capacity(),
-                    "market state selected {} pools require {} accounts; configured WS capacity={}",next.len(),wanted.len(),rpc.watch_capacity());
-                // Do not use pre-subscription prices. ACKs trigger a fresh baseline.
-                for p in &mut engine.pools {p.available=false;}
-                rpc.replace_account_watches(wanted.clone())?;
-                active.retain(|a,_|wanted.iter().any(|w|w.address==*a));
-                selected=next;ready=false;resync=true;last_ack=time::Instant::now();
-                engine.sequence+=1;
-                let prepared=candidates.len();
-                send(&out,MarketStateEvent::Selection{prepared,selected:selected.iter().map(|p|p.address.to_string()).collect(),
-                    accounts:wanted.len(),sequence:engine.sequence});
-                crate::log_event!(Info,"market state selection prepared={prepared} selected={} accounts={} capacity={}",selected.len(),wanted.len(),rpc.watch_capacity());
+            let next=if *enabled.borrow(){select(&candidates,*limit.borrow())}else{Vec::new()};
+            if next!=selected {
+                let next_map:HashMap<_,_>=next.iter().map(|p|(p.address,*p)).collect();
+                let keep:HashSet<_>=selected.iter().filter(|p|next_map.get(&p.address)==Some(*p)).map(|p|p.address).collect();
+                for p in &selected {if !keep.contains(&p.address){engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}}
+                engine.retain(&keep);cached.retain(|key,_|engine.account_ranges.contains_key(key));
+                versions.retain(|key,_|keep.contains(key));retry.retain(|key,_|keep.contains(key));
+                for p in &next {if !keep.contains(&p.address){revision+=1;versions.insert(p.address,revision);}}
+                selected=next;current=next_map;replan=true;engine.metrics.selection_changes+=1;
+                engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
+                    selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
+                crate::log_event!(Info,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
             }
             rebuild=false;
         }
+        if replan {
+            let started=Instant::now();
+            let failed:Vec<_>=retry.keys().copied().filter(|key|!engine.pools.iter().any(|p|p.key==*key)).collect();
+            let next=watches(&engine,&failed)?;
+            ensure!(next.len()<=control.capacity(),"market state selected {} pools require {} accounts; configured WS capacity={}",selected.len(),next.len(),control.capacity());
+            if next!=wanted {
+                let old:HashMap<_,_>=wanted.iter().map(|w|(w.address,w.view)).collect();
+                let changed:HashSet<_>=next.iter().filter(|w|old.get(&w.address)!=Some(&w.view)).map(|w|w.address).collect();
+                invalidate_accounts(&mut engine,&changed,&mut versions,&mut revision,"account watch changed; awaiting baseline");
+                let desired:HashSet<_>=next.iter().map(|w|w.address).collect();
+                active.retain(|key,_|desired.contains(key)&&!changed.contains(key));
+                control.replace(next.clone())?;wanted=next;
+            }
+            engine.metrics.watch_plan.add(nanos(started));replan=false;schedule=true;
+        }
+        if schedule && jobs.is_empty() {
+            schedule=false;
+            let now=time::Instant::now();
+            let present:HashMap<_,_>=engine.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
+            let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address).is_some_and(|&pi|
+                !engine.pools[pi].ready && complete(&engine,pi,&active)) && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
+            let baseline=!targets.is_empty();
+            if !baseline {targets=selected.iter().filter(|p|!present.contains_key(&p.address)&&retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();}
+            targets.truncate(64);
+            if !targets.is_empty() {
+                let tickets:Vec<_>=targets.iter().map(|p|(*p,versions[&p.address])).collect();
+                let rpc=rpc.clone();let output=out.clone();engine.metrics.hydration_jobs+=1;
+                jobs.spawn(async move {let result=hydrate(&targets,&rpc,&output,baseline).await;(tickets,baseline,result)});
+            }
+        }
         tokio::select! {
-            _=stop.changed()=>{},
-            control=enabled.changed()=>{if control.is_err(){break;}rebuild=true;},
+            changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){break;}},
+            changed=enabled.changed()=>{if changed.is_err(){break;}rebuild=true;},
+            changed=limit.changed()=>{if changed.is_err(){break;}rebuild=true;},
             update=input.recv(),if input_open=>match update {
-                Ok(batch)=>{for p in &batch.pools {rebuild|=reconcile(&registry,&mut candidates,p.address);}},
-                Err(broadcast::error::RecvError::Lagged(_))=>{candidates=identities(&registry);rebuild=true;},
+                Ok(batch)=>{for p in &batch.pools {
+                    if persisted {
+                        let next=registry.get(p.address).as_ref().and_then(PoolInput::prepared);
+                        if candidates.get(&p.address).copied()!=next {if let Some(p)=next{candidates.insert(p.address,p);}else{candidates.remove(&p.address);}rebuild=true;}
+                    }else{rebuild|=reconcile(&registry,&mut candidates,p.address);}
+                }},
+                Err(broadcast::error::RecvError::Lagged(_))=>{candidates=snapshot(&registry);rebuild=true;},
                 Err(broadcast::error::RecvError::Closed)=>input_open=false,
             },
-            event=events.recv()=>match event {
-                Ok(WsEvent::Subscribed{address,provider})=>{
-                    active.insert(address,provider);last_ack=time::Instant::now();resync=true;
-                },
-                Ok(WsEvent::Unsubscribed{address,..})=>{active.remove(&address);},
-                Ok(WsEvent::Gap{provider,reason})=>{
-                    active.retain(|_,p|p!=&provider);ready=false;resync=true;
-                    engine.sequence+=1;send(&out,MarketStateEvent::Gap{reason:format!("{provider}: {reason}"),sequence:engine.sequence});
-                    invalidate(&mut engine,"stream gap; awaiting subscription baseline");
-                },
-                Ok(WsEvent::Rejected{address,provider,code})=>{
-                    active.remove(&address);ready=false;resync=true;
-                    crate::log_event!(Warn,"market state subscription rejected provider={provider} account={address} code={code}");
-                },
-                Ok(WsEvent::Account{address,provider,slot,received_at_ms,value})=>{
-                    if !ready || active.get(&address)!=Some(&provider) {continue;}
-                    let address=address.to_string();
-                    // A queued same-slot notification cannot be ordered relative to an HTTP baseline.
-                    // Wait for a strictly newer slot once, then preserve WebSocket order within a slot.
-                    if baseline_floor.get(&address).is_some_and(|floor|slot<=*floor){continue;}
-                    baseline_floor.remove(&address);
-                    if engine.observed.get(&address).is_some_and(|(old,_)|slot<*old){continue;}
-                    engine.observed.insert(address.clone(),(slot,received_at_ms.saturating_mul(1000)));
-                    let indices:Vec<usize>=engine.subs.iter().enumerate().filter(|(_,s)|s.address==address).map(|(i,_)|i).collect();
-                    for index in indices {
-                        let pi=engine.subs[index].pool;
-                        if !complete(&engine,pi,&active){continue;}
-                        let decoded=(||->Result<(String,&[u8])>{
-                            let account=value.as_ref().context("account deleted")?;
-                            let (offset,length)=engine.subs[index].field.slice();
-                            let bytes=if engine.subs[index].field==Field::ManifestBook {
-                                ensure!(account.view==AccountView::Full,"orderbook requires full account");account.bytes.as_slice()
-                            }else {match account.view {
-                                AccountView::Full=>{
-                                    if engine.subs[index].field==Field::VirtualQuote && account.bytes.len()<offset+length {&[]}
-                                    else {bytes(&account.bytes,offset,length)?}
-                                },
-                                AccountView::Slice{offset:start,..}=>{
-                                    let begin=offset.checked_sub(start).context("account slice starts after requested field")?;
-                                    if engine.subs[index].field==Field::VirtualQuote && account.bytes.is_empty(){&[]}
-                                    else {bytes(&account.bytes,begin,length)?}
-                                }
-                            }};
-                            Ok((account.owner.to_string(),bytes))
-                        })();
-                        let updated=match decoded {
-                            Ok((owner,bytes))=>engine.update(index,slot,&owner,bytes,received_at_ms.saturating_mul(1000)),
-                            Err(e)=>Err(e),
-                        };
-                        if let Err(error)=updated {
-                            engine.invalid.insert(address.clone());
-                            engine.pools[pi].available=false;
-                            engine.publish_unavailable(pi,slot,received_at_ms.saturating_mul(1000),format!("account update: {error:#}"));
+            joined=jobs.join_next(),if !jobs.is_empty()=>{
+                let started=Instant::now();
+                let (tickets,baseline,result)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
+                let (mut part,failures)=result?;schedule=true;
+                let valid:HashSet<_>=tickets.iter().filter(|(p,version)|current.get(&p.address)==Some(p)&&versions.get(&p.address)==Some(version))
+                    .map(|(p,_)|p.address).collect();
+                engine.metrics.discarded_results+=(part.pools.len()-part.pools.iter().filter(|p|valid.contains(&p.key)).count()) as u64;
+                part.retain(&valid);
+                for (p,reason) in failures {if valid.contains(&p.address) {
+                    retry.insert(p.address,time::Instant::now()+Duration::from_secs(30));engine.metrics.hydration_failures+=1;
+                    engine.sequence+=1;send(&out,MarketStateEvent::Unavailable{pool:p.address.to_string(),venue:Venue::from_core(p.venue).map_or("unsupported",Venue::label),slot:0,received_at_us:timestamp_us(),sequence:engine.sequence,reason});
+                }}
+                let keys:HashSet<_>=part.pools.iter().map(|p|p.key).collect();
+                for p in &mut part.pools {p.ready=baseline;retry.remove(&p.key);}
+                engine.install(part);replan=true;
+                if baseline {
+                    for pi in 0..engine.pools.len() {if keys.contains(&engine.pools[pi].key) {
+                        if engine.pools[pi].available {engine.publish_price(pi,PriceOrigin::Baseline,None,None,None);}
+                        else{engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),"baseline has no valid indicative price".into());}
+                    }}
+                    let replay_keys:HashSet<_>=engine.subs.iter().filter(|sub|keys.contains(&engine.pools[sub.pool].key)).map(|sub|sub.key).collect();
+                    for key in replay_keys {if let Some((event,received))=cached.remove(&key) {
+                        if engine.account(&event,&active,received,true,Some(&keys)){cached.insert(key,(event,received));}
+                    }}
+                }
+                engine.metrics.install.add(nanos(started));
+            },
+            event=events.recv()=>{
+                engine.metrics.max_queue_depth=engine.metrics.max_queue_depth.max(events.len());
+                match event {
+                    Ok(event@WsEvent::Account{address,slot,..})=>{
+                        let received=timestamp_us();
+                        if engine.account(&event,&active,received,false,None) {
+                            let newer=cached.get(&address).is_none_or(|(old,_)|matches!(old,WsEvent::Account{slot:old,..} if slot>=*old));
+                            if newer && cached.insert(address,(event,received)).is_some(){engine.metrics.buffer_replaced+=1;}
                         }
-                    }
-                },
-                Err(broadcast::error::RecvError::Lagged(n))=>{
-                    ready=false;resync=true;engine.sequence+=1;
-                    send(&out,MarketStateEvent::Gap{reason:format!("account receiver lagged {n}"),sequence:engine.sequence});
-                    invalidate(&mut engine,"account stream lag; awaiting baseline");
-                },
-                Err(broadcast::error::RecvError::Closed)=>bail!("market account transport closed"),
+                    },
+                    Ok(WsEvent::Subscribed{address,provider})=>{active.insert(address,provider);schedule=true;},
+                    Ok(WsEvent::Unsubscribed{address,provider})=>{
+                        if active.get(&address)==Some(&provider){active.remove(&address);invalidate_accounts(&mut engine,&HashSet::from([address]),&mut versions,&mut revision,"account unsubscribed");}
+                    },
+                    Ok(WsEvent::Gap{provider,reason})=>{
+                        engine.metrics.gaps+=1;
+                        let keys:HashSet<_>=active.iter().filter(|(_,source)|source.as_str()==provider.as_str()).map(|(key,_)|*key).collect();
+                        active.retain(|_,source|source.as_str()!=provider.as_str());
+                        invalidate_accounts(&mut engine,&keys,&mut versions,&mut revision,reason);
+                    },
+                    Ok(WsEvent::Rejected{address,provider,code})=>{
+                        engine.metrics.rejections+=1;active.remove(&address);
+                        invalidate_accounts(&mut engine,&HashSet::from([address]),&mut versions,&mut revision,"subscription rejected");
+                        crate::log_event!(Warn,"market state subscription rejected provider={provider} account={address} code={code}");
+                    },
+                    Err(broadcast::error::RecvError::Lagged(n))=>{
+                        schedule=true;
+                        engine.metrics.lost+=n;let keys=engine.account_ranges.keys().copied().collect();cached.clear();
+                        invalidate_accounts(&mut engine,&keys,&mut versions,&mut revision,"account receiver lagged");
+                        engine.sequence+=1;send(&out,MarketStateEvent::Gap{reason:format!("account receiver lagged {n}"),sequence:engine.sequence});
+                    },
+                    Err(broadcast::error::RecvError::Closed)=>bail!("market account transport closed"),
+                }
             },
             _=tick.tick()=>{
                 ticks+=1;
-                // Recheck selected pools without cloning the entire multi-million-entry Registry.
-                // New identities arrive over the Registry stream; lag forces a complete rebuild.
-                if ticks%5==0 {for p in &selected {rebuild|=reconcile(&registry,&mut candidates,p.address);}}
-                if resync && !active.is_empty() && last_ack.elapsed()>=Duration::from_secs(1) {
-                    ready=false;engine.sequence+=1;
-                    send(&out,MarketStateEvent::Gap{reason:"establishing account baseline".into(),sequence:engine.sequence});
-                    let (next_engine,next_failed,changed)=baseline(&selected,&rpc,&out,engine.sequence,&mut events,&mut active,&mut last_ack).await?;
-                    engine=next_engine;failed=next_failed;
-                    if changed {resync=true;last_ack=time::Instant::now();continue;}
-                    let next_watches=watches(&engine,&failed)?;
-                    if next_watches!=wanted {
-                        ensure!(next_watches.len()<=rpc.watch_capacity(),"market resync requires {} accounts; configured WS capacity={}",next_watches.len(),rpc.watch_capacity());
-                        active.retain(|a,_|next_watches.iter().any(|w|w.address==*a));
-                        wanted=next_watches;rpc.replace_account_watches(wanted.clone())?;
-                        ready=false;resync=true;last_ack=time::Instant::now();
-                        invalidate(&mut engine,"account requirements changed; awaiting subscriptions");
-                        continue;
-                    }
-                    baseline_floor=engine.observed.iter().map(|(a,(slot,_))|(a.clone(),*slot)).collect();
-                    ready=true;resync=false;
-                    for pi in 0..engine.pools.len() {
-                        if complete(&engine,pi,&active) && engine.pools[pi].available {
-                            engine.publish_price(pi,PriceOrigin::Baseline,None,None);
-                        }else {
-                            engine.pools[pi].available=false;
-                            engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),"waiting for complete account subscription or valid price".into());
-                        }
-                    }
-                }
-                if ticks%30==0 && !failed.is_empty(){resync=true;}
+                if !retry.is_empty(){schedule=true;}
                 if ticks%5==0 {
-                    let (ws_messages,ws_text_bytes)=rpc.stream_counts();engine.sequence+=1;
-                    send(&out,MarketStateEvent::Stats{pools:selected.len(),available:engine.pools.iter().filter(|p|p.available).count(),
-                        accounts:wanted.len(),active:active.len(),ws_messages,ws_text_bytes,sequence:engine.sequence});
+                    for p in &selected {if !persisted{rebuild|=reconcile(&registry,&mut candidates,p.address);}}
+                    let (ws_messages,ws_text_bytes)=control.stream_counts();engine.sequence+=1;
+                    send(&out,MarketStateEvent::Stats{pools:selected.len(),ready:engine.pools.iter().filter(|p|p.ready).count(),
+                        available:engine.pools.iter().filter(|p|p.available).count(),accounts:wanted.len(),active:active.len(),ws_messages,ws_text_bytes,sequence:engine.sequence});
                 }
             }
         }
     }
-    rpc.replace_watches(Vec::new())?;
+    // JoinSet drops/cancels the one preparation job. No detached HTTP initializer.
+    drop(jobs);
+    let report=engine.metrics.report();
     for p in &selected {engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true");
-    Ok(())
+    Ok(report)
 }
 
 /// Real typed consumer. Maintains price coverage against the same graph catalog generation.
@@ -956,16 +1107,13 @@ impl ObservationReport {
 
 /// Cancels hydration as well as idle streaming, then releases the sole desired watch set.
 pub async fn run(registry:PoolRegistry,input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    rpc:RpcHandle,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
+    rpc:RpcHandle,control:AccountStreamControl,events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
     stop:watch::Receiver<bool>,enabled:watch::Receiver<bool>)->Result<()> {
-    let mut cancel=stop.clone();
-    let result=tokio::select! {
-        result=produce(registry,input,rpc.clone(),out,settings,stop,enabled)=>result,
-        _=cancel.wait_for(|v|*v)=>Ok(()),
-    };
-    let cleanup=rpc.replace_watches(Vec::new());
+    let (_limit_tx,limit)=watch::channel(settings.pool_limit);
+    let result=produce(registry,input,rpc,control.clone(),events,out,stop,enabled,limit,false).await;
+    let cleanup=control.replace(Vec::new());
     crate::log_event!(Info,"market state released_watches=true");
-    result.and(cleanup)
+    result.map(|_|()).and(cleanup)
 }
 
 pub async fn observe(mut input:PriceEventStream,mut catalog:watch::Receiver<Arc<WatchCatalog>>,trace:bool)->Result<ObservationReport> {

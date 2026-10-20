@@ -501,12 +501,26 @@ pub async fn run()->Result<()>{
         updates.subscribe(),graph_tx,graph_settings));
     // Price observations are optional. The Registry and graph retain their own eligibility rules.
     let market_enabled=enabled("MARKET_STATE_ENABLED")?;
+    let signals_enabled=enabled("GRAPH_SIGNALS_ENABLED")?;
+    anyhow::ensure!(!signals_enabled || market_enabled,"GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
     let market_control=if market_enabled {
         let settings=market_state::Settings::from_env()?;
         let (control,enabled_rx)=watch::channel(true);
         let (prices,price_rx)=broadcast::channel(16384);
+        if signals_enabled {
+            let cfg=crate::workers::graph_signals::Settings::from_env()?;
+            let (signals,signal_rx)=broadcast::channel(crate::workers::graph_signals::OUTPUT_CAPACITY);
+            let signal_input=prices.subscribe(); let signal_catalog=catalog_rx.clone();
+            critical(&mut tasks,"graph_signals",async move {
+                crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?.ensure_complete()
+            });
+            critical(&mut tasks,"graph_signals.consumer",async move {
+                crate::workers::graph_signals::observe(signal_rx,cfg).await?.ensure_integrity()
+            });
+        }
+        let (account_control,account_events)=rpc.account_stream();
         critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),
-            rpc.clone(),prices,settings,stop_rx.clone(),enabled_rx));
+            rpc.clone(),account_control,account_events,prices,settings,stop_rx.clone(),enabled_rx));
         let market_catalog=catalog_rx.clone();
         critical(&mut tasks,"market_state.consumer",async move {
             market_state::observe(price_rx,market_catalog,settings.trace).await.map(|_|())
