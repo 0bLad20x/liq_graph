@@ -1,124 +1,126 @@
-# CP1: independent account reception
+# CP1.2: real account reception under load
 
-Scope: source configuration + desired account watches -> real account bytes -> independent consumer.
-No database, Registry, admission/enrichment, Market-State, graph, wallet or execution runs in this mode.
+The RPC transport receives a typed `Vec<AccountWatch>` and publishes immutable account bytes through
+`core/account_stream.rs`. It owns sockets, subscription distribution, framing, reconnects and provider
+policy. Market-State owns the protocol-specific account requirements, slices and price decoding.
+Graph/route evaluation and execution are outside this checkpoint.
 
-## Contract and implementation
-
-`core/account_stream.rs` owns `AccountWatch`, `AccountView`, `AccountData`, `AccountEvent`,
-`AccountEventStream` and the single desired-watch controller. Commitment is source configuration
-(`RPC_COMMITMENT`, default `confirmed`). Account events carry a source/socket identity, local
-session and notification sequence, slot, requested/actual view, raw bytes or deletion and local times.
-The local sequence is not an on-chain write version or a total order across sources.
-
-The RPC worker reuses that contract for HTTP account values. Its WebSocket implementation is
-private in `workers/rpc_transport/ws.rs`. `Market-State` now receives stream control and events
-explicitly from orchestration. Its pool selection, global baseline, decoders and price formulas
-are unchanged; the global-baseline problem belongs to CP2.
-
-The socket's read and write halves are polled independently. The reader never awaits a subscription
-sleep, socket send/flush or downstream receiver. A private writer applies subscription pacing,
-handles ping/pong flushing and reports control timings. At most 32 subscription/unsubscription
-requests are pending. Reply deadlines are absolute from local request enqueue and are not restarted
-by ordinary notifications. Target changes reconcile metadata; ordinary account updates only look
-up their subscription ID. A required view change reconnects and emits a continuity gap.
-
-JSON-RPC/base64 framing is decoded in the transport worker with typed borrowed fields. Pool bytes
-are not interpreted. Each account payload is wrapped once in `Arc`; a broadcast receiver clones
-the reference, not the byte vector. The existing 4096-event broadcast remains non-waiting and
-reports lag to receivers. This is not a lock-free or allocation-free claim. Any gap, rejection,
-decode failure, sequence error, lag or unequal producer/consumer totals fails this live audit.
-
-All socket tasks are owned by a JoinSet. Dropping/stopping the RPC task cancels them and their
-internal writer futures; socket task errors propagate to the RPC task.
-
-## Real live run on Windows
+## Windows run
 
 ```powershell
-.\scripts\rpc_account_stream_live.ps1 -DurationSeconds 300 -WsProviders "5,6"
+.\scripts\rpc_account_stream_live.ps1 -PoolLimit 1000 -DurationSeconds 600
 ```
 
-The default watch file contains 15 real pool addresses from the previously uploaded live evidence.
-Its first two addresses had actual WebSocket observations in the f5c1942 run. It is a small transport
-proof, not a 10000-account load proof. Account activity can change; an ACK-only or quiet run fails.
-Only providers 5 and 6 are selected by default, with one socket each and 64 aggregate account slots.
-These settings are local limits, not verified provider allowances. The standalone path performs no
-HTTP RPC requests even if HTTP providers are configured.
+Default input is the persisted Prepared pool population. `PoolLimit=0` means no pool-count limit;
+`10000` is a larger explicit run. Provider capacity always remains enforced. Pools and account
+subscriptions are different quantities: reserve-based pools also require vault accounts.
 
-For larger real watch lists:
+Enable the intended providers in `.env`, for example `RPC_5_WS_ACCOUNT_SUBSCRIBE=true` and
+`RPC_6_WS_ACCOUNT_SUBSCRIBE=true`; disable unwanted providers there. Endpoints and these limits
+are read per provider:
+
+* `RPC_N_WS_MAX_CONNECTIONS`
+* `RPC_N_WS_MAX_SUBSCRIPTIONS` (aggregate account capacity for this provider)
+* `RPC_N_WS_SUBSCRIPTIONS_PER_CONNECTION`
+* `RPC_N_WS_SUBSCRIBE_SPACING_MS`
+* `RPC_N_WS_TIMEOUT_MS` / `RPC_N_WS_RECONNECT_MS`
+
+The script changes no `RPC_N_*` variable. It disables the older global test overrides for its lifetime
+(`RPC_WS_PROVIDER_SELECTION=configured`, `RPC_WS_ACCOUNT_BUDGET=0`,
+`RPC_WS_CONNECTIONS_PER_PROVIDER=0`) so provider ENV flags and limits are authoritative. Previous
+process variables are restored in `finally`. The effective plan omits URLs/credentials and is saved
+before preparation. There is no automatic capacity increase, account truncation or provider switch.
+The current configuration identifies providers by `RPC_N`, not by a shared API-key identity; operators
+must keep the aggregate connections of entries sharing a key inside that key's allowance.
+
+HTTP RPS, in-flight, timeout and retry settings apply to HTTP preparation. They do not pace incoming
+WebSocket updates. `WS_SUBSCRIBE_SPACING_MS` paces outgoing Subscribe requests only.
+
+## Prepared account plan
+
+Orchestration restores the existing persistence snapshot into a private Registry and asks Market-State
+for the account plan. Market-State selects persisted Prepared identities and reuses its production
+HTTP account discovery, identity/owner checks, subscription bindings and slice planner. The same
+hydration implementation is used, with baseline price calculation/publication disabled for the probe.
+Required accounts are deduplicated; overlapping slices are combined. Missing/unsupported pools fail
+preparation with their reasons; they are not silently dropped to produce a successful smaller run.
+The plan reports pool counts by venue, pool addresses, account references, unique accounts, preparation
+time and whether ENV capacity is sufficient. HTTP preparation ends before measured reception starts.
+
+Persisted Prepared proofs are a historical address source for this transport experiment. They do not
+establish live TVL admission, refresh completion manifests or promote any pool in the production
+Registry. No admission/enrichment source, graph, signal worker, wallet or transaction execution runs.
+Market-State's production global-baseline lifecycle is unchanged and remains CP2.
+
+An explicit real account file remains available without database/Market-State preparation:
 
 ```powershell
-.\scripts\rpc_account_stream_live.ps1 -DurationSeconds 900 `
-    -AccountsPath .\my_accounts.json -WsProviders "5,6" -WsAccountBudget 30000
+.\scripts\rpc_account_stream_live.ps1 -AccountsPath .\scripts\rpc_account_stream_accounts.json -DurationSeconds 300
 ```
 
-The JSON file is an array. An account may request a full value or a nonempty slice:
+The checked-in file has 15 real pool addresses and is a small smoke run only. Custom input is a JSON
+array of distinct `address` strings with optional paired `offset` / `length` integers. Omit both for
+full accounts. At least four real accounts are required. No fake notifications or prices are injected.
 
-```json
-[
-  {"address":"REAL_ACCOUNT_ADDRESS"},
-  {"address":"ANOTHER_REAL_ACCOUNT","offset":76,"length":6}
-]
-```
+## Measurement phases
 
-Use at least four distinct real addresses; the example above only illustrates the file format.
-No fixture values or invented notifications are injected into the worker.
+The same consumer receives initial half / add all / remove half / restore all / final drain phases.
+Halves refer to the deduplicated account list, not complete pool bundles. No prices are evaluated.
+Existing account-to-socket assignments are retained across list changes.
 
-Four equal timed phases subscribe half the list, add the remainder, remove the added half, and
-restore the full list. Existing source assignments are retained. A final drain removes all watches
-and continues consuming until unsubscribe ACKs and a 1.5-second metrics settlement, up to 60 seconds.
-The reported duration excludes that final drain. Each timed phase must acknowledge its full desired
-set and deliver real notifications. Add/remove/restore must also deliver notifications for retained
-accounts. Every selected socket must publish real account updates.
+`DurationSeconds` now specifies the sum of the four post-ACK observation periods. Each period starts
+only after the full desired account set has been acknowledged. Preparation and subscription transitions
+are additional elapsed time, with separate timings. A transition has its own timeout (default 600 s,
+configurable using `-TransitionTimeoutSeconds`). The final drain waits for all unsubscribe ACKs and
+then 1.5 s for the producer's one-second metrics publication. The process keeps consuming throughout
+subscription changes. The readiness set is checked until first completion, not scanned per steady update.
 
-`updates_before_transition_complete` additionally shows notifications received before the phase's
-ACK transition finished. A zero value does not prove a stall: a quiet account may not update in
-that short interval. The audit does not claim uninterrupted delivery during a transition without
-those observations; use a larger active watch set to collect that evidence.
+Each phase reports `transition` and `steady` separately:
 
-## Evidence and timing
+* account updates, distinct updated accounts, decoded account bytes, updates/s and decoded bytes/s;
+* peak accepted update counts and decoded bytes in fixed 10-ms and 1-s windows;
+* text-read -> consumer and transport-decode -> consumer latency histograms;
+* ACK transition time, actual observation time and active account count at the end;
+* `continuing_updates_during_transition`: updates for retained accounts before full ACK completion.
 
-The script requires a clean tracked checkout, builds `--locked --release`, verifies Cargo.lock,
-restores temporary process variables, and saves `checkout.json`, `websocket_plan.json`, `accounts.json`,
-`report.json` and `worker.log` in `rpc_account_stream_live/<timestamp>`.
+The burst windows are fixed, aligned to the start of the respective phase interval, not rolling
+windows. They describe acceptance at the consumer; they are not exchange traffic or network packet
+measurements. Aggregate `transport_text_messages` and `transport_text_bytes` count incoming JSON text,
+including ACKs, before base64 decoding; they exclude TLS/TCP overhead. Per-phase byte rates describe
+only decoded account payloads. No per-update printing or receiver-waiting send was introduced.
 
-The producer separately counts text frames, account notifications, published accounts, retired
-notifications, subscription/unsubscription ACKs, rejected requests, decode errors, gaps and sessions.
-The consumer reports source totals, sequence/lag/clock errors, observed queue depth and bounded real
-payload examples. Producer publication totals must equal consumer account totals.
+The consumer compares producer publication totals, source/session sequences, actual payload identities
+and lag/clock/gap counters. All phases must reach the desired ACK set; the four observation periods
+must receive real account updates and add/remove/restore must retain real ongoing activity. Every
+reported source must publish real account updates without framing failures. Any gap, rejection, lag,
+sequence/clock error or unequal local producer/consumer account totals fails the live evidence.
 
-Socket read termination is logged with source/session and retained in `producer.sources[].last_read_end`:
-close status/reason, read error, stream end without a close frame, or an unexpected frame. A null value
-means no read termination was recorded; it does not exclude another gap cause. The generic gap still
-invalidates continuity. Reconnection does not prove that the provider delivered updates missed while
-disconnected, and matching local publication/consumption totals cannot establish that.
+`transition_activity_observed` separately requires retained-account notifications during all three
+control-change transitions. False means that specific evidence is absent, not that a stall was proved.
+A continuity pass alone does not prove load capacity, uninterrupted transition delivery, a latency
+ceiling or full-pipeline performance. Assess actual traffic and the reported phase distributions.
 
-Times are nanoseconds; percentile fields are histogram bucket upper bounds:
+## Evidence and limits
 
-* `producer.sources[].decode`: text read through transport decode and payload creation.
-* `publication`: immediate channel send and publication bookkeeping.
-* `control_pacing` / `control_write`: writer wait/send times, independent of the reader.
-* `watch_reconcile` / `control_enqueue`: CPU time spent on desired-watch reconciliation and bounded
-  request staging in the session; these are not part of the per-account decode interval.
-* `consumer.decode_to_consumer`: decode timestamp through consumer acceptance, including scheduling.
-* `consumer.frame_to_consumer`: complete local text-read -> consumer interval.
-* `transition_frame_to_consumer` / `steady_frame_to_consumer`: before/after the current phase's
-  first complete ACK set. These are per-phase readiness classifications, not provider latency.
+The script checks the committed checkout, builds `--locked --release`, verifies Cargo.lock and saves
+`checkout.json`, `websocket_plan.json`, `preparation.json` (Prepared mode), `accounts.json`, `report.json`
+and `worker.log` in `rpc_account_stream_live/<timestamp>`. The exact account input gets a SHA-256 hash.
+Preparation failures leave their plan/log; unexpected early exits get an explicit incomplete report.
 
-Local wall timestamps have microsecond resolution; producer durations use Instant. Provider,
-network, TLS/OS buffering and time before the socket yields a text message are not measured by
-`frame_to_consumer`. No zero-latency guarantee or achieved throughput is inferred from the code.
-`live_evidence_passed` proves continuity/activity in the observed run; latency values and the
-tested input volume must be assessed separately before scaling. This is not a full pipeline proof.
+Latency values are nanoseconds; percentile fields are histogram bucket upper bounds. Local wall
+measurements have microsecond resolution; producer durations use Instant. Timing begins when the
+WebSocket stream yields a complete text frame. Provider/network latency, TLS/OS buffering and time
+before that yield are not measured. `last_read_end` preserves read errors or close status/reason.
+Reconnection and matching local totals do not establish delivery of chain updates missed while offline.
 
-Uploaded Windows evidence for `2beb99d7` (2026-10-20): locked release build succeeded with one
-unused-field warning; 15 accounts, two sockets and 300 seconds produced/consumed 218 account updates,
-with zero local lag or sequence errors. Frame-to-consumer mean was 0.097321 ms and maximum 0.275 ms.
-Both sockets disconnected after approximately 136 seconds and reconnected, so continuity failed.
-The old reader discarded the termination details; the cause is not established. No updates were
-observed during the short subscription ACK transitions, and this is not a large-load proof.
+The transport keeps its non-waiting 4096-event broadcast; slow consumers receive explicit lag. Read
+and write halves are independently polled; only the writer awaits subscription spacing and writes.
+Socket tasks are JoinSet-owned and cancelled on RPC shutdown. At most 32 RPC control requests are
+pending per socket. Metadata reconciliation occurs on desired-list changes. This is not a lock-free
+or allocation-free claim.
 
-The follow-up preserves read termination details and checks unsubscribe source ownership in the
-audit, which also uses the formerly unread provider field. It does not claim to fix the disconnect.
-Cargo/Rust and PowerShell are unavailable in the editing environment; the follow-up build/live
-run are pending. No formatter, automated test suite, dependency or lockfile change is included.
+Previous Windows evidence: `fbf9269` built successfully and passed a 300-second, 15-account run:
+177/177 locally published/received updates, no gaps/lag, mean 0.097311 ms and maximum 0.181 ms from
+text-read to consumer. That run did not reproduce the earlier disconnect; its cause remains unknown.
+The CP1.2 changes require a new Windows build and real load run. Cargo/Rust and PowerShell are absent
+in the editing environment. No formatter, automated test suite, dependencies or lockfile changes.

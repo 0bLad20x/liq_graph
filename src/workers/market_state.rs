@@ -349,7 +349,7 @@ impl Engine{
             self.account_ranges.insert(key,start..self.account_bindings.len());
         }
     }
-    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Result<Self>{
+    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
         let pool_records=fetch_batch(rpc,&pool_addrs).await?;
         let mut raw_pools=Vec::new();let mut details=Vec::<String>::new();
@@ -496,7 +496,7 @@ impl Engine{
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
                 price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,
             };
-            if !matches!(&pool.state,State::Manifest{available:false,..}) {
+            if prices && !matches!(&pool.state,State::Manifest{available:false,..}) {
                 pool.price=pool.compute_price()?;
                 pool.available=true;
             }
@@ -685,7 +685,11 @@ impl Settings {
 struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey}
 impl PoolInput {
     fn of(p:&PoolState)->Option<Self> {
-        if p.completion_state!=CompletionState::Prepared || !p.completion_admission.is_admitted(){return None;}
+        if !p.completion_admission.is_admitted(){return None;}
+        Self::prepared(p)
+    }
+    fn prepared(p:&PoolState)->Option<Self> {
+        if p.completion_state!=CompletionState::Prepared{return None;}
         Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?})
     }
 }
@@ -708,7 +712,7 @@ fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
     let _=out.send(Arc::new(event));
 }
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
-    mut sequence:u64)->Result<(Engine,Vec<Pubkey>)> {
+    mut sequence:u64,prices:bool)->Result<(Engine,Vec<Pubkey>)> {
     let mut engine=Engine::empty(out.clone(),sequence);
     // Bisect failing batches to isolate a bad pool without one RPC round-trip per healthy pool.
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
@@ -717,7 +721,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
             Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?}))
             .collect::<Result<Vec<_>>>()?})})();
-        let result=match config {Ok(cfg)=>Engine::hydrate(cfg,rpc,out.clone(),sequence).await,Err(e)=>Err(e)};
+        let result=match config {Ok(cfg)=>Engine::hydrate(cfg,rpc,out.clone(),sequence,prices).await,Err(e)=>Err(e)};
         let result=result.and_then(|part| {
             for (actual,expected) in part.pools.iter().zip(&batch) {
                 ensure!(actual.a==expected.mint_a.to_string()
@@ -752,7 +756,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
 async fn baseline(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,
     events:&mut AccountEventStream,active:&mut HashMap<Pubkey,String>,last_ack:&mut time::Instant)
     ->Result<(Engine,Vec<Pubkey>,bool)> {
-    let future=hydrate(pools,rpc,out,sequence);tokio::pin!(future);
+    let future=hydrate(pools,rpc,out,sequence,true);tokio::pin!(future);
     let mut changed=false;
     loop {tokio::select! {
         result=&mut future=>{let (engine,failed)=result?;return Ok((engine,failed,changed));},
@@ -784,6 +788,39 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     }
     for &address in failed {wanted.insert(address,AccountView::Full);}
     Ok(wanted.into_iter().map(|(address,view)|AccountWatch{address,view}).collect())
+}
+
+/// Real transport input only: persisted Prepared proofs are not live Registry admission.
+/// Reuse the production account discovery and slice planner; do not publish prices.
+pub async fn account_stream_plan(registry:&PoolRegistry,rpc:&RpcHandle)->Result<Vec<AccountWatch>> {
+    let started=time::Instant::now();let limit=Settings::from_env()?.pool_limit;
+    let candidates=registry.snapshot().iter().filter_map(PoolInput::prepared).map(|p|(p.address,p)).collect();
+    let selected=select(&candidates,limit);
+    ensure!(!selected.is_empty(),"no persisted Prepared pools for the account transport plan");
+    crate::log_event!(Info,"market account plan preparing=true prepared={} selected={} pool_limit={limit} admission=historical_proof_only prices=false",candidates.len(),selected.len());
+    let (output,mut diagnostics)=broadcast::channel(selected.len().max(16));
+    let (engine,failed)=hydrate(&selected,rpc,&output,0,false).await?;
+    let wanted=watches(&engine,&[])?;
+    let mut failures=Vec::new();
+    while let Ok(event)=diagnostics.try_recv() {
+        if let MarketStateEvent::Unavailable{pool,reason,..}=event.as_ref(){failures.push(serde_json::json!({"pool":pool,"reason":reason}));}
+    }
+    let mut venues=BTreeMap::<&str,usize>::new();
+    for pool in &engine.pools {*venues.entry(pool.venue.label()).or_default()+=1;}
+    let capacity=rpc.account_stream().0.capacity();
+    let report=serde_json::json!({"source":"persisted_prepared_proofs","live_admission_established":false,
+        "pool_limit":limit,"prepared_candidates":candidates.len(),"selected_pools":selected.len(),
+        "planned_pools":engine.pools.len(),"failed_pools":failed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "failures":failures,"pools_by_venue":venues,"account_references":engine.subs.len(),
+        "unique_accounts":wanted.len(),"account_capacity":capacity,"capacity_sufficient":wanted.len()<=capacity,
+        "preparation_seconds":started.elapsed().as_secs_f64(),
+        "pools":selected.iter().map(|p|p.address.to_string()).collect::<Vec<_>>()});
+    let path=env::var("MARKET_STATE_ACCOUNT_PLAN_PATH").context("MARKET_STATE_ACCOUNT_PLAN_PATH is required")?;
+    std::fs::write(path,serde_json::to_vec_pretty(&report)?).context("write market account plan")?;
+    ensure!(failed.is_empty(),"account plan failed for {} of {} pools; inspect preparation.json",failed.len(),selected.len());
+    ensure!(wanted.len()<=capacity,"{} pools require {} distinct accounts; ENV WebSocket capacity is {}; no subscriptions were opened",selected.len(),wanted.len(),capacity);
+    crate::log_event!(Info,"market account plan complete=true pools={} accounts={} seconds={:.3}",engine.pools.len(),wanted.len(),started.elapsed().as_secs_f64());
+    Ok(wanted)
 }
 fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
     engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))

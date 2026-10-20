@@ -522,10 +522,21 @@ pub async fn run() -> Result<()> {
         println!("{}",crate::workers::execution_v10::Settings::load(std::path::Path::new(&args[1]))?.wallet());
         return Ok(());
     }
-    if args.len()==1 && args[0]=="--rpc-account-stream-live" {
+    if args.len()==1 && matches!(args[0].as_str(),"--rpc-account-stream-live"|"--rpc-account-stream-prepared-live") {
         let (handle,mut task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+        let work=async {
+            let planned=if args[0]=="--rpc-account-stream-prepared-live" {
+                let database=persistence::Persistence::connect().await?;
+                let restored=database.restore().await?;
+                drop(database);
+                let registry=pool_registry::PoolRegistry::default();
+                registry.restore(restored)?;
+                Some(crate::workers::market_state::account_stream_plan(&registry,&handle).await?)
+            }else{None};
+            rpc_transport::account_stream_live(&handle,planned).await
+        };
         let result=tokio::select! {
-            result=rpc_transport::account_stream_live(&handle)=>result,
+            result=work=>result,
             result=&mut task=>{
                 result.context("RPC transport task panicked")??;
                 bail!("RPC transport ended before account stream proof")
