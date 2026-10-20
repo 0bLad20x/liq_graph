@@ -4,6 +4,7 @@ param(
     [double]$ThresholdBps = 0,
     [switch]$TracePrices,
     [switch]$TraceSignals,
+    [switch]$ProfileSignals,
     [string]$WsProviders = "Configured",
     [ValidateRange(0, 2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0, 64)][int]$WsConnectionsPerProvider = 0,
@@ -16,4 +17,4 @@ param(
     -DurationSeconds $DurationSeconds -PoolLimit $PoolLimit -ThresholdBps $ThresholdBps `
     -WsProviders $WsProviders -WsAccountBudget $WsAccountBudget -WsConnectionsPerProvider $WsConnectionsPerProvider `
     -PlanOnly:$PlanOnly `
-    -TracePrices:$TracePrices -TraceSignals:$TraceSignals -Rewatch:$Rewatch
+    -TracePrices:$TracePrices -TraceSignals:$TraceSignals -ProfileSignals:$ProfileSignals -Rewatch:$Rewatch

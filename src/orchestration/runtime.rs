@@ -510,10 +510,12 @@ pub async fn run()->Result<()>{
         if signals_enabled {
             let cfg=crate::workers::graph_signals::Settings::from_env()?;
             let (signals,signal_rx)=broadcast::channel(16384);
-            critical(&mut tasks,"graph_signals",crate::workers::graph_signals::run(
-                prices.subscribe(),catalog_rx.clone(),signals,cfg));
+            let signal_input=prices.subscribe(); let signal_catalog=catalog_rx.clone();
+            critical(&mut tasks,"graph_signals",async move {
+                crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?.ensure_complete()
+            });
             critical(&mut tasks,"graph_signals.consumer",async move {
-                crate::workers::graph_signals::observe(signal_rx,cfg).await.map(|_|())
+                crate::workers::graph_signals::observe(signal_rx,cfg).await?.ensure_integrity()
             });
         }
         critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),

@@ -13,7 +13,7 @@ const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 #[derive(Clone, Copy)]
-pub struct Settings { pub threshold_bps: f64, pub sample_limit: usize, pub trace: bool }
+pub struct Settings { pub threshold_bps: f64, pub sample_limit: usize, pub trace: bool, pub profile: bool }
 impl Settings {
     pub fn from_env() -> Result<Self> {
         let threshold_bps: f64 = env::var("GRAPH_SIGNALS_THRESHOLD_BPS")
@@ -27,7 +27,12 @@ impl Settings {
             Ok("0" | "false") | Err(env::VarError::NotPresent) => false,
             _ => bail!("GRAPH_SIGNALS_TRACE must be true or false"),
         };
-        Ok(Self { threshold_bps, sample_limit, trace })
+        let profile = match env::var("GRAPH_SIGNALS_PROFILE").as_deref() {
+            Ok("1" | "true") => true,
+            Ok("0" | "false") | Err(env::VarError::NotPresent) => false,
+            _ => bail!("GRAPH_SIGNALS_PROFILE must be true or false"),
+        };
+        Ok(Self { threshold_bps, sample_limit, trace, profile })
     }
 }
 
@@ -281,18 +286,22 @@ struct Scored { sum: f64, bps: f64 }
 enum Calculation { Missing, Nonfinite, Scored(Scored) }
 struct Pending { slots: [usize; 4], reverse: bool, scored: Scored }
 struct Work {
-    stats: SignalEvaluation, by_kind: [u64; 4], pending: Vec<Pending>, last_yield: u64,
+    stats: SignalEvaluation, by_kind: [u64; 4], pending: Vec<Pending>,
+    ready: Vec<Arc<SignalEvent>>, last_yield: u64,
 }
 struct InputTiming { started: Instant, received_us: u64, preparation_ns: u64, logarithms: u64, plan_ns: u64 }
 struct Engine {
     prices: Prices, output: broadcast::Sender<Arc<SignalEvent>>, scratch: Vec<Pending>,
+    ready: Vec<Arc<SignalEvent>>, production: ProductionReport,
     settings: Settings, sequence: u64, samples: usize, websocket_samples: usize, threshold_log: f64,
 }
 impl Engine {
-    fn emit(&self, event: SignalEvent) -> Result<()> {
-        self.output.send(Arc::new(event)).map(|_| ())
-            .map_err(|_| anyhow::anyhow!("signal output has no consumer"))
+    fn publish(&mut self, event: Arc<SignalEvent>) -> Result<()> {
+        self.output.send(event).map_err(|_| anyhow::anyhow!("signal output has no consumer"))?;
+        self.production.published_events += 1;
+        Ok(())
     }
+    fn emit(&mut self, event: SignalEvent) -> Result<()> { self.publish(Arc::new(event)) }
     fn calculate<const N: usize>(&self, slots: &[usize; N]) -> Calculation {
         let mut sum = 0.0;
         for &slot in slots {
@@ -359,16 +368,26 @@ impl Engine {
                         negative_log_sum: pending.scored.sum, indicative_return_bps: pending.scored.bps,
                         threshold_bps: self.settings.threshold_bps, qualifies, emitted_at_us,
                         account_to_emitted_us: account_age(&work.stats.trigger, emitted_at_us) };
-                    if qualifies { self.emit(SignalEvent::Candidate(route))?; }
+                    if qualifies { work.ready.push(Arc::new(SignalEvent::Candidate(route))); }
                     else {
                         if live { self.websocket_samples += 1; } else { self.samples += 1; }
-                        self.emit(SignalEvent::RouteSample(route))?;
+                        work.ready.push(Arc::new(SignalEvent::RouteSample(route)));
                     }
                 }
-                work.stats.output_ns = work.stats.output_ns.saturating_add(nanos(started));
+                let built = nanos(started);
+                let publishing = Instant::now();
+                for event in work.ready.drain(..) { self.publish(event)?; }
+                self.production.max_output_queue_depth = self.production.max_output_queue_depth.max(self.output.len());
+                let published = nanos(publishing);
+                work.stats.event_build_ns = work.stats.event_build_ns.saturating_add(built);
+                work.stats.publication_ns = work.stats.publication_ns.saturating_add(published);
+                work.stats.output_ns = work.stats.output_ns.saturating_add(built.saturating_add(published));
             }
             if work.stats.combinations_visited - work.last_yield >= YIELD_ROUTES {
-                tokio::task::yield_now().await; work.last_yield = work.stats.combinations_visited;
+                let started = Instant::now();
+                tokio::task::yield_now().await;
+                work.stats.cooperative_yield_ns = work.stats.cooperative_yield_ns.saturating_add(nanos(started));
+                work.last_yield = work.stats.combinations_visited;
             }
         }
         Ok(())
@@ -405,8 +424,10 @@ impl Engine {
             routes_affected: 0, routes_scored: 0, routes_missing_prices: 0, routes_nonfinite: 0,
             candidates: 0, scored_by_kind: kinds(), price_queue_depth,
             price_preparation_ns: timing.preparation_ns, logarithms_prepared: timing.logarithms,
-            plan_build_ns: timing.plan_ns, calculation_ns: 0, output_ns: 0, processing_ns: 0 },
-            by_kind: [0; 4], pending: std::mem::take(&mut self.scratch), last_yield: 0 };
+            plan_build_ns: timing.plan_ns, event_build_ns: 0, publication_ns: 0,
+            cooperative_yield_ns: 0, calculation_ns: 0, output_ns: 0, processing_ns: 0, completed_at_us: 0 },
+            by_kind: [0; 4], pending: std::mem::take(&mut self.scratch),
+            ready: std::mem::take(&mut self.ready), last_yield: 0 };
         if let Some(pool) = changed {
             for binding in plan.for_pool(pool) {
                 self.group(binding.group, binding.affected, &plan, &mut work).await?;
@@ -421,20 +442,24 @@ impl Engine {
         for (name, count) in ["direct_2", "direct_3", "triangle_3", "triangle_4"].into_iter().zip(work.by_kind) {
             stats.scored_by_kind.insert(name, count);
         }
-        self.scratch = work.pending;
+        self.scratch = work.pending; self.ready = work.ready;
         self.sequence += 1; stats.sequence = self.sequence; stats.processing_ns = nanos(timing.started);
+        stats.completed_at_us = now_us();
+        self.production.record(stats);
         self.emit(SignalEvent::Evaluated(work.stats))
     }
 }
 
 pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<WatchCatalog>>,
-    output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings) -> Result<()> {
+    output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings) -> Result<ProductionReport> {
     let mut engine = Engine { prices: Prices::default(), output, scratch: Vec::with_capacity(BLOCK_ROUTES),
+        ready: Vec::with_capacity(BLOCK_ROUTES), production: ProductionReport::default(),
         settings, sequence: 0, samples: 0, websocket_samples: 0,
         threshold_log: -(settings.threshold_bps / 10_000.0).ln_1p() };
+    let outcome: Result<()> = async {
     let mut plan = Arc::new(ExecutionPlan::compile(catalogs.borrow_and_update().clone(), &mut engine.prices)?);
     let mut catalog_open = true;
-    crate::log_event!(Info, "graph signals started=true execution_layout={} output_layout=shared_fixed_legs_v1 threshold_bps={} execution=false", EXECUTION_LAYOUT, settings.threshold_bps);
+    crate::log_event!(Info, "graph signals started=true execution_layout={} profiling={} output_layout=shared_fixed_legs_v1 threshold_bps={} execution=false", EXECUTION_LAYOUT, settings.profile, settings.threshold_bps);
     loop { tokio::select! {
         change = catalogs.changed(), if catalog_open => {
             if change.is_err() { catalog_open = false; continue; }
@@ -493,8 +518,14 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }}
-    crate::log_event!(Info, "graph signals complete=true execution_layout={}", EXECUTION_LAYOUT);
     Ok(())
+    }.await;
+    engine.production.error = outcome.err().map(|e| format!("{e:#}"));
+    crate::log_event!(Info, "graph signals producer complete={} published={} evaluations={} ws_evaluations={} candidates={} max_output_queue={} error={:?}",
+        engine.production.error.is_none(), engine.production.published_events, engine.production.evaluations,
+        engine.production.websocket_evaluations, engine.production.candidates,
+        engine.production.max_output_queue_depth, engine.production.error);
+    Ok(engine.production)
 }
 
 /// Fixed logarithmic histogram: bounded measurement memory, no route-result cache.
@@ -528,11 +559,69 @@ impl Histogram {
             p50_upper_bound: self.percentile(50), p95_upper_bound: self.percentile(95), p99_upper_bound: self.percentile(99) }
     }
 }
+impl serde::Serialize for Histogram {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.report(), serializer)
+    }
+}
 #[derive(serde::Serialize)]
 pub struct Timing { count: u64, min: Option<u64>, max: Option<u64>, mean: Option<f64>,
     p50_upper_bound: Option<u64>, p95_upper_bound: Option<u64>, p99_upper_bound: Option<u64> }
+
+// Owned by the producer: output loss cannot erase these completed-input measurements.
+#[derive(Default, serde::Serialize)]
+struct ProductionTimings {
+    preparation_ns: Histogram, calculation_ns: Histogram, event_build_ns: Histogram,
+    publication_ns: Histogram, cooperative_yield_ns: Histogram, processing_ns: Histogram, account_to_worker_us: Histogram,
+}
+impl ProductionTimings {
+    fn record(&mut self, e: &SignalEvaluation) {
+        self.preparation_ns.add(e.price_preparation_ns); self.calculation_ns.add(e.calculation_ns);
+        self.event_build_ns.add(e.event_build_ns); self.publication_ns.add(e.publication_ns);
+        self.cooperative_yield_ns.add(e.cooperative_yield_ns);
+        self.processing_ns.add(e.processing_ns);
+        if let Some(age) = e.account_to_worker_us { self.account_to_worker_us.add(age); }
+    }
+}
+#[derive(Default, serde::Serialize)]
+pub struct ProductionReport {
+    error: Option<String>, published_events: u64, evaluations: u64, websocket_evaluations: u64,
+    candidates: u64, websocket_candidates: u64, routes_scored: u64, websocket_routes_scored: u64,
+    max_price_queue_depth: usize, max_output_queue_depth: usize,
+    all_inputs: ProductionTimings, websocket_inputs: ProductionTimings, catalog_plan_build_ns: Histogram,
+}
+impl ProductionReport {
+    fn record(&mut self, e: &SignalEvaluation) {
+        self.evaluations += 1; self.candidates += e.candidates; self.routes_scored += e.routes_scored;
+        self.max_price_queue_depth = self.max_price_queue_depth.max(e.price_queue_depth);
+        self.all_inputs.record(e);
+        if websocket(&e.trigger) {
+            self.websocket_evaluations += 1; self.websocket_candidates += e.candidates;
+            self.websocket_routes_scored += e.routes_scored; self.websocket_inputs.record(e);
+        }
+        if matches!(e.trigger.as_ref(), SignalTrigger::Catalog { .. }) { self.catalog_plan_build_ns.add(e.plan_build_ns); }
+    }
+    pub fn ensure_complete(&self) -> Result<()> {
+        ensure!(self.error.is_none(), "signal producer failed: {}", self.error.as_deref().unwrap_or(""));
+        Ok(())
+    }
+    pub fn ensure_delivery(&self, received: &ObservationReport) -> Result<()> {
+        self.ensure_complete()?; received.ensure_integrity()?;
+        ensure!(self.published_events == received.received_events
+            && self.evaluations == received.evaluation_events && self.candidates == received.candidates
+            && self.websocket_evaluations == received.websocket_evaluations
+            && self.websocket_candidates == received.websocket_candidates,
+            "signal producer/consumer totals differ; inspect both reports");
+        Ok(())
+    }
+}
 #[derive(serde::Serialize)]
 pub struct ObservationReport {
+    pub profile_enabled: bool, pub error: Option<String>, pub received_events: u64,
+    pub lost_events: u64, pub lag_incidents: u64, pub first_lag: Option<serde_json::Value>,
+    pub consumer_bookkeeping_sample_period: u64, pub consumer_bookkeeping_sample_ns: Timing,
+    pub completion_to_consumer_us: Timing, pub websocket_completion_to_consumer_us: Timing,
+    pub consumer_periodic_logging_ns: u64,
     pub output_layout: &'static str,
     pub execution_layout: &'static str,
     pub evaluation_events: u64, pub price_evaluations: u64, pub websocket_evaluations: u64,
@@ -557,7 +646,14 @@ pub struct ObservationReport {
     pub consumer_formatting_ns: u64,
 }
 impl ObservationReport {
+    pub fn ensure_integrity(&self) -> Result<()> {
+        ensure!(self.error.is_none(), "signal consumer failed: {}", self.error.as_deref().unwrap_or(""));
+        ensure!(self.lost_events == 0, "signal consumer lost {} events in {} incidents; live evidence incomplete",
+            self.lost_events, self.lag_incidents);
+        Ok(())
+    }
     pub fn ensure_calculation_evidence(&self) -> Result<()> {
+        self.ensure_integrity()?;
         ensure!(self.websocket_evaluations > 0 && self.websocket_routes_scored > 0,
             "no complete route calculated from a real WebSocket price update; inspect price coverage and per-kind counts");
         Ok(())
@@ -571,6 +667,11 @@ impl ObservationReport {
 }
 
 pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
+    const SAMPLE_PERIOD: u64 = 257;
+    let mut received_events = 0_u64; let mut lost_events = 0_u64; let mut lag_incidents = 0_u64;
+    let mut first_lag = None; let mut last_sequence = None;
+    let mut bookkeeping = Histogram::default(); let mut completion_age = Histogram::default();
+    let mut ws_completion_age = Histogram::default(); let mut periodic_logging_ns = 0_u64;
     let mut evaluations = 0; let mut price_evaluations = 0; let mut ws_evaluations = 0; let mut catalog_evaluations = 0;
     let mut combinations = 0; let mut affected = 0; let mut scored = 0; let mut ws_scored = 0;
     let mut available = 0; let mut routes_expected = 0; let mut logarithms = 0;
@@ -588,16 +689,25 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     let mut worker_age = Histogram::default(); let mut candidate_age = Histogram::default(); let mut consumer_age = Histogram::default();
     let mut format_ns = 0_u64;
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    let outcome: Result<()> = async {
     loop { tokio::select! {
         _ = ticker.tick() => {
+            let started = Instant::now();
             crate::log_event!(Info, "graph signals consumer execution_layout={} evaluations={evaluations} ws_evaluations={ws_evaluations} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} max_price_queue={input_max} max_signal_queue={output_max}", EXECUTION_LAYOUT);
             crate::log_event!(Info, "graph signals indexed ws_combinations_available={ws_available} ws_combinations_visited={ws_combinations} ws_routes_expected={ws_expected} ws_logarithms_prepared={ws_logarithms} ws_preparation_mean_ns={:?}", ws_preparation.report().mean);
             crate::log_event!(Info, "graph signals timings output_layout=shared_fixed_legs_v1 ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
                 ws_output.report().mean, ws_process.report().mean, ws_process.report().max, ws_evaluation_consumer_age.report().max);
+            periodic_logging_ns = periodic_logging_ns.saturating_add(nanos(started));
         },
         event = input.recv() => match event {
             Ok(event) => {
+                received_events += 1;
+                let sampled = (settings.profile && received_events % SAMPLE_PERIOD == 1).then(Instant::now);
                 output_max = output_max.max(input.len());
+                last_sequence = match event.as_ref() {
+                    SignalEvent::Candidate(r) | SignalEvent::RouteSample(r) => Some(r.sequence),
+                    SignalEvent::Evaluated(e) => Some(e.sequence), SignalEvent::Invalidated { .. } => last_sequence,
+                };
                 let print = match event.as_ref() {
                     SignalEvent::Candidate(route) => {
                         candidates += 1; if websocket(&route.trigger) { ws_candidates += 1; }
@@ -611,6 +721,11 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                     SignalEvent::Invalidated { .. } => { invalidations += 1; settings.trace || invalidations <= settings.sample_limit as u64 },
                     SignalEvent::Evaluated(e) => {
                         evaluations += 1;
+                        let at = now_us();
+                        if let Some(age) = at.checked_sub(e.completed_at_us) {
+                            completion_age.add(age);
+                            if websocket(&e.trigger) { ws_completion_age.add(age); }
+                        }
                         match e.trigger.as_ref() {
                             SignalTrigger::Price { .. } => {
                                 price_evaluations += 1; preparation.add(e.price_preparation_ns);
@@ -628,7 +743,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             if let Some(age) = e.account_to_worker_us { ws_worker_age.add(age); }
                             // This marker follows every candidate for the input. Its receipt
                             // includes producer work and output queue/consumer work, even if no candidate qualified.
-                            if let Some(age) = account_age(&e.trigger, now_us()) { ws_evaluation_consumer_age.add(age); }
+                            if let Some(age) = account_age(&e.trigger, at) { ws_evaluation_consumer_age.add(age); }
                         }
                         combinations += e.combinations_visited; affected += e.routes_affected;
                         available += e.combinations_available; routes_expected += e.routes_expected;
@@ -641,7 +756,9 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                         max_groups = max_groups.max(e.groups_visited); max_routes = max_routes.max(e.routes_affected);
                         scored += e.routes_scored; missing += e.routes_missing_prices; nonfinite += e.routes_nonfinite;
                         expected_candidates += e.candidates;
-                        ensure!(candidates == expected_candidates, "signal candidate accounting mismatch at evaluation {}", e.sequence);
+                        if lost_events == 0 {
+                            ensure!(candidates == expected_candidates, "signal candidate accounting mismatch at evaluation {}", e.sequence);
+                        }
                         input_max = input_max.max(e.price_queue_depth);
                         for (&k, &n) in &e.scored_by_kind {
                             *by_kind.entry(k).or_default() += n;
@@ -653,19 +770,36 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             || (websocket(&e.trigger) && ws_evaluations <= settings.sample_limit as u64)
                     },
                 };
+                if let Some(started) = sampled { bookkeeping.add(nanos(started)); }
                 if print {
                     let started = Instant::now();
                     println!("{}", serde_json::to_string(event.as_ref())?);
                     format_ns = format_ns.saturating_add(nanos(started));
                 }
             },
-            Err(broadcast::error::RecvError::Lagged(n)) => bail!("signal consumer lost {n} events; live evidence incomplete"),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                lost_events += n; lag_incidents += 1;
+                if first_lag.is_none() {
+                    first_lag = Some(serde_json::json!({"at_us":now_us(),"lost_events":n,
+                        "received_events":received_events,"evaluations":evaluations,"candidates":candidates,
+                        "last_sequence":last_sequence,"queue_depth":input.len(),"formatting_ns":format_ns}));
+                    crate::log_event!(Warn, "graph signals consumer first_lag={} profiling={} live_evidence_valid=false", n, settings.profile);
+                }
+                if !settings.profile { bail!("signal consumer lost {n} events; live evidence incomplete"); }
+            },
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }}
-    ensure!(candidates == expected_candidates, "signal candidate consumer accounting mismatch");
-    crate::log_event!(Info, "graph signals consumer complete=true routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates}");
+    if lost_events == 0 { ensure!(candidates == expected_candidates, "signal candidate consumer accounting mismatch"); }
+    Ok(())
+    }.await;
+    let error = outcome.err().map(|e| format!("{e:#}"));
+    crate::log_event!(Info, "graph signals consumer complete={} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} received={received_events} lost={lost_events}", error.is_none());
     Ok(ObservationReport { output_layout: "shared_fixed_legs_v1", execution_layout: EXECUTION_LAYOUT,
+        profile_enabled: settings.profile, error, received_events, lost_events, lag_incidents, first_lag,
+        consumer_bookkeeping_sample_period: SAMPLE_PERIOD, consumer_bookkeeping_sample_ns: bookkeeping.report(),
+        completion_to_consumer_us: completion_age.report(), websocket_completion_to_consumer_us: ws_completion_age.report(),
+        consumer_periodic_logging_ns: periodic_logging_ns,
         evaluation_events: evaluations, price_evaluations, websocket_evaluations: ws_evaluations,
         catalog_evaluations, combinations_visited: combinations, routes_affected: affected, routes_scored: scored,
         combinations_available: available, routes_expected, logarithms_prepared: logarithms,

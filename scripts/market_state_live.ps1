@@ -4,6 +4,7 @@ param(
     [switch]$Signals,
     [double]$ThresholdBps = 0,
     [switch]$TraceSignals,
+    [switch]$ProfileSignals,
     [switch]$TracePrices,
     [string]$WsProviders = "Configured",
     [ValidateRange(0, 2147483647)][int]$WsAccountBudget = 0,
@@ -13,6 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($ProfileSignals -and -not $Signals) { throw "ProfileSignals requires the Graph-Signals runner." }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps) -or $ThresholdBps -lt 0) { throw "ThresholdBps must be finite and nonnegative." }
 $label = if ($Signals) { "Graph-Signals" } else { "Market-State" }
 $outputRoot = if ($Signals) { "graph_signals_live" } else { "market_state_live" }
@@ -43,7 +45,7 @@ $log = Join-Path $folder "worker.log"
 $report = Join-Path $folder "report.json"
 $metadata = Join-Path $folder "checkout.json"
 $utf8 = [System.Text.UTF8Encoding]::new($false)
-$checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch; signals_enabled = [bool]$Signals; threshold_bps = $ThresholdBps; trace_prices = [bool]$TracePrices; trace_signals = [bool]$TraceSignals; ws_providers = $WsProviders; ws_account_budget = $WsAccountBudget; ws_connections_per_provider = $WsConnectionsPerProvider; plan_only = [bool]$PlanOnly }
+$checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch; signals_enabled = [bool]$Signals; threshold_bps = $ThresholdBps; trace_prices = [bool]$TracePrices; trace_signals = [bool]$TraceSignals; profile_signals = [bool]$ProfileSignals; ws_providers = $WsProviders; ws_account_budget = $WsAccountBudget; ws_connections_per_provider = $WsConnectionsPerProvider; plan_only = [bool]$PlanOnly }
 [System.IO.File]::WriteAllText($metadata, ($checkout | ConvertTo-Json -Depth 5), $utf8)
 
 $values = @{
@@ -60,6 +62,7 @@ if ($Signals) {
     $values["GRAPH_SIGNALS_THRESHOLD_BPS"] = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
     $values["GRAPH_SIGNALS_SAMPLE_LIMIT"] = "16"
     $values["GRAPH_SIGNALS_TRACE"] = $(if ($TraceSignals) { "true" } else { "false" })
+    $values["GRAPH_SIGNALS_PROFILE"] = $(if ($ProfileSignals) { "true" } else { "false" })
 }
 # Optional ACK logs demonstrate actual unsubscriptions during a real-pool rewatch.
 if ($Rewatch) {
@@ -98,12 +101,24 @@ try {
     } finally {
         $ErrorActionPreference = $oldPreference
     }
-    if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Inspect worker.log and report.json if present." }
-    if (-not (Test-Path -LiteralPath $report)) { throw "No live evidence report was produced." }
+    if (-not (Test-Path -LiteralPath $report)) {
+        # A crash/forced process termination cannot return worker measurements.
+        $partial = @{ run_complete = $false; live_evidence_passed = $false; worker_exit = $workerExit; error = "Worker produced no report; inspect worker.log." }
+        [System.IO.File]::WriteAllText($report, ($partial | ConvertTo-Json), $utf8)
+    }
     $evidence = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+    Write-Host "Run complete=$($evidence.run_complete) live evidence=$($evidence.live_evidence_passed) report=$report"
+    if ($Signals) {
+        $produced = $evidence.signal_production_report
+        $received = $evidence.signal_report
+        Write-Host "Signals published=$($produced.published_events) received=$($received.received_events) lost=$($received.lost_events) lag incidents=$($received.lag_incidents) delivery passed=$($evidence.signal_delivery_passed)"
+        if ($ProfileSignals) { Write-Host "Profile: inspect producer websocket_inputs and consumer bookkeeping/formatting/completion timings. Event loss remains an acceptance failure." }
+    }
+    if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Diagnostics: $report and $log" }
+    if ($evidence.run_complete -ne $true) { throw "Live run did not complete; inspect report.json and worker.log." }
     if ($evidence.live_evidence_passed -ne $true) { throw "Live evidence requirements were not fulfilled." }
     if ($Signals) {
-        if ($evidence.signal_calculation_passed -ne $true -or $evidence.signal_candidate_passed -ne $true) { throw "No complete live signal proof; inspect signal_report and worker.log." }
+        if ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true -or $evidence.signal_candidate_passed -ne $true) { throw "No complete live signal proof; inspect both signal reports and worker.log." }
         $signalReport = $evidence.signal_report
         if ($signalReport.execution_layout -ne "indexed_role_plan_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
         if ($signalReport.combinations_visited -ne $signalReport.routes_expected -or

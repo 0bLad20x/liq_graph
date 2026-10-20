@@ -15,6 +15,22 @@ async fn optional_join<T>(task:&mut Option<Task<T>>)->std::result::Result<T,toki
 }
 
 pub async fn run(signals_enabled:bool)->Result<()> {
+    let mut evidence=serde_json::json!({"run_complete":false,"live_evidence_passed":false,
+        "signals_enabled":signals_enabled,"execution":false,"signal_production_report":null,"signal_report":null});
+    let result=run_inner(signals_enabled,&mut evidence).await;
+    if let Err(error)=&result {
+        evidence["error"]=serde_json::json!(format!("{error:#}"));
+        evidence["live_evidence_passed"]=serde_json::json!(false);
+    }
+    // Also persist partial diagnostics on setup, worker and shutdown errors.
+    if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH") {
+        std::fs::write(path,serde_json::to_vec_pretty(&evidence)?).context("write market live evidence")?;
+    }
+    println!("{}",serde_json::to_string(&evidence)?);
+    result
+}
+
+async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result<()> {
     let duration:u64=env::var("MARKET_STATE_DURATION_SECONDS").unwrap_or_else(|_|"600".into()).parse()?;
     ensure!((30..=86400).contains(&duration),"market live duration must be 30..86400 seconds");
     let rewatch=match env::var("MARKET_STATE_LIVE_REWATCH").as_deref() {
@@ -23,6 +39,10 @@ pub async fn run(signals_enabled:bool)->Result<()> {
     };
     let settings=market_state::Settings::from_env()?;
     let signal_settings=if signals_enabled {Some(graph_signals::Settings::from_env()?)}else{None};
+    evidence["duration_seconds"]=serde_json::json!(duration);
+    evidence["pool_limit"]=serde_json::json!(settings.pool_limit);
+    evidence["rewatch"]=serde_json::json!(rewatch);
+    evidence["signal_profile_enabled"]=serde_json::json!(signal_settings.map(|s|s.profile));
     // Restore intentionally supplies no live TVL. Reuse CP1's existing admission
     // producers instead of promoting historical observations or bypassing the gate.
     let jupiter_settings=super::jupiter_settings()?
@@ -38,6 +58,7 @@ pub async fn run(signals_enabled:bool)->Result<()> {
     drop(database);
     let rpc_settings=rpc_transport::settings_from_env()?;
     let websocket_plan=rpc_settings.websocket_plan()?;
+    evidence["websocket_plan"]=serde_json::to_value(&websocket_plan)?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_settings)?;
     let mut rpc_task=Task(rpc_task);
     let (updates,_)=broadcast::channel::<Arc<PoolUpdateBatch>>(256);
@@ -90,16 +111,34 @@ pub async fn run(signals_enabled:bool)->Result<()> {
         std::future::pending::<()>().await;
         Ok::<(),anyhow::Error>(())
     }));
+    let mut production_report=None;
+    let mut signal_report=None;
     let early=tokio::select! {
         _=tokio::time::sleep(Duration::from_secs(duration))=>None,
         result=&mut worker.0=>Some(result.context("market producer panicked").and_then(|r|r).err()
             .unwrap_or_else(||anyhow::anyhow!("market producer ended before live duration"))),
         result=&mut consumer.0=>Some(result.context("market consumer panicked").and_then(|r|r).err()
             .unwrap_or_else(||anyhow::anyhow!("market consumer ended before live duration"))),
-        result=optional_join(&mut signal_worker)=>Some(result.context("signal worker panicked").and_then(|r|r).err()
-            .unwrap_or_else(||anyhow::anyhow!("signal worker ended before live duration"))),
-        result=optional_join(&mut signal_consumer)=>Some(result.context("signal consumer panicked").and_then(|r|r).err()
-            .unwrap_or_else(||anyhow::anyhow!("signal consumer ended before live duration"))),
+        result=optional_join(&mut signal_worker)=>{
+            signal_worker=None;
+            Some(match result.context("signal worker panicked").and_then(|r|r) {
+                Ok(report)=>{
+                    let error=report.ensure_complete().err();
+                    production_report=Some(report);
+                    error.unwrap_or_else(||anyhow::anyhow!("signal worker ended before live duration"))
+                },Err(error)=>error,
+            })
+        },
+        result=optional_join(&mut signal_consumer)=>{
+            signal_consumer=None;
+            Some(match result.context("signal consumer panicked").and_then(|r|r) {
+                Ok(report)=>{
+                    let error=report.ensure_integrity().err();
+                    signal_report=Some(report);
+                    error.unwrap_or_else(||anyhow::anyhow!("signal consumer ended before live duration"))
+                },Err(error)=>error,
+            })
+        },
         result=&mut graph.0=>Some(result.context("market graph panicked").and_then(|r|r).err()
             .unwrap_or_else(||anyhow::anyhow!("market graph ended before live duration"))),
         result=&mut catalog.0=>Some(result.context("market catalog panicked").and_then(|r|r).err()
@@ -117,7 +156,29 @@ pub async fn run(signals_enabled:bool)->Result<()> {
     };
     stop.send_replace(true);
     drop(rewatch_task);
-    if let Some(error)=early {return Err(error);}
+    if let Some(error)=early {
+        // Close the price source and collect remaining signal diagnostics, without
+        // asking the calculation to wait for consumption or replay dropped events.
+        worker.0.abort();drop(prices);
+        if let Some(task)=signal_worker.as_mut() {
+            match tokio::time::timeout(Duration::from_secs(30),&mut task.0).await
+                .context("signal producer shutdown timeout").and_then(|r|r.context("signal producer panicked")).and_then(|r|r) {
+                Ok(report)=>production_report=Some(report),
+                Err(error)=>evidence["signal_producer_shutdown_error"]=serde_json::json!(format!("{error:#}")),
+            }
+        }
+        drop(signal_output);
+        if let Some(task)=signal_consumer.as_mut() {
+            match tokio::time::timeout(Duration::from_secs(30),&mut task.0).await
+                .context("signal consumer shutdown timeout").and_then(|r|r.context("signal consumer panicked")).and_then(|r|r) {
+                Ok(report)=>signal_report=Some(report),
+                Err(error)=>evidence["signal_consumer_shutdown_error"]=serde_json::json!(format!("{error:#}")),
+            }
+        }
+        evidence["signal_production_report"]=serde_json::to_value(&production_report)?;
+        evidence["signal_report"]=serde_json::to_value(&signal_report)?;
+        return Err(error);
+    }
     // Cancel external producers, then let the sole Registry writer drain their inputs.
     dex.0.abort();jupiter.0.abort();qualification.0.abort();
     let _=tokio::join!(&mut dex.0,&mut jupiter.0,&mut qualification.0);
@@ -125,34 +186,38 @@ pub async fn run(signals_enabled:bool)->Result<()> {
     tokio::time::timeout(Duration::from_secs(10),&mut worker.0).await.context("market producer shutdown timeout")???;
     drop(prices);drop(rpc);
     if let Some(task)=signal_worker.as_mut() {
-        tokio::time::timeout(Duration::from_secs(30),&mut task.0).await.context("signal worker shutdown timeout")???;
+        production_report=Some(tokio::time::timeout(Duration::from_secs(30),&mut task.0).await.context("signal worker shutdown timeout")???);
+        evidence["signal_production_report"]=serde_json::to_value(&production_report)?;
     }
     drop(signal_output);
-    let signal_report=if let Some(task)=signal_consumer.as_mut() {
-        Some(tokio::time::timeout(Duration::from_secs(30),&mut task.0).await.context("signal consumer shutdown timeout")???)
-    }else{None};
+    if let Some(task)=signal_consumer.as_mut() {
+        signal_report=Some(tokio::time::timeout(Duration::from_secs(30),&mut task.0).await.context("signal consumer shutdown timeout")???);
+        evidence["signal_report"]=serde_json::to_value(&signal_report)?;
+    }
     let report=tokio::time::timeout(Duration::from_secs(10),&mut consumer.0).await.context("market consumer shutdown timeout")???;
+    evidence["report"]=serde_json::to_value(&report)?;
     tokio::time::timeout(Duration::from_secs(30),&mut registry_task.0).await.context("market Registry shutdown timeout")???;
     drop(updates);
     tokio::time::timeout(Duration::from_secs(30),&mut graph.0).await.context("market graph shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(10),&mut catalog.0).await.context("market catalog shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(10),&mut rpc_task.0).await.context("market RPC shutdown timeout")???;
     let result=report.ensure_live_evidence(rewatch).and_then(|()| {
-        if let Some(r)=&signal_report {r.ensure_live_evidence()}else{Ok(())}
+        if let Some(r)=&signal_report {
+            production_report.as_ref().context("missing signal producer report")?.ensure_delivery(r)?;
+            r.ensure_live_evidence()
+        }else{Ok(())}
     });
-    let evidence=serde_json::json!({"duration_seconds":duration,"pool_limit":settings.pool_limit,
+    *evidence=serde_json::json!({"run_complete":true,"duration_seconds":duration,"pool_limit":settings.pool_limit,
         "rewatch":rewatch,"persisted_prepared":persisted_prepared,"live_tvl_pools":registry.live_tvl_count(),
         "admission_source":"live_enrichment","live_evidence_passed":result.is_ok(),"report":report,
         "signals_enabled":signals_enabled,"signal_threshold_bps":signal_settings.map(|s|s.threshold_bps),
         "signal_calculation_passed":signal_report.as_ref().map(|r|r.ensure_calculation_evidence().is_ok()),
         "signal_candidate_passed":signal_report.as_ref().map(|r|r.ensure_live_evidence().is_ok()),
-        "signal_report":signal_report,"execution":false,
+        "signal_profile_enabled":signal_settings.map(|s|s.profile),
+        "signal_delivery_passed":production_report.as_ref().zip(signal_report.as_ref()).map(|(p,r)|p.ensure_delivery(r).is_ok()),
+        "signal_production_report":production_report,"signal_report":signal_report,"execution":false,
         "websocket_plan":websocket_plan,
         "error":result.as_ref().err().map(|e|format!("{e:#}"))});
-    println!("{}",serde_json::to_string(&evidence)?);
-    if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH") {
-        std::fs::write(path,serde_json::to_vec_pretty(&evidence)?).context("write market live evidence")?;
-    }
     result?;
     crate::log_event!(Info,"market state live complete=true real_websocket=true graph_consumer=true signals_enabled={signals_enabled}");
     Ok(())

@@ -92,12 +92,20 @@ pub struct SignalEvaluation {
     pub logarithms_prepared: u64,
     /// Generation compilation; zero for ordinary price inputs.
     pub plan_build_ns: u64,
+    /// Route-event construction and allocation, measured per existing calculation block.
+    pub event_build_ns: u64,
+    /// Non-waiting broadcast publication and publication counters, per block.
+    pub publication_ns: u64,
+    /// Wall time suspended at the existing cooperative yields.
+    pub cooperative_yield_ns: u64,
     /// Block enumeration, dense-array calculation and bounded output staging.
     pub calculation_ns: u64,
     /// Evidence construction and publishing; excludes downstream formatting/file IO.
     pub output_ns: u64,
     /// Full processing wall time, including enumeration and cooperative scheduling.
     pub processing_ns: u64,
+    /// Local creation time of this completion marker, before channel publication.
+    pub completed_at_us: u64,
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -81,7 +81,43 @@ Add `-Rewatch` for the existing controlled subscription pause/resume. The existi
 
 The small entry script delegates to `market_state_live.ps1 -Signals`, sharing checkout/build guards and environment restoration. It checks branch, exact HEAD and tracked/untracked status, requires a clean tracked checkout and `cargo build --locked --release` without lockfile changes, then records checkout metadata and parameters. Artifacts are written to `graph_signals_live/<UTC timestamp>/checkout.json`, `worker.log` and `report.json`. Process environment values are restored afterwards. Culture-independent decimal formatting is used for the threshold.
 
-`signal_calculation_passed` requires complete route calculations triggered by real WebSocket observations. `signal_candidate_passed` additionally requires a real WebSocket-triggered positive candidate to reach the consumer. Overall `live_evidence_passed` requires these and the existing Market-State evidence. If the market produces no candidate above the configured threshold, arithmetic can be demonstrated while candidate delivery remains unproven; the report states that distinction and the script does not claim full acceptance. Early task failures may have only a worker log, rather than a completed report.
+`signal_calculation_passed` requires complete route calculations triggered by real WebSocket observations. `signal_candidate_passed` additionally requires a real WebSocket-triggered positive candidate to reach the consumer. Overall `live_evidence_passed` requires these, producer/consumer delivery agreement and the existing Market-State evidence. If the market produces no candidate above the configured threshold, arithmetic can be demonstrated while candidate delivery remains unproven; the report states that distinction and the script does not claim full acceptance. The runner also writes partial reports on returned setup, task and shutdown errors; unavailable worker reports remain null. A crash or forced termination that returns control to the script gets an explicit failed-report placeholder, not invented measurements.
+
+## Output-path profiling checkpoint
+
+The uploaded `adf14a9` run ended with `signal consumer lost 6306 events` before a final report was written. Those were overwritten signal-output events; that message alone does not identify the relative cost of construction, broadcast publication, consumer bookkeeping, console IO or scheduling. This checkpoint measures those existing operations. It does not claim to fix throughput or reach the latency objective.
+
+Run the same large observation scope with explicit profiling enabled:
+
+```powershell
+.\scripts\graph_signals_live.ps1 -DurationSeconds 900 -PoolLimit 10000 -ThresholdBps 0 `
+    -WsProviders "5,6" -WsAccountBudget 30000 -WsConnectionsPerProvider 1 -ProfileSignals
+```
+
+Keep both trace options off. The same limited real arithmetic examples remain visible. The new switch sets `GRAPH_SIGNALS_PROFILE=true` temporarily and records it in `checkout.json`. Default operation still stops on diagnostic receiver lag. With profiling enabled, this receiver counts each `Lagged` notification and continues to the end of the observation period; a price-input gap/lag or calculation error still stops the worker. **Any lost output events invalidate delivery and live acceptance**, even when `run_complete=true`. The script prints report locations and producer/receiver totals before returning failure. It does not replay lost events, mask failure or backpressure the producer.
+
+The producer still publishes individual typed events through the existing 16,384-entry broadcast channel. No receiver acknowledgement, blocking capacity wait, additional channel, output ranking, route filtering or larger queue is introduced. To time construction separately from publication without putting clock reads around every candidate, the existing 256-route block now first constructs its events into a reused vector of at most 256 `Arc` pointers, then sends them in the same order. This changes within-block publication timing and adds bounded staging; it is not an evaluation-wide buffer. Route arithmetic and the set/order of qualifying outputs are preserved. `emitted_at_us` remains the event's creation timestamp and precedes this staging delay.
+
+Inspect the two independent reports:
+
+| Field in `report.json` | Measurement |
+| --- | --- |
+| `signal_production_report.all_inputs` / `.websocket_inputs` | Completed-input distributions recorded directly by the producer, independent of received output events. |
+| `preparation_ns`, `calculation_ns` | Existing preparation and block calculation boundaries. |
+| `event_build_ns` | Route evidence construction, frozen-observation references and event/Arc allocation per nonempty block. |
+| `publication_ns` | Synchronous broadcast sends, publication counters and a queue-depth sample per block; includes contention and any overwritten-event destruction. No receive acknowledgement is awaited. |
+| `cooperative_yield_ns` | Wall time across the existing `yield_now` calls. This includes rescheduling delay, not just the yield instruction's CPU cost. Other preemptions remain included in their enclosing wall-time measurements. |
+| `processing_ns` | Worker acceptance through calculation, output construction/publication and accounting checks; ends before recording producer aggregates and publishing the completion marker. Includes loop overhead and scheduling. |
+| `signal_production_report.catalog_plan_build_ns` | Generation-plan compilation, separated from price-input work. |
+| `signal_report.consumer_bookkeeping_sample_ns` | One event in every 257 received events when profiling; histogram of bookkeeping/checks before JSON/printing. Not a total CPU-time estimate and not the channel receive/select cost. |
+| `signal_report.consumer_formatting_ns` / `.consumer_periodic_logging_ns` | Total wall time in sampled-example JSON/printing and periodic log calls respectively; includes blocking output/console IO. |
+| `signal_report.completion_to_consumer_us` / `.websocket_completion_to_consumer_us` | Completion-marker creation to receiver bookkeeping, including producer aggregate recording, marker allocation/send, queueing and receiver scheduling. Not pure channel latency. |
+| `signal_report.first_lag`, `.lost_events`, `.lag_incidents` | First loss context and all reported output losses. After a loss, consumer counters/timings cover only surviving events; producer completed-input measurements remain available. |
+| `signal_delivery_passed` | Producer completion, zero consumer loss/errors and agreement of published/received events, evaluations and candidates, including WebSocket totals. |
+
+`max_output_queue_depth` is sampled at producer block boundaries, so it is an observed maximum rather than an exact queue high-water mark. Histograms remain fixed-size logarithmic distributions. Component measurements are wall time and carry instrumentation overhead; their percentiles cannot be added to obtain an end-to-end percentile. Baseline ages must be separated from real WebSocket ages. Producer aggregates include completed inputs only; a failed or forcibly aborted evaluation is not represented as a completed one.
+
+`run_complete=false` marks early/setup/shutdown failure; partial reports retain the data that could be collected. Timeout/panic/forced termination can leave a worker report unavailable, and process/file-system failure can prevent persistence. `run_complete=true` establishes that the requested duration and shutdown finished, while `live_evidence_passed` remains a separate check. Upload `checkout.json`, `websocket_plan.json`, `report.json` and `worker.log` even if the script reports failure. The next decision is based on these separated measurements, not an assumed queue or consumer bottleneck. No build or new real run has been demonstrated in the agent environment; Cargo and PowerShell are unavailable here.
 
 Inspect `websocket_scored_by_kind`: a Direct2 observation does not prove the other three forms. Large pool-count performance, unobserved protocol decoders, production-wide runtime composition and the future execution handoff require their own real evidence.
 
