@@ -156,7 +156,6 @@ async fn run(registry:PoolRegistry,rpc:RpcHandle,report:&mut Value)->Result<()> 
     account_control.replace(Vec::new())?;
     let consumed=time::timeout(Duration::from_secs(10),&mut consumer.0).await.context("decode consumer shutdown timed out")???;
     report["phases"]=json!(phases);report["consumer"]=consumed;
-    report["transport"]=rpc.stream_report();
     report["producer"]=produced?;
     report["run_complete"]=json!(phases_result.is_ok());
     phases_result?;
