@@ -43,7 +43,7 @@ $metadata = Join-Path $folder "checkout.json"
 $checkout = @{ branch=$branch; head=$head; status=$status; measured_seconds=$DurationSeconds; pool_limit=$PoolLimit;
     transition_timeout_seconds=$TransitionTimeoutSeconds; input=$runFlag; transport_config="RPC_N_ENV" }
 # ENV provider flags and limits are authoritative. Disable the older aggregate test overrides.
-# No RPC_N_* variable, endpoint, spacing, timeout or connection limit is changed.
+# The file supplies provider values; old shell overrides must not shadow its WS keys.
 $values = @{
     RPC_ACCOUNT_STREAM_ACCOUNTS_PATH=$inputCopy
     RPC_ACCOUNT_STREAM_REPORT_PATH=$report
@@ -61,6 +61,24 @@ foreach ($name in $values.Keys) {
     [Environment]::SetEnvironmentVariable($name,$values[$name],"Process")
 }
 try {
+    $envFile = Join-Path (Get-Location) ".env"
+    $ignoredWsOverrides = @()
+    if (Test-Path -LiteralPath $envFile) {
+        # Read key names only. dotenvy in each child binary still parses all values.
+        foreach ($line in [System.IO.File]::ReadLines($envFile)) {
+            if ($line -match '^\s*(?:export\s+)?(RPC_[1-9][0-9]*_WS_[A-Z0-9_]+)\s*=') {
+                $name = $Matches[1]
+                if (-not $previous.ContainsKey($name)) {
+                    $previous[$name] = [Environment]::GetEnvironmentVariable($name,"Process")
+                    if ($null -ne $previous[$name]) { $ignoredWsOverrides += $name }
+                }
+                [Environment]::SetEnvironmentVariable($name,$null,"Process")
+            }
+        }
+    }
+    $checkout["repository_env_present"] = Test-Path -LiteralPath $envFile
+    $checkout["ignored_ws_process_variables"] = $ignoredWsOverrides
+    Write-Host "WS configuration: repository .env first; ignored inherited overrides=$($ignoredWsOverrides.Count)"
     [System.IO.File]::WriteAllText($metadata,($checkout | ConvertTo-Json -Depth 10),$utf8)
     $binary = Join-Path (Get-Location) "target\release\liq_graph.exe"
     $planText = & $binary --rpc-ws-plan
@@ -100,5 +118,5 @@ try {
         continuing_updates_during_transition | Format-Table | Out-Host
     if ($workerExit -ne 0 -or $evidence.live_evidence_passed -ne $true) { throw "Account-Stream CP1.2 failed. Inspect report.json, preparation.json and worker.log." }
 } finally {
-    foreach ($name in $values.Keys) { [Environment]::SetEnvironmentVariable($name,$previous[$name],"Process") }
+    foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name,$previous[$name],"Process") }
 }

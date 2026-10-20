@@ -25,7 +25,13 @@ are read per provider:
 * `RPC_N_WS_SUBSCRIBE_SPACING_MS`
 * `RPC_N_WS_TIMEOUT_MS` / `RPC_N_WS_RECONNECT_MS`
 
-The script changes no `RPC_N_*` variable. It disables the older global test overrides for its lifetime
+For WS keys declared in the repository `.env`, the runner temporarily removes inherited process
+values so stale PowerShell overrides cannot shadow the file. It reads key names only; dotenvy in
+the child binary parses values. The ignored process key names (never their values) are recorded in
+`checkout.json`. Keys absent from that file retain normal process-environment behavior. All previous
+process values are restored afterward. No provider value in the file is rewritten or increased.
+
+The script disables the older global test overrides for its lifetime
 (`RPC_WS_PROVIDER_SELECTION=configured`, `RPC_WS_ACCOUNT_BUDGET=0`,
 `RPC_WS_CONNECTIONS_PER_PROVIDER=0`) so provider ENV flags and limits are authoritative. Previous
 process variables are restored in `finally`. The effective plan omits URLs/credentials and is saved
@@ -122,5 +128,12 @@ or allocation-free claim.
 Previous Windows evidence: `fbf9269` built successfully and passed a 300-second, 15-account run:
 177/177 locally published/received updates, no gaps/lag, mean 0.097311 ms and maximum 0.181 ms from
 text-read to consumer. That run did not reproduce the earlier disconnect; its cause remains unknown.
-The CP1.2 changes require a new Windows build and real load run. Cargo/Rust and PowerShell are absent
+CP1.2 load acceptance remains pending. Cargo/Rust and PowerShell are absent
 in the editing environment. No formatter, automated test suite, dependencies or lockfile changes.
+
+Uploaded `c85a0b8` evidence: the locked release build succeeded and preparation resolved all 1000
+selected pools into 1500 accounts. Effective capacity was only 24+24, so the run correctly stopped
+before opening subscriptions. Existing process variables take precedence with ordinary dotenvy
+loading; the runner now gives declared repository-file WS keys precedence for this isolated run.
+Capacity must still cover 1500 accounts, for example 1000 per enabled provider when permitted.
+This correction changes only the runner/documentation; its PowerShell execution remains pending.
