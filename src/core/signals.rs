@@ -74,6 +74,10 @@ pub struct SignalEvaluation {
     pub graph_generation: u64,
     pub trigger: Arc<SignalTrigger>,
     pub groups_visited: u64,
+    /// Full group combinations the former enumerator would have visited.
+    pub combinations_available: u64,
+    /// Analytical affected-route count from the compiled pool-role bindings.
+    pub routes_expected: u64,
     pub combinations_visited: u64,
     pub routes_affected: u64,
     pub routes_scored: u64,
@@ -83,7 +87,12 @@ pub struct SignalEvaluation {
     pub scored_by_kind: std::collections::BTreeMap<&'static str, u64>,
     pub price_queue_depth: usize,
     pub account_to_worker_us: Option<u64>,
-    /// Lookup, direction resolution, logarithms and complete sum, for every affected route.
+    /// Parsing, identity validation, directional weights and storage for this input.
+    pub price_preparation_ns: u64,
+    pub logarithms_prepared: u64,
+    /// Generation compilation; zero for ordinary price inputs.
+    pub plan_build_ns: u64,
+    /// Block enumeration, dense-array calculation and bounded output staging.
     pub calculation_ns: u64,
     /// Evidence construction and publishing; excludes downstream formatting/file IO.
     pub output_ns: u64,

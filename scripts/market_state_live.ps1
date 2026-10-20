@@ -104,7 +104,14 @@ try {
     if ($evidence.live_evidence_passed -ne $true) { throw "Live evidence requirements were not fulfilled." }
     if ($Signals) {
         if ($evidence.signal_calculation_passed -ne $true -or $evidence.signal_candidate_passed -ne $true) { throw "No complete live signal proof; inspect signal_report and worker.log." }
-        Write-Host "Graph-Signals reference live evidence passed. Review per-kind coverage and timing histograms in report.json."
+        $signalReport = $evidence.signal_report
+        if ($signalReport.execution_layout -ne "indexed_role_plan_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
+        if ($signalReport.combinations_visited -ne $signalReport.routes_expected -or
+            $signalReport.routes_affected -ne $signalReport.routes_expected -or
+            $signalReport.logarithms_prepared -ne $signalReport.price_evaluations -or
+            $signalReport.websocket_combinations_visited -ne $signalReport.websocket_routes_expected -or
+            $signalReport.websocket_logarithms_prepared -ne $signalReport.websocket_evaluations) { throw "Indexed signal accounting failed; inspect signal_report." }
+        Write-Host "Graph-Signals indexed plan live evidence passed. Review per-kind coverage and complete latency in report.json."
     } else {
         Write-Host "Market-State live evidence passed. Review per-venue coverage in report.json before accepting the checkpoint."
     }
