@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, watch};
 use crate::core::{market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin},
-    signals::{RouteEvaluation, SignalEvaluation, SignalEvent, SignalLeg, SignalStream, SignalTrigger}};
+    signals::{RouteEvaluation, SignalEvaluation, SignalEvent, SignalLeg, SignalLegs, SignalStream, SignalTrigger}};
 use super::{graph_liquidity::{Group, GroupKind}, graph_watch_catalog::WatchCatalog};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
@@ -55,13 +55,10 @@ fn account_age(trigger: &SignalTrigger, at: u64) -> Option<u64> {
     }
 }
 
-struct CachedPrice { event: Arc<MarketStateEvent>, base: Pubkey, quote: Pubkey, a: Pubkey, b: Pubkey }
+struct CachedPrice { observation: Arc<PoolPriceObservation>, base: Pubkey, quote: Pubkey, a: Pubkey, b: Pubkey }
 impl CachedPrice {
-    fn observation(&self) -> &PoolPriceObservation {
-        match self.event.as_ref() { MarketStateEvent::Price(p) => p, _ => unreachable!() }
-    }
-    fn new(event: Arc<MarketStateEvent>) -> Result<(Pubkey, Self)> {
-        let MarketStateEvent::Price(p) = event.as_ref() else { bail!("expected pool price"); };
+    fn observation(&self) -> &PoolPriceObservation { &self.observation }
+    fn new(p: &PoolPriceObservation) -> Result<(Pubkey, Self)> {
         let pool: Pubkey = p.pool.parse().context("signal pool address")?;
         let base: Pubkey = p.base_mint.parse().context("signal base mint")?;
         let quote: Pubkey = p.quote_mint.parse().context("signal quote mint")?;
@@ -71,7 +68,10 @@ impl CachedPrice {
             "price mint orientation mismatch for {pool}");
         ensure!(p.price_quote_per_base.is_finite() && p.price_quote_per_base > 0.0,
             "nonpositive/nonfinite indicative price for {pool}");
-        Ok((pool, Self { event, base, quote, a, b }))
+        // Copy the incoming payload once per accepted price, never once per route.
+        // Replacing this cache entry cannot change observations held by consumers.
+        let observation = Arc::new(p.clone());
+        Ok((pool, Self { observation, base, quote, a, b }))
     }
     fn check_catalog(&self, pool: Pubkey, catalog: &WatchCatalog) -> Result<()> {
         if let Some(w) = catalog.for_pool(pool) {
@@ -142,17 +142,19 @@ impl Engine {
         let sample_count = if live { self.websocket_samples } else { self.samples };
         if qualifies || sample_count < self.settings.sample_limit {
             let started = Instant::now();
-            let mut legs = Vec::with_capacity(pools.len());
-            for (i, pool) in pools.iter().enumerate() {
-                legs.push(SignalLeg { input_mint: mints[i].to_string(), output_mint: mints[i + 1].to_string(),
-                    indicative_rate: scored.rates[i], negative_log_weight: scored.weights[i],
-                    observation: self.prices[pool].observation().clone() });
-            }
+            let leg = |i: usize| SignalLeg { input_mint: mints[i], output_mint: mints[i + 1],
+                indicative_rate: scored.rates[i], negative_log_weight: scored.weights[i],
+                observation: Arc::clone(&self.prices[&pools[i]].observation) };
+            let legs = match pools.len() {
+                2 => SignalLegs::Two(std::array::from_fn(leg)),
+                3 => SignalLegs::Three(std::array::from_fn(leg)),
+                4 => SignalLegs::Four(std::array::from_fn(leg)),
+                _ => unreachable!("calculate validated the route length"),
+            };
             self.sequence += 1;
             let mut route = RouteEvaluation { sequence: self.sequence, graph_generation: stats.graph_generation,
-                group_id: id, trigger: stats.trigger.clone(), settlement: g.settlement.to_string(),
-                target: g.target.to_string(), bridge: g.bridge.map(|p| p.to_string()),
-                conversion_pool: g.conversion.map(|p| p.to_string()), legs,
+                group_id: id, trigger: Arc::clone(&stats.trigger), settlement: g.settlement,
+                target: g.target, bridge: g.bridge, conversion_pool: g.conversion, legs,
                 negative_log_sum: scored.sum, indicative_return_bps: scored.bps,
                 threshold_bps: self.settings.threshold_bps, qualifies, emitted_at_us: 0,
                 account_to_emitted_us: None };
@@ -173,7 +175,7 @@ impl Engine {
         let ids: Vec<u32> = if let Some(pool) = changed { catalog.graph.for_pool(pool).to_vec() }
             else { (0..catalog.graph.groups.len()).map(|i| i as u32).collect() };
         let mut stats = SignalEvaluation { sequence: 0, graph_generation: catalog.generation,
-            account_to_worker_us: account_age(&trigger, received_at_us), trigger,
+            account_to_worker_us: account_age(&trigger, received_at_us), trigger: Arc::new(trigger),
             groups_visited: 0, combinations_visited: 0, routes_affected: 0, routes_scored: 0,
             routes_missing_prices: 0, routes_nonfinite: 0, candidates: 0, scored_by_kind: kinds(),
             price_queue_depth, calculation_ns: 0, output_ns: 0, processing_ns: 0 };
@@ -229,7 +231,7 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
         threshold_log: -(settings.threshold_bps / 10_000.0).ln_1p() };
     let mut current = catalogs.borrow_and_update().clone();
     let mut catalog_open = true;
-    crate::log_event!(Info, "graph signals started=true reference=true threshold_bps={} execution=false", settings.threshold_bps);
+    crate::log_event!(Info, "graph signals started=true reference=true output_layout=shared_fixed_legs_v1 threshold_bps={} execution=false", settings.threshold_bps);
     loop { tokio::select! {
         change = catalogs.changed(), if catalog_open => {
             if change.is_err() { catalog_open = false; continue; }
@@ -247,10 +249,10 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
             Ok(event) => match event.as_ref() {
                 MarketStateEvent::Price(p) => {
                     let started = Instant::now(); let received_at_us = now_us();
-                    let trigger = SignalTrigger::Price { pool: p.pool.clone(), sequence: p.sequence,
-                        origin: p.origin, received_at_us: p.received_at_us };
-                    let (pool, price) = CachedPrice::new(event.clone())?;
+                    let (pool, price) = CachedPrice::new(p)?;
                     price.check_catalog(pool, &current)?;
+                    let trigger = SignalTrigger::Price { pool, sequence: p.sequence,
+                        origin: p.origin, received_at_us: p.received_at_us };
                     engine.prices.insert(pool, price);
                     engine.evaluate(current.clone(), trigger, Some(pool), input.len(), started, received_at_us).await?;
                 },
@@ -325,14 +327,19 @@ pub struct Timing { count: u64, min: Option<u64>, max: Option<u64>, mean: Option
     p50_upper_bound: Option<u64>, p95_upper_bound: Option<u64>, p99_upper_bound: Option<u64> }
 #[derive(serde::Serialize)]
 pub struct ObservationReport {
+    pub output_layout: &'static str,
     pub evaluation_events: u64, pub price_evaluations: u64, pub websocket_evaluations: u64,
     pub catalog_evaluations: u64, pub combinations_visited: u64, pub routes_affected: u64,
     pub groups_visited: u64, pub max_groups_per_input: u64, pub max_routes_per_input: u64,
     pub routes_scored: u64, pub websocket_routes_scored: u64, pub routes_missing_prices: u64,
     pub routes_nonfinite: u64, pub candidates: u64, pub websocket_candidates: u64,
+    pub candidate_leg_references: u64,
     pub invalidations: u64, pub max_price_queue_depth: usize, pub max_signal_queue_depth: usize,
     pub scored_by_kind: BTreeMap<&'static str, u64>, pub websocket_scored_by_kind: BTreeMap<&'static str, u64>,
     pub calculation_ns_per_input: Timing, pub output_ns_per_input: Timing,
+    pub websocket_calculation_ns_per_input: Timing, pub websocket_output_ns_per_input: Timing,
+    pub websocket_processing_ns_per_input: Timing,
+    pub websocket_account_to_worker_us: Timing, pub websocket_account_to_evaluation_consumer_us: Timing,
     pub processing_ns_per_input: Timing, pub account_to_worker_us: Timing,
     pub account_to_candidate_us: Timing, pub account_to_consumer_us: Timing,
     pub consumer_formatting_ns: u64,
@@ -357,15 +364,20 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     let mut groups = 0_u64; let mut max_groups = 0_u64; let mut max_routes = 0_u64;
     let mut missing = 0; let mut nonfinite = 0; let mut candidates = 0; let mut ws_candidates = 0;
     let mut expected_candidates = 0;
+    let mut candidate_legs = 0_u64;
     let mut invalidations = 0_u64; let mut input_max = 0_usize; let mut output_max = 0_usize;
     let mut by_kind = kinds(); let mut ws_by_kind = kinds();
     let mut calculate = Histogram::default(); let mut output = Histogram::default(); let mut process = Histogram::default();
+    let mut ws_calculate = Histogram::default(); let mut ws_output = Histogram::default(); let mut ws_process = Histogram::default();
+    let mut ws_worker_age = Histogram::default(); let mut ws_evaluation_consumer_age = Histogram::default();
     let mut worker_age = Histogram::default(); let mut candidate_age = Histogram::default(); let mut consumer_age = Histogram::default();
     let mut format_ns = 0_u64;
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     loop { tokio::select! {
         _ = ticker.tick() => {
             crate::log_event!(Info, "graph signals consumer reference=true evaluations={evaluations} ws_evaluations={ws_evaluations} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} max_price_queue={input_max} max_signal_queue={output_max}");
+            crate::log_event!(Info, "graph signals timings output_layout=shared_fixed_legs_v1 ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
+                ws_output.report().mean, ws_process.report().mean, ws_process.report().max, ws_evaluation_consumer_age.report().max);
         },
         event = input.recv() => match event {
             Ok(event) => {
@@ -373,6 +385,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                 let print = match event.as_ref() {
                     SignalEvent::Candidate(route) => {
                         candidates += 1; if websocket(&route.trigger) { ws_candidates += 1; }
+                        candidate_legs += route.legs.as_slice().len() as u64;
                         if let Some(age) = route.account_to_emitted_us { candidate_age.add(age); }
                         if let Some(age) = account_age(&route.trigger, now_us()) { consumer_age.add(age); }
                         settings.trace || candidates <= settings.sample_limit as u64
@@ -382,16 +395,24 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                     SignalEvent::Invalidated { .. } => { invalidations += 1; settings.trace || invalidations <= settings.sample_limit as u64 },
                     SignalEvent::Evaluated(e) => {
                         evaluations += 1;
-                        match &e.trigger {
+                        match e.trigger.as_ref() {
                             SignalTrigger::Price { .. } => price_evaluations += 1,
                             SignalTrigger::Catalog { .. } => catalog_evaluations += 1,
                         }
-                        if websocket(&e.trigger) { ws_evaluations += 1; ws_scored += e.routes_scored; }
+                        if websocket(&e.trigger) {
+                            ws_evaluations += 1; ws_scored += e.routes_scored;
+                            ws_calculate.add(e.calculation_ns); ws_output.add(e.output_ns); ws_process.add(e.processing_ns);
+                            if let Some(age) = e.account_to_worker_us { ws_worker_age.add(age); }
+                            // This marker follows every candidate for the input. Its receipt
+                            // includes producer work and output queue/consumer work, even if no candidate qualified.
+                            if let Some(age) = account_age(&e.trigger, now_us()) { ws_evaluation_consumer_age.add(age); }
+                        }
                         combinations += e.combinations_visited; affected += e.routes_affected;
                         groups += e.groups_visited;
                         max_groups = max_groups.max(e.groups_visited); max_routes = max_routes.max(e.routes_affected);
                         scored += e.routes_scored; missing += e.routes_missing_prices; nonfinite += e.routes_nonfinite;
                         expected_candidates += e.candidates;
+                        ensure!(candidates == expected_candidates, "signal candidate accounting mismatch at evaluation {}", e.sequence);
                         input_max = input_max.max(e.price_queue_depth);
                         for (&k, &n) in &e.scored_by_kind {
                             *by_kind.entry(k).or_default() += n;
@@ -415,13 +436,18 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     }}
     ensure!(candidates == expected_candidates, "signal candidate consumer accounting mismatch");
     crate::log_event!(Info, "graph signals consumer complete=true routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates}");
-    Ok(ObservationReport { evaluation_events: evaluations, price_evaluations, websocket_evaluations: ws_evaluations,
+    Ok(ObservationReport { output_layout: "shared_fixed_legs_v1",
+        evaluation_events: evaluations, price_evaluations, websocket_evaluations: ws_evaluations,
         catalog_evaluations, combinations_visited: combinations, routes_affected: affected, routes_scored: scored,
         groups_visited: groups, max_groups_per_input: max_groups, max_routes_per_input: max_routes,
         websocket_routes_scored: ws_scored, routes_missing_prices: missing, routes_nonfinite: nonfinite,
-        candidates, websocket_candidates: ws_candidates, invalidations, max_price_queue_depth: input_max,
+        candidates, websocket_candidates: ws_candidates, candidate_leg_references: candidate_legs,
+        invalidations, max_price_queue_depth: input_max,
         max_signal_queue_depth: output_max, scored_by_kind: by_kind, websocket_scored_by_kind: ws_by_kind,
         calculation_ns_per_input: calculate.report(), output_ns_per_input: output.report(), processing_ns_per_input: process.report(),
+        websocket_calculation_ns_per_input: ws_calculate.report(), websocket_output_ns_per_input: ws_output.report(),
+        websocket_processing_ns_per_input: ws_process.report(), websocket_account_to_worker_us: ws_worker_age.report(),
+        websocket_account_to_evaluation_consumer_us: ws_evaluation_consumer_age.report(),
         account_to_worker_us: worker_age.report(), account_to_candidate_us: candidate_age.report(),
         account_to_consumer_us: consumer_age.report(), consumer_formatting_ns: format_ns })
 }

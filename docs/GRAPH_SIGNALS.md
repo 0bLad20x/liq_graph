@@ -49,7 +49,7 @@ The calculation uses the existing indicative price only, including the current M
 - `Evaluated`: one accounting/measurement event per complete price or catalog evaluation.
 - `Invalidated`: loss of pool coverage or replacement of the graph generation. Candidates are event observations, not durable execution approvals.
 
-The consumer counts all events. By default it prints the first 16 candidates and input evaluations plus the first 16 of each triggered by WebSocket; nonqualifying route samples are limited to 16 per trigger category, and invalidations to the first 16. This keeps actual live examples visible after initial baselines. `-TraceSignals` prints all emitted events; it does not expand nonqualifying route sampling. Terminal/file IO is measured separately from worker publishing. Candidate production and per-route evidence allocation still contribute to worker output cost.
+The consumer counts all events. By default it prints the first 16 candidates and input evaluations plus the first 16 of each triggered by WebSocket; nonqualifying route samples are limited to 16 per trigger category, and invalidations to the first 16. This keeps actual live examples visible after initial baselines. `-TraceSignals` prints all emitted events; it does not expand nonqualifying route sampling. Terminal/file IO is measured separately from worker publishing. Candidate construction, reference-count operations and per-event publishing still contribute to worker output cost.
 
 The final `signal_report` includes:
 
@@ -58,6 +58,8 @@ The final `signal_report` includes:
 - calculation, evidence/publishing and total processing nanoseconds per input;
 - local account receipt to worker receipt, candidate creation and diagnostic consumer receipt in microseconds;
 - diagnostic formatting/output wall time.
+
+The report also separates calculation, output and processing timings for WebSocket-triggered inputs (`websocket_calculation_ns_per_input`, `websocket_output_ns_per_input`, `websocket_processing_ns_per_input`). `websocket_account_to_worker_us` measures age when the signal worker accepts the input. `websocket_account_to_evaluation_consumer_us` measures age when the consumer receives that input's completion marker, after all its candidates have reached the same consumer. The latter includes preceding queue wait and worker processing; it is not pure output-channel latency. Zero-candidate inputs are included. Periodic timing lines retain WebSocket output/processing means and maximum processing/completion ages in `worker.log` even if shutdown later fails before writing the report. Candidate counts are checked at every completion marker as well as at shutdown. `candidate_leg_references` counts all delivered candidate legs, including references to older frozen observations.
 
 Timing histograms have bounded memory and logarithmic buckets. `p50_upper_bound`, `p95_upper_bound` and `p99_upper_bound` are bucket upper bounds, not exact percentiles. Min/max/mean are recorded. Processing time includes identity joining, enumeration, cooperative scheduling and publishing. Calculation time includes per-route lookups, direction resolution, logs and sums; it excludes evidence construction and downstream output. Summing many short measurements adds measurement overhead, which is retained in this reference implementation.
 
@@ -81,7 +83,25 @@ The small entry script delegates to `market_state_live.ps1 -Signals`, sharing ch
 
 Inspect `websocket_scored_by_kind`: a Direct2 observation does not prove the other three forms. Large pool-count performance, unobserved protocol decoders, production-wide runtime composition and the future execution handoff require their own real evidence.
 
-The uploaded 600-second run at `2ecb489ad28f8474d23695e17eed08329fd3ba94` established the Direct2 dataflow with 16 selected pools, 32 active accounts, 17 WebSocket price events, 34 complete WebSocket-triggered route calculations and 17 WebSocket-triggered candidates at the consumer. All 64 printed route calculations were independently recomputed without a mismatch. The other three route shapes were not price-covered. This is the baseline evidence; the expanded provider configuration below still requires its own local build and live run.
+The uploaded 600-second run at `2ecb489ad28f8474d23695e17eed08329fd3ba94` established the Direct2 dataflow with 16 selected pools, 32 active accounts, 17 WebSocket price events, 34 complete WebSocket-triggered route calculations and 17 WebSocket-triggered candidates at the consumer. All 64 printed route calculations were independently recomputed without a mismatch. The other three route shapes were not price-covered.
+
+The subsequent uploaded run at `cf5f553b419fa07c3c04033ed539dc14e10001ed` used only RPC 5/6 and reached 5,100 selected pools and 9,706 active account subscriptions. Its printed WebSocket evaluation counters covered all four route shapes. Market-State produced 8,851 WebSocket price observations; the last signal-consumer log accounted for only 2,516 completed WebSocket evaluations, with an observed maximum price queue depth of 6,805. Shutdown failed at the unchanged 30-second signal-worker deadline, so there was no successful final report or large-load acceptance. One printed evaluation visited 488,668 combinations, scored 80,092 routes and emitted 40,046 candidates: 27.5287 ms calculation, 172.8301 ms output, 299.3262 ms total processing. These are one input's measurements, not whole-run averages. The 64 printed full route examples were independently recomputed without a mismatch.
+
+## Output optimization checkpoint 1
+
+`signal_report.output_layout` and the worker startup log identify `shared_fixed_legs_v1`:
+
+- The signal worker owns one immutable `Arc<PoolPriceObservation>` snapshot per accepted Price input. The incoming observation is copied once when joining the price cache, not once per candidate leg. Total per-input processing time includes that copy. Replacing/removing the cached price or changing the catalog cannot mutate or invalidate an observation already held by an emitted route; reference counts release it after the cache, output channel and consumers no longer hold it.
+- Every route and the completion marker share one immutable trigger per input evaluation. Group generation, IDs, numeric values and binary group addresses remain self-contained in the output; no Registry/DB access is needed to interpret it.
+- Route mint/context addresses are `Pubkey` values internally. The existing JSON serializers format Base58 only when the diagnostic consumer actually serializes a selected example. Price-observation metadata retains its existing representation and values.
+- `SignalLegs::Two/Three/Four` hold fixed arrays inline; candidate construction allocates no leg vector. Their untagged serialization preserves the previous `legs` JSON array with exactly 2, 3 or 4 entries. Shared triggers/observations serialize to the same JSON objects and addresses remain strings.
+- Each qualifying candidate is still published immediately as its own typed event. There is no whole-evaluation buffer, batch wait, candidate suppression, additional lookup service or legacy output path. One event allocation and channel publication per candidate remain part of this checkpoint's cost.
+
+This changes only `core/signals.rs` and `workers/graph_signals.rs` plus this documentation. Enumeration, per-route lookup/logarithms/sum/threshold, yields, invalidations, sample limits, provider settings, Market-State decoding and shutdown deadlines remain as before. Registry ownership and the Core / Workers / Orchestration boundaries remain unchanged. There are no new dependencies or lockfile changes.
+
+For a scoped load comparison, repeat the RPC 5/6 command below with the same pool limit, account budget, duration and 0-bps threshold; leave `-TraceSignals` and `-TracePrices` off. Upload `checkout.json`, `websocket_plan.json`, `report.json` and `worker.log` from that run. A successful locked build and real consumer delivery are required before acceptance. Inspect WebSocket-only timings, route/candidate counts and queues together, and require clean completion without lag or timeout. A shorter output time alone does not establish a shorter complete pipeline. Different live inputs do not prove a numerical speedup on identical work. The overall 1-2 ms objective is not an acceptance claim for this change.
+
+The agent environment has no Cargo/Rust compiler or PowerShell, RPC credentials or database access. This revision is prepared for the existing local locked-build-gated runner; compilation and live performance remain unverified until it is run there. No test suites or formatting checks are added.
 
 ## Larger observation scope and provider selection
 

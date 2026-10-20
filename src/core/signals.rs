@@ -1,20 +1,43 @@
 //! Indicative route evaluation output. No execution requests or admission policy.
+use std::sync::Arc;
+use solana_pubkey::Pubkey;
 use super::market_state::{PoolPriceObservation, PriceOrigin};
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalTrigger {
-    Price { pool: String, sequence: u64, origin: PriceOrigin, received_at_us: u64 },
+    Price {
+        #[serde(with = "super::execution::pubkey_json")]
+        pool: Pubkey,
+        sequence: u64, origin: PriceOrigin, received_at_us: u64,
+    },
     Catalog { generation: u64 },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SignalLeg {
-    pub input_mint: String,
-    pub output_mint: String,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub input_mint: Pubkey,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub output_mint: Pubkey,
     pub indicative_rate: f64,
     pub negative_log_weight: f64,
-    pub observation: PoolPriceObservation,
+    /// Frozen observation shared by every route using this exact pool update.
+    pub observation: Arc<PoolPriceObservation>,
+}
+
+/// At most four legs, stored inline. JSON remains an array of exactly 2/3/4 legs.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum SignalLegs {
+    Two([SignalLeg; 2]),
+    Three([SignalLeg; 3]),
+    Four([SignalLeg; 4]),
+}
+impl SignalLegs {
+    pub fn as_slice(&self) -> &[SignalLeg] {
+        match self { Self::Two(v) => v, Self::Three(v) => v, Self::Four(v) => v }
+    }
 }
 
 /// One concrete directed roundtrip, not an amount-dependent quote or packed job.
@@ -24,12 +47,17 @@ pub struct RouteEvaluation {
     pub sequence: u64,
     pub graph_generation: u64,
     pub group_id: u32,
-    pub trigger: SignalTrigger,
-    pub settlement: String,
-    pub target: String,
-    pub bridge: Option<String>,
-    pub conversion_pool: Option<String>,
-    pub legs: Vec<SignalLeg>,
+    /// One immutable trigger per input evaluation, shared with its route outputs.
+    pub trigger: Arc<SignalTrigger>,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub settlement: Pubkey,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub target: Pubkey,
+    #[serde(with = "super::execution::optional_pubkey_json")]
+    pub bridge: Option<Pubkey>,
+    #[serde(with = "super::execution::optional_pubkey_json")]
+    pub conversion_pool: Option<Pubkey>,
+    pub legs: SignalLegs,
     pub negative_log_sum: f64,
     pub indicative_return_bps: f64,
     pub threshold_bps: f64,
@@ -44,7 +72,7 @@ pub struct RouteEvaluation {
 pub struct SignalEvaluation {
     pub sequence: u64,
     pub graph_generation: u64,
-    pub trigger: SignalTrigger,
+    pub trigger: Arc<SignalTrigger>,
     pub groups_visited: u64,
     pub combinations_visited: u64,
     pub routes_affected: u64,
