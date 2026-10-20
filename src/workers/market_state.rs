@@ -1,7 +1,5 @@
 //! Indicative market state: Prepared pool inputs -> account watches -> typed prices.
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
-mod live;
-pub use live::decode_live;
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
