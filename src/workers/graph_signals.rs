@@ -5,8 +5,8 @@ use std::{collections::{BTreeMap, HashMap}, env, sync::Arc,
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, watch};
-use crate::core::{market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin},
-    signals::{RouteEvaluation, SignalEvaluation, SignalEvent, SignalLeg, SignalLegs, SignalStream, SignalTrigger}};
+use crate::core::{market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin, PricePipelineTiming},
+    signals::{SignalEvaluation, SignalEvent, SignalLeg, SignalRouteRow, SignalRouteBlock, SIGNAL_BLOCK_ROWS, SignalStream, SignalTrigger}};
 use super::{graph_liquidity::GroupKind, graph_watch_catalog::WatchCatalog};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
@@ -57,6 +57,9 @@ fn account_age(trigger: &SignalTrigger, at: u64) -> Option<u64> {
 const EXECUTION_LAYOUT: &str = "indexed_role_plan_v1";
 const BLOCK_ROUTES: usize = 256;
 const YIELD_ROUTES: u64 = 4096;
+const OUTPUT_LAYOUT: &str = "compact_route_blocks_v1";
+// At most 256 * 64 = 16,384 retained route rows, without enlarging the old row budget.
+pub const OUTPUT_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy)]
 enum PriceState { Missing, Nonfinite, Available }
@@ -287,18 +290,20 @@ enum Calculation { Missing, Nonfinite, Scored(Scored) }
 struct Pending { slots: [usize; 4], reverse: bool, scored: Scored }
 struct Work {
     stats: SignalEvaluation, by_kind: [u64; 4], pending: Vec<Pending>,
-    ready: Vec<Arc<SignalEvent>>, last_yield: u64,
+    last_yield: u64,
 }
-struct InputTiming { started: Instant, received_us: u64, preparation_ns: u64, logarithms: u64, plan_ns: u64 }
+struct InputTiming { started: Instant, received_us: u64, preparation_ns: u64, logarithms: u64, plan_ns: u64,
+    pipeline:Option<PricePipelineTiming> }
 struct Engine {
     prices: Prices, output: broadcast::Sender<Arc<SignalEvent>>, scratch: Vec<Pending>,
-    ready: Vec<Arc<SignalEvent>>, production: ProductionReport,
+    block_slots:Vec<(u64,u16)>, block_epoch:u64, production: ProductionReport,
     settings: Settings, sequence: u64, samples: usize, websocket_samples: usize, threshold_log: f64,
 }
 impl Engine {
     fn publish(&mut self, event: Arc<SignalEvent>) -> Result<()> {
         self.output.send(event).map_err(|_| anyhow::anyhow!("signal output has no consumer"))?;
         self.production.published_events += 1;
+        self.production.max_output_queue_depth=self.production.max_output_queue_depth.max(self.output.len());
         Ok(())
     }
     fn emit(&mut self, event: SignalEvent) -> Result<()> { self.publish(Arc::new(event)) }
@@ -342,47 +347,48 @@ impl Engine {
             }
             work.stats.calculation_ns = work.stats.calculation_ns.saturating_add(nanos(started));
             if before == work.stats.combinations_visited { break; }
-            if !work.pending.is_empty() {
+            for pending in work.pending.chunks(SIGNAL_BLOCK_ROWS) {
                 let started = Instant::now();
-                for pending in work.pending.drain(..) {
-                    let leg = |i: usize| {
+                self.block_epoch += 1;
+                let mut block = SignalRouteBlock { graph_generation: work.stats.graph_generation,
+                    group_id: id as u32, trigger: work.stats.trigger.clone(), settlement: group.settlement,
+                    target: group.target, bridge: group.bridge, conversion_pool: group.conversion,
+                    emitted_at_us:now_us(), threshold_bps: self.settings.threshold_bps, leg_count: N,
+                    legs: Vec::with_capacity(pending.len() * N), rows: Vec::with_capacity(pending.len()) };
+                for pending in pending {
+                    let mut leg_indices = [0; 4];
+                    for (i, entry) in leg_indices[..N].iter_mut().enumerate() {
                         let slot = pending.slots[i];
-                        let input = if pending.reverse { N - i } else { i };
-                        let output = if pending.reverse { N - i - 1 } else { i + 1 };
-                        SignalLeg { input_mint: compiled.mints[input], output_mint: compiled.mints[output],
-                            indicative_rate: self.prices.rates[slot], negative_log_weight: self.prices.weights[slot],
-                            observation: Arc::clone(self.prices.observations[slot / 2].as_ref().expect("scored pool observation")) }
-                    };
-                    let legs = match N {
-                        2 => SignalLegs::Two(std::array::from_fn(leg)),
-                        3 => SignalLegs::Three(std::array::from_fn(leg)),
-                        4 => SignalLegs::Four(std::array::from_fn(leg)),
-                        _ => unreachable!("compiled route length"),
-                    };
-                    self.sequence += 1;
-                    let emitted_at_us = now_us();
-                    let qualifies = pending.scored.sum < self.threshold_log;
-                    let route = RouteEvaluation { sequence: self.sequence, graph_generation: work.stats.graph_generation,
-                        group_id: id as u32, trigger: Arc::clone(&work.stats.trigger), settlement: group.settlement,
-                        target: group.target, bridge: group.bridge, conversion_pool: group.conversion, legs,
-                        negative_log_sum: pending.scored.sum, indicative_return_bps: pending.scored.bps,
-                        threshold_bps: self.settings.threshold_bps, qualifies, emitted_at_us,
-                        account_to_emitted_us: account_age(&work.stats.trigger, emitted_at_us) };
-                    if qualifies { work.ready.push(Arc::new(SignalEvent::Candidate(route))); }
-                    else {
-                        if live { self.websocket_samples += 1; } else { self.samples += 1; }
-                        work.ready.push(Arc::new(SignalEvent::RouteSample(route)));
+                        if self.block_slots[slot].0 != self.block_epoch {
+                            let input = if pending.reverse { N - i } else { i };
+                            let output = if pending.reverse { N - i - 1 } else { i + 1 };
+                            let index = block.legs.len() as u16;
+                            block.legs.push(SignalLeg { input_mint: compiled.mints[input], output_mint: compiled.mints[output],
+                                indicative_rate: self.prices.rates[slot], negative_log_weight: self.prices.weights[slot],
+                                observation: self.prices.observations[slot / 2].as_ref().expect("scored pool observation").clone() });
+                            self.block_slots[slot] = (self.block_epoch, index);
+                        }
+                        *entry = self.block_slots[slot].1;
                     }
+                    self.sequence += 1;
+                    let qualifies = pending.scored.sum < self.threshold_log;
+                    if !qualifies { if live { self.websocket_samples += 1; } else { self.samples += 1; } }
+                    block.rows.push(SignalRouteRow { sequence: self.sequence, leg_indices,
+                        negative_log_sum: pending.scored.sum, indicative_return_bps: pending.scored.bps,
+                        qualifies });
                 }
+                let rows = block.rows.len() as u64;
+                let event = Arc::new(SignalEvent::Routes(block));
                 let built = nanos(started);
                 let publishing = Instant::now();
-                for event in work.ready.drain(..) { self.publish(event)?; }
-                self.production.max_output_queue_depth = self.production.max_output_queue_depth.max(self.output.len());
+                self.publish(event)?;
+                self.production.published_route_rows += rows;
                 let published = nanos(publishing);
                 work.stats.event_build_ns = work.stats.event_build_ns.saturating_add(built);
                 work.stats.publication_ns = work.stats.publication_ns.saturating_add(published);
                 work.stats.output_ns = work.stats.output_ns.saturating_add(built.saturating_add(published));
             }
+            work.pending.clear();
             if work.stats.combinations_visited - work.last_yield >= YIELD_ROUTES {
                 let started = Instant::now();
                 tokio::task::yield_now().await;
@@ -420,6 +426,7 @@ impl Engine {
         changed: Option<usize>, price_queue_depth: usize, timing: InputTiming) -> Result<()> {
         let mut work = Work { stats: SignalEvaluation { sequence: 0, graph_generation: plan.catalog.generation,
             account_to_worker_us: account_age(&trigger, timing.received_us), trigger: Arc::new(trigger),
+            worker_received_at_us:timing.received_us,price_pipeline:timing.pipeline,
             groups_visited: 0, combinations_available: 0, routes_expected: 0, combinations_visited: 0,
             routes_affected: 0, routes_scored: 0, routes_missing_prices: 0, routes_nonfinite: 0,
             candidates: 0, scored_by_kind: kinds(), price_queue_depth,
@@ -427,7 +434,8 @@ impl Engine {
             plan_build_ns: timing.plan_ns, event_build_ns: 0, publication_ns: 0,
             cooperative_yield_ns: 0, calculation_ns: 0, output_ns: 0, processing_ns: 0, completed_at_us: 0 },
             by_kind: [0; 4], pending: std::mem::take(&mut self.scratch),
-            ready: std::mem::take(&mut self.ready), last_yield: 0 };
+            last_yield: 0 };
+        self.block_slots.resize(self.prices.rates.len(), (0, 0));
         if let Some(pool) = changed {
             for binding in plan.for_pool(pool) {
                 self.group(binding.group, binding.affected, &plan, &mut work).await?;
@@ -442,7 +450,7 @@ impl Engine {
         for (name, count) in ["direct_2", "direct_3", "triangle_3", "triangle_4"].into_iter().zip(work.by_kind) {
             stats.scored_by_kind.insert(name, count);
         }
-        self.scratch = work.pending; self.ready = work.ready;
+        self.scratch = work.pending;
         self.sequence += 1; stats.sequence = self.sequence; stats.processing_ns = nanos(timing.started);
         stats.completed_at_us = now_us();
         self.production.record(stats);
@@ -453,13 +461,13 @@ impl Engine {
 pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<WatchCatalog>>,
     output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings) -> Result<ProductionReport> {
     let mut engine = Engine { prices: Prices::default(), output, scratch: Vec::with_capacity(BLOCK_ROUTES),
-        ready: Vec::with_capacity(BLOCK_ROUTES), production: ProductionReport::default(),
+        block_slots:Vec::new(), block_epoch:0, production: ProductionReport::default(),
         settings, sequence: 0, samples: 0, websocket_samples: 0,
         threshold_log: -(settings.threshold_bps / 10_000.0).ln_1p() };
     let outcome: Result<()> = async {
     let mut plan = Arc::new(ExecutionPlan::compile(catalogs.borrow_and_update().clone(), &mut engine.prices)?);
     let mut catalog_open = true;
-    crate::log_event!(Info, "graph signals started=true execution_layout={} profiling={} output_layout=shared_fixed_legs_v1 threshold_bps={} execution=false", EXECUTION_LAYOUT, settings.profile, settings.threshold_bps);
+    crate::log_event!(Info, "graph signals started=true execution_layout={} profiling={} output_layout={} threshold_bps={} execution=false", EXECUTION_LAYOUT, settings.profile, OUTPUT_LAYOUT, settings.threshold_bps);
     loop { tokio::select! {
         change = catalogs.changed(), if catalog_open => {
             if change.is_err() { catalog_open = false; continue; }
@@ -473,7 +481,7 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
                 reason: "graph generation replaced; group IDs belong to the new catalog".into() })?;
             plan = next;
             engine.evaluate(plan.clone(), SignalTrigger::Catalog { generation: plan.catalog.generation },
-                None, input.len(), InputTiming { started, received_us, preparation_ns: 0, logarithms: 0, plan_ns }).await?;
+                None, input.len(), InputTiming { started, received_us, preparation_ns: 0, logarithms: 0, plan_ns, pipeline:None }).await?;
         },
         received = input.recv() => match received {
             Ok(event) => match event.as_ref() {
@@ -485,7 +493,7 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
                     let trigger = SignalTrigger::Price { pool, sequence: p.sequence,
                         origin: p.origin, received_at_us: p.received_at_us };
                     engine.evaluate(plan.clone(), trigger, Some(id), input.len(),
-                        InputTiming { started, received_us, preparation_ns, logarithms: 1, plan_ns: 0 }).await?;
+                        InputTiming { started, received_us, preparation_ns, logarithms: 1, plan_ns: 0, pipeline:p.pipeline }).await?;
                 },
                 MarketStateEvent::Unavailable { pool, reason, .. } => {
                     engine.prices.remove(pool.parse::<Pubkey>()?);
@@ -521,8 +529,8 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
     Ok(())
     }.await;
     engine.production.error = outcome.err().map(|e| format!("{e:#}"));
-    crate::log_event!(Info, "graph signals producer complete={} published={} evaluations={} ws_evaluations={} candidates={} max_output_queue={} error={:?}",
-        engine.production.error.is_none(), engine.production.published_events, engine.production.evaluations,
+    crate::log_event!(Info, "graph signals producer complete={} published={} rows={} evaluations={} ws_evaluations={} candidates={} max_output_queue={} error={:?}",
+        engine.production.error.is_none(), engine.production.published_events, engine.production.published_route_rows, engine.production.evaluations,
         engine.production.websocket_evaluations, engine.production.candidates,
         engine.production.max_output_queue_depth, engine.production.error);
     Ok(engine.production)
@@ -536,8 +544,12 @@ impl Default for Histogram {
 }
 impl Histogram {
     fn add(&mut self, n: u64) {
+        self.add_many(n,1);
+    }
+    fn add_many(&mut self,n:u64,count:u64) {
+        if count==0 {return;}
         let bin = if n == 0 { 0 } else { (64 - n.leading_zeros()) as usize };
-        self.bins[bin.min(63)] += 1; self.count += 1; self.total += u128::from(n);
+        self.bins[bin.min(63)] += count; self.count += count; self.total += u128::from(n)*u128::from(count);
         self.min = self.min.min(n); self.max = self.max.max(n);
     }
     fn percentile(&self, percent: u64) -> Option<u64> {
@@ -573,6 +585,8 @@ pub struct Timing { count: u64, min: Option<u64>, max: Option<u64>, mean: Option
 struct ProductionTimings {
     preparation_ns: Histogram, calculation_ns: Histogram, event_build_ns: Histogram,
     publication_ns: Histogram, cooperative_yield_ns: Histogram, processing_ns: Histogram, account_to_worker_us: Histogram,
+    transport_decode_us:Histogram, transport_to_market_us:Histogram, market_processing_us:Histogram,
+    price_queue_us:Histogram, frame_to_worker_us:Histogram,
 }
 impl ProductionTimings {
     fn record(&mut self, e: &SignalEvaluation) {
@@ -581,11 +595,20 @@ impl ProductionTimings {
         self.cooperative_yield_ns.add(e.cooperative_yield_ns);
         self.processing_ns.add(e.processing_ns);
         if let Some(age) = e.account_to_worker_us { self.account_to_worker_us.add(age); }
+        if let Some(t)=e.price_pipeline {
+            for (end,start,hist) in [
+                (t.transport_decoded_at_us,t.frame_received_at_us,&mut self.transport_decode_us),
+                (t.market_received_at_us,t.transport_decoded_at_us,&mut self.transport_to_market_us),
+                (t.price_published_at_us,t.market_received_at_us,&mut self.market_processing_us),
+                (e.worker_received_at_us,t.price_published_at_us,&mut self.price_queue_us),
+                (e.worker_received_at_us,t.frame_received_at_us,&mut self.frame_to_worker_us),
+            ] {if let Some(us)=end.checked_sub(start){hist.add(us);}}
+        }
     }
 }
 #[derive(Default, serde::Serialize)]
 pub struct ProductionReport {
-    error: Option<String>, published_events: u64, evaluations: u64, websocket_evaluations: u64,
+    error: Option<String>, published_events: u64, published_route_rows:u64, evaluations: u64, websocket_evaluations: u64,
     candidates: u64, websocket_candidates: u64, routes_scored: u64, websocket_routes_scored: u64,
     max_price_queue_depth: usize, max_output_queue_depth: usize,
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings, catalog_plan_build_ns: Histogram,
@@ -607,7 +630,10 @@ impl ProductionReport {
     }
     pub fn ensure_delivery(&self, received: &ObservationReport) -> Result<()> {
         self.ensure_complete()?; received.ensure_integrity()?;
-        ensure!(self.published_events == received.received_events
+        let t=&self.websocket_inputs;
+        ensure!([&t.transport_decode_us,&t.transport_to_market_us,&t.market_processing_us,&t.price_queue_us,&t.frame_to_worker_us]
+            .iter().all(|h|h.count==self.websocket_evaluations),"incomplete WebSocket pipeline timing");
+        ensure!(self.published_events == received.received_events && self.published_route_rows == received.received_route_rows
             && self.evaluations == received.evaluation_events && self.candidates == received.candidates
             && self.websocket_evaluations == received.websocket_evaluations
             && self.websocket_candidates == received.websocket_candidates,
@@ -618,11 +644,13 @@ impl ProductionReport {
 #[derive(serde::Serialize)]
 pub struct ObservationReport {
     pub profile_enabled: bool, pub error: Option<String>, pub received_events: u64,
+    pub received_route_rows:u64,
     pub lost_events: u64, pub lag_incidents: u64, pub first_lag: Option<serde_json::Value>,
     pub consumer_bookkeeping_sample_period: u64, pub consumer_bookkeeping_sample_ns: Timing,
     pub completion_to_consumer_us: Timing, pub websocket_completion_to_consumer_us: Timing,
     pub consumer_periodic_logging_ns: u64,
     pub output_layout: &'static str,
+    pub output_capacity:usize, pub max_rows_per_block:usize,
     pub execution_layout: &'static str,
     pub evaluation_events: u64, pub price_evaluations: u64, pub websocket_evaluations: u64,
     pub catalog_evaluations: u64, pub combinations_visited: u64, pub routes_affected: u64,
@@ -641,6 +669,7 @@ pub struct ObservationReport {
     pub websocket_calculation_ns_per_input: Timing, pub websocket_output_ns_per_input: Timing,
     pub websocket_processing_ns_per_input: Timing,
     pub websocket_account_to_worker_us: Timing, pub websocket_account_to_evaluation_consumer_us: Timing,
+    pub websocket_frame_to_evaluation_consumer_us:Timing,
     pub processing_ns_per_input: Timing, pub account_to_worker_us: Timing,
     pub account_to_candidate_us: Timing, pub account_to_consumer_us: Timing,
     pub consumer_formatting_ns: u64,
@@ -648,7 +677,7 @@ pub struct ObservationReport {
 impl ObservationReport {
     pub fn ensure_integrity(&self) -> Result<()> {
         ensure!(self.error.is_none(), "signal consumer failed: {}", self.error.as_deref().unwrap_or(""));
-        ensure!(self.lost_events == 0, "signal consumer lost {} events in {} incidents; live evidence incomplete",
+        ensure!(self.lost_events == 0, "signal consumer lost {} block/control events in {} incidents; live evidence incomplete",
             self.lost_events, self.lag_incidents);
         Ok(())
     }
@@ -668,7 +697,7 @@ impl ObservationReport {
 
 pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
     const SAMPLE_PERIOD: u64 = 257;
-    let mut received_events = 0_u64; let mut lost_events = 0_u64; let mut lag_incidents = 0_u64;
+    let mut received_events = 0_u64; let mut received_route_rows=0_u64; let mut lost_events = 0_u64; let mut lag_incidents = 0_u64;
     let mut first_lag = None; let mut last_sequence = None;
     let mut bookkeeping = Histogram::default(); let mut completion_age = Histogram::default();
     let mut ws_completion_age = Histogram::default(); let mut periodic_logging_ns = 0_u64;
@@ -686,6 +715,8 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     let mut ws_calculate = Histogram::default(); let mut ws_output = Histogram::default(); let mut ws_process = Histogram::default();
     let mut preparation = Histogram::default(); let mut ws_preparation = Histogram::default(); let mut plan_build = Histogram::default();
     let mut ws_worker_age = Histogram::default(); let mut ws_evaluation_consumer_age = Histogram::default();
+    let mut ws_frame_consumer_age=Histogram::default();
+    let mut window=ProductionTimings::default();
     let mut worker_age = Histogram::default(); let mut candidate_age = Histogram::default(); let mut consumer_age = Histogram::default();
     let mut format_ns = 0_u64;
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -695,31 +726,60 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
             let started = Instant::now();
             crate::log_event!(Info, "graph signals consumer execution_layout={} evaluations={evaluations} ws_evaluations={ws_evaluations} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} max_price_queue={input_max} max_signal_queue={output_max}", EXECUTION_LAYOUT);
             crate::log_event!(Info, "graph signals indexed ws_combinations_available={ws_available} ws_combinations_visited={ws_combinations} ws_routes_expected={ws_expected} ws_logarithms_prepared={ws_logarithms} ws_preparation_mean_ns={:?}", ws_preparation.report().mean);
-            crate::log_event!(Info, "graph signals timings output_layout=shared_fixed_legs_v1 ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
+            crate::log_event!(Info, "graph signals timings output_layout={OUTPUT_LAYOUT} ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
                 ws_output.report().mean, ws_process.report().mean, ws_process.report().max, ws_evaluation_consumer_age.report().max);
+            if settings.profile {
+                crate::log_event!(Info,"graph signals window ws_evaluations={} transport_decode_mean_us={:?} transport_to_market_mean_us={:?} market_mean_us={:?} price_queue_mean_us={:?} frame_to_worker_max_us={:?} processing_mean_ns={:?} processing_max_ns={:?}",
+                    window.processing_ns.count,window.transport_decode_us.report().mean,window.transport_to_market_us.report().mean,
+                    window.market_processing_us.report().mean,window.price_queue_us.report().mean,window.frame_to_worker_us.report().max,
+                    window.processing_ns.report().mean,window.processing_ns.report().max);
+                window=ProductionTimings::default();
+            }
             periodic_logging_ns = periodic_logging_ns.saturating_add(nanos(started));
         },
         event = input.recv() => match event {
             Ok(event) => {
                 received_events += 1;
                 let sampled = (settings.profile && received_events % SAMPLE_PERIOD == 1).then(Instant::now);
+                let format_before=format_ns;
                 output_max = output_max.max(input.len());
-                last_sequence = match event.as_ref() {
-                    SignalEvent::Candidate(r) | SignalEvent::RouteSample(r) => Some(r.sequence),
-                    SignalEvent::Evaluated(e) => Some(e.sequence), SignalEvent::Invalidated { .. } => last_sequence,
-                };
                 let print = match event.as_ref() {
-                    SignalEvent::Candidate(route) => {
-                        candidates += 1; if websocket(&route.trigger) { ws_candidates += 1; }
-                        candidate_legs += route.legs.as_slice().len() as u64;
-                        if let Some(age) = route.account_to_emitted_us { candidate_age.add(age); }
-                        if let Some(age) = account_age(&route.trigger, now_us()) { consumer_age.add(age); }
-                        settings.trace || candidates <= settings.sample_limit as u64
-                            || (websocket(&route.trigger) && ws_candidates <= settings.sample_limit as u64)
+                    SignalEvent::Routes(block) => {
+                        ensure!(!block.rows.is_empty() && block.rows.len() <= SIGNAL_BLOCK_ROWS
+                            && (2..=4).contains(&block.leg_count), "invalid signal block bounds");
+                        received_route_rows += block.rows.len() as u64;
+                        let live=websocket(&block.trigger);
+                        let at=now_us();
+                        let before=candidates;
+                        for (index,row) in block.rows.iter().enumerate() {
+                            if lost_events==0 {ensure!(row.sequence==last_sequence.unwrap_or(0)+1,"signal row sequence gap");}
+                            last_sequence=Some(row.sequence);
+                            ensure!(row.leg_indices[..block.leg_count].iter().all(|&i|usize::from(i)<block.legs.len()),
+                                "signal row references missing frozen leg");
+                            let print=if row.qualifies {
+                                candidates += 1; if live {ws_candidates += 1;}
+                                settings.trace || candidates<=settings.sample_limit as u64
+                                    || (live && ws_candidates<=settings.sample_limit as u64)
+                            }else{true};
+                            if print {
+                                let started=Instant::now();
+                                let route=block.route(index).context("invalid signal row expansion")?;
+                                let example=if row.qualifies {serde_json::json!({"Candidate":route})}
+                                    else{serde_json::json!({"RouteSample":route})};
+                                println!("{}",serde_json::to_string(&example)?);
+                                format_ns=format_ns.saturating_add(nanos(started));
+                            }
+                        }
+                        let count=candidates-before;
+                        candidate_legs += count*block.leg_count as u64;
+                        if let Some(age)=account_age(&block.trigger,block.emitted_at_us){candidate_age.add_many(age,count);}
+                        if let Some(age)=account_age(&block.trigger,at){consumer_age.add_many(age,count);}
+                        false
                     },
-                    SignalEvent::RouteSample(_) => true,
                     SignalEvent::Invalidated { .. } => { invalidations += 1; settings.trace || invalidations <= settings.sample_limit as u64 },
                     SignalEvent::Evaluated(e) => {
+                        if lost_events==0 {ensure!(e.sequence==last_sequence.unwrap_or(0)+1,"signal evaluation sequence gap");}
+                        last_sequence=Some(e.sequence);
                         evaluations += 1;
                         let at = now_us();
                         if let Some(age) = at.checked_sub(e.completed_at_us) {
@@ -735,6 +795,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             SignalTrigger::Catalog { .. } => { catalog_evaluations += 1; plan_build.add(e.plan_build_ns); },
                         }
                         if websocket(&e.trigger) {
+                            if settings.profile {window.record(e);}
                             ws_evaluations += 1; ws_scored += e.routes_scored;
                             ws_available += e.combinations_available; ws_combinations += e.combinations_visited;
                             ws_expected += e.routes_expected; ws_logarithms += e.logarithms_prepared;
@@ -744,6 +805,9 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             // This marker follows every candidate for the input. Its receipt
                             // includes producer work and output queue/consumer work, even if no candidate qualified.
                             if let Some(age) = account_age(&e.trigger, at) { ws_evaluation_consumer_age.add(age); }
+                            if let Some(t)=e.price_pipeline {
+                                if let Some(age)=at.checked_sub(t.frame_received_at_us){ws_frame_consumer_age.add(age);}
+                            }
                         }
                         combinations += e.combinations_visited; affected += e.routes_affected;
                         available += e.combinations_available; routes_expected += e.routes_expected;
@@ -770,7 +834,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             || (websocket(&e.trigger) && ws_evaluations <= settings.sample_limit as u64)
                     },
                 };
-                if let Some(started) = sampled { bookkeeping.add(nanos(started)); }
+                if let Some(started) = sampled { bookkeeping.add(nanos(started).saturating_sub(format_ns-format_before)); }
                 if print {
                     let started = Instant::now();
                     println!("{}", serde_json::to_string(event.as_ref())?);
@@ -785,7 +849,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                         "last_sequence":last_sequence,"queue_depth":input.len(),"formatting_ns":format_ns}));
                     crate::log_event!(Warn, "graph signals consumer first_lag={} profiling={} live_evidence_valid=false", n, settings.profile);
                 }
-                if !settings.profile { bail!("signal consumer lost {n} events; live evidence incomplete"); }
+                if !settings.profile { bail!("signal consumer lost {n} block/control events; live evidence incomplete"); }
             },
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -795,8 +859,9 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     }.await;
     let error = outcome.err().map(|e| format!("{e:#}"));
     crate::log_event!(Info, "graph signals consumer complete={} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} received={received_events} lost={lost_events}", error.is_none());
-    Ok(ObservationReport { output_layout: "shared_fixed_legs_v1", execution_layout: EXECUTION_LAYOUT,
-        profile_enabled: settings.profile, error, received_events, lost_events, lag_incidents, first_lag,
+    Ok(ObservationReport { output_layout: OUTPUT_LAYOUT, execution_layout: EXECUTION_LAYOUT,
+        output_capacity:OUTPUT_CAPACITY,max_rows_per_block:SIGNAL_BLOCK_ROWS,
+        profile_enabled: settings.profile, error, received_events, received_route_rows, lost_events, lag_incidents, first_lag,
         consumer_bookkeeping_sample_period: SAMPLE_PERIOD, consumer_bookkeeping_sample_ns: bookkeeping.report(),
         completion_to_consumer_us: completion_age.report(), websocket_completion_to_consumer_us: ws_completion_age.report(),
         consumer_periodic_logging_ns: periodic_logging_ns,
@@ -816,6 +881,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
         websocket_calculation_ns_per_input: ws_calculate.report(), websocket_output_ns_per_input: ws_output.report(),
         websocket_processing_ns_per_input: ws_process.report(), websocket_account_to_worker_us: ws_worker_age.report(),
         websocket_account_to_evaluation_consumer_us: ws_evaluation_consumer_age.report(),
+        websocket_frame_to_evaluation_consumer_us:ws_frame_consumer_age.report(),
         account_to_worker_us: worker_age.report(), account_to_candidate_us: candidate_age.report(),
         account_to_consumer_us: consumer_age.report(), consumer_formatting_ns: format_ns })
 }

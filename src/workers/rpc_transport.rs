@@ -3,10 +3,10 @@
 //! No venue/account decoding beyond JSON-RPC and base64 transport framing.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     env,
     sync::{Arc, Mutex as StdMutex, atomic::{AtomicU64, AtomicUsize, Ordering}},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -181,6 +181,7 @@ pub enum WsEvent {
     Subscribed {provider:String, address:Pubkey},
     Unsubscribed {provider:String, address:Pubkey},
     Account {provider:String, address:Pubkey, slot:u64, received_at_ms:u64,
+        frame_received_at_us:u64, decoded_at_us:u64,
         value:Option<AccountData>},
     Gap {provider:String, reason:&'static str},
     Rejected {provider:String, address:Pubkey, code:i64},
@@ -722,6 +723,9 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
 fn emit(tx:&broadcast::Sender<WsEvent>,event:WsEvent) {
     let _=tx.send(event);
 }
+fn ws_timestamp_us()->u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64
+}
 
 async fn ws_session(
     name:String,endpoint:String,capacity:usize,spacing_ms:u64,timeout_ms:u64,reconnect_ms:u64,
@@ -771,9 +775,13 @@ async fn ws_session(
         let mut rejected:HashSet<Pubkey>=HashSet::new();
         let mut pending_unsub:HashMap<u64,Pubkey>=HashMap::new();
         let mut request_id=1_u64;
-        let mut desired:BTreeSet<Pubkey>=targets.borrow().iter().copied().collect();
+        let mut desired:BTreeSet<Pubkey>=targets.borrow_and_update().iter().copied().collect();
+        let mut dirty=true;
+        let mut busy=HashSet::<Pubkey>::new();
+        let mut subscribe=VecDeque::<Pubkey>::new();
         'connected:loop {
-            // Remove obsolete subscriptions; keep valid active subscriptions stable.
+            // Reconcile only when targets change, never for ordinary account messages.
+            if dirty {
             let obsolete:Vec<_>=active.iter().filter(|(_,address)|!desired.contains(address))
                 .map(|(id,address)|(*id,*address)).collect();
             for (subscription_id,address) in obsolete {
@@ -785,10 +793,12 @@ async fn ws_session(
                 retired.insert(subscription_id);
                 pending_unsub.insert(id,address);
             }
-            let busy:BTreeSet<Pubkey>=active.values().chain(pending.values()).chain(pending_unsub.values()).copied().collect();
-            for address in desired.iter().filter(|address|!busy.contains(address) && !rejected.contains(address))
-                .take(32_usize.saturating_sub(pending.len())).copied().collect::<Vec<_>>() {
-                if active.len()+pending.len()>=capacity {break;}
+            subscribe=desired.iter().filter(|a|!busy.contains(*a) && !rejected.contains(*a)).copied().collect();
+            dirty=false;
+            }
+            while pending.len()<32 && active.len()+pending.len()<capacity {
+                let Some(address)=subscribe.pop_front() else {break;};
+                if !desired.contains(&address) || busy.contains(&address) || rejected.contains(&address) {continue;}
                 let id=request_id;request_id+=1;
                 let view=if slices_enabled {views.lock().expect("RPC views lock").get(&address).copied().unwrap_or(AccountView::Full)}
                     else {AccountView::Full};
@@ -799,6 +809,7 @@ async fn ws_session(
                     "method":"accountSubscribe","params":[address.to_string(),config]}).to_string().into()))
                     .await.is_err(){break 'connected;}
                 pending.insert(id,address);
+                busy.insert(address);
                 if spacing_ms>0 {sleep(Duration::from_millis(spacing_ms)).await;}
             }
             tokio::select! {
@@ -809,11 +820,12 @@ async fn ws_session(
                 }
                 update=targets.changed()=>{
                     if update.is_err(){return Ok(());}
-                    desired=targets.borrow().iter().copied().collect();
+                    desired=targets.borrow_and_update().iter().copied().collect();
                     let changed={let current=views.lock().expect("RPC views lock");
                         slices_enabled && requested_views.iter().any(|(a,v)|desired.contains(a) && current.get(a)!=Some(v))};
                     if changed {break 'connected;}
                     rejected.retain(|address|desired.contains(address));
+                    dirty=true;
                 }
                 _=sleep(Duration::from_millis(timeout_ms)), if !pending.is_empty()=>{
                     emit(&events,WsEvent::Gap{provider:name.clone(),reason:"subscribe_ack_timeout"});
@@ -826,6 +838,7 @@ async fn ws_session(
                         Some(Ok(_))=>continue,
                         _=>break 'connected,
                     };
+                    let frame_received_at_us=ws_timestamp_us();
                     messages.fetch_add(1,Ordering::Relaxed);
                     text_bytes.fetch_add(message.len() as u64,Ordering::Relaxed);
                     let value:Value=match serde_json::from_str(&message) {
@@ -846,10 +859,13 @@ async fn ws_session(
                                 break 'connected;
                             }else if let Some(subscription)=value.get("result").and_then(Value::as_u64) {
                                 active.insert(subscription,address);
+                                if !desired.contains(&address) {dirty=true;}
                                 crate::log_event!(Debug,"rpc websocket provider={name} subscribed={address} subscription={subscription}");
                                 emit(&events,WsEvent::Subscribed{provider:name.clone(),address});
                             }else {break 'connected;}
                         } else if let Some(address)=pending_unsub.remove(&id) {
+                            busy.remove(&address);
+                            if desired.contains(&address) {subscribe.push_back(address);}
                             if value.get("result").and_then(Value::as_bool)==Some(true) {
                                 crate::log_event!(Debug,"rpc websocket provider={name} unsubscribed={address}");
                                 emit(&events,WsEvent::Unsubscribed{provider:name.clone(),address});
@@ -876,10 +892,11 @@ async fn ws_session(
                         Ok((slot,decode_account(address,item,requested_views.get(&address).copied().unwrap_or(AccountView::Full))?))
                     })();
                     match decoded {
-                        Ok((slot,payload))=>emit(&events,WsEvent::Account{
-                            provider:name.clone(),address,slot,
-                            received_at_ms:now_unix_ms()?,value:payload,
-                        }),
+                        Ok((slot,payload))=>{
+                            let decoded_at_us=ws_timestamp_us();
+                            emit(&events,WsEvent::Account{provider:name.clone(),address,slot,
+                                received_at_ms:decoded_at_us/1000,frame_received_at_us,decoded_at_us,value:payload});
+                        },
                         Err(error)=>{
                             crate::log_event!(Warn,"rpc websocket provider={name} decode_error={error:#}");
                             emit(&events,WsEvent::Gap{provider:name.clone(),reason:"malformed_account_notification"});
@@ -1035,7 +1052,7 @@ pub async fn live_probe(handle:&RpcHandle)->Result<()> {
                         crate::log_event!(Info,"rpc live websocket subscribed provider={provider} account={address}");
                         return Ok(());
                     }
-                    Ok(WsEvent::Account{provider,address,slot,value,received_at_ms})=>{
+                    Ok(WsEvent::Account{provider,address,slot,value,received_at_ms,..})=>{
                         crate::log_event!(Info,"rpc live websocket update provider={provider} address={address} slot={slot} received_at_ms={received_at_ms} found={}",value.is_some());
                     }
                     Ok(WsEvent::Gap{provider,reason})=>

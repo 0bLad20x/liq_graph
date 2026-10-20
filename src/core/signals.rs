@@ -1,7 +1,7 @@
 //! Indicative route evaluation output. No execution requests or admission policy.
 use std::sync::Arc;
 use solana_pubkey::Pubkey;
-use super::market_state::{PoolPriceObservation, PriceOrigin};
+use super::market_state::{PoolPriceObservation, PriceOrigin, PricePipelineTiming};
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -34,12 +34,6 @@ pub enum SignalLegs {
     Three([SignalLeg; 3]),
     Four([SignalLeg; 4]),
 }
-impl SignalLegs {
-    pub fn as_slice(&self) -> &[SignalLeg] {
-        match self { Self::Two(v) => v, Self::Three(v) => v, Self::Four(v) => v }
-    }
-}
-
 /// One concrete directed roundtrip, not an amount-dependent quote or packed job.
 /// group_id belongs exclusively to graph_generation; addresses identify the route.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -63,8 +57,52 @@ pub struct RouteEvaluation {
     pub threshold_bps: f64,
     pub qualifies: bool,
     pub emitted_at_us: u64,
-    /// Local transport receipt to candidate creation; wall-clock, millisecond input resolution.
+    /// Local transport receipt to block construction; wall-clock, millisecond input resolution.
     pub account_to_emitted_us: Option<u64>,
+}
+
+/// Bounded output block. Each row keeps its result; context and frozen legs are shared.
+pub const SIGNAL_BLOCK_ROWS: usize = 64;
+#[derive(Debug, serde::Serialize)]
+pub struct SignalRouteRow {
+    pub sequence:u64, pub leg_indices:[u16;4], pub negative_log_sum:f64,
+    pub indicative_return_bps:f64, pub qualifies:bool,
+}
+#[derive(Debug, serde::Serialize)]
+pub struct SignalRouteBlock {
+    pub graph_generation:u64, pub group_id:u32, pub trigger:Arc<SignalTrigger>,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub settlement:Pubkey,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub target:Pubkey,
+    #[serde(with = "super::execution::optional_pubkey_json")]
+    pub bridge:Option<Pubkey>,
+    #[serde(with = "super::execution::optional_pubkey_json")]
+    pub conversion_pool:Option<Pubkey>,
+    /// Local start of block construction; shared by its diagnostic row expansions.
+    pub emitted_at_us:u64,
+    pub threshold_bps:f64, pub leg_count:usize, pub legs:Vec<SignalLeg>, pub rows:Vec<SignalRouteRow>,
+}
+impl SignalRouteBlock {
+    /// Expand a selected row for a consumer; does not consult mutable worker state.
+    pub fn route(&self, index:usize)->Option<RouteEvaluation> {
+        let row=self.rows.get(index)?;
+        let leg=|i:usize|self.legs.get(usize::from(row.leg_indices[i])).cloned();
+        let legs=match self.leg_count {
+            2=>SignalLegs::Two([leg(0)?,leg(1)?]),
+            3=>SignalLegs::Three([leg(0)?,leg(1)?,leg(2)?]),
+            4=>SignalLegs::Four([leg(0)?,leg(1)?,leg(2)?,leg(3)?]), _=>return None,
+        };
+        let account_to_emitted_us=match self.trigger.as_ref() {
+            SignalTrigger::Price{received_at_us,..}=>self.emitted_at_us.checked_sub(*received_at_us),
+            SignalTrigger::Catalog{..}=>None,
+        };
+        Some(RouteEvaluation{sequence:row.sequence,graph_generation:self.graph_generation,group_id:self.group_id,
+            trigger:self.trigger.clone(),settlement:self.settlement,target:self.target,bridge:self.bridge,
+            conversion_pool:self.conversion_pool,legs,negative_log_sum:row.negative_log_sum,
+            indicative_return_bps:row.indicative_return_bps,threshold_bps:self.threshold_bps,
+            qualifies:row.qualifies,emitted_at_us:self.emitted_at_us,account_to_emitted_us})
+    }
 }
 
 /// One complete input evaluation. No route is skipped because its price is unchanged.
@@ -87,6 +125,7 @@ pub struct SignalEvaluation {
     pub scored_by_kind: std::collections::BTreeMap<&'static str, u64>,
     pub price_queue_depth: usize,
     pub account_to_worker_us: Option<u64>,
+    pub worker_received_at_us:u64, pub price_pipeline:Option<PricePipelineTiming>,
     /// Parsing, identity validation, directional weights and storage for this input.
     pub price_preparation_ns: u64,
     pub logarithms_prepared: u64,
@@ -110,8 +149,7 @@ pub struct SignalEvaluation {
 
 #[derive(Debug, serde::Serialize)]
 pub enum SignalEvent {
-    Candidate(RouteEvaluation),
-    RouteSample(RouteEvaluation),
+    Routes(SignalRouteBlock),
     Evaluated(SignalEvaluation),
     Invalidated { graph_generation: u64, pool: Option<String>, reason: String },
 }

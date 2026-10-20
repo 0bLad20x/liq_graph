@@ -5,7 +5,7 @@ use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Dura
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
-    market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin}};
+    market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, rpc_transport::{AccountView, AccountWatch, RpcAnswer, RpcHandle, RpcOperation, WsEvent},
     graph_watch_catalog::{WatchCatalog,RouteKind}};
 const DLMM_PROGRAM:&str="LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
@@ -323,14 +323,31 @@ impl Field{
         Self::ManifestBook=>(0,0) // full variable-length market account; no dataSlice
     }}
 }
-struct Subscription{pool:usize,field:Field,address:String,owner:String}
+struct Subscription{pool:usize,field:Field,address:String,key:Pubkey,owner:Pubkey}
 struct Engine {
     pools: Vec<Pool>, subs: Vec<Subscription>,
     events: broadcast::Sender<Arc<MarketStateEvent>>, sequence: u64,
-    observed: HashMap<String,(u64,u64)>,
-    invalid: HashSet<String>,
+    observed: HashMap<Pubkey,(u64,u64)>, invalid: HashSet<Pubkey>,
+    account_ranges:HashMap<Pubkey,std::ops::Range<usize>>, account_bindings:Vec<usize>,
+    pool_subs:Vec<Vec<usize>>,
 }
 impl Engine{
+    fn empty(events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Self {
+        Self{pools:Vec::new(),subs:Vec::new(),events,sequence,observed:HashMap::new(),invalid:HashSet::new(),
+            account_ranges:HashMap::new(),account_bindings:Vec::new(),pool_subs:Vec::new()}
+    }
+    fn index(&mut self) {
+        let mut by_account=HashMap::<Pubkey,Vec<usize>>::new();
+        self.pool_subs=vec![Vec::new();self.pools.len()];
+        for (i,s) in self.subs.iter().enumerate() {
+            by_account.entry(s.key).or_default().push(i);self.pool_subs[s.pool].push(i);
+        }
+        self.account_ranges.clear();self.account_bindings.clear();
+        for (key,indices) in by_account {
+            let start=self.account_bindings.len();self.account_bindings.extend(indices);
+            self.account_ranges.insert(key,start..self.account_bindings.len());
+        }
+    }
     async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
         let pool_records=fetch_batch(rpc,&pool_addrs).await?;
@@ -483,25 +500,25 @@ impl Engine{
                 pool.available=true;
             }
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
-            subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),owner:pool_records[idx].owner.clone()});
+            subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),key:watch.address.parse()?,owner:pool_records[idx].owner.parse()?});
             if let State::Pump{base_vault,quote_vault,..}=&pool.state{
                 for (field,address) in [(Field::BaseVault,base_vault),(Field::QuoteVault,quote_vault)]{
                     let acc=dict.get(address).context("vault not found")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),owner:acc.owner.clone()});
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?});
                 }
             }
             if let State::RaydiumAmmV4{base_vault,quote_vault,..}=&pool.state {
                 for (field,address) in [(Field::RaydiumV4BaseVault,base_vault),
                     (Field::RaydiumV4QuoteVault,quote_vault)] {
                     let acc=dict.get(address).context("Raydium vault not found")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),owner:acc.owner.clone()});
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?});
                 }
             }
             if let State::RaydiumCpmm{base_vault,quote_vault,..}=&pool.state {
                 for (field,address) in [(Field::RaydiumCpmmBaseVault,base_vault),
                     (Field::RaydiumCpmmQuoteVault,quote_vault)] {
                     let acc=dict.get(address).context("Raydium CPMM vault missing")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),owner:acc.owner.clone()});
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?});
                 }
             }
             pools.push(pool);
@@ -509,26 +526,30 @@ impl Engine{
 
         let mut observed=HashMap::new();
         for (watch,acc) in cfg.watches.iter().zip(&pool_records) {
-            observed.insert(watch.address.clone(),(acc.slot,acc.received_us));
+            observed.insert(watch.address.parse()?,(acc.slot,acc.received_us));
         }
-        for (address,acc) in &dict {observed.insert(address.clone(),(acc.slot,acc.received_us));}
-        let engine=Self{pools,subs,events,sequence,observed,invalid:HashSet::new()};
+        for (address,acc) in &dict {observed.insert(address.parse()?,(acc.slot,acc.received_us));}
+        let mut engine=Self::empty(events,sequence);
+        engine.pools=pools;engine.subs=subs;engine.observed=observed;engine.index();
         Ok(engine)
     }
     fn next_sequence(&mut self)->u64 {
         self.sequence=self.sequence.saturating_add(1);
         self.sequence
     }
-    fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>) {
+    fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>,mut pipeline:Option<PricePipelineTiming>) {
         let sequence=self.next_sequence();
         let pool=&self.pools[pi];
         let (best_bid,best_ask)=pool.manifest_quotes().map_or((None,None),|(bid,ask)|(Some(bid),Some(ask)));
-        let components:Vec<(u64,u64)>=self.subs.iter().filter(|s|s.pool==pi)
-            .filter_map(|s|self.observed.get(&s.address).copied()).collect();
-        let component_slot_min=components.iter().map(|v|v.0).min().unwrap_or(pool.slot);
-        let component_slot_max=components.iter().map(|v|v.0).max().unwrap_or(pool.slot);
-        let component_received_at_us_min=components.iter().map(|v|v.1).min().unwrap_or(pool.received_us);
-        let component_received_at_us_max=components.iter().map(|v|v.1).max().unwrap_or(pool.received_us);
+        let mut extrema=None::<(u64,u64,u64,u64)>;
+        for &i in &self.pool_subs[pi] {
+            if let Some(&(slot,at))=self.observed.get(&self.subs[i].key) {
+                extrema=Some(match extrema {Some((a,b,c,d))=>(a.min(slot),b.max(slot),c.min(at),d.max(at)),
+                    None=>(slot,slot,at,at)});
+            }
+        }
+        let (component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max)=
+            extrema.unwrap_or((pool.slot,pool.slot,pool.received_us,pool.received_us));
         let event=PoolPriceObservation {
             origin,pool:pool.id.clone(),venue:pool.venue.label(),
             mint_a:pool.a.clone(),mint_b:pool.b.clone(),
@@ -540,7 +561,11 @@ impl Engine{
             best_bid_quote_per_base:best_bid,best_ask_quote_per_base:best_ask,
             consistency:pool.consistency(),slot:pool.slot,received_at_us:component_received_at_us_max,
             sequence,component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max,trigger_field:field.map(Field::label),
+            pipeline:None,
         };
+        let mut event=event;
+        if let Some(t)=pipeline.as_mut(){t.price_published_at_us=timestamp_us();}
+        event.pipeline=pipeline;
         // A slow consumer must not block the price hotpath.
         let _=self.events.send(Arc::new(MarketStateEvent::Price(event)));
     }
@@ -552,15 +577,16 @@ impl Engine{
             received_at_us:recv_us,sequence,reason,
         }));
     }
-    fn update(&mut self,index:usize,slot:u64,owner:&str,data:&[u8],recv_us:u64)->Result<()> {
+    fn update(&mut self,index:usize,slot:u64,owner:Pubkey,data:&[u8],recv_us:u64,pipeline:PricePipelineTiming)->Result<()> {
         let (pi,field,expected_owner,expected_len)={let s=&self.subs[index];
-            (s.pool,s.field,s.owner.as_str(),s.field.slice().1)};
+            (s.pool,s.field,s.owner,s.field.slice().1)};
         ensure!(owner==expected_owner,"{} owner mismatch",self.subs[index].address);
         ensure!(field==Field::ManifestBook || data.len()==expected_len ||
             (field==Field::VirtualQuote && data.is_empty()),
             "slice length mismatch: {} expected {} got {}",field.label(),expected_len,data.len());
-        self.invalid.remove(&self.subs[index].address);
-        let blocked=self.subs.iter().any(|s|s.pool==pi && self.invalid.contains(&s.address));
+        self.invalid.remove(&self.subs[index].key);
+        let blocked=self.pool_subs[pi].iter().any(|&i|self.invalid.contains(&self.subs[i].key));
+        let newest=self.pool_subs[pi].iter().filter_map(|&i|self.observed.get(&self.subs[i].key).map(|v|v.0)).max().unwrap_or(slot);
         let pool=&mut self.pools[pi];
         let old=pool.price;
         let was_available=pool.available;
@@ -615,8 +641,7 @@ impl Engine{
             },
             _=>bail!("wrong field {:?} for pool {}",field,pool.id),
         }
-        pool.slot=self.subs.iter().filter(|s|s.pool==pi)
-            .filter_map(|s|self.observed.get(&s.address).map(|v|v.0)).max().unwrap_or(slot);
+        pool.slot=newest;
         pool.received_us=recv_us;pool.updates+=1;
         if blocked {pool.available=false;return Ok(());}
         if let Some(reason)=unavailable_reason {
@@ -637,7 +662,7 @@ impl Engine{
         // After any unavailable state, the next valid observation has no
         // adjacent previous price. This applies to every venue, not just Manifest.
         let previous=if was_available{Some(old)}else{None};
-        self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field));
+        self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field),Some(pipeline));
         Ok(())
     }
 
@@ -683,7 +708,7 @@ fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
 }
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
     mut sequence:u64)->Result<(Engine,Vec<Pubkey>)> {
-    let mut engine=Engine{pools:Vec::new(),subs:Vec::new(),events:out.clone(),sequence,observed:HashMap::new(),invalid:HashSet::new()};
+    let mut engine=Engine::empty(out.clone(),sequence);
     // Bisect failing batches to isolate a bad pool without one RPC round-trip per healthy pool.
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
     while let Some(batch)=pending.pop() {
@@ -718,6 +743,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
         }
     }
     engine.sequence=sequence;
+    engine.index();
     Ok((engine,failed))
 }
 // Consume transport notifications while HTTP hydration is pending. A baseline deliberately
@@ -745,7 +771,7 @@ async fn baseline(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<M
 fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     let mut wanted=BTreeMap::<Pubkey,AccountView>::new();
     for s in &engine.subs {
-        let address=s.address.parse()?;let (offset,length)=s.field.slice();
+        let address=s.key;let (offset,length)=s.field.slice();
         let view=if s.field==Field::ManifestBook {AccountView::Full}else{AccountView::Slice{offset,length}};
         let combined=match (wanted.get(&address).copied(),view) {
             (None,v)=>v,(Some(AccountView::Full),_)|(_,AccountView::Full)=>AccountView::Full,
@@ -759,8 +785,7 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     Ok(wanted.into_iter().map(|(address,view)|AccountWatch{address,view}).collect())
 }
 fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
-    engine.subs.iter().filter(|s|s.pool==pi).all(|s|
-        s.address.parse::<Pubkey>().is_ok_and(|a|active.contains_key(&a)))
+    engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))
 }
 fn invalidate(engine:&mut Engine,reason:&str) {
     for pi in 0..engine.pools.len() {
@@ -777,14 +802,14 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     ensure!(rpc.can_watch(),"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
     let mut events=rpc.subscribe_events();
     let mut candidates=identities(&registry);
-    let mut selected:Vec<PoolInput>=Vec::new();let mut engine=Engine{pools:Vec::new(),subs:Vec::new(),events:out.clone(),sequence:0,observed:HashMap::new(),invalid:HashSet::new()};
+    let mut selected:Vec<PoolInput>=Vec::new();let mut engine=Engine::empty(out.clone(),0);
     let mut failed=Vec::new();let mut wanted=Vec::<AccountWatch>::new();
     let mut active=HashMap::<Pubkey,String>::new();
     let mut ready=false;let mut rebuild=true;let mut resync=false;
     let mut input_open=true;let mut tick=time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut ticks=0_u64;let mut last_ack=time::Instant::now();let mut initialized=false;
-    let mut baseline_floor=HashMap::<String,u64>::new();
+    let mut baseline_floor=HashMap::<Pubkey,u64>::new();
     loop {
         if *stop.borrow(){break;}
         if rebuild {
@@ -838,20 +863,22 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     active.remove(&address);ready=false;resync=true;
                     crate::log_event!(Warn,"market state subscription rejected provider={provider} account={address} code={code}");
                 },
-                Ok(WsEvent::Account{address,provider,slot,received_at_ms,value})=>{
+                Ok(WsEvent::Account{address,provider,slot,received_at_ms,frame_received_at_us,decoded_at_us,value})=>{
+                    let pipeline=PricePipelineTiming{frame_received_at_us,transport_decoded_at_us:decoded_at_us,
+                        market_received_at_us:timestamp_us(),price_published_at_us:0};
                     if !ready || active.get(&address)!=Some(&provider) {continue;}
-                    let address=address.to_string();
                     // A queued same-slot notification cannot be ordered relative to an HTTP baseline.
                     // Wait for a strictly newer slot once, then preserve WebSocket order within a slot.
                     if baseline_floor.get(&address).is_some_and(|floor|slot<=*floor){continue;}
                     baseline_floor.remove(&address);
                     if engine.observed.get(&address).is_some_and(|(old,_)|slot<*old){continue;}
-                    engine.observed.insert(address.clone(),(slot,received_at_ms.saturating_mul(1000)));
-                    let indices:Vec<usize>=engine.subs.iter().enumerate().filter(|(_,s)|s.address==address).map(|(i,_)|i).collect();
-                    for index in indices {
+                    engine.observed.insert(address,(slot,received_at_ms.saturating_mul(1000)));
+                    let indices=engine.account_ranges.get(&address).cloned().unwrap_or(0..0);
+                    for position in indices {
+                        let index=engine.account_bindings[position];
                         let pi=engine.subs[index].pool;
                         if !complete(&engine,pi,&active){continue;}
-                        let decoded=(||->Result<(String,&[u8])>{
+                        let decoded=(||->Result<(Pubkey,&[u8])>{
                             let account=value.as_ref().context("account deleted")?;
                             let (offset,length)=engine.subs[index].field.slice();
                             let bytes=if engine.subs[index].field==Field::ManifestBook {
@@ -867,14 +894,14 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                                     else {bytes(&account.bytes,begin,length)?}
                                 }
                             }};
-                            Ok((account.owner.to_string(),bytes))
+                            Ok((account.owner,bytes))
                         })();
                         let updated=match decoded {
-                            Ok((owner,bytes))=>engine.update(index,slot,&owner,bytes,received_at_ms.saturating_mul(1000)),
+                            Ok((owner,bytes))=>engine.update(index,slot,owner,bytes,received_at_ms.saturating_mul(1000),pipeline),
                             Err(e)=>Err(e),
                         };
                         if let Err(error)=updated {
-                            engine.invalid.insert(address.clone());
+                            engine.invalid.insert(address);
                             engine.pools[pi].available=false;
                             engine.publish_unavailable(pi,slot,received_at_ms.saturating_mul(1000),format!("account update: {error:#}"));
                         }
@@ -907,11 +934,11 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                         invalidate(&mut engine,"account requirements changed; awaiting subscriptions");
                         continue;
                     }
-                    baseline_floor=engine.observed.iter().map(|(a,(slot,_))|(a.clone(),*slot)).collect();
+                    baseline_floor=engine.observed.iter().map(|(a,(slot,_))|(*a,*slot)).collect();
                     ready=true;resync=false;
                     for pi in 0..engine.pools.len() {
                         if complete(&engine,pi,&active) && engine.pools[pi].available {
-                            engine.publish_price(pi,PriceOrigin::Baseline,None,None);
+                            engine.publish_price(pi,PriceOrigin::Baseline,None,None,None);
                         }else {
                             engine.pools[pi].available=false;
                             engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),"waiting for complete account subscription or valid price".into());

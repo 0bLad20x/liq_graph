@@ -111,7 +111,7 @@ try {
     if ($Signals) {
         $produced = $evidence.signal_production_report
         $received = $evidence.signal_report
-        Write-Host "Signals published=$($produced.published_events) received=$($received.received_events) lost=$($received.lost_events) lag incidents=$($received.lag_incidents) delivery passed=$($evidence.signal_delivery_passed)"
+        Write-Host "Signals blocks/control published=$($produced.published_events) received=$($received.received_events) route rows published=$($produced.published_route_rows) received=$($received.received_route_rows) lost=$($received.lost_events) lag incidents=$($received.lag_incidents) delivery passed=$($evidence.signal_delivery_passed)"
         if ($ProfileSignals) { Write-Host "Profile: inspect producer websocket_inputs and consumer bookkeeping/formatting/completion timings. Event loss remains an acceptance failure." }
     }
     if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Diagnostics: $report and $log" }
@@ -120,7 +120,13 @@ try {
     if ($Signals) {
         if ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true -or $evidence.signal_candidate_passed -ne $true) { throw "No complete live signal proof; inspect both signal reports and worker.log." }
         $signalReport = $evidence.signal_report
-        if ($signalReport.execution_layout -ne "indexed_role_plan_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
+        if ($signalReport.execution_layout -ne "indexed_role_plan_v1" -or $signalReport.output_layout -ne "compact_route_blocks_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
+        if ($produced.published_route_rows -ne $signalReport.received_route_rows -or
+            $signalReport.output_capacity -ne 256 -or $signalReport.max_rows_per_block -ne 64) { throw "Signal block delivery or output bounds differ; inspect both signal reports." }
+        $pipeline = $produced.websocket_inputs
+        foreach ($stage in @("transport_decode_us", "transport_to_market_us", "market_processing_us", "price_queue_us", "frame_to_worker_us")) {
+            if ($pipeline.$stage.count -ne $produced.websocket_evaluations) { throw "Incomplete WebSocket pipeline timing: $stage" }
+        }
         if ($signalReport.combinations_visited -ne $signalReport.routes_expected -or
             $signalReport.routes_affected -ne $signalReport.routes_expected -or
             $signalReport.logarithms_prepared -ne $signalReport.price_evaluations -or

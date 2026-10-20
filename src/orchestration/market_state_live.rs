@@ -78,7 +78,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let (control,enabled)=watch::channel(true);
     let (prices,price_rx)=broadcast::channel(16384);
     let (signal_output,mut signal_worker,mut signal_consumer)=if let Some(cfg)=signal_settings {
-        let (output,receiver)=broadcast::channel(16384);
+        let (output,receiver)=broadcast::channel(graph_signals::OUTPUT_CAPACITY);
         let observer=Task(tokio::spawn(graph_signals::observe(receiver,cfg)));
         let worker=Task(tokio::spawn(graph_signals::run(prices.subscribe(),catalog_rx.clone(),output.clone(),cfg)));
         (Some(output),Some(worker),Some(observer))

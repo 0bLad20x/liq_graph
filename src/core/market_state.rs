@@ -12,6 +12,12 @@ pub enum Consistency {
 }
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub enum PriceOrigin { Baseline, Websocket }
+/// Local pipeline boundaries, starting when a text frame is read from the socket.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct PricePipelineTiming {
+    pub frame_received_at_us:u64, pub transport_decoded_at_us:u64,
+    pub market_received_at_us:u64, pub price_published_at_us:u64,
+}
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PoolPriceObservation {
     pub origin: PriceOrigin,
@@ -36,6 +42,7 @@ pub struct PoolPriceObservation {
     pub component_received_at_us_min: u64,
     pub component_received_at_us_max: u64,
     pub trigger_field: Option<&'static str>,
+    pub pipeline: Option<PricePipelineTiming>,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum MarketStateEvent {

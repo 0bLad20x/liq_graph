@@ -509,7 +509,7 @@ pub async fn run()->Result<()>{
         let (prices,price_rx)=broadcast::channel(16384);
         if signals_enabled {
             let cfg=crate::workers::graph_signals::Settings::from_env()?;
-            let (signals,signal_rx)=broadcast::channel(16384);
+            let (signals,signal_rx)=broadcast::channel(crate::workers::graph_signals::OUTPUT_CAPACITY);
             let signal_input=prices.subscribe(); let signal_catalog=catalog_rx.clone();
             critical(&mut tasks,"graph_signals",async move {
                 crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?.ensure_complete()
