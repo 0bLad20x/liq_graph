@@ -719,14 +719,16 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     let mut window=ProductionTimings::default();
     let mut worker_age = Histogram::default(); let mut candidate_age = Histogram::default(); let mut consumer_age = Histogram::default();
     let mut format_ns = 0_u64;
+    let detailed_events = (settings.trace && crate::core::logging::enabled(crate::core::logging::Level::Info,module_path!()))
+        || crate::core::logging::enabled(crate::core::logging::Level::Debug,module_path!());
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     let outcome: Result<()> = async {
     loop { tokio::select! {
         _ = ticker.tick() => {
             let started = Instant::now();
             crate::log_event!(Info, "graph signals consumer execution_layout={} evaluations={evaluations} ws_evaluations={ws_evaluations} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} max_price_queue={input_max} max_signal_queue={output_max}", EXECUTION_LAYOUT);
-            crate::log_event!(Info, "graph signals indexed ws_combinations_available={ws_available} ws_combinations_visited={ws_combinations} ws_routes_expected={ws_expected} ws_logarithms_prepared={ws_logarithms} ws_preparation_mean_ns={:?}", ws_preparation.report().mean);
-            crate::log_event!(Info, "graph signals timings output_layout={OUTPUT_LAYOUT} ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
+            crate::log_event!(Debug, "graph signals indexed ws_combinations_available={ws_available} ws_combinations_visited={ws_combinations} ws_routes_expected={ws_expected} ws_logarithms_prepared={ws_logarithms} ws_preparation_mean_ns={:?}", ws_preparation.report().mean);
+            crate::log_event!(Debug, "graph signals timings output_layout={OUTPUT_LAYOUT} ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
                 ws_output.report().mean, ws_process.report().mean, ws_process.report().max, ws_evaluation_consumer_age.report().max);
             if settings.profile {
                 crate::log_event!(Info,"graph signals window ws_evaluations={} transport_decode_mean_us={:?} transport_to_market_mean_us={:?} market_mean_us={:?} price_queue_mean_us={:?} frame_to_worker_max_us={:?} processing_mean_ns={:?} processing_max_ns={:?}",
@@ -761,12 +763,13 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 settings.trace || candidates<=settings.sample_limit as u64
                                     || (live && ws_candidates<=settings.sample_limit as u64)
                             }else{true};
-                            if print {
+                            if print && detailed_events {
                                 let started=Instant::now();
                                 let route=block.route(index).context("invalid signal row expansion")?;
                                 let example=if row.qualifies {serde_json::json!({"Candidate":route})}
                                     else{serde_json::json!({"RouteSample":route})};
-                                println!("{}",serde_json::to_string(&example)?);
+                                if settings.trace {crate::log_event!(Info,"graph signals event={example}");}
+                                else {crate::log_event!(Debug,"graph signals event={example}");}
                                 format_ns=format_ns.saturating_add(nanos(started));
                             }
                         }
@@ -835,9 +838,10 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                     },
                 };
                 if let Some(started) = sampled { bookkeeping.add(nanos(started).saturating_sub(format_ns-format_before)); }
-                if print {
+                if print && detailed_events {
                     let started = Instant::now();
-                    println!("{}", serde_json::to_string(event.as_ref())?);
+                    if settings.trace {crate::log_event!(Info,"graph signals event={}",serde_json::to_string(event.as_ref())?);}
+                    else {crate::log_event!(Debug,"graph signals event={}",serde_json::to_string(event.as_ref())?);}
                     format_ns = format_ns.saturating_add(nanos(started));
                 }
             },

@@ -14,6 +14,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+function Write-RunLog([string]$Message) {
+    $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    Write-Host "ts_ms=$timestamp level=INFO module=liq_graph::scripts::market_state_live $Message"
+}
 if ($ProfileSignals -and -not $Signals) { throw "ProfileSignals requires the Graph-Signals runner." }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps) -or $ThresholdBps -lt 0) { throw "ThresholdBps must be finite and nonnegative." }
 $label = if ($Signals) { "Graph-Signals" } else { "Market-State" }
@@ -28,9 +32,8 @@ $status = git status --short
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect working tree." }
 $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Commit or preserve tracked changes before the live run; nothing was changed by this script." }
-if ($branch -notin @("agent/market-state-stream", "agent/graph-signals-reference", "main")) { throw "Use a Market-State/Graph-Signals feature branch, or main after merge." }
-Write-Host "$label branch=$branch head=$head signals=$([bool]$Signals) execution=false"
-if ($status) { Write-Host ($status | Out-String) }
+Write-RunLog "$label branch=$branch head=$head signals=$([bool]$Signals) execution=false"
+if ($status) { Write-RunLog "untracked_or_local_entries=$(@($status).Count)" }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed; no live run started." }
 git diff --exit-code -- Cargo.lock
@@ -75,8 +78,7 @@ foreach ($name in $values.Keys) {
     [Environment]::SetEnvironmentVariable($name, $values[$name], "Process")
 }
 try {
-    Write-Host "Report: $report"
-    Write-Host "Log:    $log"
+    Write-RunLog "report=$report worker_log=$log"
     $binary = Join-Path (Get-Location) "target\release\liq_graph.exe"
     # The binary loads .env and resolves the same transport configuration as the live run.
     # This mode opens no RPC connection and reads no database; URLs/credentials are omitted.
@@ -87,10 +89,12 @@ try {
     [System.IO.File]::WriteAllText($planPath, ($plan | ConvertTo-Json -Depth 8), $utf8)
     $checkout["websocket_plan"] = $plan
     [System.IO.File]::WriteAllText($metadata, ($checkout | ConvertTo-Json -Depth 10), $utf8)
-    Write-Host "WebSocket selection=$($plan.selection) account_capacity=$($plan.account_capacity) sockets=$($plan.socket_count)"
-    $plan.providers | Format-Table index, name, max_connections, max_subscriptions, subscriptions_per_connection | Out-Host
-    if ($WsAccountBudget -gt 0) { Write-Host "The explicit account budget is a local test setting; provider acceptance is measured by the live run." }
-    if ($PlanOnly) { Write-Host "Plan only: $planPath. No RPC subscriptions or database reads were started."; return }
+    Write-RunLog "websocket_selection=$($plan.selection) account_capacity=$($plan.account_capacity) sockets=$($plan.socket_count)"
+    foreach ($provider in $plan.providers) {
+        Write-RunLog "ws_provider=$($provider.name) index=$($provider.index) connections=$($provider.max_connections) subscriptions=$($provider.max_subscriptions) per_connection=$($provider.subscriptions_per_connection)"
+    }
+    if ($WsAccountBudget -gt 0) { Write-RunLog "explicit_ws_budget=$WsAccountBudget provider_acceptance_requires_live_run=true" }
+    if ($PlanOnly) { Write-RunLog "plan_only=true path=$planPath rpc_connections=false database_reads=false"; return }
     if ($plan.account_capacity -le 0) { throw "No WebSocket account providers selected. Use Configured flags, All, or explicit indices." }
     # stderr contains ordinary Rust log lines. Do not interpret those as PowerShell errors.
     $oldPreference = $ErrorActionPreference
@@ -107,12 +111,12 @@ try {
         [System.IO.File]::WriteAllText($report, ($partial | ConvertTo-Json), $utf8)
     }
     $evidence = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-    Write-Host "Run complete=$($evidence.run_complete) live evidence=$($evidence.live_evidence_passed) report=$report"
+    Write-RunLog "run_complete=$($evidence.run_complete) live_evidence_passed=$($evidence.live_evidence_passed) report=$report"
     if ($Signals) {
         $produced = $evidence.signal_production_report
         $received = $evidence.signal_report
-        Write-Host "Signals blocks/control published=$($produced.published_events) received=$($received.received_events) route rows published=$($produced.published_route_rows) received=$($received.received_route_rows) lost=$($received.lost_events) lag incidents=$($received.lag_incidents) delivery passed=$($evidence.signal_delivery_passed)"
-        if ($ProfileSignals) { Write-Host "Profile: inspect producer websocket_inputs and consumer bookkeeping/formatting/completion timings. Event loss remains an acceptance failure." }
+        Write-RunLog "signals_published=$($produced.published_events) signals_received=$($received.received_events) route_rows_published=$($produced.published_route_rows) route_rows_received=$($received.received_route_rows) lost=$($received.lost_events) lag_incidents=$($received.lag_incidents) delivery_passed=$($evidence.signal_delivery_passed)"
+        if ($ProfileSignals) { Write-RunLog "profile=true details=report.json websocket_inputs=true" }
     }
     if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Diagnostics: $report and $log" }
     if ($evidence.run_complete -ne $true) { throw "Live run did not complete; inspect report.json and worker.log." }
@@ -132,9 +136,9 @@ try {
             $signalReport.logarithms_prepared -ne $signalReport.price_evaluations -or
             $signalReport.websocket_combinations_visited -ne $signalReport.websocket_routes_expected -or
             $signalReport.websocket_logarithms_prepared -ne $signalReport.websocket_evaluations) { throw "Indexed signal accounting failed; inspect signal_report." }
-        Write-Host "Graph-Signals indexed plan live evidence passed. Review per-kind coverage and complete latency in report.json."
+        Write-RunLog "graph_signals_live_passed=true details=report.json"
     } else {
-        Write-Host "Market-State live evidence passed. Review per-venue coverage in report.json before accepting the checkpoint."
+        Write-RunLog "market_state_live_passed=true details=report.json"
     }
 } finally {
     foreach ($name in $previous.Keys) {

@@ -1,7 +1,5 @@
 //! Indicative market state: Prepared pool inputs -> account watches -> typed prices.
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
-mod live;
-pub use live::decode_live;
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
@@ -820,35 +818,6 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
     Ok(wanted.into_iter().map(|(address,view)|AccountWatch{address,view}).collect())
 }
 
-/// Real transport input only: persisted Prepared proofs are not live Registry admission.
-/// Reuse the production account discovery and slice planner; do not publish prices.
-pub async fn account_stream_plan(registry:&PoolRegistry,rpc:&RpcHandle)->Result<Vec<AccountWatch>> {
-    let started=time::Instant::now();let limit=Settings::from_env()?.pool_limit;
-    let candidates=registry.snapshot().iter().filter_map(PoolInput::prepared).map(|p|(p.address,p)).collect();
-    let selected=select(&candidates,limit);
-    ensure!(!selected.is_empty(),"no persisted Prepared pools for the account transport plan");
-    crate::log_event!(Info,"market account plan preparing=true prepared={} selected={} pool_limit={limit} admission=historical_proof_only prices=false",candidates.len(),selected.len());
-    let (output,_)=broadcast::channel(16);
-    let (engine,failed)=hydrate(&selected,rpc,&output,false).await?;
-    let wanted=watches(&engine,&[])?;
-    let failures:Vec<_>=failed.iter().map(|(p,reason)|serde_json::json!({"pool":p.address.to_string(),"reason":reason})).collect();
-    let mut venues=BTreeMap::<&str,usize>::new();
-    for pool in &engine.pools {*venues.entry(pool.venue.label()).or_default()+=1;}
-    let capacity=rpc.account_stream().0.capacity();
-    let report=serde_json::json!({"source":"persisted_prepared_proofs","live_admission_established":false,
-        "pool_limit":limit,"prepared_candidates":candidates.len(),"selected_pools":selected.len(),
-        "planned_pools":engine.pools.len(),"failed_pools":failed.iter().map(|(p,_)|p.address.to_string()).collect::<Vec<_>>(),
-        "failures":failures,"pools_by_venue":venues,"account_references":engine.subs.len(),
-        "unique_accounts":wanted.len(),"account_capacity":capacity,"capacity_sufficient":wanted.len()<=capacity,
-        "preparation_seconds":started.elapsed().as_secs_f64(),
-        "pools":selected.iter().map(|p|p.address.to_string()).collect::<Vec<_>>()});
-    let path=env::var("MARKET_STATE_ACCOUNT_PLAN_PATH").context("MARKET_STATE_ACCOUNT_PLAN_PATH is required")?;
-    std::fs::write(path,serde_json::to_vec_pretty(&report)?).context("write market account plan")?;
-    ensure!(failed.is_empty(),"account plan failed for {} of {} pools; inspect preparation.json",failed.len(),selected.len());
-    ensure!(wanted.len()<=capacity,"{} pools require {} distinct accounts; ENV WebSocket capacity is {}; no subscriptions were opened",selected.len(),wanted.len(),capacity);
-    crate::log_event!(Info,"market account plan complete=true pools={} accounts={} seconds={:.3}",engine.pools.len(),wanted.len(),started.elapsed().as_secs_f64());
-    Ok(wanted)
-}
 fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
     engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))
 }
@@ -955,7 +924,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 selected=next;current=next_map;replan=true;engine.metrics.selection_changes+=1;
                 engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
-                crate::log_event!(Info,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
+                crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
             }
             rebuild=false;
         }
@@ -1136,20 +1105,24 @@ pub async fn observe(mut input:PriceEventStream,mut catalog:watch::Receiver<Arc<
                         }
                         let first=prices.insert(p.pool.clone(),p.origin).is_none();
                         let first_live=matches!(p.origin,PriceOrigin::Websocket) && first_ws.insert(p.pool.clone());
-                        if trace || (first && observed<=16) || (first_live && first_ws.len()<=16) {println!("{}",serde_json::to_string(event.as_ref())?);}
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else if (first && observed<=16) || (first_live && first_ws.len()<=16) {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     },
                     MarketStateEvent::Unavailable{pool,..}=>{
                         prices.remove(pool);
                         let first=unavailable.insert(pool.clone());
-                        if trace || (first && unavailable.len()<=16){println!("{}",serde_json::to_string(event.as_ref())?);}
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else if first && unavailable.len()<=16 {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     },
                     MarketStateEvent::Removed{pool,..}=>{removals+=1;prices.remove(pool);
-                        if trace || removals<=16 {println!("{}",serde_json::to_string(event.as_ref())?);}},
-                    MarketStateEvent::Gap{..}=>{gaps+=1;prices.clear();println!("{}",serde_json::to_string(event.as_ref())?);},
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else if removals<=16 {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}},
+                    MarketStateEvent::Gap{reason,sequence}=>{gaps+=1;prices.clear();crate::log_event!(Warn,"market state gap reason={reason} sequence={sequence}");},
                     MarketStateEvent::Selection{selected,..}=>{selections+=1;
                         if selected.is_empty(){cleared=true;}else if cleared{rewatching=true;}
                         let current:HashSet<_>=selected.iter().cloned().collect();prices.retain(|p,_|current.contains(p));
-                        println!("{}",serde_json::to_string(event.as_ref())?);
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     },
                     MarketStateEvent::Stats{active,..}=>{
                         max_active=max_active.max(*active);
@@ -1161,7 +1134,8 @@ pub async fn observe(mut input:PriceEventStream,mut catalog:watch::Receiver<Arc<
                             .any(|p|matches!(prices.get(&p.to_string()),Some(PriceOrigin::Websocket)))).count();
                         pairs_max=pairs_max.max(direct_pairs);live_pairs_max=live_pairs_max.max(live_pairs);
                         crate::log_event!(Info,"market state consumer prices={} observations={observed} websocket={websocket} graph_generation={} priced_pairs={direct_pairs} live_priced_pairs={live_pairs}",prices.len(),graph.generation);
-                        println!("{}",serde_json::to_string(event.as_ref())?);
+                        if trace {crate::log_event!(Info,"market state event={}",serde_json::to_string(event.as_ref())?);}
+                        else {crate::log_event!(Debug,"market state event={}",serde_json::to_string(event.as_ref())?);}
                     }
                 }
             },

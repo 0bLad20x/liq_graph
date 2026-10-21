@@ -106,8 +106,15 @@ pub async fn run(
                         }
                         dirty=true;
                     },
-                    Err(broadcast::error::RecvError::Lagged(n))=>
-                        anyhow::bail!("qualification lost {n} registry batches"),
+                    Err(broadcast::error::RecvError::Lagged(n))=>{
+                        // Only this receiver missed the broadcast updates. The existing
+                        // cursor scan revisits persisted pool identities; a catalogue
+                        // refresh also reconciles the current qualified mint set.
+                        // This is not proof that any mint identity was lost permanently.
+                        dirty=true;
+                        crate::log_event!(Warn,
+                            "mint qualification registry_lagged missed_batches={n} reconciliation=periodic_sql");
+                    },
                     Err(broadcast::error::RecvError::Closed)=>break,
                 }
             },
