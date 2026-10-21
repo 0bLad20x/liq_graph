@@ -133,11 +133,17 @@ emit Exited intervals. Selection withdraws all deselected pools in one state rev
 State changes invalidate every route depending on them without individual exit expansion.
 A new graph generation replaces the published plan and seeds it from retained prices.
 Price-input loss publishes a clear/invalidation before the producer reports failure.
-The receiver stops on any missing event/revision rather than silently using incomplete state.
+Signal-output broadcast loss is a warning: the observer records the lost count, incident,
+timestamps, last sequence/revision and queue depth, discards its invalid local mirror and
+continues consuming. Producer timings and independent arrival measurements continue.
+State-dependent range validation, samples and trace output resume only after the next
+existing full State snapshot. No replay request, extra snapshot, larger queue, waiting or
+transport change is introduced. If no snapshot arrives, the observer remains unsynchronized.
+Other contract violations and producer/input failures remain errors.
 
 ## Measurement report
 
-Production and receiver counters must match. Market-State price/WS totals must also equal
+Production and receiver counters must match for delivery acceptance. Market-State price/WS totals must also equal
 signal price/WS evaluation totals. Existing source-gap/admission/coverage measurements
 remain in the Market-State section of report.json.
 
@@ -190,6 +196,24 @@ from baseline and WS inputs separately for each kind. State arrival age ends bef
 the delta; frame-to-state-consumer ends after applying it. Consumer timing includes contract
 checks but does not run the old reference enumeration.
 
+Receiver counters count received events, including unverified events after a loss. They
+need not balance across revisions in a run with loss. lag_incidents, first_loss_at_us and
+last_loss_at_us locate output overruns; lost_events remains cumulative after recovery.
+unverified_events/unverified_ranges count received data skipped by state-dependent checks,
+not the contents of missing events. resynchronizations counts accepted recovery snapshots;
+awaiting_snapshot describes the final mirror status. last_revision is the last applied
+revision. Arrival ages still include unverified arrivals (without delta application while
+unsynchronized); witnesses are collected only from synchronized revisions.
+
+The finite live runner completes its requested duration after output loss and exits normally
+with a warning, provided the producer, Market-State/input accounting, pipeline timing and
+other contract checks pass. run_complete=true then means only that the run finished.
+signal_output_loss_warning=true is separate from live_evidence_passed,
+signal_delivery_passed and signal_measurement_passed, which remain false for any loss,
+even after resynchronization. Producer timings remain available for diagnosis; this is not
+a successful delivery/acceptance result. A lost output event alone no longer shuts down
+the experiment. Unexpected errors still produce a nonzero exit.
+
 signal_measurement_passed requires real WS inputs, a fully priceable topology queried,
 and complete delivery. A quiet market can pass measurement without a qualifying range;
 signal_candidate_passed independently records whether one was observed. Neither flag
@@ -220,8 +244,10 @@ One low-load measurement does not establish behavior at arbitrary fan-out or poo
 
 ## Status
 
-Implementation prepared for local measurement; no reference comparison performed.
-Rust/Cargo, PowerShell and live DB/RPC credentials are unavailable in the agent environment.
-No successful build, live run, sub-five-millisecond latency, numerical equivalence or full
-issue-40 acceptance is claimed. The issue remains open for real measurements and the
+The first uploaded real run built and processed prices, but ended after about 32 seconds
+when the output observer lost 158 events. This identifies a signal-output delivery failure;
+it does not establish a WebSocket transport failure or full-load acceptance.
+The warning/continuation change needs a new real run. Rust/Cargo, PowerShell and live
+DB/RPC credentials are unavailable in the agent environment, so no build or live verification
+of that change is claimed here. Issue #40 remains open for complete measurements and the
 subsequent separately requested reference comparison.

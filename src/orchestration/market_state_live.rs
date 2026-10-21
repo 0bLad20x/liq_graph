@@ -204,27 +204,36 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     tokio::time::timeout(Duration::from_secs(30),&mut graph.0).await.context("market graph shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(10),&mut catalog.0).await.context("market catalog shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(10),&mut rpc_task.0).await.context("market RPC shutdown timeout")???;
+    let output_loss_warning=signal_report.as_ref().is_some_and(|r|r.has_delivery_loss());
     let result=report.ensure_live_evidence(rewatch).and_then(|()| {
         if let Some(r)=&signal_report {
-            production_report.as_ref().context("missing signal producer report")?.ensure_delivery(r)?;
-            production_report.as_ref().context("missing signal producer report")?
-                .ensure_input_delivery(report.observations,report.websocket_observations)?;
-            r.ensure_calculation_evidence()
+            let producer=production_report.as_ref().context("missing signal producer report")?;
+            producer.ensure_input_delivery(report.observations,report.websocket_observations)?;
+            r.ensure_complete()?;
+            // Output loss invalidates delivery evidence, not this finite measurement run.
+            // Producer/input failures and contract violations remain errors.
+            if r.has_delivery_loss() {Ok(())}
+            else {producer.ensure_delivery(r)?; r.ensure_calculation_evidence()}
         }else{Ok(())}
     });
+    let measurement_passed=result.is_ok() && !output_loss_warning;
     *evidence=serde_json::json!({"run_complete":true,"duration_seconds":duration,"pool_limit":settings.pool_limit,
         "rewatch":rewatch,"persisted_prepared":persisted_prepared,"live_tvl_pools":registry.live_tvl_count(),
-        "admission_source":"live_enrichment","live_evidence_passed":result.is_ok(),"report":report,
+        "admission_source":"live_enrichment","live_evidence_passed":measurement_passed,"report":report,
         "signals_enabled":signals_enabled,"signal_threshold_bps":signal_settings.map(|s|s.threshold_bps),
         "signal_calculation_passed":signal_report.as_ref().map(|r|r.ensure_calculation_evidence().is_ok()),
         "signal_candidate_passed":signal_report.as_ref().map(|r|r.ensure_live_evidence().is_ok()),
         "signal_profile_enabled":signal_settings.map(|s|s.profile),
         "signal_delivery_passed":production_report.as_ref().zip(signal_report.as_ref()).map(|(p,r)|p.ensure_delivery(r).is_ok()),
-        "signal_measurement_passed":signals_enabled && result.is_ok(),"reference_comparison_performed":false,
+        "signal_measurement_passed":signals_enabled && measurement_passed,"signal_output_loss_warning":output_loss_warning,
+        "reference_comparison_performed":false,
         "signal_production_report":production_report,"signal_report":signal_report,"execution":false,
         "websocket_plan":websocket_plan,
         "error":result.as_ref().err().map(|e|format!("{e:#}"))});
     result?;
+    if output_loss_warning {
+        crate::log_event!(Warn,"market state live measurement_completed=true signal_output_loss=true delivery_valid=false inspect=signal_report");
+    }
     crate::log_event!(Info,"market state live complete=true real_websocket=true graph_consumer=true signals_enabled={signals_enabled}");
     Ok(())
 }

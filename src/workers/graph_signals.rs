@@ -690,15 +690,16 @@ impl ProductionReport {
     pub fn ensure_delivery(&self, r: &ObservationReport) -> Result<()> {
         self.ensure_complete()?; r.ensure_integrity()?;
         ensure!(self.counts==r.counts,"signal producer/consumer counts differ");
+        Ok(())
+    }
+    pub fn ensure_input_delivery(&self, prices: u64, websocket: u64) -> Result<()> {
+        self.ensure_complete()?;
+        ensure!(self.counts.price_evaluations==prices && self.counts.websocket_evaluations==websocket,
+            "Market-State/signal input totals differ");
         let t=&self.websocket_inputs;
         ensure!([&t.transport_decode_us,&t.transport_to_market_us,&t.market_processing_us,
             &t.price_queue_us,&t.frame_to_worker_us].iter().all(|h|h.count==self.counts.websocket_evaluations),
             "incomplete WebSocket pipeline timing");
-        Ok(())
-    }
-    pub fn ensure_input_delivery(&self, prices: u64, websocket: u64) -> Result<()> {
-        ensure!(self.counts.price_evaluations==prices && self.counts.websocket_evaluations==websocket,
-            "Market-State/signal input totals differ");
         Ok(())
     }
 }
@@ -712,6 +713,8 @@ pub struct ObservationReport {
     execution_layout: &'static str, output_layout: &'static str,
     output_capacity: usize, max_ranges_per_block: usize, reference_comparison_performed: bool,
     lost_events: u64, max_queue_depth: usize, last_sequence: u64, last_revision: u64,
+    lag_incidents: u64, first_loss_at_us: Option<u64>, last_loss_at_us: Option<u64>,
+    resynchronizations: u64, awaiting_snapshot: bool, unverified_events: u64, unverified_ranges: u64,
     state_ready_to_consumer_us: Histogram, websocket_state_ready_to_consumer_us: Histogram,
     websocket_frame_to_state_consumer_us: Histogram, websocket_frame_to_range_consumer_us: Histogram,
     completion_to_consumer_us: Histogram, websocket_frame_to_completion_consumer_us: Histogram,
@@ -721,8 +724,13 @@ pub struct ObservationReport {
     consumer_logging_ns: u64,
 }
 impl ObservationReport {
-    pub fn ensure_integrity(&self) -> Result<()> {
+    pub fn ensure_complete(&self) -> Result<()> {
         ensure!(self.error.is_none(),"signal consumer failed: {}",self.error.as_deref().unwrap_or(""));
+        Ok(())
+    }
+    pub fn has_delivery_loss(&self) -> bool { self.lost_events>0 }
+    pub fn ensure_integrity(&self) -> Result<()> {
+        self.ensure_complete()?;
         ensure!(self.lost_events==0,"signal consumer lost {} events",self.lost_events);
         Ok(())
     }
@@ -841,12 +849,25 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                         SignalEvent::State(s)=>s.sequence, SignalEvent::Ranges(b)=>b.sequence,
                         SignalEvent::Evaluated(e)=>e.sequence,
                     };
-                    ensure!(sequence==report.last_sequence+1,"signal event sequence gap");
+                    ensure!(report.awaiting_snapshot || sequence==report.last_sequence+1,"signal event sequence gap");
                     report.last_sequence=sequence;
+                    // Deltas cannot repair a missing revision. Keep measuring arrivals,
+                    // but resume state-dependent checks only at an existing full snapshot.
+                    let recovering=report.awaiting_snapshot
+                        && matches!(event.as_ref(),SignalEvent::State(s) if s.snapshot.is_some());
+                    if report.awaiting_snapshot && !recovering {report.unverified_events+=1;}
                     match event.as_ref() {
                         SignalEvent::State(s) => {
-                            ensure!(!pending,"state replaced before previous evaluation completed");
-                            mirror.state(s)?; pending=true; ranges=[0;3]; report.last_revision=s.revision;
+                            if !report.awaiting_snapshot || recovering {
+                                ensure!(!pending,"state replaced before previous evaluation completed");
+                                if recovering {mirror.revision=s.revision.checked_sub(1).context("invalid snapshot revision")?;}
+                                mirror.state(s)?; pending=true; ranges=[0;3]; report.last_revision=s.revision;
+                                if recovering {
+                                    report.awaiting_snapshot=false; report.resynchronizations+=1;
+                                    crate::log_event!(Warn,"graph signals receiver snapshot_applied=true sequence={sequence} revision={} generation={} resynchronizations={} lost_total={} delivery_valid=false",
+                                        s.revision,s.graph_generation,report.resynchronizations,report.lost_events);
+                                }
+                            }
                             report.counts.state(s);
                             if let Some(us)=at.checked_sub(s.ready_at_us) {
                                 report.state_ready_to_consumer_us.add(us);
@@ -861,18 +882,22 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             }
                         },
                         SignalEvent::Ranges(b) => {
-                            ensure!(pending && !b.ranges.is_empty() && b.ranges.len()<=SIGNAL_BLOCK_RANGES,"invalid signal range block");
-                            for r in &b.ranges {
-                                mirror.range(b,r)?; ranges[change_id(r.change)]+=1;
-                                let kind=kind_id(mirror.plan.as_ref().unwrap().groups[r.group_id].kind);
-                                let samples=if live(&b.trigger) {&mut sample_ws}else{&mut sample_baseline};
-                                if samples[kind]<settings.sample_limit {
-                                    samples[kind]+=1;
-                                    report.examples.push(Example { graph_generation:b.graph_generation,revision:b.revision,
-                                        trigger:b.trigger.clone(),range:r.clone() });
-                                }
-                                if settings.trace {
-                                    crate::log_event!(Info,"graph signals range={}",serde_json::to_string(r)?);
+                            ensure!(!b.ranges.is_empty() && b.ranges.len()<=SIGNAL_BLOCK_RANGES,"invalid signal range block");
+                            if report.awaiting_snapshot {report.unverified_ranges+=b.ranges.len() as u64;}
+                            else {
+                                ensure!(pending,"range block without state");
+                                for r in &b.ranges {
+                                    mirror.range(b,r)?; ranges[change_id(r.change)]+=1;
+                                    let kind=kind_id(mirror.plan.as_ref().unwrap().groups[r.group_id].kind);
+                                    let samples=if live(&b.trigger) {&mut sample_ws}else{&mut sample_baseline};
+                                    if samples[kind]<settings.sample_limit {
+                                        samples[kind]+=1;
+                                        report.examples.push(Example { graph_generation:b.graph_generation,revision:b.revision,
+                                            trigger:b.trigger.clone(),range:r.clone() });
+                                    }
+                                    if settings.trace {
+                                        crate::log_event!(Info,"graph signals range={}",serde_json::to_string(r)?);
+                                    }
                                 }
                             }
                             report.counts.block(b);
@@ -883,9 +908,12 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             }
                         },
                         SignalEvent::Evaluated(e) => {
-                            ensure!(pending && e.revision==mirror.revision && e.graph_generation==mirror.generation,
-                                "completion references wrong state");
-                            ensure!(ranges==e.ranges && e.ranges.iter().sum::<u64>()==e.ranges_by_kind.iter().sum::<u64>(),
+                            if !report.awaiting_snapshot {
+                                ensure!(pending && e.revision==mirror.revision && e.graph_generation==mirror.generation,
+                                    "completion references wrong state");
+                                ensure!(ranges==e.ranges,"range/completion counts differ");
+                            }
+                            ensure!(e.ranges.iter().sum::<u64>()==e.ranges_by_kind.iter().sum::<u64>(),
                                 "range/completion counts differ");
                             ensure!(e.logarithms_prepared==u64::from(matches!(e.trigger.as_ref(),SignalTrigger::Price {..})),
                                 "price logarithm accounting mismatch");
@@ -901,7 +929,13 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                     report.consumer_processing_ns.add(nanos(started));
                 },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    report.lost_events+=n; bail!("signal state stream lost {n} events; revision coverage invalid");
+                    let at=now_us();
+                    report.lost_events+=n; report.lag_incidents+=1;
+                    report.first_loss_at_us.get_or_insert(at); report.last_loss_at_us=Some(at);
+                    report.max_queue_depth=report.max_queue_depth.max(input.len());
+                    report.awaiting_snapshot=true; mirror=Mirror::default(); pending=false; ranges=[0;3];
+                    crate::log_event!(Warn,"graph signals channel=signal_output lost={n} lost_total={} lag_incidents={} last_sequence={} last_valid_revision={} queue_depth={} awaiting_snapshot=true continuing=true delivery_valid=false",
+                        report.lost_events,report.lag_incidents,report.last_sequence,report.last_revision,input.len());
                 },
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -913,7 +947,8 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     report.ranges_by_kind=names(report.counts.ranges_by_kind);
     report.ready_anchors_by_kind=names(report.counts.ready_anchors);
     report.websocket_ready_anchors_by_kind=names(report.counts.websocket_ready_anchors);
-    crate::log_event!(Info,"graph signals consumer complete={} events={} ranges={} lost={} error={:?}",
-        report.error.is_none(),report.counts.events,report.counts.ranges,report.lost_events,report.error);
+    crate::log_event!(Info,"graph signals consumer complete={} events={} ranges={} lost={} awaiting_snapshot={} delivery_valid={} error={:?}",
+        report.error.is_none(),report.counts.events,report.counts.ranges,report.lost_events,
+        report.awaiting_snapshot,report.ensure_integrity().is_ok(),report.error);
     Ok(report)
 }

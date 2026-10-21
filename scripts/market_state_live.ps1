@@ -121,25 +121,30 @@ try {
     }
     if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Diagnostics: $report and $log" }
     if ($evidence.run_complete -ne $true) { throw "Live run did not complete; inspect report.json and worker.log." }
-    if ($evidence.live_evidence_passed -ne $true) { throw "Live evidence requirements were not fulfilled." }
+    $deliveryWarning = $Signals -and $evidence.signal_output_loss_warning -eq $true -and $received.lost_events -gt 0
+    if ($evidence.live_evidence_passed -ne $true -and -not $deliveryWarning) { throw "Live evidence requirements were not fulfilled." }
     if ($Signals) {
-        if ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true) { throw "No complete live state/query measurement; inspect both signal reports and worker.log." }
+        if (-not $deliveryWarning -and ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true)) { throw "No complete live state/query measurement; inspect both signal reports and worker.log." }
         $signalReport = $evidence.signal_report
         if ($signalReport.execution_layout -ne "factorized_roles_v1" -or $signalReport.output_layout -ne "versioned_state_ranges_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
         if ($evidence.reference_comparison_performed -ne $false -or $signalReport.reference_comparison_performed -ne $false) { throw "Unexpected reference comparison in measurement run." }
-        if ($produced.counts.ranges -ne $signalReport.counts.ranges -or
+        if ((-not $deliveryWarning -and $produced.counts.ranges -ne $signalReport.counts.ranges) -or
             $signalReport.output_capacity -ne 256 -or $signalReport.max_ranges_per_block -ne 64) { throw "Signal range delivery or output bounds differ; inspect both signal reports." }
         $pipeline = $produced.websocket_inputs
         foreach ($stage in @("transport_decode_us", "transport_to_market_us", "market_processing_us", "price_queue_us", "frame_to_worker_us")) {
             if ($pipeline.$stage.count -ne $produced.counts.websocket_evaluations) { throw "Incomplete WebSocket pipeline timing: $stage" }
         }
-        $counts = $signalReport.counts
+        # Producer accounting stays mandatory even if the output observer missed events.
+        $counts = $produced.counts
         if ($counts.logarithms_prepared -ne $counts.price_evaluations -or
             $counts.state_updates -ne $counts.evaluations -or
             $counts.price_evaluations -ne $evidence.report.observations -or
             $counts.websocket_evaluations -ne $evidence.report.websocket_observations -or
-            $counts.ranges -ne ($counts.entered_ranges + $counts.updated_ranges + $counts.exited_ranges)) { throw "Factorized signal accounting failed; inspect signal_report." }
-        Write-RunLog "graph_signals_measurement_passed=true candidate_observed=$($evidence.signal_candidate_passed) reference_comparison=false details=report.json"
+            $counts.ranges -ne ($counts.entered_ranges + $counts.updated_ranges + $counts.exited_ranges)) { throw "Factorized signal accounting failed; inspect signal_production_report." }
+        if ($deliveryWarning) {
+            Write-Warning "Measurement run completed with signal output loss: lost=$($received.lost_events) incidents=$($received.lag_incidents) resynchronizations=$($received.resynchronizations) awaiting_snapshot=$($received.awaiting_snapshot) unverified_ranges=$($received.unverified_ranges). Delivery/acceptance failed; producer timings are retained in report.json."
+        }
+        Write-RunLog "graph_signals_measurement_passed=$($evidence.signal_measurement_passed) candidate_observed=$($evidence.signal_candidate_passed) reference_comparison=false details=report.json"
     } else {
         Write-RunLog "market_state_live_passed=true details=report.json"
     }
