@@ -232,8 +232,8 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
 }
 
 struct Signed { bytes:Vec<u8>, keys:Vec<Pubkey>, signature:String }
-fn compile(ix: &mut Instruction, request: &ExecutionRequest, settings: &Settings,
-    blockhash: &str) -> Result<Signed> {
+fn message(ix: &mut Instruction, request: &ExecutionRequest,
+    blockhash: &str) -> Result<(Vec<u8>,Vec<Pubkey>)> {
     let mut merged:Vec<Meta>=Vec::new();
     let program_meta=Meta{address:key(EXECUTOR),writable:false,signer:false};
     for meta in ix.metas.iter().chain(std::iter::once(&program_meta)) {
@@ -265,12 +265,25 @@ fn compile(ix: &mut Instruction, request: &ExecutionRequest, settings: &Settings
     for meta in &ix.metas {message.push(index(meta.address));}
     message.extend(&ix.data);
     ensure!(message.len()+64<=4096,"v1 transaction exceeds 4096 bytes; producer must reduce the job");
+    ix.metrics.unique_accounts=keys.len(); ix.metrics.transaction_bytes=message.len()+64;
+    Ok((message,keys))
+}
+
+/// Exact existing packing/validation boundary. No signing, RPC or pool selection.
+pub fn validate(request: &ExecutionRequest) -> Result<ExecutionMetrics> {
+    let mut ix=instruction(request,request.wallet)?;
+    let _=message(&mut ix,request,"11111111111111111111111111111111")?;
+    Ok(ix.metrics)
+}
+
+fn compile(ix: &mut Instruction, request: &ExecutionRequest, settings: &Settings,
+    blockhash: &str) -> Result<Signed> {
+    let (mut message,keys)=message(ix,request,blockhash)?;
     let signature=settings.signer.sign(&message);
     signature::UnparsedPublicKey::new(&signature::ED25519,settings.signer.public_key().as_ref())
         .verify(&message,signature.as_ref()).map_err(|_|anyhow::anyhow!("local signature verification failed"))?;
     let signature_text=bs58::encode(signature.as_ref()).into_string();
     message.extend(signature.as_ref());
-    ix.metrics.unique_accounts=keys.len(); ix.metrics.transaction_bytes=message.len();
     Ok(Signed{bytes:message,keys,signature:signature_text})
 }
 
@@ -296,7 +309,7 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
     report: &mut ExecutionReport) -> Result<()> {
     let mut ix=instruction(request,settings.wallet())?;
     // Check exact account/byte limits before performing any RPC or signing real blockhash data.
-    let _=compile(&mut ix,request,settings,"11111111111111111111111111111111")?;
+    let _=message(&mut ix,request,"11111111111111111111111111111111")?;
     report.metrics=Some(ix.metrics.clone());
     report.phase="chain_preflight".into(); report.outcome=ExecutionOutcome::RpcFailure;
     match rpc.call(RpcOperation::GenesisHash).await?.answer {

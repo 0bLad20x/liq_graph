@@ -1,7 +1,8 @@
 # Graph signals: factorized state and versioned interval output
 
 This branch implements the measurement stage of issue #40. It runs one new signal engine.
-There is no reference engine, performance comparison, transaction simulation or execution.
+There is no reference engine or performance comparison. An opt-in downstream V10 simulation
+handoff is described below; the measurement-only mode remains the default.
 A successful measurement run is not a numerical-equivalence acceptance against the previous enumerator.
 
 ## Ownership and scope
@@ -12,9 +13,9 @@ pool prices; RPC transport and protocol decoders are unchanged. The signal worke
 private compiled plan, ordered weights, validity, interval queries, output and measurements.
 Core contains the necessary shared data contracts, not the evaluation algorithm.
 
-The old per-route production path and its contracts are replaced. No new worker, crate,
-dependency, formatter or automated test suite is introduced. The existing V10 executor is
-not connected to these signals by this checkpoint.
+The old per-route production path and its contracts are replaced. The optional execution
+handoff adds one flat worker file, `src/workers/execution_candidates.rs`. There is no new
+crate, dependency, formatter or automated test suite.
 
 ## State and compilation
 
@@ -251,3 +252,118 @@ The warning/continuation change needs a new real run. Rust/Cargo, PowerShell and
 DB/RPC credentials are unavailable in the agent environment, so no build or live verification
 of that change is claimed here. Issue #40 remains open for complete measurements and the
 subsequent separately requested reference comparison.
+
+## Optional live signal -> V10 simulation handoff
+
+`execution_candidates` consumes the existing State/Ranges/Evaluated contract independently
+of the measurement observer. It applies the published snapshot/deltas in order; it owns
+no graph builder, global profitability engine, protocol decoder, signer or RPC client.
+The existing live orchestration supplies the Registry read handle, wallet public key,
+ExecutionParameters and the executor's typed `validate` packing boundary.
+
+Only non-replay WebSocket Price revisions may create jobs. Baseline, catalog, coverage
+and initialization replay still update the consumer's view but do not consume the
+simulation budget. A complete Evaluated marker closes selection for one price revision.
+All non-Exited range witnesses of the requested route kind are ranked by their current
+Q48 sum, ascending. The first seed whose current Prepared proofs and exact V10 packing
+are valid becomes the selected topology. Invalid seeds are counted and the next seed is
+tried. This is selection among reported indicative witnesses, not proof of globally optimal
+execution or enumeration of every represented route.
+
+One request contains one topology/group with multiple pool alternatives:
+
+| Signal form | V10 request |
+| --- | --- |
+| Direct2 | Direct group, settlement/target pool alternatives |
+| Direct3 | Direct group with settlement/target and other-settlement/target alternatives, plus one conversion pool |
+| Triangle3 | Bridge group: one fixed target/bridge intermediate, alternatives for bridge/settlement and target/settlement |
+| Triangle4 | Bridge group with those roles quoted as prescribed by the graph, plus one conversion pool |
+
+Forward/reverse selects the indicative weights used for ranking; V10 receives the pool
+set and retains its own on-chain route selection. Both alternative roles may grow.
+The selected witness's pools and fixed legs remain mandatory. Additional priced pools
+from these two roles are ranked by their sum with the seed's opposite leg and fixed
+weights; only sums strictly below the same signal threshold are considered. Pools are
+added greedily while the exact existing V10 validator accepts the whole request. A failed
+addition is removed; later, possibly cheaper additions are still tried. No new local
+16-pool/account/byte validator, account truncation, fixed TVL ranking or Cartesian-product
+expansion is introduced. This greedy policy does not claim an optimal pool set under
+resource constraints. `alternative_pools_added` records whether the selected request
+actually contains alternatives beyond its seed route.
+
+Every selected pool must still be admitted and Prepared in the Registry, have a price
+for the direction used, and supply matching manifests/mint proofs for the configured
+wallet. The resulting ExecutionRequest freezes those exact inputs. No mint-proof lookup,
+manifest repair, fee/depth/slippage model, amount optimization or send operation is added.
+The finite live harness continues to load persisted manifests and refresh TVL admission;
+it does **not** start completion refresh. `manifest_checked_at_ms` and
+`manifest_validated_slot` retain the actual proof ages; `manifest_refresh_performed=false`.
+Fresh market prices must not be mistaken for a fresh execution manifest.
+
+The signal producer never awaits this consumer or the simulator. The candidate worker
+uses `try_reserve` on the existing typed job channel (capacity one); busy revisions are
+counted and skipped before packing. There may be one simulation running and one accepted
+job waiting. This is a bounded simulation probe, not a guarantee of execution against the
+latest market state. On signal output loss the candidate view is invalidated and jobs
+pause until the next existing full snapshot. Previously accepted jobs remain frozen.
+There is no transport change, replay request, extra snapshot or generation optimization.
+
+Use the existing runner, existing provider configuration and the real wallet path:
+
+```powershell
+.\scripts\graph_signals_live.ps1 `
+    -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals `
+    -SimulateV10 `
+    -WalletPath (Join-Path $env:USERPROFILE ".solana\meteora-arb-test.json") `
+    -SimulationLimit 10 -RouteKind All
+```
+
+`-RouteKind Direct2|Direct3|Triangle3|Triangle4` restricts this downstream probe to one
+form; it does not change graph calculation. `All` does not promise coverage of all four
+forms: only fully priced, qualifying, packable live inputs can produce requests.
+`-ExecutionParametersPath` optionally loads an existing ExecutionParameters JSON object;
+otherwise the shared Rust defaults apply, including trade_size=0 and no_failure=false.
+No parameter is changed just to manufacture a successful simulation. `-SimulateV10` is
+explicit opt-in. Without it the runner sets GRAPH_EXECUTION_SIMULATE=false and neither
+loads a signer nor starts either execution worker. The production `--run` is unchanged.
+
+Native configuration for the existing `--graph-signals-live` entry is:
+
+- GRAPH_EXECUTION_SIMULATE=true
+- GRAPH_EXECUTION_WALLET_PATH=<absolute keypair path>
+- GRAPH_EXECUTION_MAX_REQUESTS=10 (1..1000; successful queue submissions, not profitability)
+- GRAPH_EXECUTION_ROUTE_KIND=All
+- GRAPH_EXECUTION_PARAMETERS_PATH=<optional ExecutionParameters JSON path>
+
+The runner builds with --locked --release before opening connections and preserves the
+existing environment afterward. No private key bytes are logged or copied into artifacts.
+After the live duration it drains accepted simulations with RPC still available (up to
+300 seconds), then writes additional flat files beside checkout.json/report.json/worker.log:
+
+- request-NN.json: complete reusable ExecutionRequest;
+- selection-NN.json: trigger, generation/revision, direction, original indicative seed,
+  selected role/pool prices and observations, proof times, packing counts, rejection
+  counts and timings;
+- simulation-NN.json: actual existing executor report with the same request ID.
+
+report.json also retains execution_candidates, execution_reports, simulation_successes,
+simulation_failures and simulation_dex_calls_observed. Per request, selection_ns includes
+ranking and rejected seed attempts through construction; frame_to_request_us starts at
+local WebSocket frame read, signal_to_request_us at signal state readiness. The original
+price_pipeline distinguishes initialization and the preceding transport/market stages.
+These are not network-to-chain execution latency measurements.
+
+execution_handoff_observed requires at least one actual non-replay live request, exactly
+one corresponding report per submitted request, matching exact packing metrics, and an
+actual V10 program invocation with a completed simulation response. A raw on-chain
+simulation failure can establish that handoff; it is counted separately and is never
+called a successful simulation or profitable trade. execution_integration_passed additionally
+requires at least one successful simulation (with or without observed DEX calls). A run
+with only on-chain errors does not pass acceptance; their causes are not inferred. Local
+rejection, RPC failure, missing reports or zero requests fail the handoff. Output-loss measurement flags remain independent
+and false for a lossy run; any request issued after a loss requires snapshot recovery.
+Successful simulation, DEX-call observation and profit remain distinct evidence.
+
+Implementation status: new handoff code is a draft until a locked build and local live
+run prove these artifacts. The earlier factorized calculation measurements do not validate
+this new worker or any of the four V10 mappings.

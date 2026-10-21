@@ -1,8 +1,10 @@
 //! Finite Market-State wiring: persisted proofs, existing live TVL admission, then RPC prices.
 use std::{env,sync::Arc,time::Duration};
 use anyhow::{Context,Result,bail,ensure};
-use tokio::{sync::{broadcast,watch},task::JoinHandle};
-use crate::{core::{self,CompletionState,DataBatch,PoolUpdateBatch,PoolUpdateKind},workers::{
+use tokio::{sync::{broadcast,mpsc,watch},task::JoinHandle};
+use crate::{core::{self,CompletionState,DataBatch,PoolUpdateBatch,PoolUpdateKind,
+    execution::{ExecutionOutcome,ExecutionReport},signals::SignalStream},workers::{
+    execution_candidates,execution_v10,
     graph_liquidity,graph_watch_catalog,graph_signals,market_state,mint_qualification,persistence,pool_registry,
     rpc_transport,source_dexscreener,source_jupiter_mint}};
 
@@ -14,10 +16,67 @@ async fn optional_join<T>(task:&mut Option<Task<T>>)->std::result::Result<T,toki
     match task { Some(task)=>(&mut task.0).await, None=>std::future::pending().await }
 }
 
+struct ExecutionTasks {
+    candidates:Task<Result<execution_candidates::Report>>,
+    executor:Task<Result<()>>,
+    reports:Task<Vec<ExecutionReport>>,
+}
+impl ExecutionTasks {
+    fn start(settings:execution_v10::Settings,input:SignalStream,
+        registry:pool_registry::PoolRegistry,rpc:rpc_transport::RpcHandle)->Result<Self> {
+        let cfg=execution_candidates::Settings::from_env(settings.wallet(),execution_v10::validate)?;
+        let (jobs,requests)=mpsc::channel(1);
+        let (output,mut responses)=mpsc::channel(1);
+        let reports=Task(tokio::spawn(async move {
+            let mut received=Vec::new();
+            while let Some(report)=responses.recv().await {received.push(report);}
+            received
+        }));
+        Ok(Self {
+            candidates:Task(tokio::spawn(execution_candidates::run(input,registry,jobs,cfg))),
+            executor:Task(tokio::spawn(execution_v10::run(settings,rpc,requests,output))),reports,
+        })
+    }
+    async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<()> {
+        let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
+            .context("candidate shutdown timeout")???;
+        // The candidate stream has closed. Let accepted jobs and reports drain
+        // while the shared RPC transport remains alive.
+        evidence["execution_candidates"]=serde_json::to_value(&candidates)?;
+        let executed=tokio::time::timeout(Duration::from_secs(300),&mut self.executor.0).await
+            .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r);
+        let reports=tokio::time::timeout(Duration::from_secs(10),&mut self.reports.0).await
+            .context("V10 report shutdown timeout")??;
+        evidence["execution_reports"]=serde_json::to_value(&reports)?;
+        evidence["simulation_successes"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,
+            ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved)).count());
+        evidence["simulation_failures"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,ExecutionOutcome::SimulationFailed)).count());
+        evidence["simulation_dex_calls_observed"]=serde_json::json!(reports.iter().filter(|r|!r.dex_invocations.is_empty()).count());
+        // All artifacts share the existing run directory; no additional code hierarchy.
+        if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH") {
+            let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
+            for (i,selection) in candidates.requests.iter().enumerate() {
+                std::fs::write(folder.join(format!("request-{:02}.json",i+1)),serde_json::to_vec_pretty(&selection.request)?)?;
+                std::fs::write(folder.join(format!("selection-{:02}.json",i+1)),serde_json::to_vec_pretty(selection)?)?;
+                if let Some(report)=reports.iter().find(|r|r.id==selection.request.id) {
+                    std::fs::write(folder.join(format!("simulation-{:02}.json",i+1)),serde_json::to_vec_pretty(report)?)?;
+                }
+            }
+        }
+        executed?;
+        evidence["execution_handoff_observed"]=serde_json::json!(candidates.ensure_handoff(&reports).is_ok());
+        let acceptance=candidates.ensure_live_evidence(&reports);
+        evidence["execution_integration_passed"]=serde_json::json!(acceptance.is_ok());
+        evidence["execution_integration_error"]=serde_json::json!(acceptance.err().map(|e|format!("{e:#}")));
+        Ok(())
+    }
+}
+
 pub async fn run(signals_enabled:bool)->Result<()> {
     let mut evidence=serde_json::json!({"run_complete":false,"live_evidence_passed":false,
         "signals_enabled":signals_enabled,"execution":false,"reference_comparison_performed":false,"signal_measurement_passed":false,
-        "signal_production_report":null,"signal_report":null});
+        "signal_production_report":null,"signal_report":null,"execution_handoff_observed":false,
+        "execution_integration_passed":false,"broadcasts":false});
     let result=run_inner(signals_enabled,&mut evidence).await;
     if let Err(error)=&result {
         evidence["error"]=serde_json::json!(format!("{error:#}"));
@@ -41,6 +100,16 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     };
     let settings=market_state::Settings::from_env()?;
     let signal_settings=if signals_enabled {Some(graph_signals::Settings::from_env()?)}else{None};
+    let simulate=match env::var("GRAPH_EXECUTION_SIMULATE").as_deref() {
+        Ok("1"|"true")=>true,Ok("0"|"false")|Err(env::VarError::NotPresent)=>false,
+        _=>bail!("GRAPH_EXECUTION_SIMULATE must be true or false"),
+    };
+    ensure!(!simulate || signals_enabled,"V10 signal simulation requires Graph-Signals");
+    evidence["execution"]=serde_json::json!(simulate);
+    let mut execution_settings=if simulate {
+        Some(execution_v10::Settings::load(std::path::Path::new(&env::var("GRAPH_EXECUTION_WALLET_PATH")
+            .context("GRAPH_EXECUTION_WALLET_PATH is required")?))?)
+    }else{None};
     evidence["duration_seconds"]=serde_json::json!(duration);
     evidence["pool_limit"]=serde_json::json!(settings.pool_limit);
     evidence["rewatch"]=serde_json::json!(rewatch);
@@ -79,12 +148,16 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let (stop,stop_rx)=watch::channel(false);
     let (control,enabled)=watch::channel(true);
     let (prices,price_rx)=broadcast::channel(16384);
-    let (signal_output,mut signal_worker,mut signal_consumer)=if let Some(cfg)=signal_settings {
+    let (signal_output,mut signal_worker,mut signal_consumer,mut execution)=if let Some(cfg)=signal_settings {
         let (output,receiver)=broadcast::channel(graph_signals::OUTPUT_CAPACITY);
+        let execution=match execution_settings.take() {
+            Some(settings)=>Some(ExecutionTasks::start(settings,output.subscribe(),registry.clone(),rpc.clone())?),
+            None=>None,
+        };
         let observer=Task(tokio::spawn(graph_signals::observe(receiver,cfg)));
         let worker=Task(tokio::spawn(graph_signals::run(prices.subscribe(),catalog_rx.clone(),output.clone(),cfg)));
-        (Some(output),Some(worker),Some(observer))
-    }else{(None,None,None)};
+        (Some(output),Some(worker),Some(observer),execution)
+    }else{(None,None,None,None)};
     let mut consumer=Task(tokio::spawn(market_state::observe(price_rx,catalog_rx,settings.trace)));
     // Keep resource roots alive until the producer result has been joined. Otherwise
     // an errored producer can close the consumer/RPC first and hide its actual error.
@@ -99,7 +172,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let mut jupiter=Task(tokio::spawn(source_jupiter_mint::run_targeted(
         http,jupiter_settings,target_rx,jupiter_out.clone())));
     let mut dex=Task(tokio::spawn(source_dexscreener::run_live(qualified_rx,registry.clone(),source.clone())));
-    crate::log_event!(Info,"market state live started=true restored={count} persisted_prepared={persisted_prepared} duration_s={duration} pool_limit={} rewatch={rewatch} execution=false registry_seed=persisted admission_source=live_enrichment warmup=true",settings.pool_limit);
+    crate::log_event!(Info,"market state live started=true restored={count} persisted_prepared={persisted_prepared} duration_s={duration} pool_limit={} rewatch={rewatch} execution={simulate} broadcasts=false registry_seed=persisted admission_source=live_enrichment warmup=true",settings.pool_limit);
     crate::log_event!(Info,"market state live signals_enabled={signals_enabled} reference_comparison=false");
     let rewatch_task=Task(tokio::spawn(async move {
         if rewatch {
@@ -118,6 +191,13 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let mut signal_report=None;
     let early=tokio::select! {
         _=tokio::time::sleep(Duration::from_secs(duration))=>None,
+        _=async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if execution.as_ref().is_some_and(|tasks|tasks.candidates.0.is_finished()
+                    || tasks.executor.0.is_finished() || tasks.reports.0.is_finished()) {break;}
+            }
+        }=>Some(anyhow::anyhow!("execution pipeline ended before live duration; inspect execution reports")),
         result=&mut worker.0=>Some(result.context("market producer panicked").and_then(|r|r).err()
             .unwrap_or_else(||anyhow::anyhow!("market producer ended before live duration"))),
         result=&mut consumer.0=>Some(result.context("market consumer panicked").and_then(|r|r).err()
@@ -178,6 +258,11 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
                 Err(error)=>evidence["signal_consumer_shutdown_error"]=serde_json::json!(format!("{error:#}")),
             }
         }
+        if let Some(tasks)=execution.as_mut() {
+            if let Err(error)=tasks.finish(evidence).await {
+                evidence["execution_shutdown_error"]=serde_json::json!(format!("{error:#}"));
+            }
+        }
         evidence["signal_production_report"]=serde_json::to_value(&production_report)?;
         evidence["signal_report"]=serde_json::to_value(&signal_report)?;
         return Err(error);
@@ -187,7 +272,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let _=tokio::join!(&mut dex.0,&mut jupiter.0,&mut qualification.0);
     drop(source);drop(jupiter_out);
     tokio::time::timeout(Duration::from_secs(10),&mut worker.0).await.context("market producer shutdown timeout")???;
-    drop(prices);drop(rpc);
+    drop(prices);
     if let Some(task)=signal_worker.as_mut() {
         production_report=Some(tokio::time::timeout(Duration::from_secs(30),&mut task.0).await.context("signal worker shutdown timeout")???);
         evidence["signal_production_report"]=serde_json::to_value(&production_report)?;
@@ -197,6 +282,8 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         signal_report=Some(tokio::time::timeout(Duration::from_secs(30),&mut task.0).await.context("signal consumer shutdown timeout")???);
         evidence["signal_report"]=serde_json::to_value(&signal_report)?;
     }
+    if let Some(tasks)=execution.as_mut() {tasks.finish(evidence).await?;}
+    drop(rpc);
     let report=tokio::time::timeout(Duration::from_secs(10),&mut consumer.0).await.context("market consumer shutdown timeout")???;
     evidence["report"]=serde_json::to_value(&report)?;
     tokio::time::timeout(Duration::from_secs(30),&mut registry_task.0).await.context("market Registry shutdown timeout")???;
@@ -217,7 +304,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         }else{Ok(())}
     });
     let measurement_passed=result.is_ok() && !output_loss_warning;
-    *evidence=serde_json::json!({"run_complete":true,"duration_seconds":duration,"pool_limit":settings.pool_limit,
+    let mut final_evidence=serde_json::json!({"run_complete":true,"duration_seconds":duration,"pool_limit":settings.pool_limit,
         "rewatch":rewatch,"persisted_prepared":persisted_prepared,"live_tvl_pools":registry.live_tvl_count(),
         "admission_source":"live_enrichment","live_evidence_passed":measurement_passed,"report":report,
         "signals_enabled":signals_enabled,"signal_threshold_bps":signal_settings.map(|s|s.threshold_bps),
@@ -227,9 +314,14 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         "signal_delivery_passed":production_report.as_ref().zip(signal_report.as_ref()).map(|(p,r)|p.ensure_delivery(r).is_ok()),
         "signal_measurement_passed":signals_enabled && measurement_passed,"signal_output_loss_warning":output_loss_warning,
         "reference_comparison_performed":false,
-        "signal_production_report":production_report,"signal_report":signal_report,"execution":false,
+        "signal_production_report":production_report,"signal_report":signal_report,"execution":simulate,"broadcasts":false,
         "websocket_plan":websocket_plan,
         "error":result.as_ref().err().map(|e|format!("{e:#}"))});
+    for key in ["execution_candidates","execution_reports","execution_handoff_observed","execution_integration_passed","execution_integration_error",
+        "simulation_successes","simulation_failures","simulation_dex_calls_observed"] {
+        if let Some(value)=evidence.get(key) {final_evidence[key]=value.clone();}
+    }
+    *evidence=final_evidence;
     result?;
     if output_loss_warning {
         crate::log_event!(Warn,"market state live measurement_completed=true signal_output_loss=true delivery_valid=false inspect=signal_report");

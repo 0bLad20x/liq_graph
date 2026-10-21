@@ -10,7 +10,12 @@ param(
     [ValidateRange(0, 2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0, 64)][int]$WsConnectionsPerProvider = 0,
     [switch]$PlanOnly,
-    [switch]$Rewatch
+    [switch]$Rewatch,
+    [switch]$SimulateV10,
+    [string]$WalletPath,
+    [ValidateRange(1, 1000)][int]$SimulationLimit = 10,
+    [ValidateSet("All", "Direct2", "Direct3", "Triangle3", "Triangle4")][string]$RouteKind = "All",
+    [string]$ExecutionParametersPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +24,12 @@ function Write-RunLog([string]$Message) {
     Write-Host "ts_ms=$timestamp level=INFO module=liq_graph::scripts::market_state_live $Message"
 }
 if ($ProfileSignals -and -not $Signals) { throw "ProfileSignals requires the Graph-Signals runner." }
+if ($SimulateV10 -and -not $Signals) { throw "SimulateV10 requires the Graph-Signals runner." }
+if ($SimulateV10 -and -not $PlanOnly) {
+    if (-not $WalletPath) { throw "SimulateV10 requires WalletPath; only simulation is supported." }
+    $WalletPath = (Resolve-Path -LiteralPath $WalletPath).Path
+    if ($ExecutionParametersPath) { $ExecutionParametersPath = (Resolve-Path -LiteralPath $ExecutionParametersPath).Path }
+}
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps) -or $ThresholdBps -lt 0) { throw "ThresholdBps must be finite and nonnegative." }
 $label = if ($Signals) { "Graph-Signals" } else { "Market-State" }
 $outputRoot = if ($Signals) { "graph_signals_live" } else { "market_state_live" }
@@ -32,7 +43,7 @@ $status = git status --short
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect working tree." }
 $tracked = git status --short --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Commit or preserve tracked changes before the live run; nothing was changed by this script." }
-Write-RunLog "$label branch=$branch head=$head signals=$([bool]$Signals) execution=false"
+Write-RunLog "$label branch=$branch head=$head signals=$([bool]$Signals) execution=$([bool]$SimulateV10) broadcasts=false"
 if ($status) { Write-RunLog "untracked_or_local_entries=$(@($status).Count)" }
 cargo build --locked --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --locked --release failed; no live run started." }
@@ -49,6 +60,10 @@ $report = Join-Path $folder "report.json"
 $metadata = Join-Path $folder "checkout.json"
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 $checkout = @{ branch = $branch; head = $head; status = @($status); duration_seconds = $DurationSeconds; pool_limit = $PoolLimit; rewatch = [bool]$Rewatch; signals_enabled = [bool]$Signals; threshold_bps = $ThresholdBps; trace_prices = [bool]$TracePrices; trace_signals = [bool]$TraceSignals; profile_signals = [bool]$ProfileSignals; ws_providers = $WsProviders; ws_account_budget = $WsAccountBudget; ws_connections_per_provider = $WsConnectionsPerProvider; plan_only = [bool]$PlanOnly }
+$checkout["simulate_v10"] = [bool]$SimulateV10
+$checkout["simulation_limit"] = $SimulationLimit
+$checkout["route_kind"] = $RouteKind
+$checkout["broadcasts"] = $false
 [System.IO.File]::WriteAllText($metadata, ($checkout | ConvertTo-Json -Depth 5), $utf8)
 
 $values = @{
@@ -60,6 +75,11 @@ $values = @{
     RPC_WS_PROVIDER_SELECTION = $WsProviders
     RPC_WS_ACCOUNT_BUDGET = "$WsAccountBudget"
     RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
+    GRAPH_EXECUTION_SIMULATE = $(if ($SimulateV10) { "true" } else { "false" })
+    GRAPH_EXECUTION_WALLET_PATH = $WalletPath
+    GRAPH_EXECUTION_MAX_REQUESTS = "$SimulationLimit"
+    GRAPH_EXECUTION_ROUTE_KIND = $RouteKind
+    GRAPH_EXECUTION_PARAMETERS_PATH = $ExecutionParametersPath
 }
 if ($Signals) {
     $values["GRAPH_SIGNALS_THRESHOLD_BPS"] = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
@@ -118,6 +138,13 @@ try {
         Write-RunLog "signals_published=$($produced.counts.events) signals_received=$($received.counts.events) ranges_published=$($produced.counts.ranges) ranges_received=$($received.counts.ranges) lost=$($received.lost_events) delivery_passed=$($evidence.signal_delivery_passed) reference_comparison=false"
         Write-RunLog "state_ready_mean_ns=$($produced.steady_state_inputs.state_ready_ns.mean) state_ready_max_ns=$($produced.steady_state_inputs.state_ready_ns.max) query_mean_ns=$($produced.steady_state_inputs.query_ns.mean) processing_max_ns=$($produced.steady_state_inputs.processing_ns.max)"
         if ($ProfileSignals) { Write-RunLog "profile=true details=report.json websocket_inputs=true" }
+    }
+    if ($SimulateV10) {
+        Write-RunLog "execution_handoff_observed=$($evidence.execution_handoff_observed) execution_integration_passed=$($evidence.execution_integration_passed) requests=$(@($evidence.execution_candidates.requests).Count) simulation_reports=$(@($evidence.execution_reports).Count) simulation_successes=$($evidence.simulation_successes) simulation_failures=$($evidence.simulation_failures) dex_calls_observed=$($evidence.simulation_dex_calls_observed) broadcasts=false"
+        Write-RunLog "candidate_lost_events=$($evidence.execution_candidates.lost_events) candidate_resynchronizations=$($evidence.execution_candidates.resynchronizations) manifest_refresh_performed=false request_artifacts=$folder"
+        if ($evidence.execution_integration_passed -ne $true) {
+            throw "Signal-to-V10 simulation acceptance failed: $($evidence.execution_integration_error). Inspect execution_candidates, execution_reports and worker.log."
+        }
     }
     if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Diagnostics: $report and $log" }
     if ($evidence.run_complete -ne $true) { throw "Live run did not complete; inspect report.json and worker.log." }

@@ -9,7 +9,12 @@ param(
     [ValidateRange(0, 2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0, 64)][int]$WsConnectionsPerProvider = 0,
     [switch]$PlanOnly,
-    [switch]$Rewatch
+    [switch]$Rewatch,
+    [switch]$SimulateV10,
+    [string]$WalletPath,
+    [ValidateRange(1, 1000)][int]$SimulationLimit = 10,
+    [ValidateSet("All", "Direct2", "Direct3", "Triangle3", "Triangle4")][string]$RouteKind = "All",
+    [string]$ExecutionParametersPath
 )
 
 # Share checkout/build guards, evidence capture and environment restoration.
@@ -17,4 +22,6 @@ param(
     -DurationSeconds $DurationSeconds -PoolLimit $PoolLimit -ThresholdBps $ThresholdBps `
     -WsProviders $WsProviders -WsAccountBudget $WsAccountBudget -WsConnectionsPerProvider $WsConnectionsPerProvider `
     -PlanOnly:$PlanOnly `
-    -TracePrices:$TracePrices -TraceSignals:$TraceSignals -ProfileSignals:$ProfileSignals -Rewatch:$Rewatch
+    -TracePrices:$TracePrices -TraceSignals:$TraceSignals -ProfileSignals:$ProfileSignals -Rewatch:$Rewatch `
+    -SimulateV10:$SimulateV10 -WalletPath $WalletPath -SimulationLimit $SimulationLimit `
+    -RouteKind $RouteKind -ExecutionParametersPath $ExecutionParametersPath

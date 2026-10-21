@@ -124,3 +124,17 @@ Primary references:
 - https://github.com/Cetipoo/solana-onchain-arbitrage-bot/blob/master/src/v10.rs
 - https://solana.com/docs/core/transactions/versioned-transactions
 - https://solana.com/docs/rpc/http/simulatetransaction
+
+## Optional signal input (draft)
+
+The finite `--graph-signals-live` runner can now opt into the existing simulation worker
+via `-SimulateV10 -WalletPath ... -SimulationLimit 10`. See
+[GRAPH_SIGNALS.md](GRAPH_SIGNALS.md#optional-live-signal---v10-simulation-handoff) for the
+selection policy, four route-form mappings, actual proof-age reporting, artifacts and
+acceptance criteria. Production `--run` and the manual file-input mode are unchanged.
+
+The new upstream `execution_candidates` worker supplies the existing ExecutionRequest
+contract. `execution_v10::validate` exposes the same unsigned packing checks used by the
+execution path, without a signer or RPC. It does not introduce another validator or
+selection algorithm inside the executor. Signing and simulation behavior are unchanged.
+The new connection has not yet been built or live validated in this environment.
