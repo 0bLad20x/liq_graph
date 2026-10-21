@@ -1,113 +1,227 @@
-# Graph signals: indexed input and compact route output
+# Graph signals: factorized state and versioned interval output
 
-## Scope and boundaries
+This branch implements the measurement stage of issue #40. It runs one new signal engine.
+There is no reference engine, performance comparison, transaction simulation or execution.
+A successful measurement run is not a numerical-equivalence acceptance against the previous enumerator.
 
-The existing Registry owns canonical pool state. Prepared/admitted pools feed the graph catalog and Market-State. `rpc_transport` owns connections/subscriptions, `market_state` owns protocol decoding and normalized indicative prices, and `graph_signals` owns route evaluation. Orchestration provides channels and tasks. The shared Core contracts contain data and lossless block expansion, not routing/admission logic.
+## Ownership and scope
 
-This checkpoint replaces repeated input scans and individual route-event construction/publication. It introduces no additional parallelism, worker, service, dependency or lockfile change. It does not pack, sign, simulate or broadcast transactions. V10 group/declaration/account/byte limits remain part of the subsequent execution-job handoff: graph templates are not packed transactions.
+Registry admission and the existing liquidity graph determine the allowed universe.
+GraphSnapshot/WatchCatalog are unchanged. Market-State still supplies normalized indicative
+pool prices; RPC transport and protocol decoders are unchanged. The signal worker owns the
+private compiled plan, ordered weights, validity, interval queries, output and measurements.
+Core contains the necessary shared data contracts, not the evaluation algorithm.
 
-## Indexed input
+The old per-route production path and its contracts are replaced. No new worker, crate,
+dependency, formatter or automated test suite is introduced. The existing V10 executor is
+not connected to these signals by this checkpoint.
 
-`rpc_transport::ws_session` keeps a pending subscription queue and an address membership set. Target changes reconcile the desired set; ACKs maintain membership incrementally. Ordinary account messages do not rebuild the active/busy sets or scan desired subscriptions. The existing 32-pending limit, per-provider subscribe spacing, capacities, view negotiation, rejection/gap handling and reconnect behavior remain. Notifications for retired subscriptions are still ignored. An address removed while its subscribe ACK is pending is unsubscribed after that ACK; a desired address can be resubscribed after its outstanding unsubscribe reply.
+## State and compilation
 
-Market-State builds private binary-key indices after hydration: account -> CSR subscription range and pool -> component indices. Shared accounts retain every field/pool binding in the former subscription order. Normal updates inspect only those bindings and the affected pool's components. Owner/address comparisons use `Pubkey`; component slots/timestamps use one local pass without a temporary component vector. Completeness, invalid components, older-slot rejection, baseline floors and protocol price formulas retain their meaning.
+Each observed pool has a stable worker-local integer ID and two canonical directed slots:
+2*pool is mint-A -> mint-B; 2*pool+1 is mint-B -> mint-A. These IDs are published with
+identities; they are not database IDs. The current indicative model still prepares one
+logarithm per Price and reciprocal directions. Bid/ask or amount-dependent quotes are not
+introduced here.
 
-Registry identity/admission changes, HTTP hydration and ACK-baseline coordination retain their existing lifecycle. In particular, selection changes still establish a fresh global baseline; incremental pool hydration is not implemented here. Transport/frame timing begins when `ws.next()` yields text, not at provider generation, network arrival or OS-buffer entry.
+Each graph generation compiles:
 
-## Route calculation
+- the existing Direct2, Direct3, Triangle3 and Triangle4 groups;
+- one shared ordered index per directed mint-pair role, with pool identity as a tie breaker;
+- pool -> group/role dependencies and slot -> ordered-role bindings;
+- all role alternatives, including those whose price is currently missing.
 
-Every accepted Price event, including an unchanged price, recalculates every permitted concrete directed route containing the updated pool. Both directions of Direct2, Direct3, Triangle3 and Triangle4 retain the full ordered two/three/four-leg sum. A new catalog generation compiles a replacement private role plan and evaluates its full route universe using available prices. Compilation and catalog evaluation remain inline and can delay later price inputs.
+Compilation and initial index seeding are timed as catalog_plan_build_ns. This first
+measurement implementation compiles inline on a catalog change; it can delay later price
+inputs. It does not claim a background generation swap or a bound on this pause. Ordinary
+price updates never rebuild the plan.
 
-For a base-to-quote price p, the forward rate/weight are p and -ln(p); reverse values are 1/p and +ln(p). Exactly one logarithm is prepared per Price. Each route recomputes W from zero in leg order. The indicative return is `expm1(-W) * 10000` bps, qualifying strictly when `W < -ln1p(threshold_bps / 10000)`. There is no partial-sum cache, ranking, best-price pruning, unchanged-price shortcut or input coalescing.
+A BTreeSet stores each available directed weight once in its shared role index. A price
+update changes at most two indexed slots, independently of its number of
+referencing groups. Equal normalized weights leave the ordered entries in place; the new
+observation/revision is still published and queried. Tree maintenance is logarithmic in the role size. Fixed-role-only
+directions need no ordered index. Identity checking and one logarithm are measured separately.
 
-Calculation retains the existing 256-route blocks and cooperative yield points after at least 4096 visited routes. Missing/nonfinite prices keep their separate classifications. No arbitrary price TTL is added. A stream Gap clears coverage; Unavailable/Removed withdraw the pool. Group IDs belong to one graph generation. Distinct role mint pairs prevent repeated pools in 3/4-leg routes; Direct2 excludes the same pool twice. Different graph templates can represent the same concrete path.
+There is no stored floating-point score per concrete route. All route values are represented
+by their current weights and role definitions. Group alternatives are not narrowed by TVL,
+ranking or best-price selection in this worker.
 
-| Form / updated role | Expected directed visits |
+## Mathematical query and numeric contract
+
+For directed rates q, the normalized weight is round(-ln(q) * 2^48), stored as i64.
+The inverse uses the exact negated integer. The scale is published in the plan; the threshold
+is round(-ln1p(threshold_bps/10000) * 2^48). Direct2 combines two distinct pools; the other
+forms combine two alternatives and one or two fixed weights:
+
+- Direct2: a_i + b_j, excluding the same pool;
+- Direct3: a_i + b_j + c;
+- Triangle3: a_i + m + b_j;
+- Triangle4: a_i + m + b_j + c.
+
+For each affected group/direction, one role member is an anchor and the other role supplies
+partners. The addend is the anchor weight followed by the fixed weights in their stored
+order, all in normalized integer units. The qualification limit is tau_units - addend.
+Membership is the strict scalar comparison partner_weight < limit.
+
+Old and current limits partition the partner weights into at most two disjoint intervals:
+the common qualifying prefix is Updated; the difference is Entered or Exited.
+An initially unavailable addend has an empty prior qualifying set. Equal limits still
+produce Updated, so improvements or fresh observations of already-qualified routes are
+not lost. The actual current state is retained even when no interval qualifies.
+
+A range query uses BTreeSet::range and takes the first nonexcluded member as a witness.
+It does not enumerate all interval members or count their cardinality. At most one same-pool
+member is skipped for Direct2. An ordinary alternative update queries its row/column in both
+directions. Direct2 covers the two disjoint affected row/column sets once. A fixed-role
+update walks available anchors in the shorter catalog role, then performs ordered range
+lookups. Thus work still depends on referencing groups and available anchors, not just the
+two indexed weight writes.
+
+All sums and interval comparisons use the published integer units. For the same normalized
+weights, classification is independent of anchor choice or update order; summation does not
+accumulate floating-point drift. The witness publishes both the authoritative integer sum
+and its display conversion to negative-log f64 / return bps.
+
+Q48 has a step of 2^-48 (about 3.55e-15 in logarithmic weight). Rounding a weight contributes
+at most half a unit relative to the computed f64 logarithm. Four weights plus a rounded
+threshold therefore have a quantization comparison bound of 5/(2*2^48), about 8.89e-15 in
+log space. This bound covers normalization only, not ln approximation or market accuracy.
+Positive finite f64 rates have absolute logarithms below 745, so four legs and threshold
+subtraction fit well within i64. Original observations retain their f64 prices.
+External JSON readers must preserve 64-bit integers; the typed Rust stream does so.
+
+This is an explicit normalization change, not bit-equivalence to the old f64 leg sum.
+No epsilon widening is applied. Return bps are converted with expm1 only for witnesses,
+not for every represented route. Nonfinite converted bps are reported as null.
+
+These are indicative spot differences. Fees, sizing, slippage, depth, transfer fees and
+execution costs are not modeled. A positive difference is not executable profit.
+
+## Typed output
+
+execution_layout = factorized_roles_v1
+output_layout = versioned_state_ranges_v1
+
+The stream is ordered and versioned:
+
+1. State contains either a full snapshot or price/coverage changes. A snapshot publishes
+   the plan, identities and current price values. A normal delta publishes the affected
+   pool identity and immutable price observation. Every update has its own revision.
+2. Ranges contains complete intervals against that revision. Each row names the group,
+   direction, anchor, partner role, bounds, pool exclusion, old/current addends and change
+   class. One immutable, closed-route witness includes its observation references.
+3. Evaluated completes the input revision with accounting and timings.
+
+Each ordinary price update therefore makes all its affected scores reconstructable before
+query/output enumeration. A receiver must apply State, resolve/use Ranges for that revision,
+then process the next State. A range block by itself is not a standalone snapshot of all its
+members. A receiver retaining a chosen route for later execution must freeze its required
+observations before advancing its state. No output refers to another worker's mutable arrays.
+
+All eligible members inside each emitted interval are represented. A witness is a concrete
+example, not a top-1 filter. Updated intervals also carry improvements that never cross the
+configured threshold. Missing/nonqualifying routes remain represented in State.
+
+The first nonempty interval is published immediately. Remaining rows are emitted in blocks
+of up to 64 and the final partial block is flushed before the completion marker. There is
+no timer, waiting for another price input, consumer acknowledgement or capacity await.
+The existing broadcast capacity is 256 block/control events. Overflow invalidates delivery;
+queue enlargement is not used as a performance fix.
+
+Gap clears all prices and ordered indices. Unavailable/Removed withdraw the pool and may
+emit Exited intervals. Selection withdraws all deselected pools in one state revision; the
+State changes invalidate every route depending on them without individual exit expansion.
+A new graph generation replaces the published plan and seeds it from retained prices.
+Price-input loss publishes a clear/invalidation before the producer reports failure.
+The receiver stops on any missing event/revision rather than silently using incomplete state.
+
+## Measurement report
+
+Production and receiver counters must match. Market-State price/WS totals must also equal
+signal price/WS evaluation totals. Existing source-gap/admission/coverage measurements
+remain in the Market-State section of report.json.
+
+Ranges count intervals, not concrete routes. logical_routes_affected is an analytical
+topology count, including currently unpriceable combinations. ready_anchors counts queried
+anchors having a valid addend and at least one valid nonexcluded partner. None of these
+fields is a count of individually recalculated or successfully executable routes.
+
+signal_production_report contains:
+
+| Field | Meaning |
 | --- | --- |
-| Direct2, catalog | n * (n - 1) |
-| Direct2, one pool | 2 * (n - 1) |
-| Other forms, left alternative | 2 * m |
-| Other forms, right alternative | 2 * n |
-| Other forms, fixed role or catalog | 2 * n * m |
+| catalog_plan_build_ns | Compilation/index-seeding times per installed generation, including the initial empty generation. |
+| last_plan | Last installed generation: identities, roles, groups, logical route count, role references and index entries at installation. |
+| final_price_pools / final_available_directions | Coverage retained at producer shutdown, not coverage over the entire run. |
+| all_inputs | Timings for all completed state revisions, including coverage/control. |
+| websocket_inputs | Timings for all completed WebSocket price inputs. |
+| initialization_inputs | Baseline prices and WS initialization/resynchronization replay. |
+| steady_state_inputs | WS prices explicitly marked as outside initialization replay by Market-State. |
+| max_price_queue_depth / max_output_queue_depth | Observed queue depths, not substitutes for age measurements. |
 
-These are indicative spot comparisons. Fees, sizing, slippage, depth, transfer fees, execution costs and executable profit are not modeled. At threshold zero, approximately half of nonzero reciprocal forward/reverse comparisons qualifying is expected; it is not a profitable-trade rate.
+Each timing group reports count, mean, minimum, maximum, p50/p95/p99 logarithmic-bucket upper
+bounds. Empty populations have null values. The phase classification follows the source's
+initialization_replay flag; it does not prove that all subscriptions are ready.
 
-## Compact output contract
-
-`signal_report.execution_layout=indexed_role_plan_v1` and `output_layout=compact_route_blocks_v1` identify this revision.
-
-The typed stream has one route representation, `SignalEvent::Routes(SignalRouteBlock)`, plus Evaluated and Invalidated. Each existing calculation block publishes its required outputs immediately in slices of at most 64 rows. It never waits for a timer, another input, a full output block or a consumer acknowledgement. Broadcast publication remains synchronous without waiting for receiver capacity.
-
-A block shares generation, group, route context, trigger and threshold. Rows retain sequence, directed leg indices, full sum, return and qualifying flag in the former output order. Only qualifying routes and the existing bounded nonqualifying samples are materialized, exactly as before. A private epoch/index array deduplicates identical directed legs within the block. Each leg holds an immutable observation reference and its rate, weight and mint direction. Later price updates, removals or catalog replacements cannot alter queued results. There is no reference into mutable worker state.
-
-`SignalRouteBlock::route(index)` expands any row into the previous complete RouteEvaluation data. Diagnostic JSON still prints Candidate/RouteSample examples; the consumer expands only rows selected for printing. Other rows remain fully present and reconstructable. The old per-candidate typed event path is removed.
-
-One timestamp is taken at the start of block construction. Expanded rows share that `emitted_at_us`; `account_to_emitted_us` therefore measures age at block construction rather than an individual row's creation. Consumer candidate ages use one block-receipt timestamp and preserve candidate-weighted histograms via counted additions. This reduces per-row clocks and bookkeeping. Numeric route values and information needed to interpret them remain unchanged; timing boundaries differ from the previous output layout.
-
-The output channel holds 256 block/control events. At 64 rows per block, at most 16384 route rows are retained in the channel, matching the previous maximum route-event count. Control events reduce that bound. Each block can contain at most 256 directed legs; two vectors and one shared event allocation replace per-row event allocations. These are payload bounds, not a claim of identical allocator/RSS usage. In-flight blocks and diagnostic row expansions also consume memory.
-
-## Accounting, errors and measurements
-
-The producer owns `signal_production_report`; the consumer owns `signal_report`. Output loss cannot erase completed-input producer measurements. Acceptance compares published/received channel events, route rows, evaluations and candidates, including WebSocket evaluation/candidate totals. Per-evaluation accounting requires:
-
-`combinations_visited == routes_expected == routes_affected == routes_scored + routes_missing_prices + routes_nonfinite`
-
-Every accepted Price prepares one logarithm and uses the existing plan. Completed-input counters omit an evaluation interrupted by an error. Producer errors and consumer integrity errors are checked by standalone and normal-runtime orchestration.
-
-`published_events`, `received_events`, `lost_events` and queue depths now count **block/control events**, not individual candidates. Compare `published_route_rows` against `received_route_rows`, and producer candidate counts against consumer candidate counts. A lost block can contain multiple candidates; its row count cannot be inferred from a Lagged notification alone. Every loss invalidates acceptance.
-
-`-ProfileSignals` temporarily sets `GRAPH_SIGNALS_PROFILE=true`. The diagnostic receiver counts output lag and continues recording; ordinary mode stops on lag. Price-input loss and calculation errors remain fatal. `run_complete=true` only means the requested duration and shutdown finished. `live_evidence_passed` additionally requires lossless delivery and the existing live Market-State/calculation/candidate evidence. A quiet market with no qualifying WebSocket candidate cannot prove candidate delivery.
-
-Producer `all_inputs` and `websocket_inputs` contain fixed-memory histograms:
-
-| Field | Boundary |
+| Timing | Boundary |
 | --- | --- |
-| `transport_decode_us` | Text-frame read to decoded transport notification. |
-| `transport_to_market_us` | Decoded notification to Market-State acceptance, including queue/scheduling. |
-| `market_processing_us` | Market-State acceptance to price publication boundary. For a shared account this includes preceding affected bindings. |
-| `price_queue_us` | Price publication boundary to signal-worker acceptance, including allocation/send/queue/scheduling. |
-| `frame_to_worker_us` | Text-frame read to signal-worker acceptance. |
-| `preparation_ns` | Signal price parsing, validation, logarithm and frozen observation storage. |
-| `calculation_ns` | Block enumeration, dense-array ordered sums, return conversion, classification and pending output staging. |
-| `event_build_ns` | Shared block context, frozen-leg deduplication, rows and event allocation. |
-| `publication_ns` | Synchronous broadcast publication, counters and queue-depth sample. |
-| `cooperative_yield_ns` | Wall time across the existing yields, including rescheduling. |
-| `processing_ns` | Signal acceptance through calculation/output/accounting checks; ends before producer aggregates and completion-marker publication. |
+| preparation_ns | Price identity validation, logarithm and immutable observation storage. |
+| index_update_ns | Removal/insertion of shared directed weights; coverage reconciliation for control inputs. |
+| state_ready_ns | Input acceptance to fully updated private factorized state and ordered indices, before constructing State output. |
+| query_ns | Group/anchor walk, interval searches, witness creation and staging, excluding measured output-block construction/publication. |
+| event_build_ns | State snapshot/delta and range-block construction; includes snapshot copying on generation changes. |
+| publication_ns | Nonwaiting State/Range broadcast publication and publication counters. |
+| first_range_ns / last_range_ns | Input acceptance to first/last range-block publication; absent if there was no qualifying/exit range. |
+| processing_ns | Input acceptance through queries and output; ends before aggregate histogram bookkeeping and completion-marker send. |
+| transport_decode_us | Text-frame receipt to decoded transport event. |
+| transport_to_market_us | Decoded transport event to Market-State acceptance. |
+| market_processing_us | Market-State acceptance to price publication boundary. |
+| price_queue_us | Price publication boundary to signal acceptance. |
+| frame_to_worker_us | Text-frame receipt to signal acceptance. |
+| frame_to_state_ready_us | Wall-clock frame-to-worker age plus monotonic state_ready_ns, rounded up to microseconds. |
 
-`websocket_frame_to_evaluation_consumer_us` adds complete processing and marker handoff to the frame boundary. Existing account-age fields retain the decoded local transport timestamp with millisecond resolution. `completion_to_consumer_us` includes producer aggregate recording, marker allocation/send, queueing and consumer scheduling; it is not pure channel latency. Histograms use wall time: other preemptions remain in their enclosing measurements. Clock reversals omit affected durations; complete WebSocket timing counts are required for delivery acceptance.
+Frame timing starts when the transport reads a text frame, not at provider generation or
+OS-buffer arrival. Clock reversals omit wall-clock durations and invalidate complete-pipeline
+delivery checks. Maxima/percentiles of individual stages cannot be added.
 
-Profile logs include `graph signals window` at the existing five-second consumer ticker. Each window summarizes received WebSocket evaluation markers, pipeline stages and processing maxima/means, then resets. Use these windows to distinguish startup from continuing load. Output loss makes consumer windows incomplete; the final independent producer report remains authoritative for completed work. Final histograms aggregate the run and do not themselves separate steady state.
+signal_report contains receiver-side state, range and completion arrival ages, bounded
+consumer-processing histograms, per-kind ready-anchor/range counts and bounded witnesses
+from baseline and WS inputs separately for each kind. State arrival age ends before applying
+the delta; frame-to-state-consumer ends after applying it. Consumer timing includes contract
+checks but does not run the old reference enumeration.
 
-Bookkeeping is sampled once per 257 received block/control events, excluding measured row expansion/JSON/printing time. It is a per-event sample, not per-row CPU time, and excludes channel receive/select and event destruction. Diagnostic example formatting/output and periodic logging wall time are reported separately. Histogram percentiles are logarithmic bucket upper bounds, not exact percentiles. Maxima/percentiles of separate stages cannot be added. Do not compare raw queue depths/event rates across the changed output units.
+signal_measurement_passed requires real WS inputs, a fully priceable topology queried,
+and complete delivery. A quiet market can pass measurement without a qualifying range;
+signal_candidate_passed independently records whether one was observed. Neither flag
+proves equivalence to the previous implementation. reference_comparison_performed is false.
 
-The runner writes partial reports on returned setup/task/shutdown errors. Timeout/panic/forced termination may leave worker reports null. If the worker exits without a report, the PowerShell runner writes an explicit failed placeholder. Process/file-system failure can still prevent persistence. Script failures retain diagnostics and restore temporary process environment values.
+## Local run
 
-## Local build and live run
+Use the existing DB, live admission and provider settings. Provider selection is unchanged:
+Configured honors the ENV account-subscribe flags and capacities; explicit indices override
+selection only as before. No wallet is needed.
 
-Use the existing database, admission/enrichment and RPC configuration from MARKET_STATE.md. No wallet is needed. The standalone mode starts no execution, pool-cache writer or Completion worker and does not refresh cached manifests.
+PowerShell:
 
-```powershell
-.\scripts\graph_signals_live.ps1 -DurationSeconds 900 -PoolLimit 10000 -ThresholdBps 0 `
-    -WsProviders "5,6" -WsAccountBudget 30000 -WsConnectionsPerProvider 1 -ProfileSignals
-```
+    git fetch origin
+    git switch agent/factorized-route-state
+    git pull --ff-only
+    .\scripts\graph_signals_live.ps1 -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals
 
-Leave TracePrices/TraceSignals off for a comparable load run. The script requires a clean tracked checkout, builds with `cargo build --locked --release`, checks Cargo.lock, and saves checkout.json, websocket_plan.json, report.json and worker.log. Upload all four even on failure. Pool/account limits are upper bounds; successful ACKs and actual price coverage determine observed scope.
+Use the normal error guards if running these commands in a block. The runner requires a clean
+tracked checkout and cargo build --locked --release before any live subscription. Keep
+TracePrices/TraceSignals off for the measurement. PoolLimit limits observation, not the full
+graph catalog's topology universe.
 
-| WebSocket option | Meaning |
-| --- | --- |
-| `Configured` | Only providers enabled by RPC_N_WS_ACCOUNT_SUBSCRIBE, with configured capacities. |
-| `All` | Every configured nonempty WS URL; endpoint support is still unproven. |
-| `"5,6"` | Only those configured indices, overriding their account-subscribe selection flags. |
-| `-WsAccountBudget 30000` | Aggregate local test capacity, evenly shared across selected providers. Zero preserves configured capacities. |
-| `-WsConnectionsPerProvider 1` | Socket count per selected provider with an explicit budget; zero preserves configuration. |
-| `-PlanOnly` | Build and save the resolved plan without DB reads/subscriptions. |
+The existing runner writes checkout.json, websocket_plan.json, report.json and worker.log
+under graph_signals_live/<timestamp>. Upload all four, including failed/partial runs.
+Report startup, resynchronization, catalog pauses and steady-state values separately.
+One low-load measurement does not establish behavior at arbitrary fan-out or pool counts.
 
-These are local settings, not verified provider service limits. HTTP provider selection remains independent. Existing pacing/timeouts/reconnect settings apply. The plan omits endpoint URLs/credentials and proves no subscription ACKs. `-Rewatch` exercises the existing pause/resume; issue #34 tracks its diagnostic counter limitation.
+## Status
 
-Normal-runtime keys remain MARKET_STATE_ENABLED=true, GRAPH_SIGNALS_ENABLED=true, GRAPH_SIGNALS_THRESHOLD_BPS=0, GRAPH_SIGNALS_SAMPLE_LIMIT=16 and GRAPH_SIGNALS_TRACE=false. Signal processing requires Market-State. GRAPH_SIGNALS_PROFILE defaults to false.
-
-## Evidence and acceptance status
-
-The uploaded f5c1942 run processed all 16674 published prices, including 11668 WebSocket inputs, and scored 183107098 WebSocket routes. Its old individual-event output lost 36167 events in 117 incidents. Within the signal worker, event construction/publication averaged 3.328 ms of 4.526 ms total WebSocket processing. Mean pre-worker age was 32.084 ms; complete-consumer age was 37.233 ms. The first price output followed roughly 605 seconds of startup, leaving about 295 seconds of actual WebSocket processing. These are historical measurements, not performance proof for this revision.
-
-Source review covers subscription transitions, multi-pool account bindings, frozen-leg mapping, ordered row expansion and accounting. The agent attempted cargo build --locked --release, but Cargo/Rust are unavailable here; PowerShell and live DB/RPC access are also unavailable. No automated test suite or formatter is introduced. The current revision requires the local locked build and a successful lossless real run. Check all four websocket_scored_by_kind counters and the real arithmetic examples separately. Stable sub-five-millisecond processing and pipeline latency remain measurement objectives; no achieved speedup or completed acceptance is claimed.
+Implementation prepared for local measurement; no reference comparison performed.
+Rust/Cargo, PowerShell and live DB/RPC credentials are unavailable in the agent environment.
+No successful build, live run, sub-five-millisecond latency, numerical equivalence or full
+issue-40 acceptance is claimed. The issue remains open for real measurements and the
+subsequent separately requested reference comparison.

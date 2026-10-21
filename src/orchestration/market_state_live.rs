@@ -16,7 +16,8 @@ async fn optional_join<T>(task:&mut Option<Task<T>>)->std::result::Result<T,toki
 
 pub async fn run(signals_enabled:bool)->Result<()> {
     let mut evidence=serde_json::json!({"run_complete":false,"live_evidence_passed":false,
-        "signals_enabled":signals_enabled,"execution":false,"signal_production_report":null,"signal_report":null});
+        "signals_enabled":signals_enabled,"execution":false,"reference_comparison_performed":false,"signal_measurement_passed":false,
+        "signal_production_report":null,"signal_report":null});
     let result=run_inner(signals_enabled,&mut evidence).await;
     if let Err(error)=&result {
         evidence["error"]=serde_json::json!(format!("{error:#}"));
@@ -99,7 +100,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         http,jupiter_settings,target_rx,jupiter_out.clone())));
     let mut dex=Task(tokio::spawn(source_dexscreener::run_live(qualified_rx,registry.clone(),source.clone())));
     crate::log_event!(Info,"market state live started=true restored={count} persisted_prepared={persisted_prepared} duration_s={duration} pool_limit={} rewatch={rewatch} execution=false registry_seed=persisted admission_source=live_enrichment warmup=true",settings.pool_limit);
-    crate::log_event!(Info,"market state live signals_enabled={signals_enabled} reference=true");
+    crate::log_event!(Info,"market state live signals_enabled={signals_enabled} reference_comparison=false");
     let rewatch_task=Task(tokio::spawn(async move {
         if rewatch {
             tokio::time::sleep(Duration::from_secs(duration/2)).await;
@@ -206,7 +207,9 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let result=report.ensure_live_evidence(rewatch).and_then(|()| {
         if let Some(r)=&signal_report {
             production_report.as_ref().context("missing signal producer report")?.ensure_delivery(r)?;
-            r.ensure_live_evidence()
+            production_report.as_ref().context("missing signal producer report")?
+                .ensure_input_delivery(report.observations,report.websocket_observations)?;
+            r.ensure_calculation_evidence()
         }else{Ok(())}
     });
     *evidence=serde_json::json!({"run_complete":true,"duration_seconds":duration,"pool_limit":settings.pool_limit,
@@ -217,6 +220,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         "signal_candidate_passed":signal_report.as_ref().map(|r|r.ensure_live_evidence().is_ok()),
         "signal_profile_enabled":signal_settings.map(|s|s.profile),
         "signal_delivery_passed":production_report.as_ref().zip(signal_report.as_ref()).map(|(p,r)|p.ensure_delivery(r).is_ok()),
+        "signal_measurement_passed":signals_enabled && result.is_ok(),"reference_comparison_performed":false,
         "signal_production_report":production_report,"signal_report":signal_report,"execution":false,
         "websocket_plan":websocket_plan,
         "error":result.as_ref().err().map(|e|format!("{e:#}"))});

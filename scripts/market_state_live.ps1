@@ -115,28 +115,31 @@ try {
     if ($Signals) {
         $produced = $evidence.signal_production_report
         $received = $evidence.signal_report
-        Write-RunLog "signals_published=$($produced.published_events) signals_received=$($received.received_events) route_rows_published=$($produced.published_route_rows) route_rows_received=$($received.received_route_rows) lost=$($received.lost_events) lag_incidents=$($received.lag_incidents) delivery_passed=$($evidence.signal_delivery_passed)"
+        Write-RunLog "signals_published=$($produced.counts.events) signals_received=$($received.counts.events) ranges_published=$($produced.counts.ranges) ranges_received=$($received.counts.ranges) lost=$($received.lost_events) delivery_passed=$($evidence.signal_delivery_passed) reference_comparison=false"
+        Write-RunLog "state_ready_mean_ns=$($produced.steady_state_inputs.state_ready_ns.mean) state_ready_max_ns=$($produced.steady_state_inputs.state_ready_ns.max) query_mean_ns=$($produced.steady_state_inputs.query_ns.mean) processing_max_ns=$($produced.steady_state_inputs.processing_ns.max)"
         if ($ProfileSignals) { Write-RunLog "profile=true details=report.json websocket_inputs=true" }
     }
     if ($workerExit -ne 0) { throw "$label live run failed (exit $workerExit). Diagnostics: $report and $log" }
     if ($evidence.run_complete -ne $true) { throw "Live run did not complete; inspect report.json and worker.log." }
     if ($evidence.live_evidence_passed -ne $true) { throw "Live evidence requirements were not fulfilled." }
     if ($Signals) {
-        if ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true -or $evidence.signal_candidate_passed -ne $true) { throw "No complete live signal proof; inspect both signal reports and worker.log." }
+        if ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true) { throw "No complete live state/query measurement; inspect both signal reports and worker.log." }
         $signalReport = $evidence.signal_report
-        if ($signalReport.execution_layout -ne "indexed_role_plan_v1" -or $signalReport.output_layout -ne "compact_route_blocks_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
-        if ($produced.published_route_rows -ne $signalReport.received_route_rows -or
-            $signalReport.output_capacity -ne 256 -or $signalReport.max_rows_per_block -ne 64) { throw "Signal block delivery or output bounds differ; inspect both signal reports." }
+        if ($signalReport.execution_layout -ne "factorized_roles_v1" -or $signalReport.output_layout -ne "versioned_state_ranges_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
+        if ($evidence.reference_comparison_performed -ne $false -or $signalReport.reference_comparison_performed -ne $false) { throw "Unexpected reference comparison in measurement run." }
+        if ($produced.counts.ranges -ne $signalReport.counts.ranges -or
+            $signalReport.output_capacity -ne 256 -or $signalReport.max_ranges_per_block -ne 64) { throw "Signal range delivery or output bounds differ; inspect both signal reports." }
         $pipeline = $produced.websocket_inputs
         foreach ($stage in @("transport_decode_us", "transport_to_market_us", "market_processing_us", "price_queue_us", "frame_to_worker_us")) {
-            if ($pipeline.$stage.count -ne $produced.websocket_evaluations) { throw "Incomplete WebSocket pipeline timing: $stage" }
+            if ($pipeline.$stage.count -ne $produced.counts.websocket_evaluations) { throw "Incomplete WebSocket pipeline timing: $stage" }
         }
-        if ($signalReport.combinations_visited -ne $signalReport.routes_expected -or
-            $signalReport.routes_affected -ne $signalReport.routes_expected -or
-            $signalReport.logarithms_prepared -ne $signalReport.price_evaluations -or
-            $signalReport.websocket_combinations_visited -ne $signalReport.websocket_routes_expected -or
-            $signalReport.websocket_logarithms_prepared -ne $signalReport.websocket_evaluations) { throw "Indexed signal accounting failed; inspect signal_report." }
-        Write-RunLog "graph_signals_live_passed=true details=report.json"
+        $counts = $signalReport.counts
+        if ($counts.logarithms_prepared -ne $counts.price_evaluations -or
+            $counts.state_updates -ne $counts.evaluations -or
+            $counts.price_evaluations -ne $evidence.report.observations -or
+            $counts.websocket_evaluations -ne $evidence.report.websocket_observations -or
+            $counts.ranges -ne ($counts.entered_ranges + $counts.updated_ranges + $counts.exited_ranges)) { throw "Factorized signal accounting failed; inspect signal_report." }
+        Write-RunLog "graph_signals_measurement_passed=true candidate_observed=$($evidence.signal_candidate_passed) reference_comparison=false details=report.json"
     } else {
         Write-RunLog "market_state_live_passed=true details=report.json"
     }

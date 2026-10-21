@@ -1,16 +1,24 @@
-//! Compiled role plan: every affected concrete route retains its full ordered sum.
-//! Dense directed prices; no best-price pruning, partial sums or event coalescing.
-use std::{collections::{BTreeMap, HashMap}, env, sync::Arc,
+//! Factorized route state: shared ordered roles, versioned deltas and complete ranges.
+//! No per-route score cache, best-pool pruning, reference engine or consumer waits.
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    env, ops::Bound::{Excluded, Included, Unbounded}, sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, watch};
-use crate::core::{market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin, PricePipelineTiming},
-    signals::{SignalEvaluation, SignalEvent, SignalLeg, SignalRouteRow, SignalRouteBlock, SIGNAL_BLOCK_ROWS, SignalStream, SignalTrigger}};
+use crate::core::{
+    market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin, PricePipelineTiming},
+    signals::{SignalEvaluation, SignalEvent, SignalGroup, SignalLeg, SignalPlan, SignalPool,
+        SignalPoolPrice, SignalPriceChange, SignalRangeBlock, SignalRangeChange, SignalRole,
+        SignalRouteKind, SignalRouteRange, SignalSnapshot, SignalStateUpdate, SignalStream,
+        SignalTrigger, SignalWitness, SIGNAL_BLOCK_RANGES, SIGNAL_LOG_SCALE}};
 use super::{graph_liquidity::GroupKind, graph_watch_catalog::WatchCatalog};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const EXECUTION_LAYOUT: &str = "factorized_roles_v1";
+const OUTPUT_LAYOUT: &str = "versioned_state_ranges_v1";
+pub const OUTPUT_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy)]
 pub struct Settings { pub threshold_bps: f64, pub sample_limit: usize, pub trace: bool, pub profile: bool }
@@ -18,525 +26,511 @@ impl Settings {
     pub fn from_env() -> Result<Self> {
         let threshold_bps: f64 = env::var("GRAPH_SIGNALS_THRESHOLD_BPS")
             .unwrap_or_else(|_| "0".into()).parse().context("invalid GRAPH_SIGNALS_THRESHOLD_BPS")?;
-        ensure!(threshold_bps.is_finite() && threshold_bps >= 0.0,
-            "GRAPH_SIGNALS_THRESHOLD_BPS must be finite and nonnegative");
-        let sample_limit = env::var("GRAPH_SIGNALS_SAMPLE_LIMIT")
-            .unwrap_or_else(|_| "16".into()).parse().context("invalid GRAPH_SIGNALS_SAMPLE_LIMIT")?;
-        let trace = match env::var("GRAPH_SIGNALS_TRACE").as_deref() {
-            Ok("1" | "true") => true,
-            Ok("0" | "false") | Err(env::VarError::NotPresent) => false,
-            _ => bail!("GRAPH_SIGNALS_TRACE must be true or false"),
-        };
-        let profile = match env::var("GRAPH_SIGNALS_PROFILE").as_deref() {
-            Ok("1" | "true") => true,
-            Ok("0" | "false") | Err(env::VarError::NotPresent) => false,
-            _ => bail!("GRAPH_SIGNALS_PROFILE must be true or false"),
-        };
-        Ok(Self { threshold_bps, sample_limit, trace, profile })
+        ensure!(threshold_bps.is_finite() && threshold_bps >= 0.0, "invalid signal threshold");
+        let sample_limit = env::var("GRAPH_SIGNALS_SAMPLE_LIMIT").unwrap_or_else(|_| "16".into())
+            .parse().context("invalid GRAPH_SIGNALS_SAMPLE_LIMIT")?;
+        let flag = |name: &str| -> Result<bool> { match env::var(name).as_deref() {
+            Ok("1" | "true") => Ok(true), Ok("0" | "false") | Err(env::VarError::NotPresent) => Ok(false),
+            _ => bail!("{name} must be true or false"),
+        }};
+        Ok(Self { threshold_bps, sample_limit, trace: flag("GRAPH_SIGNALS_TRACE")?, profile: flag("GRAPH_SIGNALS_PROFILE")? })
     }
 }
-
-fn now_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros()
-        .min(u128::from(u64::MAX)) as u64
-}
+fn now_us() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+    .as_micros().min(u128::from(u64::MAX)) as u64 }
 fn nanos(start: Instant) -> u64 { start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64 }
-fn kinds() -> BTreeMap<&'static str, u64> {
-    ["direct_2", "direct_3", "triangle_3", "triangle_4"].into_iter().map(|k| (k, 0)).collect()
-}
-fn websocket(trigger: &SignalTrigger) -> bool {
-    matches!(trigger, SignalTrigger::Price { origin: PriceOrigin::Websocket, .. })
-}
-fn account_age(trigger: &SignalTrigger, at: u64) -> Option<u64> {
-    match trigger {
-        SignalTrigger::Price { received_at_us, .. } => at.checked_sub(*received_at_us),
-        SignalTrigger::Catalog { .. } => None,
-    }
+fn live(t: &SignalTrigger) -> bool { matches!(t, SignalTrigger::Price { origin: PriceOrigin::Websocket, .. }) }
+fn kind_id(k: SignalRouteKind) -> usize { match k {
+    SignalRouteKind::Direct2 => 0, SignalRouteKind::Direct3 => 1,
+    SignalRouteKind::Triangle3 => 2, SignalRouteKind::Triangle4 => 3,
+}}
+fn change_id(c: SignalRangeChange) -> usize { match c {
+    SignalRangeChange::Entered => 0, SignalRangeChange::Updated => 1, SignalRangeChange::Exited => 2,
+}}
+fn names(v: [u64; 4]) -> BTreeMap<&'static str, u64> {
+    ["direct_2", "direct_3", "triangle_3", "triangle_4"].into_iter().zip(v).collect()
 }
 
-const EXECUTION_LAYOUT: &str = "indexed_role_plan_v1";
-const BLOCK_ROUTES: usize = 256;
-const YIELD_ROUTES: u64 = 4096;
-const OUTPUT_LAYOUT: &str = "compact_route_blocks_v1";
-// At most 256 * 64 = 16,384 retained route rows, without enlarging the old row budget.
-pub const OUTPUT_CAPACITY: usize = 256;
-
-#[derive(Clone, Copy)]
-enum PriceState { Missing, Nonfinite, Available }
-struct PoolIdentity { address: Pubkey, a: Pubkey, b: Pubkey }
+struct Previous { pool: usize, price: Option<Arc<SignalPoolPrice>> }
 #[derive(Default)]
 struct Prices {
-    index: HashMap<Pubkey, usize>, identities: Vec<PoolIdentity>,
-    observations: Vec<Option<Arc<PoolPriceObservation>>>,
-    // Two directed slots per pool: a -> b, then b -> a. Addresses/proofs stay cold.
-    rates: Vec<f64>, weights: Vec<f64>, states: Vec<PriceState>,
+    index: HashMap<Pubkey, usize>, pools: Vec<SignalPool>,
+    mint_text: Vec<[String; 2]>, values: Vec<Option<Arc<SignalPoolPrice>>>,
 }
 impl Prices {
     fn bind(&mut self, address: Pubkey, a: Pubkey, b: Pubkey) -> Result<usize> {
         let pair = (a.min(b), a.max(b));
         if let Some(&id) = self.index.get(&address) {
-            let known = &self.identities[id];
-            ensure!((known.a, known.b) == pair, "catalog/price identity mismatch for {address}");
+            ensure!((self.pools[id].mint_a, self.pools[id].mint_b) == pair, "pool mint identity changed: {address}");
             return Ok(id);
         }
-        ensure!(a != b, "pool {address} repeats mint");
-        let id = self.identities.len();
+        ensure!(a != b, "pool repeats mint");
+        let id = self.pools.len();
         self.index.insert(address, id);
-        self.identities.push(PoolIdentity { address, a: pair.0, b: pair.1 });
-        self.observations.push(None);
-        self.rates.extend([0.0; 2]); self.weights.extend([0.0; 2]);
-        self.states.extend([PriceState::Missing; 2]);
+        self.pools.push(SignalPool { address, mint_a: pair.0, mint_b: pair.1 });
+        self.mint_text.push([pair.0.to_string(), pair.1.to_string()]);
+        self.values.push(None);
         Ok(id)
     }
-    fn observe(&mut self, p: &PoolPriceObservation) -> Result<(Pubkey, usize)> {
-        let pool: Pubkey = p.pool.parse().context("signal pool address")?;
-        let base: Pubkey = p.base_mint.parse().context("signal base mint")?;
-        let quote: Pubkey = p.quote_mint.parse().context("signal quote mint")?;
-        let a: Pubkey = p.mint_a.parse().context("signal mint A")?;
-        let b: Pubkey = p.mint_b.parse().context("signal mint B")?;
-        ensure!(a != b && ((a == base && b == quote) || (a == quote && b == base)),
-            "price mint orientation mismatch for {pool}");
+    fn observe(&mut self, p: &PoolPriceObservation) -> Result<(Pubkey, Previous)> {
+        let address: Pubkey = p.pool.parse().context("signal pool address")?;
+        let id = match self.index.get(&address).copied() {
+            Some(id) => id, None => self.bind(address, p.mint_a.parse()?, p.mint_b.parse()?)?,
+        };
+        let [a,b] = &self.mint_text[id];
+        ensure!((&p.mint_a == a && &p.mint_b == b) || (&p.mint_a == b && &p.mint_b == a), "price/catalog mint mismatch");
+        let forward = if &p.base_mint == a && &p.quote_mint == b { 0 }
+            else if &p.base_mint == b && &p.quote_mint == a { 1 }
+            else { bail!("price orientation mismatch"); };
         let price = p.price_quote_per_base;
-        ensure!(price.is_finite() && price > 0.0, "nonpositive/nonfinite indicative price for {pool}");
-        let id = self.bind(pool, a, b)?;
-        let forward = 2 * id + usize::from(base != self.identities[id].a);
-        let log_price = price.ln();
-        self.rates[forward] = price; self.weights[forward] = -log_price;
-        self.rates[forward ^ 1] = 1.0 / price; self.weights[forward ^ 1] = log_price;
-        for slot in [forward, forward ^ 1] {
-            self.states[slot] = if self.rates[slot].is_finite() && self.rates[slot] > 0.0
-                && self.weights[slot].is_finite() { PriceState::Available } else { PriceState::Nonfinite };
-        }
-        self.observations[id] = Some(Arc::new(p.clone()));
-        Ok((pool, id))
+        ensure!(price.is_finite() && price > 0.0, "invalid indicative price");
+        let logarithm = price.ln();
+        let mut weights = [None; 2];
+        let units = (-logarithm * SIGNAL_LOG_SCALE as f64).round() as i64;
+        weights[forward] = logarithm.is_finite().then_some(units);
+        weights[forward ^ 1] = (logarithm.is_finite() && (1.0 / price).is_finite()).then_some(-units);
+        let old = self.values[id].replace(Arc::new(SignalPoolPrice {
+            log_weight_units: weights, observation: Arc::new(p.clone()),
+        }));
+        Ok((address, Previous { pool: id, price: old }))
     }
-    fn leg(&self, address: Pubkey, input: Pubkey, output: Pubkey) -> Result<usize> {
-        let &id = self.index.get(&address).context("graph pool outside compiled catalog")?;
-        let p = &self.identities[id];
-        ensure!((p.a, p.b) == (input.min(output), input.max(output)),
-            "pool {address} does not connect graph route mints");
-        Ok(2 * id + usize::from(input != p.a))
+    fn price<'a>(&'a self, pool: usize, previous: Option<&'a Previous>) -> Option<&'a Arc<SignalPoolPrice>> {
+        if let Some(p) = previous { if p.pool == pool { return p.price.as_ref(); } }
+        self.values.get(pool)?.as_ref()
     }
-    fn withdraw(&mut self, id: usize) {
-        self.observations[id] = None;
-        self.states[2 * id] = PriceState::Missing; self.states[2 * id + 1] = PriceState::Missing;
+    fn weight(&self, slot: usize, previous: Option<&Previous>) -> Option<i64> {
+        self.price(slot / 2, previous)?.log_weight_units[slot % 2]
     }
-    fn remove(&mut self, address: Pubkey) {
-        if let Some(&id) = self.index.get(&address) { self.withdraw(id); }
+    fn slot(&self, pool: Pubkey, input: Pubkey, output: Pubkey) -> Result<usize> {
+        let id = *self.index.get(&pool).context("pool absent from signal identities")?;
+        let p = &self.pools[id];
+        ensure!((p.mint_a,p.mint_b) == (input.min(output),input.max(output)), "invalid graph pool role");
+        Ok(2 * id + usize::from(input != p.mint_a))
     }
-    fn retain(&mut self, selected: &std::collections::HashSet<Pubkey>) {
-        for id in 0..self.identities.len() {
-            if !selected.contains(&self.identities[id].address) { self.withdraw(id); }
-        }
+    fn change(&self, id: usize) -> SignalPriceChange { SignalPriceChange {
+        pool_id: id, identity: self.pools[id].clone(), price: self.values[id].clone(),
+    }}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Key { weight: i64, slot: usize }
+fn key(weight: i64, slot: usize) -> Key { Key { weight, slot } }
+struct OrderedRole { definition: SignalRole, ordered: BTreeSet<Key> }
+impl OrderedRole {
+    fn first(&self, lower: Option<i64>, upper: i64, exclude: Option<usize>) -> Option<Key> {
+        if lower.is_some_and(|l| l >= upper) { return None; }
+        let lower = lower.map_or(Unbounded, |w| Included(key(w, 0)));
+        self.ordered.range((lower, Excluded(key(upper, 0))))
+            .find(|k| Some(k.slot / 2) != exclude).copied()
     }
-    fn clear(&mut self) {
-        self.observations.fill(None); self.states.fill(PriceState::Missing);
+    fn has_partner(&self, exclude: Option<usize>) -> bool {
+        self.ordered.iter().take(2).any(|k| Some(k.slot / 2) != exclude)
     }
 }
-
 #[derive(Clone, Copy)]
-enum Affected { All, Both(usize), Left(usize), Right(usize), Fixed }
+enum Affected { Both(usize), Left(usize), Right(usize), Fixed }
 #[derive(Clone, Copy)]
 struct Binding { group: usize, affected: Affected }
-struct CompiledGroup {
-    kind: usize, left: Arc<[usize]>, right: Arc<[usize]>, fixed: [usize; 2],
-    mints: [Pubkey; 5], route_options: u64,
-}
-impl CompiledGroup {
-    fn expected(&self, affected: Affected) -> u64 {
-        match affected {
-            Affected::All | Affected::Fixed => self.route_options,
-            Affected::Both(_) => 2 * (self.left.len() as u64 - 1),
-            Affected::Left(_) => 2 * self.right.len() as u64,
-            Affected::Right(_) => 2 * self.left.len() as u64,
-        }
-    }
-}
 struct ExecutionPlan {
-    catalog: Arc<WatchCatalog>, groups: Vec<CompiledGroup>,
-    // CSR pool -> group/role/position bindings. No per-input copied group-ID list.
+    data: Arc<SignalPlan>, roles: Vec<OrderedRole>, slot_roles: Vec<Option<usize>>,
     offsets: Vec<usize>, bindings: Vec<Binding>,
 }
-type RoleCache = HashMap<(Pubkey, Pubkey), (Arc<[Pubkey]>, Arc<[usize]>)>;
-fn compile_role(prices: &Prices, cache: &mut RoleCache, pools: &Arc<[Pubkey]>,
-    input: Pubkey, output: Pubkey) -> Result<Arc<[usize]>> {
-    if let Some((known, slots)) = cache.get(&(input, output)) {
-        ensure!(known.as_ref() == pools.as_ref(), "graph role alternatives differ for identical mint pair");
-        return Ok(slots.clone());
+fn compile_role(prices: &Prices, pools: &Arc<[Pubkey]>, input: Pubkey, output: Pubkey,
+    cache: &mut HashMap<(Pubkey,Pubkey),usize>, roles: &mut Vec<OrderedRole>,
+    slot_roles: &mut [Option<usize>]) -> Result<usize> {
+    if let Some(&id) = cache.get(&(input,output)) {
+        ensure!(roles[id].definition.slots.len() == pools.len()
+            && roles[id].definition.slots.iter().zip(pools.iter()).all(|(&s,&p)| prices.pools[s/2].address == p),
+            "different alternatives for identical mint role");
+        return Ok(id);
     }
-    ensure!(!pools.is_empty() && pools.windows(2).all(|p| p[0] < p[1]),
-        "graph role alternatives must be nonempty, sorted and unique");
-    let slots: Arc<[usize]> = pools.iter().map(|&p| prices.leg(p, input, output))
-        .collect::<Result<Vec<_>>>()?.into();
-    cache.insert((input, output), (pools.clone(), slots.clone()));
-    Ok(slots)
+    ensure!(!pools.is_empty() && pools.windows(2).all(|p| p[0] < p[1]), "invalid graph alternatives");
+    let slots: Arc<[usize]> = pools.iter().map(|&p| prices.slot(p,input,output)).collect::<Result<Vec<_>>>()?.into();
+    let id = roles.len(); let mut ordered = BTreeSet::new();
+    for &slot in slots.iter() {
+        ensure!(slot_roles[slot].replace(id).is_none(), "directed slot belongs to multiple role indices");
+        if let Some(w) = prices.weight(slot,None) { ordered.insert(key(w,slot)); }
+    }
+    roles.push(OrderedRole { definition: SignalRole { slots }, ordered });
+    cache.insert((input,output),id);
+    Ok(id)
 }
 impl ExecutionPlan {
     fn compile(catalog: Arc<WatchCatalog>, prices: &mut Prices) -> Result<Self> {
-        ensure!(catalog.generation == catalog.graph.generation, "mixed graph/catalog generation");
-        ensure!(catalog.graph.groups.len() <= u32::MAX as usize, "too many signal groups");
-        for pool in catalog.pools.iter() { prices.bind(pool.address, pool.mint_a, pool.mint_b)?; }
-        let wsol: Pubkey = WSOL.parse()?; let usdc: Pubkey = USDC.parse()?;
-        let mut roles = RoleCache::new();
+        ensure!(catalog.generation == catalog.graph.generation, "mixed graph generation");
+        for p in catalog.pools.iter() { prices.bind(p.address,p.mint_a,p.mint_b)?; }
+        let mut roles = Vec::new(); let mut cache = HashMap::new();
+        let mut slot_roles = vec![None; 2*prices.pools.len()];
         let mut groups = Vec::with_capacity(catalog.graph.groups.len());
-        let mut by_pool = vec![Vec::<Binding>::new(); prices.identities.len()];
-        for (id, g) in catalog.graph.groups.iter().enumerate() {
-            let s = g.settlement; let t = g.target;
-            ensure!(s == wsol || s == usdc, "unsupported graph settlement");
-            let q = if s == wsol { usdc } else { wsol };
-            let left = compile_role(prices, &mut roles, &g.direct_s, s, t)?;
-            let mut right: Arc<[usize]> = Arc::from([]);
-            let mut fixed = [0; 2];
-            let (kind, length, mints) = match (g.kind, g.conversion) {
-                (GroupKind::Direct, None) => {
-                    ensure!(g.bridge.is_none() && g.intermediate.is_none()
-                        && g.direct_q.is_empty() && g.bridge_pools.is_empty(), "invalid Direct2 roles");
-                    (0, 2, [s, t, s, s, s])
+        let mut by_pool = vec![Vec::<Binding>::new(); prices.pools.len()];
+        let wsol: Pubkey = WSOL.parse()?; let usdc: Pubkey = USDC.parse()?;
+        for (id,g) in catalog.graph.groups.iter().enumerate() {
+            let s=g.settlement; let t=g.target;
+            ensure!(s == wsol || s == usdc, "unsupported settlement");
+            let q=if s == wsol { usdc } else { wsol };
+            let mut pair = |pools: &Arc<[Pubkey]>, a, b| -> Result<[usize;2]> {
+                Ok([compile_role(prices,pools,a,b,&mut cache,&mut roles,&mut slot_roles)?,
+                    compile_role(prices,pools,b,a,&mut cache,&mut roles,&mut slot_roles)?])
+            };
+            let left=pair(&g.direct_s,s,t)?;
+            let mut fixed=[0;2];
+            let (kind,right,fixed_count,length,mints)=match (g.kind,g.conversion) {
+                (GroupKind::Direct,None) => {
+                    ensure!(g.bridge.is_none() && g.intermediate.is_none() && g.direct_q.is_empty()
+                        && g.bridge_pools.is_empty(), "invalid Direct2");
+                    (SignalRouteKind::Direct2,[left[1],left[0]],0,2,[s,t,s,s,s])
                 },
-                (GroupKind::Direct, Some(conversion)) => {
-                    ensure!(g.bridge.is_none() && g.intermediate.is_none()
-                        && g.bridge_pools.is_empty(), "invalid Direct3 roles");
-                    right = compile_role(prices, &mut roles, &g.direct_q, t, q)?;
-                    fixed[0] = prices.leg(conversion, q, s)?;
-                    (1, 3, [s, t, q, s, s])
+                (GroupKind::Direct,Some(c)) => {
+                    ensure!(g.bridge.is_none() && g.intermediate.is_none() && g.bridge_pools.is_empty(), "invalid Direct3");
+                    let right=pair(&g.direct_q,t,q)?; fixed[0]=prices.slot(c,q,s)?;
+                    (SignalRouteKind::Direct3,right,1,3,[s,t,q,s,s])
                 },
-                (GroupKind::Bridge, conversion) => {
-                    ensure!(g.direct_q.is_empty(), "triangle contains direct quote role");
-                    let b = g.bridge.context("bridge group missing bridge mint")?;
-                    fixed[0] = prices.leg(g.intermediate.context("bridge group missing intermediate pool")?, t, b)?;
-                    if let Some(conversion) = conversion {
-                        right = compile_role(prices, &mut roles, &g.bridge_pools, b, q)?;
-                        fixed[1] = prices.leg(conversion, q, s)?;
-                        (3, 4, [s, t, b, q, s])
+                (GroupKind::Bridge,c) => {
+                    ensure!(g.direct_q.is_empty(), "invalid triangle quote role");
+                    let b=g.bridge.context("missing bridge mint")?;
+                    fixed[0]=prices.slot(g.intermediate.context("missing intermediate")?,t,b)?;
+                    if let Some(c)=c {
+                        let right=pair(&g.bridge_pools,b,q)?; fixed[1]=prices.slot(c,q,s)?;
+                        (SignalRouteKind::Triangle4,right,2,4,[s,t,b,q,s])
                     } else {
-                        right = compile_role(prices, &mut roles, &g.bridge_pools, b, s)?;
-                        (2, 3, [s, t, b, s, s])
+                        let right=pair(&g.bridge_pools,b,s)?;
+                        (SignalRouteKind::Triangle3,right,1,3,[s,t,b,s,s])
                     }
                 },
             };
-            // Distinct cycle mints imply disjoint pool roles for 3/4-leg routes.
-            for i in 0..length {
-                ensure!(!mints[..i].contains(&mints[i]), "graph route repeats a cycle mint");
-            }
-            let n = left.len() as u64;
-            let expected = (if kind == 0 {
-                ensure!(n >= 2, "Direct2 needs distinct pools"); n.checked_mul(n - 1)
-            } else { n.checked_mul(right.len() as u64).and_then(|v| v.checked_mul(2)) })
-                .context("graph route count overflow")?;
-            ensure!(expected == g.route_options, "compiled route count differs from graph group {id}");
-            for (position, &slot) in left.iter().enumerate() {
-                by_pool[slot / 2].push(Binding { group: id,
-                    affected: if kind == 0 { Affected::Both(position) } else { Affected::Left(position) } });
-            }
-            for (position, &slot) in right.iter().enumerate() {
-                by_pool[slot / 2].push(Binding { group: id, affected: Affected::Right(position) });
-            }
-            let fixed_count = match kind { 0 => 0, 3 => 2, _ => 1 };
-            for &slot in &fixed[..fixed_count] {
-                by_pool[slot / 2].push(Binding { group: id, affected: Affected::Fixed });
-            }
-            groups.push(CompiledGroup { kind, left, right, fixed, mints, route_options: expected });
-        }
-        let mut offsets = Vec::with_capacity(by_pool.len() + 1);
-        let mut bindings = Vec::new();
-        offsets.push(0);
-        for (id, entries) in by_pool.into_iter().enumerate() {
-            ensure!(entries.iter().map(|b| b.group as u32)
-                .eq(catalog.graph.for_pool(prices.identities[id].address).iter().copied()),
-                "compiled pool bindings differ from graph index");
-            bindings.extend(entries); offsets.push(bindings.len());
-        }
-        Ok(Self { catalog, groups, offsets, bindings })
-    }
-    fn for_pool(&self, pool: usize) -> &[Binding] {
-        match (self.offsets.get(pool), self.offsets.get(pool + 1)) {
-            (Some(&start), Some(&end)) => &self.bindings[start..end], _ => &[],
-        }
-    }
-}
-
-// Enumerate only affected choices, preserving the former filtered nested-loop order.
-struct Pairs { row: usize, end: usize, col: usize, start_col: usize, end_col: usize,
-    distinct: bool, changed: Option<usize> }
-impl Pairs {
-    fn new(g: &CompiledGroup, affected: Affected) -> Self {
-        let (row, end) = if let Affected::Left(i) = affected { (i, i + 1) } else { (0, g.left.len()) };
-        let columns = if g.kind == 0 { g.left.len() } else { g.right.len() };
-        let (col, end_col) = if let Affected::Right(i) = affected { (i, i + 1) } else { (0, columns) };
-        Self { row, end, col, start_col: col, end_col, distinct: g.kind == 0,
-            changed: if let Affected::Both(i) = affected { Some(i) } else { None } }
-    }
-}
-impl Iterator for Pairs {
-    type Item = (usize, usize);
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.row < self.end {
-            if let Some(changed) = self.changed {
-                if self.row != changed {
-                    let row = self.row; self.row += 1; self.col = self.start_col;
-                    return Some((row, changed));
+            for i in 0..length { ensure!(!mints[..i].contains(&mints[i]), "repeated cycle mint"); }
+            let n=roles[left[0]].definition.slots.len() as u64;
+            let m=roles[right[0]].definition.slots.len() as u64;
+            let expected=if kind == SignalRouteKind::Direct2 {
+                ensure!(n>=2,"Direct2 requires distinct pools"); n.checked_mul(n-1)
+            } else { n.checked_mul(m).and_then(|x|x.checked_mul(2)) }.context("route count overflow")?;
+            ensure!(expected == g.route_options, "graph/signal route count differs");
+            for &slot in roles[left[0]].definition.slots.iter() { by_pool[slot/2].push(Binding {
+                group:id, affected:if kind == SignalRouteKind::Direct2 { Affected::Both(slot) } else { Affected::Left(slot) },
+            }); }
+            if kind != SignalRouteKind::Direct2 {
+                for &slot in roles[right[0]].definition.slots.iter() {
+                    by_pool[slot/2].push(Binding { group:id, affected:Affected::Right(slot) });
                 }
             }
-            if self.col == self.end_col { self.row += 1; self.col = self.start_col; continue; }
-            let pair = (self.row, self.col); self.col += 1;
-            if !self.distinct || pair.0 != pair.1 { return Some(pair); }
+            for &slot in &fixed[..fixed_count] { by_pool[slot/2].push(Binding { group:id, affected:Affected::Fixed }); }
+            groups.push(SignalGroup { kind,left,right,fixed,fixed_count,mints,route_options:expected });
         }
-        None
+        let mut offsets=vec![0]; let mut bindings=Vec::new();
+        for (id,entries) in by_pool.into_iter().enumerate() {
+            ensure!(entries.iter().map(|b|b.group as u32).eq(catalog.graph.for_pool(prices.pools[id].address).iter().copied()),
+                "signal dependency index differs from graph");
+            bindings.extend(entries); offsets.push(bindings.len());
+        }
+        let definitions=roles.iter().map(|r|r.definition.clone()).collect::<Vec<_>>().into();
+        let data=Arc::new(SignalPlan { graph_generation:catalog.generation,log_weight_scale:SIGNAL_LOG_SCALE,roles:definitions,
+            groups:groups.into(),route_options:catalog.graph.route_options });
+        Ok(Self { data,roles,slot_roles,offsets,bindings })
+    }
+    fn refresh(&mut self, prices: &Prices, old: &Previous) -> Result<()> {
+        for slot in [2*old.pool,2*old.pool+1] {
+            let Some(Some(role))=self.slot_roles.get(slot) else { continue };
+            let before=old.price.as_ref().and_then(|p|p.log_weight_units[slot%2]);
+            let after=prices.weight(slot,None);
+            if before==after {continue;}
+            if let Some(w)=before {
+                ensure!(self.roles[*role].ordered.remove(&key(w,slot)), "missing prior ordered weight");
+            }
+            if let Some(w)=after {
+                ensure!(self.roles[*role].ordered.insert(key(w,slot)), "duplicate ordered weight");
+            }
+        }
+        Ok(())
+    }
+    fn for_pool(&self, id: usize) -> &[Binding] {
+        match (self.offsets.get(id),self.offsets.get(id+1)) {
+            (Some(&a),Some(&b)) => &self.bindings[a..b], _ => &[],
+        }
     }
 }
-struct Route<const N: usize> { slots: [usize; N], reverse: bool }
-struct Scored { sum: f64, bps: f64 }
-enum Calculation { Missing, Nonfinite, Scored(Scored) }
-struct Pending { slots: [usize; 4], reverse: bool, scored: Scored }
+enum Scope { All, Pool(usize), None }
 struct Work {
-    stats: SignalEvaluation, by_kind: [u64; 4], pending: Vec<Pending>,
-    last_yield: u64,
+    started: Instant, stats: SignalEvaluation, previous: Option<Previous>, pending: Vec<SignalRouteRange>,
 }
-struct InputTiming { started: Instant, received_us: u64, preparation_ns: u64, logarithms: u64, plan_ns: u64,
-    pipeline:Option<PricePipelineTiming> }
 struct Engine {
-    prices: Prices, output: broadcast::Sender<Arc<SignalEvent>>, scratch: Vec<Pending>,
-    block_slots:Vec<(u64,u16)>, block_epoch:u64, production: ProductionReport,
-    settings: Settings, sequence: u64, samples: usize, websocket_samples: usize, threshold_log: f64,
+    prices: Prices, output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings,
+    sequence: u64, revision: u64, threshold: i64, production: ProductionReport,
+    scratch: Vec<SignalRouteRange>,
 }
 impl Engine {
-    fn publish(&mut self, event: Arc<SignalEvent>) -> Result<()> {
-        self.output.send(event).map_err(|_| anyhow::anyhow!("signal output has no consumer"))?;
-        self.production.published_events += 1;
+    fn emit(&mut self, event: SignalEvent) -> Result<()> {
+        self.output.send(Arc::new(event)).map_err(|_|anyhow::anyhow!("signal output has no consumer"))?;
         self.production.max_output_queue_depth=self.production.max_output_queue_depth.max(self.output.len());
         Ok(())
     }
-    fn emit(&mut self, event: SignalEvent) -> Result<()> { self.publish(Arc::new(event)) }
-    fn calculate<const N: usize>(&self, slots: &[usize; N]) -> Calculation {
-        let mut sum = 0.0;
-        for &slot in slots {
-            match self.prices.states[slot] {
-                PriceState::Missing => return Calculation::Missing,
-                PriceState::Nonfinite => return Calculation::Nonfinite,
-                PriceState::Available => sum += self.prices.weights[slot],
-            }
-        }
-        let bps = (-sum).exp_m1() * 10_000.0;
-        if !sum.is_finite() || !bps.is_finite() { return Calculation::Nonfinite; }
-        Calculation::Scored(Scored { sum, bps })
+    fn next_sequence(&mut self) -> u64 { self.sequence+=1; self.sequence }
+    fn begin(&mut self, plan: &ExecutionPlan, trigger: SignalTrigger, started: Instant,
+        received: u64, pipeline: Option<PricePipelineTiming>, queue: usize) -> Work {
+        self.revision+=1;
+        Work { started, previous:None, pending:std::mem::take(&mut self.scratch),
+            stats:SignalEvaluation { sequence:0,revision:self.revision,graph_generation:plan.data.graph_generation,
+                trigger:Arc::new(trigger),price_pipeline:pipeline,worker_received_at_us:received,completed_at_us:0,
+                price_queue_depth:queue,groups_visited:0,logical_routes_affected:0,anchors_visited:0,
+                ready_anchors:[0;4],range_queries:0,ranges:[0;3],ranges_by_kind:[0;4],
+                logarithms_prepared:0,price_preparation_ns:0,index_update_ns:0,state_ready_ns:0,
+                plan_build_ns:0,query_ns:0,event_build_ns:0,publication_ns:0,
+                first_range_ns:None,last_range_ns:None,processing_ns:0 } }
     }
-    async fn routes<const N: usize>(&mut self, id: usize, plan: &ExecutionPlan, work: &mut Work,
-        mut routes: impl Iterator<Item = Route<N>>) -> Result<()> {
-        let compiled = &plan.groups[id]; let group = &plan.catalog.graph.groups[id];
-        let live = websocket(&work.stats.trigger);
-        loop {
-            let started = Instant::now();
-            let before = work.stats.combinations_visited;
-            let samples = if live { self.websocket_samples } else { self.samples };
-            let mut pending_samples = 0;
-            for route in routes.by_ref().take(BLOCK_ROUTES) {
-                work.stats.combinations_visited += 1;
-                let scored = match self.calculate(&route.slots) {
-                    Calculation::Missing => { work.stats.routes_missing_prices += 1; continue; },
-                    Calculation::Nonfinite => { work.stats.routes_nonfinite += 1; continue; },
-                    Calculation::Scored(s) => s,
-                };
-                work.stats.routes_scored += 1; work.by_kind[compiled.kind] += 1;
-                let qualifies = scored.sum < self.threshold_log;
-                if qualifies { work.stats.candidates += 1; }
-                if qualifies || pending_samples < self.settings.sample_limit.saturating_sub(samples) {
-                    if !qualifies { pending_samples += 1; }
-                    let mut slots = [0; 4]; slots[..N].copy_from_slice(&route.slots);
-                    work.pending.push(Pending { slots, reverse: route.reverse, scored });
-                }
-            }
-            work.stats.calculation_ns = work.stats.calculation_ns.saturating_add(nanos(started));
-            if before == work.stats.combinations_visited { break; }
-            for pending in work.pending.chunks(SIGNAL_BLOCK_ROWS) {
-                let started = Instant::now();
-                self.block_epoch += 1;
-                let mut block = SignalRouteBlock { graph_generation: work.stats.graph_generation,
-                    group_id: id as u32, trigger: work.stats.trigger.clone(), settlement: group.settlement,
-                    target: group.target, bridge: group.bridge, conversion_pool: group.conversion,
-                    emitted_at_us:now_us(), threshold_bps: self.settings.threshold_bps, leg_count: N,
-                    legs: Vec::with_capacity(pending.len() * N), rows: Vec::with_capacity(pending.len()) };
-                for pending in pending {
-                    let mut leg_indices = [0; 4];
-                    for (i, entry) in leg_indices[..N].iter_mut().enumerate() {
-                        let slot = pending.slots[i];
-                        if self.block_slots[slot].0 != self.block_epoch {
-                            let input = if pending.reverse { N - i } else { i };
-                            let output = if pending.reverse { N - i - 1 } else { i + 1 };
-                            let index = block.legs.len() as u16;
-                            block.legs.push(SignalLeg { input_mint: compiled.mints[input], output_mint: compiled.mints[output],
-                                indicative_rate: self.prices.rates[slot], negative_log_weight: self.prices.weights[slot],
-                                observation: self.prices.observations[slot / 2].as_ref().expect("scored pool observation").clone() });
-                            self.block_slots[slot] = (self.block_epoch, index);
-                        }
-                        *entry = self.block_slots[slot].1;
+    fn state(&mut self, plan: &ExecutionPlan, work: &mut Work, snapshot: bool,
+        clear: bool, changes: Vec<SignalPriceChange>) -> Result<()> {
+        work.stats.state_ready_ns=nanos(work.started);
+        let ready_at_us=now_us();
+        let started=Instant::now();
+        let snapshot=snapshot.then(||SignalSnapshot { plan:plan.data.clone(),
+            pools:self.prices.pools.clone(),prices:self.prices.values.clone() });
+        let update=SignalStateUpdate { sequence:self.next_sequence(),revision:self.revision,
+            graph_generation:plan.data.graph_generation,trigger:work.stats.trigger.clone(),ready_at_us,
+            price_pipeline:work.stats.price_pipeline,snapshot,clear,changes };
+        work.stats.event_build_ns+=nanos(started);
+        let started=Instant::now();
+        self.production.counts.state(&update);
+        self.emit(SignalEvent::State(update))?;
+        work.stats.publication_ns+=nanos(started);
+        Ok(())
+    }
+    fn flush(&mut self, work: &mut Work) -> Result<()> {
+        if work.pending.is_empty() { return Ok(()); }
+        let started=Instant::now();
+        let block=SignalRangeBlock { sequence:self.next_sequence(),revision:self.revision,
+            graph_generation:work.stats.graph_generation,trigger:work.stats.trigger.clone(),
+            threshold_bps:self.settings.threshold_bps,threshold_units:self.threshold,emitted_at_us:now_us(),
+            price_pipeline:work.stats.price_pipeline,
+            ranges:std::mem::replace(&mut work.pending,Vec::with_capacity(SIGNAL_BLOCK_RANGES)) };
+        work.stats.event_build_ns+=nanos(started);
+        let started=Instant::now();
+        self.production.counts.block(&block);
+        self.emit(SignalEvent::Ranges(block))?;
+        work.stats.publication_ns+=nanos(started);
+        let elapsed=nanos(work.started);
+        work.stats.first_range_ns.get_or_insert(elapsed); work.stats.last_range_ns=Some(elapsed);
+        Ok(())
+    }
+    fn addend(&self, group: &SignalGroup, anchor: usize, reverse: bool,
+        previous: Option<&Previous>) -> Option<i64> {
+        let mut sum=self.prices.weight(anchor,previous)?;
+        for &slot in &group.fixed[..group.fixed_count] {
+            sum+=self.prices.weight(slot^usize::from(reverse),previous)?;
+        }
+        Some(sum)
+    }
+    fn witness(&self, group: &SignalGroup, anchor: usize, partner: usize,
+        anchor_left: bool, reverse: bool, change: SignalRangeChange,
+        addend: i64, work: &Work) -> Result<SignalWitness> {
+        let (a,b)=if anchor_left { (anchor,partner) } else { (partner,anchor) };
+        let mut slots=[0;4];
+        let count=match group.kind {
+            SignalRouteKind::Direct2 => { slots[..2].copy_from_slice(&[a,b]); 2 },
+            SignalRouteKind::Direct3 => { slots[..3].copy_from_slice(&[a,b,group.fixed[0]^usize::from(reverse)]); 3 },
+            SignalRouteKind::Triangle3 => { slots[..3].copy_from_slice(&[a,group.fixed[0]^usize::from(reverse),b]); 3 },
+            SignalRouteKind::Triangle4 => { slots.copy_from_slice(&[a,group.fixed[0]^usize::from(reverse),b,group.fixed[1]^usize::from(reverse)]); 4 },
+        };
+        if reverse { slots[..count].reverse(); }
+        let previous=if change == SignalRangeChange::Exited { work.previous.as_ref() } else { None };
+        let mut legs=Vec::with_capacity(count);
+        for (i,&slot) in slots[..count].iter().enumerate() {
+            let input=if reverse { count-i } else { i };
+            let output=if reverse { count-i-1 } else { i+1 };
+            let value=self.prices.price(slot/2,previous).context("missing witness price")?;
+            legs.push(SignalLeg { slot,input_mint:group.mints[input],output_mint:group.mints[output],
+                log_weight_units:value.log_weight_units[slot%2].context("invalid witness direction")?,
+                observation:value.observation.clone() });
+        }
+        let units=addend+self.prices.weight(partner,None).context("missing range partner")?;
+        let sum=units as f64 / SIGNAL_LOG_SCALE as f64;
+        let bps=(-sum).exp_m1()*10_000.0;
+        Ok(SignalWitness { legs,log_sum_units:units,negative_log_sum:sum,indicative_return_bps:bps.is_finite().then_some(bps) })
+    }
+    fn anchor(&mut self, plan: &ExecutionPlan, group_id: usize, anchor: usize,
+        anchor_left: bool, reverse: bool, work: &mut Work) -> Result<()> {
+        work.stats.anchors_visited+=1;
+        let g=&plan.data.groups[group_id]; let direction=usize::from(reverse);
+        let partner_role=if anchor_left { g.right[direction] } else { g.left[direction] };
+        let exclude=(g.kind == SignalRouteKind::Direct2).then_some(anchor/2);
+        let current=self.addend(g,anchor,reverse,None);
+        let previous=work.previous.as_ref().and_then(|p|self.addend(g,anchor,reverse,Some(p)));
+        if current.is_none() && previous.is_none() { return Ok(()); }
+        let role=&plan.roles[partner_role];
+        if !role.has_partner(exclude) { return Ok(()); }
+        work.stats.ready_anchors[kind_id(g.kind)]+=1;
+        let old=previous.map(|a|self.threshold-a); let new=current.map(|a|self.threshold-a);
+        let mut intervals=[(None,0,SignalRangeChange::Updated);2]; let count;
+        match (old,new) {
+            (None,Some(n)) => { intervals[0]=(None,n,SignalRangeChange::Entered); count=1; },
+            (Some(o),None) => { intervals[0]=(None,o,SignalRangeChange::Exited); count=1; },
+            (Some(o),Some(n)) => {
+                intervals[0]=(None,o.min(n),SignalRangeChange::Updated);
+                intervals[1]=(Some(o.min(n)),o.max(n),if n>o { SignalRangeChange::Entered } else { SignalRangeChange::Exited });
+                count=2;
+            },
+            _ => return Ok(()),
+        }
+        for &(lower,upper,change) in &intervals[..count] {
+            if lower.is_some_and(|l|l>=upper) { continue; }
+            work.stats.range_queries+=1;
+            let Some(partner)=role.first(lower,upper,exclude) else { continue };
+            let addend=if change == SignalRangeChange::Exited { previous } else { current }.context("missing range addend")?;
+            let witness=self.witness(g,anchor,partner.slot,anchor_left,reverse,change,addend,work)?;
+            work.pending.push(SignalRouteRange { group_id,reverse,anchor_is_left:anchor_left,
+                anchor_slot:anchor,partner_role,exclude_pool:exclude,lower_inclusive:lower,upper_exclusive:upper,
+                previous_addend:previous,current_addend:current,change,witness });
+            work.stats.ranges[change_id(change)]+=1; work.stats.ranges_by_kind[kind_id(g.kind)]+=1;
+            if work.stats.first_range_ns.is_none() || work.pending.len()==SIGNAL_BLOCK_RANGES { self.flush(work)?; }
+        }
+        Ok(())
+    }
+    fn group(&mut self, plan: &ExecutionPlan, id: usize, affected: Option<Affected>, work: &mut Work) -> Result<()> {
+        let g=&plan.data.groups[id]; work.stats.groups_visited+=1;
+        let n=plan.roles[g.left[0]].definition.slots.len() as u64;
+        let m=plan.roles[g.right[0]].definition.slots.len() as u64;
+        work.stats.logical_routes_affected+=match affected {
+            Some(Affected::Both(_)) => 2*(n-1), Some(Affected::Left(_)) => 2*m,
+            Some(Affected::Right(_)) => 2*n, _ => g.route_options,
+        };
+        match affected {
+            Some(Affected::Both(s)) => {
+                self.anchor(plan,id,s,true,false,work)?;
+                self.anchor(plan,id,s^1,false,false,work)?;
+            },
+            Some(Affected::Left(s)) | Some(Affected::Right(s)) => {
+                let left=matches!(affected,Some(Affected::Left(_)));
+                for reverse in [false,true] { self.anchor(plan,id,s^usize::from(reverse),left,reverse,work)?; }
+            },
+            None | Some(Affected::Fixed) => {
+                // Missing prices stay in the factorized state, not in the query walk.
+                let left=g.kind == SignalRouteKind::Direct2 || n<=m;
+                let directions=if g.kind==SignalRouteKind::Direct2 {1}else{2};
+                for direction in 0..directions {
+                    let role=if left {g.left[direction]}else{g.right[direction]};
+                    for entry in &plan.roles[role].ordered {
+                        self.anchor(plan,id,entry.slot,left,direction==1,work)?;
                     }
-                    self.sequence += 1;
-                    let qualifies = pending.scored.sum < self.threshold_log;
-                    if !qualifies { if live { self.websocket_samples += 1; } else { self.samples += 1; } }
-                    block.rows.push(SignalRouteRow { sequence: self.sequence, leg_indices,
-                        negative_log_sum: pending.scored.sum, indicative_return_bps: pending.scored.bps,
-                        qualifies });
                 }
-                let rows = block.rows.len() as u64;
-                let event = Arc::new(SignalEvent::Routes(block));
-                let built = nanos(started);
-                let publishing = Instant::now();
-                self.publish(event)?;
-                self.production.published_route_rows += rows;
-                let published = nanos(publishing);
-                work.stats.event_build_ns = work.stats.event_build_ns.saturating_add(built);
-                work.stats.publication_ns = work.stats.publication_ns.saturating_add(published);
-                work.stats.output_ns = work.stats.output_ns.saturating_add(built.saturating_add(published));
-            }
-            work.pending.clear();
-            if work.stats.combinations_visited - work.last_yield >= YIELD_ROUTES {
-                let started = Instant::now();
-                tokio::task::yield_now().await;
-                work.stats.cooperative_yield_ns = work.stats.cooperative_yield_ns.saturating_add(nanos(started));
-                work.last_yield = work.stats.combinations_visited;
-            }
+            },
         }
         Ok(())
     }
-    async fn group(&mut self, id: usize, affected: Affected, plan: &ExecutionPlan, work: &mut Work) -> Result<()> {
-        let g = &plan.groups[id]; let pairs = Pairs::new(g, affected);
-        let before = work.stats.combinations_visited; let expected = g.expected(affected);
-        work.stats.groups_visited += 1; work.stats.combinations_available += g.route_options;
-        work.stats.routes_expected += expected;
-        match g.kind {
-            0 => self.routes(id, plan, work, pairs.map(|(i,j)| Route { slots: [g.left[i], g.left[j] ^ 1], reverse: false })).await?,
-            1 => self.routes(id, plan, work, pairs.flat_map(|(i,j)| {
-                let a = g.left[i]; let b = g.right[j]; let c = g.fixed[0];
-                [Route { slots: [a,b,c], reverse: false }, Route { slots: [c^1,b^1,a^1], reverse: true }]
-            })).await?,
-            2 => self.routes(id, plan, work, pairs.flat_map(|(i,j)| {
-                let a = g.left[i]; let m = g.fixed[0]; let b = g.right[j];
-                [Route { slots: [a,m,b], reverse: false }, Route { slots: [b^1,m^1,a^1], reverse: true }]
-            })).await?,
-            3 => self.routes(id, plan, work, pairs.flat_map(|(i,j)| {
-                let a = g.left[i]; let m = g.fixed[0]; let b = g.right[j]; let c = g.fixed[1];
-                [Route { slots: [a,m,b,c], reverse: false }, Route { slots: [c^1,b^1,m^1,a^1], reverse: true }]
-            })).await?,
-            _ => unreachable!("compiled route kind"),
+    fn evaluate(&mut self, plan: &ExecutionPlan, scope: Scope, mut work: Work) -> Result<()> {
+        let started=Instant::now(); let before=work.stats.event_build_ns+work.stats.publication_ns;
+        match scope {
+            Scope::All => for id in 0..plan.data.groups.len() { self.group(plan,id,None,&mut work)?; },
+            Scope::Pool(id) => for b in plan.for_pool(id) { self.group(plan,b.group,Some(b.affected),&mut work)?; },
+            Scope::None => {},
         }
-        ensure!(work.stats.combinations_visited - before == expected, "compiled affected-route count differs in group {id}");
-        Ok(())
-    }
-    async fn evaluate(&mut self, plan: Arc<ExecutionPlan>, trigger: SignalTrigger,
-        changed: Option<usize>, price_queue_depth: usize, timing: InputTiming) -> Result<()> {
-        let mut work = Work { stats: SignalEvaluation { sequence: 0, graph_generation: plan.catalog.generation,
-            account_to_worker_us: account_age(&trigger, timing.received_us), trigger: Arc::new(trigger),
-            worker_received_at_us:timing.received_us,price_pipeline:timing.pipeline,
-            groups_visited: 0, combinations_available: 0, routes_expected: 0, combinations_visited: 0,
-            routes_affected: 0, routes_scored: 0, routes_missing_prices: 0, routes_nonfinite: 0,
-            candidates: 0, scored_by_kind: kinds(), price_queue_depth,
-            price_preparation_ns: timing.preparation_ns, logarithms_prepared: timing.logarithms,
-            plan_build_ns: timing.plan_ns, event_build_ns: 0, publication_ns: 0,
-            cooperative_yield_ns: 0, calculation_ns: 0, output_ns: 0, processing_ns: 0, completed_at_us: 0 },
-            by_kind: [0; 4], pending: std::mem::take(&mut self.scratch),
-            last_yield: 0 };
-        self.block_slots.resize(self.prices.rates.len(), (0, 0));
-        if let Some(pool) = changed {
-            for binding in plan.for_pool(pool) {
-                self.group(binding.group, binding.affected, &plan, &mut work).await?;
-            }
-        } else {
-            for id in 0..plan.groups.len() { self.group(id, Affected::All, &plan, &mut work).await?; }
-        }
-        let stats = &mut work.stats;
-        stats.routes_affected = stats.combinations_visited;
-        ensure!(stats.routes_affected == stats.routes_expected && stats.routes_affected ==
-            stats.routes_scored + stats.routes_missing_prices + stats.routes_nonfinite, "incomplete indexed calculation accounting");
-        for (name, count) in ["direct_2", "direct_3", "triangle_3", "triangle_4"].into_iter().zip(work.by_kind) {
-            stats.scored_by_kind.insert(name, count);
-        }
-        self.scratch = work.pending;
-        self.sequence += 1; stats.sequence = self.sequence; stats.processing_ns = nanos(timing.started);
-        stats.completed_at_us = now_us();
-        self.production.record(stats);
+        self.flush(&mut work)?;
+        work.stats.query_ns=nanos(started).saturating_sub(work.stats.event_build_ns+work.stats.publication_ns-before);
+        self.scratch=work.pending;
+        work.stats.sequence=self.next_sequence();
+        work.stats.processing_ns=nanos(work.started); work.stats.completed_at_us=now_us();
+        self.production.record(&work.stats);
         self.emit(SignalEvent::Evaluated(work.stats))
     }
 }
 
 pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<WatchCatalog>>,
     output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings) -> Result<ProductionReport> {
-    let mut engine = Engine { prices: Prices::default(), output, scratch: Vec::with_capacity(BLOCK_ROUTES),
-        block_slots:Vec::new(), block_epoch:0, production: ProductionReport::default(),
-        settings, sequence: 0, samples: 0, websocket_samples: 0,
-        threshold_log: -(settings.threshold_bps / 10_000.0).ln_1p() };
+    let mut e=Engine { prices:Prices::default(),output,settings,sequence:0,revision:0,
+        threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,production:ProductionReport::default(),
+        scratch:Vec::with_capacity(SIGNAL_BLOCK_RANGES) };
     let outcome: Result<()> = async {
-    let mut plan = Arc::new(ExecutionPlan::compile(catalogs.borrow_and_update().clone(), &mut engine.prices)?);
-    let mut catalog_open = true;
-    crate::log_event!(Info, "graph signals started=true execution_layout={} profiling={} output_layout={} threshold_bps={} execution=false", EXECUTION_LAYOUT, settings.profile, OUTPUT_LAYOUT, settings.threshold_bps);
-    loop { tokio::select! {
-        change = catalogs.changed(), if catalog_open => {
-            if change.is_err() { catalog_open = false; continue; }
-            let started = Instant::now(); let received_us = now_us();
-            let next = catalogs.borrow_and_update().clone();
-            if next.generation == plan.catalog.generation { continue; }
-            let compile_started = Instant::now();
-            let next = Arc::new(ExecutionPlan::compile(next, &mut engine.prices)?);
-            let plan_ns = nanos(compile_started);
-            engine.emit(SignalEvent::Invalidated { graph_generation: next.catalog.generation, pool: None,
-                reason: "graph generation replaced; group IDs belong to the new catalog".into() })?;
-            plan = next;
-            engine.evaluate(plan.clone(), SignalTrigger::Catalog { generation: plan.catalog.generation },
-                None, input.len(), InputTiming { started, received_us, preparation_ns: 0, logarithms: 0, plan_ns, pipeline:None }).await?;
-        },
-        received = input.recv() => match received {
-            Ok(event) => match event.as_ref() {
-                MarketStateEvent::Price(p) => {
-                    let started = Instant::now(); let received_us = now_us();
-                    let preparation = Instant::now();
-                    let (pool, id) = engine.prices.observe(p)?;
-                    let preparation_ns = nanos(preparation);
-                    let trigger = SignalTrigger::Price { pool, sequence: p.sequence,
-                        origin: p.origin, received_at_us: p.received_at_us };
-                    engine.evaluate(plan.clone(), trigger, Some(id), input.len(),
-                        InputTiming { started, received_us, preparation_ns, logarithms: 1, plan_ns: 0, pipeline:p.pipeline }).await?;
-                },
-                MarketStateEvent::Unavailable { pool, reason, .. } => {
-                    engine.prices.remove(pool.parse::<Pubkey>()?);
-                    engine.emit(SignalEvent::Invalidated { graph_generation: plan.catalog.generation,
-                        pool: Some(pool.clone()), reason: reason.clone() })?;
-                },
-                MarketStateEvent::Removed { pool, .. } => {
-                    engine.prices.remove(pool.parse::<Pubkey>()?);
-                    engine.emit(SignalEvent::Invalidated { graph_generation: plan.catalog.generation,
-                        pool: Some(pool.clone()), reason: "pool removed from observation".into() })?;
-                },
-                MarketStateEvent::Gap { reason, .. } => {
-                    engine.prices.clear();
-                    engine.emit(SignalEvent::Invalidated { graph_generation: plan.catalog.generation,
-                        pool: None, reason: reason.clone() })?;
-                },
-                MarketStateEvent::Selection { selected, .. } => {
-                    let selected: std::collections::HashSet<Pubkey> = selected.iter()
-                        .map(|p| p.parse()).collect::<std::result::Result<_, _>>()?;
-                    engine.prices.retain(&selected);
-                },
-                MarketStateEvent::Stats { .. } => {},
+        let started=Instant::now(); let received=now_us();
+        let mut plan=ExecutionPlan::compile(catalogs.borrow_and_update().clone(),&mut e.prices)?;
+        let build_ns=nanos(started);
+        let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:plan.data.graph_generation },started,received,None,input.len());
+        work.stats.plan_build_ns=build_ns; e.state(&plan,&mut work,true,false,Vec::new())?;
+        e.production.plan(&plan,&e.prices,build_ns); e.evaluate(&plan,Scope::All,work)?;
+        let mut catalog_open=true;
+        crate::log_event!(Info,"graph signals started=true execution_layout={} output_layout={} reference_comparison=false execution=false",EXECUTION_LAYOUT,OUTPUT_LAYOUT);
+        loop { tokio::select! {
+            change=catalogs.changed(), if catalog_open => {
+                if change.is_err() { catalog_open=false; continue; }
+                let next=catalogs.borrow_and_update().clone();
+                if next.generation==plan.data.graph_generation { continue; }
+                let started=Instant::now(); let received=now_us();
+                plan=ExecutionPlan::compile(next,&mut e.prices)?; let build_ns=nanos(started);
+                let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:plan.data.graph_generation },started,received,None,input.len());
+                work.stats.plan_build_ns=build_ns; e.state(&plan,&mut work,true,false,Vec::new())?;
+                e.production.plan(&plan,&e.prices,build_ns); e.evaluate(&plan,Scope::All,work)?;
             },
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                engine.prices.clear();
-                engine.emit(SignalEvent::Invalidated { graph_generation: plan.catalog.generation,
-                    pool: None, reason: format!("price input lagged {n}; coverage invalid") })?;
-                bail!("graph signals lost {n} price events; run invalid");
+            event=input.recv() => match event {
+                Ok(event) => match event.as_ref() {
+                    MarketStateEvent::Price(p) => {
+                        let started=Instant::now(); let received=now_us(); let preparing=Instant::now();
+                        let (pool,old)=e.prices.observe(p)?; let preparation_ns=nanos(preparing);
+                        let indexing=Instant::now(); plan.refresh(&e.prices,&old)?; let index_ns=nanos(indexing);
+                        let trigger=SignalTrigger::Price { pool,sequence:p.sequence,origin:p.origin,received_at_us:p.received_at_us };
+                        let mut work=e.begin(&plan,trigger,started,received,p.pipeline,input.len());
+                        work.stats.price_preparation_ns=preparation_ns; work.stats.index_update_ns=index_ns;
+                        work.stats.logarithms_prepared=1;
+                        let id=old.pool; work.previous=Some(old);
+                        let changes=vec![e.prices.change(id)]; e.state(&plan,&mut work,false,false,changes)?;
+                        e.evaluate(&plan,Scope::Pool(id),work)?;
+                    },
+                    MarketStateEvent::Unavailable { pool,sequence,.. } | MarketStateEvent::Removed { pool,sequence } => {
+                        let reason=match event.as_ref() { MarketStateEvent::Unavailable { reason,.. } => reason.clone(), _ => "pool removed".into() };
+                        let started=Instant::now(); let received=now_us();
+                        let id=e.prices.index.get(&pool.parse::<Pubkey>()?).copied();
+                        let mut old=None;
+                        if let Some(id)=id {
+                            let p=Previous { pool:id,price:e.prices.values[id].take() }; plan.refresh(&e.prices,&p)?; old=Some(p);
+                        }
+                        let mut work=e.begin(&plan,SignalTrigger::Coverage { sequence:*sequence,reason },started,received,None,input.len());
+                        work.stats.index_update_ns=nanos(started); work.previous=old;
+                        let changes=id.map(|i|e.prices.change(i)).into_iter().collect();
+                        e.state(&plan,&mut work,false,false,changes)?;
+                        e.evaluate(&plan,id.map_or(Scope::None,Scope::Pool),work)?;
+                    },
+                    MarketStateEvent::Gap { sequence,.. } | MarketStateEvent::Selection { sequence,.. } => {
+                        let started=Instant::now(); let received=now_us(); let mut changes=Vec::new();
+                        let (clear,reason)=match event.as_ref() {
+                            MarketStateEvent::Gap { reason,.. } => {
+                                e.prices.values.fill(None); for role in &mut plan.roles { role.ordered.clear(); }
+                                (true,reason.clone())
+                            },
+                            MarketStateEvent::Selection { selected,.. } => {
+                                let selected=selected.iter().map(|p|p.parse::<Pubkey>()).collect::<Result<HashSet<_>,_>>()?;
+                                for id in 0..e.prices.pools.len() {
+                                    if e.prices.values[id].is_some() && !selected.contains(&e.prices.pools[id].address) {
+                                        let old=Previous { pool:id,price:e.prices.values[id].take() };
+                                        plan.refresh(&e.prices,&old)?; changes.push(e.prices.change(id));
+                                    }
+                                }
+                                (false,"observation selection reconciled".into())
+                            }, _ => unreachable!(),
+                        };
+                        let mut work=e.begin(&plan,SignalTrigger::Coverage { sequence:*sequence,reason },started,received,None,input.len());
+                        work.stats.index_update_ns=nanos(started);
+                        e.state(&plan,&mut work,false,clear,changes)?; e.evaluate(&plan,Scope::None,work)?;
+                    },
+                    MarketStateEvent::Stats { .. } => {},
+                },
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    let started=Instant::now(); let received=now_us();
+                    e.prices.values.fill(None); for role in &mut plan.roles {role.ordered.clear();}
+                    let mut work=e.begin(&plan,SignalTrigger::Coverage {sequence:0,
+                        reason:format!("price stream lost {n} inputs; state invalid")},started,received,None,input.len());
+                    e.state(&plan,&mut work,false,true,Vec::new())?;
+                    e.evaluate(&plan,Scope::None,work)?;
+                    bail!("signal price stream lost {n} inputs; state invalid");
+                },
+                Err(broadcast::error::RecvError::Closed) => break,
             },
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }}
-    Ok(())
+        }}
+        Ok(())
     }.await;
-    engine.production.error = outcome.err().map(|e| format!("{e:#}"));
-    crate::log_event!(Info, "graph signals producer complete={} published={} rows={} evaluations={} ws_evaluations={} candidates={} max_output_queue={} error={:?}",
-        engine.production.error.is_none(), engine.production.published_events, engine.production.published_route_rows, engine.production.evaluations,
-        engine.production.websocket_evaluations, engine.production.candidates,
-        engine.production.max_output_queue_depth, engine.production.error);
-    Ok(engine.production)
+    e.production.error=outcome.err().map(|x|format!("{x:#}"));
+    e.production.final_price_pools=e.prices.values.iter().filter(|p|p.is_some()).count();
+    e.production.final_available_directions=e.prices.values.iter().flatten()
+        .map(|p|p.log_weight_units.iter().filter(|w|w.is_some()).count()).sum();
+    crate::log_event!(Info,"graph signals producer complete={} evaluations={} websocket={} ranges={} error={:?}",
+        e.production.error.is_none(),e.production.counts.evaluations,e.production.counts.websocket_evaluations,
+        e.production.counts.ranges,e.production.error);
+    Ok(e.production)
 }
 
-/// Fixed logarithmic histogram: bounded measurement memory, no route-result cache.
 #[derive(Clone)]
 struct Histogram { bins: [u64; 64], count: u64, total: u128, min: u64, max: u64 }
 impl Default for Histogram {
@@ -580,21 +574,69 @@ impl serde::Serialize for Histogram {
 pub struct Timing { count: u64, min: Option<u64>, max: Option<u64>, mean: Option<f64>,
     p50_upper_bound: Option<u64>, p95_upper_bound: Option<u64>, p99_upper_bound: Option<u64> }
 
-// Owned by the producer: output loss cannot erase these completed-input measurements.
+
+#[derive(Default, PartialEq, Eq, serde::Serialize)]
+struct Counts {
+    events: u64, state_updates: u64, plan_snapshots: u64, changed_pools: u64, resets: u64,
+    evaluations: u64, price_evaluations: u64, websocket_evaluations: u64,
+    catalog_evaluations: u64, coverage_evaluations: u64, logarithms_prepared: u64,
+    range_blocks: u64, ranges: u64, entered_ranges: u64, updated_ranges: u64, exited_ranges: u64,
+    websocket_ranges: u64, websocket_candidate_ranges: u64,
+    groups_visited: u64, logical_routes_affected: u64, anchors_visited: u64, range_queries: u64,
+    ready_anchors: [u64;4], websocket_ready_anchors: [u64;4], ranges_by_kind: [u64;4],
+}
+impl Counts {
+    fn state(&mut self, s: &SignalStateUpdate) {
+        self.events+=1; self.state_updates+=1; self.changed_pools+=s.changes.len() as u64;
+        self.plan_snapshots+=u64::from(s.snapshot.is_some()); self.resets+=u64::from(s.clear);
+    }
+    fn block(&mut self, b: &SignalRangeBlock) {
+        self.events+=1; self.range_blocks+=1; self.ranges+=b.ranges.len() as u64;
+        for r in &b.ranges {
+            match r.change {
+                SignalRangeChange::Entered => self.entered_ranges+=1,
+                SignalRangeChange::Updated => self.updated_ranges+=1,
+                SignalRangeChange::Exited => self.exited_ranges+=1,
+            }
+            if live(&b.trigger) {
+                self.websocket_ranges+=1;
+                self.websocket_candidate_ranges+=u64::from(r.change != SignalRangeChange::Exited);
+            }
+        }
+    }
+    fn evaluation(&mut self, e: &SignalEvaluation) {
+        self.events+=1; self.evaluations+=1;
+        match e.trigger.as_ref() {
+            SignalTrigger::Price { .. } => self.price_evaluations+=1,
+            SignalTrigger::Catalog { .. } => self.catalog_evaluations+=1,
+            SignalTrigger::Coverage { .. } => self.coverage_evaluations+=1,
+        }
+        self.websocket_evaluations+=u64::from(live(&e.trigger));
+        self.logarithms_prepared+=e.logarithms_prepared;
+        self.groups_visited+=e.groups_visited; self.logical_routes_affected+=e.logical_routes_affected;
+        self.anchors_visited+=e.anchors_visited; self.range_queries+=e.range_queries;
+        for i in 0..4 {
+            self.ready_anchors[i]+=e.ready_anchors[i]; self.ranges_by_kind[i]+=e.ranges_by_kind[i];
+            if live(&e.trigger) { self.websocket_ready_anchors[i]+=e.ready_anchors[i]; }
+        }
+    }
+}
 #[derive(Default, serde::Serialize)]
 struct ProductionTimings {
-    preparation_ns: Histogram, calculation_ns: Histogram, event_build_ns: Histogram,
-    publication_ns: Histogram, cooperative_yield_ns: Histogram, processing_ns: Histogram, account_to_worker_us: Histogram,
-    transport_decode_us:Histogram, transport_to_market_us:Histogram, market_processing_us:Histogram,
-    price_queue_us:Histogram, frame_to_worker_us:Histogram,
+    preparation_ns: Histogram, index_update_ns: Histogram, state_ready_ns: Histogram,
+    query_ns: Histogram, event_build_ns: Histogram, publication_ns: Histogram, processing_ns: Histogram,
+    first_range_ns: Histogram, last_range_ns: Histogram,
+    transport_decode_us: Histogram, transport_to_market_us: Histogram, market_processing_us: Histogram,
+    price_queue_us: Histogram, frame_to_worker_us: Histogram, frame_to_state_ready_us: Histogram,
 }
 impl ProductionTimings {
     fn record(&mut self, e: &SignalEvaluation) {
-        self.preparation_ns.add(e.price_preparation_ns); self.calculation_ns.add(e.calculation_ns);
+        self.preparation_ns.add(e.price_preparation_ns); self.index_update_ns.add(e.index_update_ns);
+        self.state_ready_ns.add(e.state_ready_ns); self.query_ns.add(e.query_ns);
         self.event_build_ns.add(e.event_build_ns); self.publication_ns.add(e.publication_ns);
-        self.cooperative_yield_ns.add(e.cooperative_yield_ns);
         self.processing_ns.add(e.processing_ns);
-        if let Some(age) = e.account_to_worker_us { self.account_to_worker_us.add(age); }
+        if let Some(t)=e.first_range_ns { self.first_range_ns.add(t); }
+        if let Some(t)=e.last_range_ns { self.last_range_ns.add(t); }
         if let Some(t)=e.price_pipeline {
             for (end,start,hist) in [
                 (t.transport_decoded_at_us,t.frame_received_at_us,&mut self.transport_decode_us),
@@ -602,290 +644,276 @@ impl ProductionTimings {
                 (t.price_published_at_us,t.market_received_at_us,&mut self.market_processing_us),
                 (e.worker_received_at_us,t.price_published_at_us,&mut self.price_queue_us),
                 (e.worker_received_at_us,t.frame_received_at_us,&mut self.frame_to_worker_us),
-            ] {if let Some(us)=end.checked_sub(start){hist.add(us);}}
+            ] { if let Some(us)=end.checked_sub(start) { hist.add(us); } }
+            if let Some(us)=e.worker_received_at_us.checked_sub(t.frame_received_at_us) {
+                self.frame_to_state_ready_us.add(us.saturating_add(e.state_ready_ns.div_ceil(1000)));
+            }
         }
     }
 }
 #[derive(Default, serde::Serialize)]
 pub struct ProductionReport {
-    error: Option<String>, published_events: u64, published_route_rows:u64, evaluations: u64, websocket_evaluations: u64,
-    candidates: u64, websocket_candidates: u64, routes_scored: u64, websocket_routes_scored: u64,
+    error: Option<String>, counts: Counts,
+    all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
+    steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
+    catalog_plan_build_ns: Histogram, last_plan: Option<serde_json::Value>,
+    final_price_pools: usize, final_available_directions: usize,
     max_price_queue_depth: usize, max_output_queue_depth: usize,
-    all_inputs: ProductionTimings, websocket_inputs: ProductionTimings, catalog_plan_build_ns: Histogram,
 }
 impl ProductionReport {
+    fn plan(&mut self, p: &ExecutionPlan, prices: &Prices, ns: u64) {
+        self.catalog_plan_build_ns.add(ns);
+        self.last_plan=Some(serde_json::json!({
+            "generation":p.data.graph_generation,"pools":prices.pools.len(),"roles":p.roles.len(),
+            "groups":p.data.groups.len(),"logical_routes":p.data.route_options,
+            "role_slot_references":p.roles.iter().map(|r|r.definition.slots.len()).sum::<usize>(),
+            "ordered_entries_at_install":p.roles.iter().map(|r|r.ordered.len()).sum::<usize>(),
+            "dependency_bindings":p.bindings.len(),"build_ns":ns,
+        }));
+        crate::log_event!(Info,"graph signals plan={}",self.last_plan.as_ref().unwrap());
+    }
     fn record(&mut self, e: &SignalEvaluation) {
-        self.evaluations += 1; self.candidates += e.candidates; self.routes_scored += e.routes_scored;
-        self.max_price_queue_depth = self.max_price_queue_depth.max(e.price_queue_depth);
-        self.all_inputs.record(e);
-        if websocket(&e.trigger) {
-            self.websocket_evaluations += 1; self.websocket_candidates += e.candidates;
-            self.websocket_routes_scored += e.routes_scored; self.websocket_inputs.record(e);
+        self.counts.evaluation(e); self.all_inputs.record(e);
+        self.max_price_queue_depth=self.max_price_queue_depth.max(e.price_queue_depth);
+        if live(&e.trigger) {
+            self.websocket_inputs.record(e);
+            if e.price_pipeline.is_some_and(|t|!t.initialization_replay) { self.steady_state_inputs.record(e); }
+            else { self.initialization_inputs.record(e); }
+        } else if matches!(e.trigger.as_ref(),SignalTrigger::Price { .. }) {
+            self.initialization_inputs.record(e);
         }
-        if matches!(e.trigger.as_ref(), SignalTrigger::Catalog { .. }) { self.catalog_plan_build_ns.add(e.plan_build_ns); }
     }
     pub fn ensure_complete(&self) -> Result<()> {
-        ensure!(self.error.is_none(), "signal producer failed: {}", self.error.as_deref().unwrap_or(""));
+        ensure!(self.error.is_none(),"signal producer failed: {}",self.error.as_deref().unwrap_or(""));
         Ok(())
     }
-    pub fn ensure_delivery(&self, received: &ObservationReport) -> Result<()> {
-        self.ensure_complete()?; received.ensure_integrity()?;
+    pub fn ensure_delivery(&self, r: &ObservationReport) -> Result<()> {
+        self.ensure_complete()?; r.ensure_integrity()?;
+        ensure!(self.counts==r.counts,"signal producer/consumer counts differ");
         let t=&self.websocket_inputs;
-        ensure!([&t.transport_decode_us,&t.transport_to_market_us,&t.market_processing_us,&t.price_queue_us,&t.frame_to_worker_us]
-            .iter().all(|h|h.count==self.websocket_evaluations),"incomplete WebSocket pipeline timing");
-        ensure!(self.published_events == received.received_events && self.published_route_rows == received.received_route_rows
-            && self.evaluations == received.evaluation_events && self.candidates == received.candidates
-            && self.websocket_evaluations == received.websocket_evaluations
-            && self.websocket_candidates == received.websocket_candidates,
-            "signal producer/consumer totals differ; inspect both reports");
+        ensure!([&t.transport_decode_us,&t.transport_to_market_us,&t.market_processing_us,
+            &t.price_queue_us,&t.frame_to_worker_us].iter().all(|h|h.count==self.counts.websocket_evaluations),
+            "incomplete WebSocket pipeline timing");
+        Ok(())
+    }
+    pub fn ensure_input_delivery(&self, prices: u64, websocket: u64) -> Result<()> {
+        ensure!(self.counts.price_evaluations==prices && self.counts.websocket_evaluations==websocket,
+            "Market-State/signal input totals differ");
         Ok(())
     }
 }
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
+struct Example {
+    graph_generation: u64, revision: u64, trigger: Arc<SignalTrigger>, range: SignalRouteRange,
+}
+#[derive(Default, serde::Serialize)]
 pub struct ObservationReport {
-    pub profile_enabled: bool, pub error: Option<String>, pub received_events: u64,
-    pub received_route_rows:u64,
-    pub lost_events: u64, pub lag_incidents: u64, pub first_lag: Option<serde_json::Value>,
-    pub consumer_bookkeeping_sample_period: u64, pub consumer_bookkeeping_sample_ns: Timing,
-    pub completion_to_consumer_us: Timing, pub websocket_completion_to_consumer_us: Timing,
-    pub consumer_periodic_logging_ns: u64,
-    pub output_layout: &'static str,
-    pub output_capacity:usize, pub max_rows_per_block:usize,
-    pub execution_layout: &'static str,
-    pub evaluation_events: u64, pub price_evaluations: u64, pub websocket_evaluations: u64,
-    pub catalog_evaluations: u64, pub combinations_visited: u64, pub routes_affected: u64,
-    pub combinations_available: u64, pub routes_expected: u64, pub logarithms_prepared: u64,
-    pub websocket_combinations_available: u64, pub websocket_combinations_visited: u64,
-    pub websocket_routes_expected: u64, pub websocket_logarithms_prepared: u64,
-    pub groups_visited: u64, pub max_groups_per_input: u64, pub max_routes_per_input: u64,
-    pub routes_scored: u64, pub websocket_routes_scored: u64, pub routes_missing_prices: u64,
-    pub routes_nonfinite: u64, pub candidates: u64, pub websocket_candidates: u64,
-    pub candidate_leg_references: u64,
-    pub invalidations: u64, pub max_price_queue_depth: usize, pub max_signal_queue_depth: usize,
-    pub scored_by_kind: BTreeMap<&'static str, u64>, pub websocket_scored_by_kind: BTreeMap<&'static str, u64>,
-    pub calculation_ns_per_input: Timing, pub output_ns_per_input: Timing,
-    pub price_preparation_ns_per_input: Timing, pub websocket_price_preparation_ns_per_input: Timing,
-    pub catalog_plan_build_ns: Timing,
-    pub websocket_calculation_ns_per_input: Timing, pub websocket_output_ns_per_input: Timing,
-    pub websocket_processing_ns_per_input: Timing,
-    pub websocket_account_to_worker_us: Timing, pub websocket_account_to_evaluation_consumer_us: Timing,
-    pub websocket_frame_to_evaluation_consumer_us:Timing,
-    pub processing_ns_per_input: Timing, pub account_to_worker_us: Timing,
-    pub account_to_candidate_us: Timing, pub account_to_consumer_us: Timing,
-    pub consumer_formatting_ns: u64,
+    pub error: Option<String>, counts: Counts,
+    execution_layout: &'static str, output_layout: &'static str,
+    output_capacity: usize, max_ranges_per_block: usize, reference_comparison_performed: bool,
+    lost_events: u64, max_queue_depth: usize, last_sequence: u64, last_revision: u64,
+    state_ready_to_consumer_us: Histogram, websocket_state_ready_to_consumer_us: Histogram,
+    websocket_frame_to_state_consumer_us: Histogram, websocket_frame_to_range_consumer_us: Histogram,
+    completion_to_consumer_us: Histogram, websocket_frame_to_completion_consumer_us: Histogram,
+    ranges_by_kind: BTreeMap<&'static str,u64>, ready_anchors_by_kind: BTreeMap<&'static str,u64>,
+    websocket_ready_anchors_by_kind: BTreeMap<&'static str,u64>,
+    examples: Vec<Example>, consumer_processing_ns: Histogram,
+    consumer_logging_ns: u64,
 }
 impl ObservationReport {
     pub fn ensure_integrity(&self) -> Result<()> {
-        ensure!(self.error.is_none(), "signal consumer failed: {}", self.error.as_deref().unwrap_or(""));
-        ensure!(self.lost_events == 0, "signal consumer lost {} block/control events in {} incidents; live evidence incomplete",
-            self.lost_events, self.lag_incidents);
+        ensure!(self.error.is_none(),"signal consumer failed: {}",self.error.as_deref().unwrap_or(""));
+        ensure!(self.lost_events==0,"signal consumer lost {} events",self.lost_events);
         Ok(())
     }
     pub fn ensure_calculation_evidence(&self) -> Result<()> {
         self.ensure_integrity()?;
-        ensure!(self.websocket_evaluations > 0 && self.websocket_routes_scored > 0,
-            "no complete route calculated from a real WebSocket price update; inspect price coverage and per-kind counts");
+        ensure!(self.counts.websocket_evaluations>0
+            && self.counts.websocket_ready_anchors.iter().any(|&n|n>0),
+            "no fully priceable topology queried from real WebSocket inputs");
         Ok(())
     }
     pub fn ensure_live_evidence(&self) -> Result<()> {
         self.ensure_calculation_evidence()?;
-        ensure!(self.websocket_candidates > 0,
-            "route calculation observed, but no real WebSocket-triggered candidate exceeded the threshold; signal output remains unproven");
+        ensure!(self.counts.websocket_candidate_ranges>0,"no real WebSocket candidate range observed");
         Ok(())
     }
 }
-
-pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
-    const SAMPLE_PERIOD: u64 = 257;
-    let mut received_events = 0_u64; let mut received_route_rows=0_u64; let mut lost_events = 0_u64; let mut lag_incidents = 0_u64;
-    let mut first_lag = None; let mut last_sequence = None;
-    let mut bookkeeping = Histogram::default(); let mut completion_age = Histogram::default();
-    let mut ws_completion_age = Histogram::default(); let mut periodic_logging_ns = 0_u64;
-    let mut evaluations = 0; let mut price_evaluations = 0; let mut ws_evaluations = 0; let mut catalog_evaluations = 0;
-    let mut combinations = 0; let mut affected = 0; let mut scored = 0; let mut ws_scored = 0;
-    let mut available = 0; let mut routes_expected = 0; let mut logarithms = 0;
-    let mut ws_available = 0; let mut ws_combinations = 0; let mut ws_expected = 0; let mut ws_logarithms = 0;
-    let mut groups = 0_u64; let mut max_groups = 0_u64; let mut max_routes = 0_u64;
-    let mut missing = 0; let mut nonfinite = 0; let mut candidates = 0; let mut ws_candidates = 0;
-    let mut expected_candidates = 0;
-    let mut candidate_legs = 0_u64;
-    let mut invalidations = 0_u64; let mut input_max = 0_usize; let mut output_max = 0_usize;
-    let mut by_kind = kinds(); let mut ws_by_kind = kinds();
-    let mut calculate = Histogram::default(); let mut output = Histogram::default(); let mut process = Histogram::default();
-    let mut ws_calculate = Histogram::default(); let mut ws_output = Histogram::default(); let mut ws_process = Histogram::default();
-    let mut preparation = Histogram::default(); let mut ws_preparation = Histogram::default(); let mut plan_build = Histogram::default();
-    let mut ws_worker_age = Histogram::default(); let mut ws_evaluation_consumer_age = Histogram::default();
-    let mut ws_frame_consumer_age=Histogram::default();
-    let mut window=ProductionTimings::default();
-    let mut worker_age = Histogram::default(); let mut candidate_age = Histogram::default(); let mut consumer_age = Histogram::default();
-    let mut format_ns = 0_u64;
-    let detailed_events = (settings.trace && crate::core::logging::enabled(crate::core::logging::Level::Info,module_path!()))
-        || crate::core::logging::enabled(crate::core::logging::Level::Debug,module_path!());
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    let outcome: Result<()> = async {
-    loop { tokio::select! {
-        _ = ticker.tick() => {
-            let started = Instant::now();
-            crate::log_event!(Info, "graph signals consumer execution_layout={} evaluations={evaluations} ws_evaluations={ws_evaluations} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} max_price_queue={input_max} max_signal_queue={output_max}", EXECUTION_LAYOUT);
-            crate::log_event!(Debug, "graph signals indexed ws_combinations_available={ws_available} ws_combinations_visited={ws_combinations} ws_routes_expected={ws_expected} ws_logarithms_prepared={ws_logarithms} ws_preparation_mean_ns={:?}", ws_preparation.report().mean);
-            crate::log_event!(Debug, "graph signals timings output_layout={OUTPUT_LAYOUT} ws_output_mean_ns={:?} ws_processing_mean_ns={:?} ws_processing_max_ns={:?} ws_completion_age_max_us={:?}",
-                ws_output.report().mean, ws_process.report().mean, ws_process.report().max, ws_evaluation_consumer_age.report().max);
-            if settings.profile {
-                crate::log_event!(Info,"graph signals window ws_evaluations={} transport_decode_mean_us={:?} transport_to_market_mean_us={:?} market_mean_us={:?} price_queue_mean_us={:?} frame_to_worker_max_us={:?} processing_mean_ns={:?} processing_max_ns={:?}",
-                    window.processing_ns.count,window.transport_decode_us.report().mean,window.transport_to_market_us.report().mean,
-                    window.market_processing_us.report().mean,window.price_queue_us.report().mean,window.frame_to_worker_us.report().max,
-                    window.processing_ns.report().mean,window.processing_ns.report().max);
-                window=ProductionTimings::default();
+#[derive(Default)]
+struct Mirror {
+    plan: Option<Arc<SignalPlan>>, pools: Vec<SignalPool>,
+    prices: Vec<Option<Arc<SignalPoolPrice>>>, slot_roles: Vec<Option<usize>>,
+    revision: u64, generation: u64,
+}
+impl Mirror {
+    fn state(&mut self, s: &SignalStateUpdate) -> Result<()> {
+        ensure!(s.revision==self.revision+1,"state revision gap");
+        if let Some(snapshot)=&s.snapshot {
+            ensure!(snapshot.plan.graph_generation==s.graph_generation
+                && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE && snapshot.pools.len()==snapshot.prices.len(),"invalid state snapshot");
+            self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
+            self.slot_roles=vec![None;2*self.pools.len()];
+            for (id,role) in snapshot.plan.roles.iter().enumerate() {
+                for &slot in role.slots.iter() {
+                    let entry=self.slot_roles.get_mut(slot).context("snapshot slot outside pool identities")?;
+                    ensure!(entry.replace(id).is_none(),"duplicate snapshot role slot");
+                }
             }
-            periodic_logging_ns = periodic_logging_ns.saturating_add(nanos(started));
-        },
-        event = input.recv() => match event {
-            Ok(event) => {
-                received_events += 1;
-                let sampled = (settings.profile && received_events % SAMPLE_PERIOD == 1).then(Instant::now);
-                let format_before=format_ns;
-                output_max = output_max.max(input.len());
-                let print = match event.as_ref() {
-                    SignalEvent::Routes(block) => {
-                        ensure!(!block.rows.is_empty() && block.rows.len() <= SIGNAL_BLOCK_ROWS
-                            && (2..=4).contains(&block.leg_count), "invalid signal block bounds");
-                        received_route_rows += block.rows.len() as u64;
-                        let live=websocket(&block.trigger);
-                        let at=now_us();
-                        let before=candidates;
-                        for (index,row) in block.rows.iter().enumerate() {
-                            if lost_events==0 {ensure!(row.sequence==last_sequence.unwrap_or(0)+1,"signal row sequence gap");}
-                            last_sequence=Some(row.sequence);
-                            ensure!(row.leg_indices[..block.leg_count].iter().all(|&i|usize::from(i)<block.legs.len()),
-                                "signal row references missing frozen leg");
-                            let print=if row.qualifies {
-                                candidates += 1; if live {ws_candidates += 1;}
-                                settings.trace || candidates<=settings.sample_limit as u64
-                                    || (live && ws_candidates<=settings.sample_limit as u64)
-                            }else{true};
-                            if print && detailed_events {
-                                let started=Instant::now();
-                                let route=block.route(index).context("invalid signal row expansion")?;
-                                let example=if row.qualifies {serde_json::json!({"Candidate":route})}
-                                    else{serde_json::json!({"RouteSample":route})};
-                                if settings.trace {crate::log_event!(Info,"graph signals event={example}");}
-                                else {crate::log_event!(Debug,"graph signals event={example}");}
-                                format_ns=format_ns.saturating_add(nanos(started));
-                            }
-                        }
-                        let count=candidates-before;
-                        candidate_legs += count*block.leg_count as u64;
-                        if let Some(age)=account_age(&block.trigger,block.emitted_at_us){candidate_age.add_many(age,count);}
-                        if let Some(age)=account_age(&block.trigger,at){consumer_age.add_many(age,count);}
-                        false
-                    },
-                    SignalEvent::Invalidated { .. } => { invalidations += 1; settings.trace || invalidations <= settings.sample_limit as u64 },
-                    SignalEvent::Evaluated(e) => {
-                        if lost_events==0 {ensure!(e.sequence==last_sequence.unwrap_or(0)+1,"signal evaluation sequence gap");}
-                        last_sequence=Some(e.sequence);
-                        evaluations += 1;
-                        let at = now_us();
-                        if let Some(age) = at.checked_sub(e.completed_at_us) {
-                            completion_age.add(age);
-                            if websocket(&e.trigger) { ws_completion_age.add(age); }
-                        }
-                        match e.trigger.as_ref() {
-                            SignalTrigger::Price { .. } => {
-                                price_evaluations += 1; preparation.add(e.price_preparation_ns);
-                                ensure!(e.logarithms_prepared == 1 && e.plan_build_ns == 0,
-                                    "price input did not use exactly one logarithm and the existing plan");
-                            },
-                            SignalTrigger::Catalog { .. } => { catalog_evaluations += 1; plan_build.add(e.plan_build_ns); },
-                        }
-                        if websocket(&e.trigger) {
-                            if settings.profile {window.record(e);}
-                            ws_evaluations += 1; ws_scored += e.routes_scored;
-                            ws_available += e.combinations_available; ws_combinations += e.combinations_visited;
-                            ws_expected += e.routes_expected; ws_logarithms += e.logarithms_prepared;
-                            ws_preparation.add(e.price_preparation_ns);
-                            ws_calculate.add(e.calculation_ns); ws_output.add(e.output_ns); ws_process.add(e.processing_ns);
-                            if let Some(age) = e.account_to_worker_us { ws_worker_age.add(age); }
-                            // This marker follows every candidate for the input. Its receipt
-                            // includes producer work and output queue/consumer work, even if no candidate qualified.
-                            if let Some(age) = account_age(&e.trigger, at) { ws_evaluation_consumer_age.add(age); }
-                            if let Some(t)=e.price_pipeline {
-                                if let Some(age)=at.checked_sub(t.frame_received_at_us){ws_frame_consumer_age.add(age);}
-                            }
-                        }
-                        combinations += e.combinations_visited; affected += e.routes_affected;
-                        available += e.combinations_available; routes_expected += e.routes_expected;
-                        logarithms += e.logarithms_prepared;
-                        ensure!(e.combinations_visited == e.routes_expected && e.routes_affected == e.routes_expected
-                            && e.routes_affected == e.routes_scored + e.routes_missing_prices + e.routes_nonfinite
-                            && e.combinations_available >= e.combinations_visited,
-                            "indexed route accounting mismatch at evaluation {}", e.sequence);
-                        groups += e.groups_visited;
-                        max_groups = max_groups.max(e.groups_visited); max_routes = max_routes.max(e.routes_affected);
-                        scored += e.routes_scored; missing += e.routes_missing_prices; nonfinite += e.routes_nonfinite;
-                        expected_candidates += e.candidates;
-                        if lost_events == 0 {
-                            ensure!(candidates == expected_candidates, "signal candidate accounting mismatch at evaluation {}", e.sequence);
-                        }
-                        input_max = input_max.max(e.price_queue_depth);
-                        for (&k, &n) in &e.scored_by_kind {
-                            *by_kind.entry(k).or_default() += n;
-                            if websocket(&e.trigger) { *ws_by_kind.entry(k).or_default() += n; }
-                        }
-                        calculate.add(e.calculation_ns); output.add(e.output_ns); process.add(e.processing_ns);
-                        if let Some(age) = e.account_to_worker_us { worker_age.add(age); }
-                        settings.trace || evaluations <= settings.sample_limit as u64
-                            || (websocket(&e.trigger) && ws_evaluations <= settings.sample_limit as u64)
-                    },
-                };
-                if let Some(started) = sampled { bookkeeping.add(nanos(started).saturating_sub(format_ns-format_before)); }
-                if print && detailed_events {
-                    let started = Instant::now();
-                    if settings.trace {crate::log_event!(Info,"graph signals event={}",serde_json::to_string(event.as_ref())?);}
-                    else {crate::log_event!(Debug,"graph signals event={}",serde_json::to_string(event.as_ref())?);}
-                    format_ns = format_ns.saturating_add(nanos(started));
-                }
-            },
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                lost_events += n; lag_incidents += 1;
-                if first_lag.is_none() {
-                    first_lag = Some(serde_json::json!({"at_us":now_us(),"lost_events":n,
-                        "received_events":received_events,"evaluations":evaluations,"candidates":candidates,
-                        "last_sequence":last_sequence,"queue_depth":input.len(),"formatting_ns":format_ns}));
-                    crate::log_event!(Warn, "graph signals consumer first_lag={} profiling={} live_evidence_valid=false", n, settings.profile);
-                }
-                if !settings.profile { bail!("signal consumer lost {n} block/control events; live evidence incomplete"); }
-            },
-            Err(broadcast::error::RecvError::Closed) => break,
+            self.generation=s.graph_generation;
+        } else { ensure!(self.plan.is_some() && s.graph_generation==self.generation,"state update without matching snapshot"); }
+        if s.clear { self.prices.fill(None); }
+        for c in &s.changes {
+            if c.pool_id==self.pools.len() {
+                self.pools.push(c.identity.clone()); self.prices.push(None); self.slot_roles.extend([None;2]);
+            }
+            ensure!(self.pools.get(c.pool_id)==Some(&c.identity),"price delta identity mismatch");
+            self.prices[c.pool_id]=c.price.clone();
         }
-    }}
-    if lost_events == 0 { ensure!(candidates == expected_candidates, "signal candidate consumer accounting mismatch"); }
-    Ok(())
+        self.revision=s.revision;
+        Ok(())
+    }
+    fn range(&self, b: &SignalRangeBlock, r: &SignalRouteRange) -> Result<()> {
+        ensure!(b.revision==self.revision && b.graph_generation==self.generation,"range references another state revision");
+        let plan=self.plan.as_ref().context("range before state snapshot")?;
+        let g=plan.groups.get(r.group_id).context("range group missing")?;
+        let direction=usize::from(r.reverse);
+        let anchor_role=if r.anchor_is_left {g.left[direction]}else{g.right[direction]};
+        let partner_role=if r.anchor_is_left {g.right[direction]}else{g.left[direction]};
+        ensure!(partner_role==r.partner_role && self.slot_roles.get(r.anchor_slot)==Some(&Some(anchor_role)),
+            "range role mismatch");
+        ensure!(r.exclude_pool==(g.kind==SignalRouteKind::Direct2).then_some(r.anchor_slot/2),
+            "range same-pool exclusion mismatch");
+        let count=match g.kind { SignalRouteKind::Direct2=>2,SignalRouteKind::Triangle4=>4,_=>3 };
+        ensure!(r.witness.legs.len()==count 
+            && r.lower_inclusive.is_none_or(|l|l<r.upper_exclusive),"invalid range or witness");
+        let partner=r.witness.legs.iter().find(|leg|self.slot_roles.get(leg.slot)==Some(&Some(partner_role))
+            && leg.slot!=r.anchor_slot).context("witness partner missing")?;
+        let w=self.prices.get(partner.slot/2).and_then(|p|p.as_ref())
+            .and_then(|p|p.log_weight_units[partner.slot%2]).context("witness partner unavailable")?;
+        ensure!(Some(partner.slot/2)!=r.exclude_pool && r.lower_inclusive.is_none_or(|l|w>=l)
+            && w<r.upper_exclusive,"witness outside reported interval");
+        let threshold=b.threshold_units;
+        let before=r.previous_addend.is_some_and(|a|w<threshold-a);
+        let after=r.current_addend.is_some_and(|a|w<threshold-a);
+        ensure!(match r.change {
+            SignalRangeChange::Entered=>!before && after,
+            SignalRangeChange::Updated=>before && after,
+            SignalRangeChange::Exited=>before && !after,
+        },"witness status mismatch");
+        let addend=if r.change==SignalRangeChange::Exited {r.previous_addend}else{r.current_addend}.context("witness addend missing")?;
+        ensure!(r.witness.log_sum_units==addend+w && r.witness.negative_log_sum.is_finite(),"invalid witness score");
+        ensure!(r.witness.legs.iter().map(|l|l.log_weight_units).sum::<i64>()==r.witness.log_sum_units,
+            "witness legs do not match the reported score");
+        for i in 0..count {
+            let next=(i+1)%count;
+            ensure!(r.witness.legs[i].output_mint==r.witness.legs[next].input_mint,"witness is not a closed route");
+        }
+        Ok(())
+    }
+}
+pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
+    let mut report=ObservationReport { execution_layout:EXECUTION_LAYOUT,output_layout:OUTPUT_LAYOUT,
+        output_capacity:OUTPUT_CAPACITY,max_ranges_per_block:SIGNAL_BLOCK_RANGES,..Default::default() };
+    let mut mirror=Mirror::default(); let mut pending=false; let mut ranges=[0_u64;3];
+    let mut sample_baseline=[0_usize;4]; let mut sample_ws=[0_usize;4];
+    let mut ticker=tokio::time::interval(Duration::from_secs(5));
+    let outcome: Result<()> = async {
+        loop { tokio::select! {
+            _=ticker.tick() => {
+                let started=Instant::now();
+                crate::log_event!(Info,"graph signals factorized evaluations={} ws={} ready_anchors={} ranges={} entered={} updated={} exited={} max_queue={} reference_comparison=false",
+                    report.counts.evaluations,report.counts.websocket_evaluations,
+                    report.counts.websocket_ready_anchors.iter().sum::<u64>(),report.counts.ranges,
+                    report.counts.entered_ranges,report.counts.updated_ranges,report.counts.exited_ranges,report.max_queue_depth);
+                if settings.profile {
+                    crate::log_event!(Info,"graph signals receiver state_age_mean_us={:?} state_age_max_us={:?} completion_age_max_us={:?}",
+                        report.websocket_frame_to_state_consumer_us.report().mean,
+                        report.websocket_frame_to_state_consumer_us.report().max,
+                        report.websocket_frame_to_completion_consumer_us.report().max);
+                }
+                report.consumer_logging_ns+=nanos(started);
+            },
+            event=input.recv() => match event {
+                Ok(event) => {
+                    let started=Instant::now(); let at=now_us();
+                    report.max_queue_depth=report.max_queue_depth.max(input.len());
+                    let sequence=match event.as_ref() {
+                        SignalEvent::State(s)=>s.sequence, SignalEvent::Ranges(b)=>b.sequence,
+                        SignalEvent::Evaluated(e)=>e.sequence,
+                    };
+                    ensure!(sequence==report.last_sequence+1,"signal event sequence gap");
+                    report.last_sequence=sequence;
+                    match event.as_ref() {
+                        SignalEvent::State(s) => {
+                            ensure!(!pending,"state replaced before previous evaluation completed");
+                            mirror.state(s)?; pending=true; ranges=[0;3]; report.last_revision=s.revision;
+                            report.counts.state(s);
+                            if let Some(us)=at.checked_sub(s.ready_at_us) {
+                                report.state_ready_to_consumer_us.add(us);
+                                if live(&s.trigger) {report.websocket_state_ready_to_consumer_us.add(us);}
+                            }
+                            if live(&s.trigger) {
+                                if let Some(t)=s.price_pipeline {
+                                    if let Some(us)=now_us().checked_sub(t.frame_received_at_us) {
+                                        report.websocket_frame_to_state_consumer_us.add(us);
+                                    }
+                                }
+                            }
+                        },
+                        SignalEvent::Ranges(b) => {
+                            ensure!(pending && !b.ranges.is_empty() && b.ranges.len()<=SIGNAL_BLOCK_RANGES,"invalid signal range block");
+                            for r in &b.ranges {
+                                mirror.range(b,r)?; ranges[change_id(r.change)]+=1;
+                                let kind=kind_id(mirror.plan.as_ref().unwrap().groups[r.group_id].kind);
+                                let samples=if live(&b.trigger) {&mut sample_ws}else{&mut sample_baseline};
+                                if samples[kind]<settings.sample_limit {
+                                    samples[kind]+=1;
+                                    report.examples.push(Example { graph_generation:b.graph_generation,revision:b.revision,
+                                        trigger:b.trigger.clone(),range:r.clone() });
+                                }
+                                if settings.trace {
+                                    crate::log_event!(Info,"graph signals range={}",serde_json::to_string(r)?);
+                                }
+                            }
+                            report.counts.block(b);
+                            if live(&b.trigger) {
+                                if let Some(t)=b.price_pipeline {
+                                    if let Some(us)=at.checked_sub(t.frame_received_at_us) {report.websocket_frame_to_range_consumer_us.add(us);}
+                                }
+                            }
+                        },
+                        SignalEvent::Evaluated(e) => {
+                            ensure!(pending && e.revision==mirror.revision && e.graph_generation==mirror.generation,
+                                "completion references wrong state");
+                            ensure!(ranges==e.ranges && e.ranges.iter().sum::<u64>()==e.ranges_by_kind.iter().sum::<u64>(),
+                                "range/completion counts differ");
+                            ensure!(e.logarithms_prepared==u64::from(matches!(e.trigger.as_ref(),SignalTrigger::Price {..})),
+                                "price logarithm accounting mismatch");
+                            report.counts.evaluation(e); pending=false;
+                            if let Some(us)=at.checked_sub(e.completed_at_us) {report.completion_to_consumer_us.add(us);}
+                            if live(&e.trigger) {
+                                if let Some(t)=e.price_pipeline {
+                                    if let Some(us)=at.checked_sub(t.frame_received_at_us) {report.websocket_frame_to_completion_consumer_us.add(us);}
+                                }
+                            }
+                        },
+                    }
+                    report.consumer_processing_ns.add(nanos(started));
+                },
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    report.lost_events+=n; bail!("signal state stream lost {n} events; revision coverage invalid");
+                },
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }}
+        ensure!(!pending,"signal stream closed during an evaluation");
+        Ok(())
     }.await;
-    let error = outcome.err().map(|e| format!("{e:#}"));
-    crate::log_event!(Info, "graph signals consumer complete={} routes_scored={scored} ws_routes_scored={ws_scored} candidates={candidates} ws_candidates={ws_candidates} received={received_events} lost={lost_events}", error.is_none());
-    Ok(ObservationReport { output_layout: OUTPUT_LAYOUT, execution_layout: EXECUTION_LAYOUT,
-        output_capacity:OUTPUT_CAPACITY,max_rows_per_block:SIGNAL_BLOCK_ROWS,
-        profile_enabled: settings.profile, error, received_events, received_route_rows, lost_events, lag_incidents, first_lag,
-        consumer_bookkeeping_sample_period: SAMPLE_PERIOD, consumer_bookkeeping_sample_ns: bookkeeping.report(),
-        completion_to_consumer_us: completion_age.report(), websocket_completion_to_consumer_us: ws_completion_age.report(),
-        consumer_periodic_logging_ns: periodic_logging_ns,
-        evaluation_events: evaluations, price_evaluations, websocket_evaluations: ws_evaluations,
-        catalog_evaluations, combinations_visited: combinations, routes_affected: affected, routes_scored: scored,
-        combinations_available: available, routes_expected, logarithms_prepared: logarithms,
-        websocket_combinations_available: ws_available, websocket_combinations_visited: ws_combinations,
-        websocket_routes_expected: ws_expected, websocket_logarithms_prepared: ws_logarithms,
-        groups_visited: groups, max_groups_per_input: max_groups, max_routes_per_input: max_routes,
-        websocket_routes_scored: ws_scored, routes_missing_prices: missing, routes_nonfinite: nonfinite,
-        candidates, websocket_candidates: ws_candidates, candidate_leg_references: candidate_legs,
-        invalidations, max_price_queue_depth: input_max,
-        max_signal_queue_depth: output_max, scored_by_kind: by_kind, websocket_scored_by_kind: ws_by_kind,
-        calculation_ns_per_input: calculate.report(), output_ns_per_input: output.report(), processing_ns_per_input: process.report(),
-        price_preparation_ns_per_input: preparation.report(), websocket_price_preparation_ns_per_input: ws_preparation.report(),
-        catalog_plan_build_ns: plan_build.report(),
-        websocket_calculation_ns_per_input: ws_calculate.report(), websocket_output_ns_per_input: ws_output.report(),
-        websocket_processing_ns_per_input: ws_process.report(), websocket_account_to_worker_us: ws_worker_age.report(),
-        websocket_account_to_evaluation_consumer_us: ws_evaluation_consumer_age.report(),
-        websocket_frame_to_evaluation_consumer_us:ws_frame_consumer_age.report(),
-        account_to_worker_us: worker_age.report(), account_to_candidate_us: candidate_age.report(),
-        account_to_consumer_us: consumer_age.report(), consumer_formatting_ns: format_ns })
+    report.error=outcome.err().map(|e|format!("{e:#}"));
+    report.ranges_by_kind=names(report.counts.ranges_by_kind);
+    report.ready_anchors_by_kind=names(report.counts.ready_anchors);
+    report.websocket_ready_anchors_by_kind=names(report.counts.websocket_ready_anchors);
+    crate::log_event!(Info,"graph signals consumer complete={} events={} ranges={} lost={} error={:?}",
+        report.error.is_none(),report.counts.events,report.counts.ranges,report.lost_events,report.error);
+    Ok(report)
 }
