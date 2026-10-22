@@ -136,7 +136,7 @@ try {
     }
     $sw.Stop()
     $errors = @(Select-String -LiteralPath $log -Pattern 'level=ERROR|runtime fatal worker=|runtime shutdown drain_error=')
-    $warnings = @(Select-String -LiteralPath $log -Pattern 'level=WARN')
+    $warnings = @(Select-String -LiteralPath $log -Pattern 'level=WARN' | Where-Object { $_.Line -notmatch 'policy=restart started=true' })
     $warningFile = Join-Path $folder 'warnings_errors.log'
     @($warnings + $errors | ForEach-Object { $_.Line }) |
         Set-Content -LiteralPath $warningFile -Encoding UTF8
@@ -151,19 +151,37 @@ try {
         $null -ne $execution.execution_candidates.requests) {
         @($execution.execution_candidates.requests)
     } else { @() }
+    $marketTotals = @(Select-String -LiteralPath $log -Pattern 'market state consumer complete=true observations=([0-9]+) websocket=([0-9]+)' | Select-Object -Last 1)
+    $wsObservations = 0
+    $observations = 0
+    if ($marketTotals.Count -gt 0) {
+        $observations = [int64]$marketTotals[0].Matches[0].Groups[1].Value
+        $wsObservations = [int64]$marketTotals[0].Matches[0].Groups[2].Value
+    }
+    $simulated = @($reports | Where-Object {
+        $_.outcome -in @('SimulatedNoDexCallObserved','SimulatedDexCallsObserved')
+    }).Count
+    $failed = @($reports | Where-Object { $_.outcome -eq 'SimulationFailed' }).Count
+    $runtimeComplete = [bool](Select-String -LiteralPath $log -Pattern 'runtime shutdown complete=true' -Quiet)
+    $auditPassed = ($exitCode -eq 0 -and $runtimeComplete -and $lifecycleAccepted -gt 0 -and
+        $preparedRefreshes -gt 0 -and $wsObservations -gt 0 -and $requests.Count -gt 0 -and
+        $reports.Count -eq $requests.Count)
     $summary = [ordered]@{
+        full_audit_passed=$auditPassed
+        market_state_observations=$observations
+        market_state_websocket_observations=$wsObservations
         branch=$branch; head=$head; elapsed_seconds=[math]::Round($sw.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; exit_code=$exitCode
         runtime_ready=[bool](Select-String -LiteralPath $log -Pattern 'runtime ready=true' -Quiet)
-        runtime_completed=[bool](Select-String -LiteralPath $log -Pattern 'runtime shutdown complete=true' -Quiet)
+        runtime_completed=$runtimeComplete
         lifecycle_started=[bool](Select-String -LiteralPath $log -Pattern 'lifecycle started' -Quiet)
         lifecycle_accepted_from_filtered_log=$lifecycleAccepted
         lifecycle_prepared_refreshes_from_filtered_log=$preparedRefreshes
         lifecycle_accepted_by_venue=$acceptedByVenue
         v10_candidates_started=[bool](Select-String -LiteralPath $log -Pattern 'execution candidates|v10.simulation' -Quiet)
         v10_requests=$requests.Count; v10_simulation_reports=$reports.Count
-        v10_simulation_successes=@($reports | Where-Object { $_.outcome -like 'simulated_*' }).Count
-        v10_simulation_failures=@($reports | Where-Object { $_.outcome -eq 'simulation_failed' }).Count
+        v10_simulation_successes=$simulated
+        v10_simulation_failures=$failed
         v10_handoff_observed=if ($null -ne $execution) { $execution.execution_handoff_observed } else { $false }
         signal_output_loss_warning=[bool](Select-String -LiteralPath $log -Pattern 'signal delivery_loss=true' -Quiet)
         warnings=$warnings.Count; errors=$errors.Count
@@ -174,6 +192,9 @@ try {
     $summary | Format-List
     Write-Host "Audit completed. Artifacts: $folder"
     if ($exitCode -ne 0) { throw "Runtime exit_code=$exitCode. Inspect summary.json and warnings_errors.log." }
+    if (-not $auditPassed) {
+        throw "Full vertical audit incomplete: websocket_observations=$wsObservations, requests=$($requests.Count), reports=$($reports.Count), prepared_refreshes=$preparedRefreshes. Inspect summary.json and signal reports."
+    }
 } finally {
     foreach ($name in $envNames) {
         [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
