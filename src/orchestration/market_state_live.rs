@@ -37,6 +37,38 @@ impl ExecutionTasks {
             executor:Task(tokio::spawn(execution_v10::run(settings,rpc,requests,output))),reports,
         })
     }
+    /// Production candidates are long-lived consumers. Only drain them after the
+    /// orchestration has stopped its upstream producers.
+    pub(super) async fn until_stop(&mut self,mut stop:watch::Receiver<bool>)->Result<()> {
+        if *stop.borrow() {return Ok(());}
+        tokio::select! {
+            changed=stop.changed()=>{
+                changed.context("runtime stop channel closed before shutdown")?;
+                ensure!(*stop.borrow(),"runtime stop channel changed without stopping");
+                Ok(())
+            },
+            result=&mut self.candidates.0=>{
+                match result {
+                    Ok(Ok(report))=>bail!("V10 candidate worker exited before runtime shutdown: requests={} error={:?}",report.requests.len(),report.error),
+                    Ok(Err(error))=>Err(error).context("V10 candidate worker exited before runtime shutdown"),
+                    Err(error)=>Err(error).context("V10 candidate worker task failed before shutdown"),
+                }
+            },
+            result=&mut self.executor.0=>{
+                match result {
+                    Ok(Ok(()))=>bail!("V10 executor exited before runtime shutdown"),
+                    Ok(Err(error))=>Err(error).context("V10 executor exited before runtime shutdown"),
+                    Err(error)=>Err(error).context("V10 executor task failed before shutdown"),
+                }
+            },
+            result=&mut self.reports.0=>{
+                match result {
+                    Ok(reports)=>bail!("V10 report collector exited before runtime shutdown after {} reports",reports.len()),
+                    Err(error)=>Err(error).context("V10 report collector task failed before shutdown"),
+                }
+            },
+        }
+    }
     pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<()> {
         let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
             .context("candidate shutdown timeout")???;
