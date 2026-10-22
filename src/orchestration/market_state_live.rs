@@ -16,13 +16,13 @@ async fn optional_join<T>(task:&mut Option<Task<T>>)->std::result::Result<T,toki
     match task { Some(task)=>(&mut task.0).await, None=>std::future::pending().await }
 }
 
-struct ExecutionTasks {
+pub(super) struct ExecutionTasks {
     candidates:Task<Result<execution_candidates::Report>>,
     executor:Task<Result<()>>,
     reports:Task<Vec<ExecutionReport>>,
 }
 impl ExecutionTasks {
-    fn start(settings:execution_v10::Settings,input:SignalStream,
+    pub(super) fn start(settings:execution_v10::Settings,input:SignalStream,
         registry:pool_registry::PoolRegistry,rpc:rpc_transport::RpcHandle)->Result<Self> {
         let cfg=execution_candidates::Settings::from_env(settings.wallet(),execution_v10::validate)?;
         let (jobs,requests)=mpsc::channel(1);
@@ -37,7 +37,7 @@ impl ExecutionTasks {
             executor:Task(tokio::spawn(execution_v10::run(settings,rpc,requests,output))),reports,
         })
     }
-    async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<()> {
+    pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<()> {
         let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
             .context("candidate shutdown timeout")???;
         // The candidate stream has closed. Let accepted jobs and reports drain
@@ -53,7 +53,7 @@ impl ExecutionTasks {
         evidence["simulation_failures"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,ExecutionOutcome::SimulationFailed)).count());
         evidence["simulation_dex_calls_observed"]=serde_json::json!(reports.iter().filter(|r|!r.dex_invocations.is_empty()).count());
         // All artifacts share the existing run directory; no additional code hierarchy.
-        if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH") {
+        if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH").or_else(|_|env::var("GRAPH_EXECUTION_REPORT_PATH")) {
             let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
             for (i,selection) in candidates.requests.iter().enumerate() {
                 std::fs::write(folder.join(format!("request-{:02}.json",i+1)),serde_json::to_vec_pretty(&selection.request)?)?;
