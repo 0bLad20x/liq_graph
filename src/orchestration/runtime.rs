@@ -12,8 +12,8 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
         diagnostic_source, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
         identity_hydration_venues, market_state, persistence, pool_registry,
-        rpc_transport, source_jupiter_mint}};
-use super::jupiter_settings;
+        rpc_transport, source_jupiter_mint, execution_v10}};
+use super::{jupiter_settings, market_state_live};
 
 struct AbortOnDrop<T>(JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {fn drop(&mut self) {self.0.abort();}}
@@ -502,7 +502,9 @@ pub async fn run()->Result<()>{
     // Price observations are optional. The Registry and graph retain their own eligibility rules.
     let market_enabled=enabled("MARKET_STATE_ENABLED")?;
     let signals_enabled=enabled("GRAPH_SIGNALS_ENABLED")?;
+    let simulation_enabled=enabled("GRAPH_EXECUTION_SIMULATE")?;
     anyhow::ensure!(!signals_enabled || market_enabled,"GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
+    anyhow::ensure!(!simulation_enabled || signals_enabled,"GRAPH_EXECUTION_SIMULATE requires GRAPH_SIGNALS_ENABLED and MARKET_STATE_ENABLED");
     let market_control=if market_enabled {
         let settings=market_state::Settings::from_env()?;
         let (control,enabled_rx)=watch::channel(true);
@@ -510,12 +512,47 @@ pub async fn run()->Result<()>{
         if signals_enabled {
             let cfg=crate::workers::graph_signals::Settings::from_env()?;
             let (signals,signal_rx)=broadcast::channel(crate::workers::graph_signals::OUTPUT_CAPACITY);
+            if simulation_enabled {
+                let path=env::var("GRAPH_EXECUTION_WALLET_PATH")
+                    .context("GRAPH_EXECUTION_SIMULATE requires GRAPH_EXECUTION_WALLET_PATH")?;
+                let signer=execution_v10::Settings::load(std::path::Path::new(&path))?;
+                let mut execution=market_state_live::ExecutionTasks::start(
+                    signer,signals.subscribe(),registry.clone(),rpc.clone())?;
+                critical(&mut tasks,"v10.simulation",async move {
+                    let mut evidence=serde_json::json!({});
+                    let result=execution.finish(&mut evidence).await;
+                    if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
+                        std::fs::write(path,serde_json::to_vec_pretty(&evidence)?)
+                            .context("write combined V10 simulation report")?;
+                    }
+                    let requests=evidence.pointer("/execution_candidates/requests")
+                        .and_then(serde_json::Value::as_array).map_or(0,|v|v.len());
+                    crate::log_event!(Info,"runtime v10 simulation completed requests={} successes={} failures={} dex_call_reports={} handoff={} integration_passed={} broadcasts=false",
+                        requests,evidence["simulation_successes"],evidence["simulation_failures"],
+                        evidence["simulation_dex_calls_observed"],evidence["execution_handoff_observed"],
+                        evidence["execution_integration_passed"]);
+                    result
+                });
+            }
             let signal_input=prices.subscribe(); let signal_catalog=catalog_rx.clone();
             critical(&mut tasks,"graph_signals",async move {
-                crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?.ensure_complete()
+                let report=crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?;
+                if let Ok(path)=env::var("GRAPH_RUNTIME_PRODUCTION_REPORT_PATH") {
+                    std::fs::write(path,serde_json::to_vec_pretty(&report)?)
+                        .context("write factorized production report")?;
+                }
+                report.ensure_complete()
             });
             critical(&mut tasks,"graph_signals.consumer",async move {
-                crate::workers::graph_signals::observe(signal_rx,cfg).await?.ensure_integrity()
+                let report=crate::workers::graph_signals::observe(signal_rx,cfg).await?;
+                if let Ok(path)=env::var("GRAPH_RUNTIME_SIGNAL_REPORT_PATH") {
+                    std::fs::write(path,serde_json::to_vec_pretty(&report)?)
+                        .context("write factorized consumer report")?;
+                }
+                if report.has_delivery_loss() {
+                    crate::log_event!(Warn,"runtime signal delivery_loss=true consumer_verification_incomplete=true calculation_not_invalidated=true");
+                }
+                report.ensure_complete()
             });
         }
         let (account_control,account_events)=rpc.account_stream();
@@ -742,7 +779,8 @@ pub async fn run()->Result<()>{
     };
     crate::log_event!(Info,"runtime shutdown reason={reason}");
     stop_tx.send_replace(true);
-    let drained=tokio::time::timeout(Duration::from_secs(30),async{
+    let shutdown_s=number("RUN_SHUTDOWN_SECONDS",if simulation_enabled {360}else{30})?;
+    let drained=tokio::time::timeout(Duration::from_secs(shutdown_s),async{
         while let Some(joined)=tasks.join_next().await{joined??;}
         Ok::<(),anyhow::Error>(())
     }).await;
@@ -757,11 +795,11 @@ pub async fn run()->Result<()>{
         },
         Err(_)=>{
             tasks.abort_all();
-            crate::log_event!(Warn,"runtime shutdown drain_timeout_s=30");
+            crate::log_event!(Warn,"runtime shutdown drain_timeout_s={shutdown_s}");
             if let Some(original)=error.take(){
                 return Err(original.context("shutdown drain exceeded 30 seconds"));
             }
-            bail!("runtime graceful shutdown exceeded 30 seconds");
+            bail!("runtime graceful shutdown exceeded {shutdown_s} seconds");
         }
     }
     if let Some(error)=error{return Err(error);}
