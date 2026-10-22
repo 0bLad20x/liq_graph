@@ -75,6 +75,8 @@ struct Entry {
     work:CompletionWork,
     failures:u32,
     flight:Option<Flight>,
+    // Most recent timed-out request for this pool; older executor replies must not overwrite proofs.
+    last_expired:Option<u64>,
 }
 #[derive(Default)]
 struct Counters {
@@ -87,6 +89,8 @@ struct Counters {
     refreshes:u64,
     repeated_refreshes:u64,
     withdrawals:u64,
+    timeouts:u64,
+    late_responses:u64,
 }
 struct Scheduler {
     entries:HashMap<Pubkey,Entry>,
@@ -144,7 +148,7 @@ impl Scheduler {
             }
             let (work,due)=Self::plan(pool,configuration_ready,settings,now);
             crate::log_event!(Debug,"lifecycle plan pool={} venue={:?} executing={managed} work={work:?} due_at_ms={due:?}",key,pool.venue);
-            self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None});
+            self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None,last_expired:None});
             if managed {if let Some(at)=due{self.due.insert((at,key));}}
             return;
         }
@@ -221,7 +225,23 @@ impl Scheduler {
         let mut forward=Vec::with_capacity(batch.responses.len());
         for response in batch.responses {
             let result=response.result;
-            let entry=self.entries.get_mut(&result.pool).context("untracked lifecycle response")?;
+            let Some(entry)=self.entries.get_mut(&result.pool) else {
+                // A pool can lose admission while its executor request is still running.
+                self.counters.late_responses+=1;
+                crate::log_event!(Warn,
+                    "lifecycle orphan_response_dropped request_id={} pool={} reason=pool_no_longer_tracked",
+                    response.id,result.pool);
+                continue;
+            };
+            if entry.last_expired.is_some_and(|expired|response.id<=expired) {
+                // Its timeout was already accounted for and retried. Never forward an
+                // expired completion result to the sole Registry writer.
+                self.counters.late_responses+=1;
+                crate::log_event!(Warn,
+                    "lifecycle late_response_dropped request_id={} pool={} latest_expired_id={:?} proof_retained=true",
+                    response.id,result.pool,entry.last_expired);
+                continue;
+            }
             let flight=entry.flight.as_ref().context("response for idle lifecycle pool")?;
             ensure!(flight.id==response.id && flight.terminal.is_none(),
                 "duplicate or mismatched lifecycle response pool={}",result.pool);
@@ -299,9 +319,9 @@ impl Scheduler {
         let oldest=self.due.first().map_or(0,|(at,_)|now.saturating_sub(*at));
         let c=&self.counters;
         crate::log_event!(Info,
-            "lifecycle stats final={final_report} tracked={} in_flight={in_flight} overdue={overdue} oldest_overdue_ms={oldest} dispatched={} accepted={} prepared={} incomplete={} retryable={} non_advancing={} prepared_refreshes={} repeated_prepared_refreshes={} admission_withdrawals={}",
+            "lifecycle stats final={final_report} tracked={} in_flight={in_flight} overdue={overdue} oldest_overdue_ms={oldest} dispatched={} accepted={} prepared={} incomplete={} retryable={} non_advancing={} timeouts={} late_responses={} prepared_refreshes={} repeated_prepared_refreshes={} admission_withdrawals={}",
             self.entries.len(),c.dispatched,c.accepted,c.prepared,c.incomplete,c.retryable,c.non_advancing,
-            c.refreshes,c.repeated_refreshes,c.withdrawals);
+            c.timeouts,c.late_responses,c.refreshes,c.repeated_refreshes,c.withdrawals);
         let mut venues:Vec<Venue>=self.entries.values().map(|e|e.pool.venue).collect();
         venues.sort_unstable_by_key(|v|format!("{v:?}"));venues.dedup();
         for venue in venues {
@@ -354,14 +374,29 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         let finite_drained=settings.finite && (*source_done.borrow()||!input_open) && input.is_empty()
             && scheduler.due.first().is_none_or(|(at,_)|*at>now);
         if active==0 && (stopping||limit||finite_drained){break;}
-        for entry in scheduler.entries.values() {
+        // A single slow executor or Registry acknowledgement is a pool-local
+        // failure, not a reason to kill discovery, pricing, graph and execution.
+        // Preserve the last accepted proof and use the existing bounded backoff.
+        let mut expired=Vec::new();
+        for (pool,entry) in &mut scheduler.entries {
             if let Some(flight)=&entry.flight {
                 let timeout=if flight.terminal.is_some(){settings.acknowledgement_ms}
                     else{settings.attempt_timeout.as_millis() as u64+30000};
-                ensure!(now.saturating_sub(flight.sent_at)<=timeout,
-                    "lifecycle request stalled request_id={} pool={} awaiting_registry={}",
-                    flight.id,entry.pool.address,flight.terminal.is_some());
+                let age=now.saturating_sub(flight.sent_at);
+                if age>timeout {
+                    let id=flight.id;
+                    let awaiting_registry=flight.terminal.is_some();
+                    entry.last_expired=Some(id);
+                    Scheduler::retry(entry,settings,now);
+                    expired.push((*pool,id,entry.pool.venue,age,awaiting_registry,entry.due));
+                }
             }
+        }
+        for (pool,id,venue,age,awaiting_registry,due) in expired {
+            scheduler.counters.timeouts+=1;
+            if let Some(at)=due {scheduler.due.insert((at,pool));}
+            crate::log_event!(Warn,
+                "lifecycle request_timeout request_id={id} pool={pool} venue={venue:?} elapsed_ms={age} awaiting_registry={awaiting_registry} retry_at_ms={due:?} proof_retained=true");
         }
         tokio::select! {
             update=input.recv(),if input_open=>match update {
@@ -394,7 +429,7 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         }
     }
     ensure!(scheduler.counters.dispatched==scheduler.counters.accepted
-        +scheduler.counters.retryable+scheduler.counters.non_advancing,
+        +scheduler.counters.retryable+scheduler.counters.non_advancing+scheduler.counters.timeouts,
         "lifecycle final accounting has unacknowledged requests");
     scheduler.report(&executors,now_unix_ms()?,true);
     Ok(())
