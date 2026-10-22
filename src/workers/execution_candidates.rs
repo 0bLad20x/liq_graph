@@ -22,7 +22,7 @@ pub struct Settings {
 impl Settings {
     pub fn from_env(wallet: Pubkey, capacity: fn(&ExecutionRequest)->Result<ExecutionMetrics>) -> Result<Self> {
         let limit=env::var("GRAPH_EXECUTION_MAX_REQUESTS").unwrap_or_else(|_|"10".into()).parse()?;
-        ensure!((1..=1000).contains(&limit), "GRAPH_EXECUTION_MAX_REQUESTS must be 1..1000");
+        ensure!((1..=5000).contains(&limit), "GRAPH_EXECUTION_MAX_REQUESTS must be 1..5000");
         let kind=match env::var("GRAPH_EXECUTION_ROUTE_KIND").unwrap_or_else(|_|"All".into()).to_ascii_lowercase().as_str() {
             "all"=>None, "direct2"=>Some(SignalRouteKind::Direct2), "direct3"=>Some(SignalRouteKind::Direct3),
             "triangle3"=>Some(SignalRouteKind::Triangle3), "triangle4"=>Some(SignalRouteKind::Triangle4),
