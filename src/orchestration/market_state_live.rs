@@ -53,7 +53,7 @@ impl ExecutionTasks {
         evidence["simulation_failures"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,ExecutionOutcome::SimulationFailed)).count());
         evidence["simulation_dex_calls_observed"]=serde_json::json!(reports.iter().filter(|r|!r.dex_invocations.is_empty()).count());
         // All artifacts share the existing run directory; no additional code hierarchy.
-        if let Ok(path)=env::var("MARKET_STATE_REPORT_PATH").or_else(|_|env::var("GRAPH_EXECUTION_REPORT_PATH")) {
+        if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH").or_else(|_|env::var("MARKET_STATE_REPORT_PATH")) {
             let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
             for (i,selection) in candidates.requests.iter().enumerate() {
                 std::fs::write(folder.join(format!("request-{:02}.json",i+1)),serde_json::to_vec_pretty(&selection.request)?)?;
