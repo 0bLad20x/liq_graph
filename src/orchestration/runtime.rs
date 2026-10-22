@@ -518,7 +518,11 @@ pub async fn run()->Result<()>{
                 let signer=execution_v10::Settings::load(std::path::Path::new(&path))?;
                 let mut execution=market_state_live::ExecutionTasks::start(
                     signer,signals.subscribe(),registry.clone(),rpc.clone())?;
+                let simulation_stop=stop_rx.clone();
                 critical(&mut tasks,"v10.simulation",async move {
+                    // Never call finish() in steady state: it waits for the signal
+                    // producer to close, which only happens during runtime shutdown.
+                    execution.until_stop(simulation_stop).await?;
                     let mut evidence=serde_json::json!({});
                     let result=execution.finish(&mut evidence).await;
                     if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
