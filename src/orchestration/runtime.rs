@@ -678,7 +678,7 @@ pub async fn run()->Result<()>{
                 venue_hydration_settings,false).await
         }
     }));
-    crate::log_event!(Info,"runtime ready=true workers_completion=10");
+    crate::log_event!(Info,"runtime ready=true workers_completion=10 v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
 
     // Keep REST source ownership and retry entirely outside the protocol workers.
     macro_rules! rest{
