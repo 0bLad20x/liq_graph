@@ -166,7 +166,16 @@ try {
     $auditPassed = ($exitCode -eq 0 -and $runtimeComplete -and $lifecycleAccepted -gt 0 -and
         $preparedRefreshes -gt 0 -and $wsObservations -gt 0 -and $requests.Count -gt 0 -and
         $reports.Count -eq $requests.Count)
+    $lifecycleStats = @(Select-String -LiteralPath $log -Pattern 'lifecycle stats .* timeouts=([0-9]+) late_responses=([0-9]+)' | Select-Object -Last 1)
+    $lifecycleTimeouts = 0
+    $lifecycleLateResponses = 0
+    if ($lifecycleStats.Count -gt 0) {
+        $lifecycleTimeouts = [int64]$lifecycleStats[0].Matches[0].Groups[1].Value
+        $lifecycleLateResponses = [int64]$lifecycleStats[0].Matches[0].Groups[2].Value
+    }
     $summary = [ordered]@{
+        lifecycle_request_timeouts=$lifecycleTimeouts
+        lifecycle_late_responses_dropped=$lifecycleLateResponses
         full_audit_passed=$auditPassed
         market_state_observations=$observations
         market_state_websocket_observations=$wsObservations
