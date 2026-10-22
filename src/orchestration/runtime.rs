@@ -51,7 +51,7 @@ where F:Future<Output=Result<()>>+Send+'static {
 async fn supervise<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     let mut failures=0_u32;
-    crate::log_event!(Warn,"runtime worker={name} policy=restart started=true");
+    crate::log_event!(Info,"runtime worker={name} policy=restart started=true");
     loop {
         if *stop.borrow(){return Ok(());}
         let started=Instant::now();
