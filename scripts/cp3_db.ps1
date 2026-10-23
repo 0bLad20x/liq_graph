@@ -97,15 +97,15 @@ try {
         & $PsqlPath @common -f $file
     } else {
         if (-not $Query) {throw "-Query is required with -Action Query."}
-        $args = @($common)
-        if ($TuplesOnly) {$args += "--tuples-only"}
-        if ($NoAlign) {$args += "--no-align"}
+        $psqlArgs = @($common)
+        if ($TuplesOnly) {$psqlArgs += "--tuples-only"}
+        if ($NoAlign) {$psqlArgs += "--no-align"}
         foreach ($key in $Variables.Keys) {
             if ($key -cnotmatch '^[a-z][a-z_0-9]*$') { throw "Invalid psql variable name." }
-            $args += "-v"
-            $args += "$key=$($Variables[$key])"
+            $psqlArgs += "-v"
+            $psqlArgs += "$key=$($Variables[$key])"
         }
-        $Query | & $PsqlPath @args
+        $Query | & $PsqlPath @psqlArgs
     }
     if ($LASTEXITCODE -ne 0) { throw "psql exited with code $LASTEXITCODE. Check DB host/user and .env configuration." }
 } finally {
