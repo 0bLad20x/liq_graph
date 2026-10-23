@@ -88,7 +88,7 @@ try {
     } elseif ($Action -eq "Verify") {
         & $PsqlPath @common -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('mints','pools','liq_graph_mint_catalog','liq_graph_pool_cache') ORDER BY table_name;"
         if ($LASTEXITCODE -ne 0) {throw "psql schema inspection failed with exit code $LASTEXITCODE"}
-        & $PsqlPath @common -c "SELECT COUNT(*) AS pools, COUNT(*) FILTER (WHERE status=1) AS prepared FROM public.pools;"
+        & $PsqlPath @common -c "SELECT COUNT(*) AS pools, COUNT(*) FILTER (WHERE jsonb_typeof(completion->'manifest')='object') AS prepared, COUNT(*) FILTER (WHERE completion IS NOT NULL AND jsonb_typeof(completion->'manifest') IS DISTINCT FROM 'object') AS incomplete FROM public.pools;"
         if ($LASTEXITCODE -ne 0) {throw "psql pool count failed with exit code $LASTEXITCODE"}
         & $PsqlPath @common -c "SELECT COUNT(*) AS mints, COUNT(*) FILTER (WHERE decimals IS NOT NULL) AS decimals_known FROM public.mints;"
     } elseif ($Action -eq "SqlFile") {
