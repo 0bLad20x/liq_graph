@@ -43,13 +43,13 @@ Do **not** proceed to destructive database actions on a compilation error. If ch
 
 **Stop all liq_graph/Jupiter processes first. Verify the database target and take a backup if any data is valuable.** This destroys historical pool completion manifests and all Jupiter mint data. It does not affect unrelated tables, schemas, or databases.
 
-\`\`\`powershell
+```powershell
 # psql does NOT load .env. This wrapper reads LIQ_GRAPH_DATABASE_URL /
 # DATABASE_URL with Rust's priority and does not print the password.
-.\\scripts\\cp3_db.ps1 -Action Inspect
+.\scripts\cp3_db.ps1 -Action Inspect
 # Only after verifying host, user, database and stopping running processes:
-.\\scripts\\cp3_db.ps1 -Action Reset -ConfirmReset
-\`\`\`
+.\scripts\cp3_db.ps1 -Action Reset -ConfirmReset
+```
 
 `Persistence::connect` creates the two new tables on the next start; do not maintain separate duplicated CREATE DDL.
 
@@ -94,7 +94,7 @@ Verify `persistence restored pools`, `persistence restored_mints`, qualified wat
 
 ## Read-only PostgreSQL checks
 
-Use \` .\\scripts\\cp3_db.ps1 -Action Verify \` for an immediate schema/pool/mint summary. To run any saved SQL file using the configured connection, use \` .\\scripts\\cp3_db.ps1 -Action SqlFile -SqlFile scripts/completion_lifecycle_inspect.sql \`. Neither command needs the password to be entered manually.
+Use `.\scripts\cp3_db.ps1 -Action Verify` for an immediate schema/pool/mint summary. To run any saved SQL file using the configured connection, use `.\scripts\cp3_db.ps1 -Action SqlFile -SqlFile scripts/completion_lifecycle_inspect.sql`. Neither command needs the password to be entered manually.
 
 ### Read-only PostgreSQL checks
 
