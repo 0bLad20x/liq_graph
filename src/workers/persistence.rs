@@ -387,26 +387,6 @@ fn encoded_config(pool:&PoolState) -> Result<String> {
     Ok(config.map(ToString::to_string).unwrap_or_else(||"{}".into()))
 }
 
-fn encoded_observation(pool:&PoolState) -> Option<String> {
-    // Preserve the canonical TVL source and its own observation timestamp.
-    // Never relabel a DexScreener value as a venue REST observation (or vice versa).
-    if pool.last_observation.as_ref().is_some_and(|o|
-        o.get("observed_at_ms").is_some()) {
-        return pool.last_observation.as_ref().map(ToString::to_string);
-    }
-    if pool.last_seen_ms>0 && pool.source!="persistence_restore" {
-        Some(json!({"tvl_usd":pool.tvl_usd,
-            "first_seen_ms":pool.first_seen_ms,
-            "observed_at_ms":pool.last_seen_ms,"source":pool.source}).to_string())
-    } else {
-        pool.last_observation.as_ref().map(ToString::to_string)
-    }
-}
-
-fn bytes_key(key:Option<Pubkey>) -> Option<Vec<u8>> {
-    key.map(|v|v.to_bytes().to_vec())
-}
-
 fn timestamp_ms(ms:u64)->Result<Option<i64>> {
     if ms==0 {Ok(None)} else {Ok(Some(i64::try_from(ms).context("timestamp overflow")?))}
 }
