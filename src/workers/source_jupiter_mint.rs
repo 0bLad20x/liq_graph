@@ -1,6 +1,5 @@
-//! Single Jupiter Search owner: the Graph watch and periodic full SQL mint scan
-//! share API-key lanes, decoding, Postgres upserts and one process-wide DB lease.
-//! Exactly one mode dispatches HTTP requests at a time.
+//! Single Jupiter Search HTTP owner: produces typed Mint DataBatches.
+//! No PostgreSQL connection or implicit backfill; persistence consumes the stream.
 use std::{collections::{HashSet, VecDeque}, env, sync::Arc, time::Duration};
 use anyhow::{bail, Context, Result, ensure};
 use reqwest::{Client, StatusCode};
@@ -63,40 +62,9 @@ impl Settings {
     }
 }
 
-#[derive(Clone)]
-struct Token {
-    mint: Pubkey,
-    created: Option<String>, updated: Option<String>,
-    liquidity: Option<String>, mcap: Option<String>,
-    holders: Option<String>, price: Option<String>,
-}
-fn date(v: Option<&Value>) -> Option<String> {
-    match v {
-        Some(Value::String(s)) if !s.trim().is_empty() && s.len()<=80 => Some(s.clone()),
-        Some(Value::Number(n)) => Some(n.to_string()),
-        _ => None,
-    }
-}
-fn usd(v: Option<&Value>) -> Option<String> {
-    let s = match v {
-        Some(Value::String(s)) => s.trim().to_owned(),
-        Some(Value::Number(n)) => n.to_string(),
-        _ => return None,
-    };
-    let value=s.parse::<f64>().ok()?;
-    (value.is_finite() && value>=0.0).then_some(s)
-}
-fn count(v: Option<&Value>) -> Option<String> {
-    let value=match v {
-        Some(Value::String(s))=>s.parse::<i64>().ok()?,
-        Some(Value::Number(n))=>n.as_i64()?,
-        _=>return None,
-    };
-    (value>=0).then(||value.to_string())
-}
 struct Decoded {
     batch: DataBatch,
-    rows: Vec<Token>,
+    found: usize,
     rejected: usize,
 }
 fn decode(body: &[u8], requested: &[Pubkey]) -> Result<Decoded> {
@@ -105,7 +73,6 @@ fn decode(body: &[u8], requested: &[Pubkey]) -> Result<Decoded> {
     let allowed=requested.iter().copied().collect::<HashSet<_>>();
     let mut seen=HashSet::new();
     let mut records=Vec::with_capacity(values.len());
-    let mut rows=Vec::with_capacity(values.len());
     let mut rejected=0;
     for payload in values {
         let address=payload.get("id").and_then(Value::as_str)
@@ -116,20 +83,13 @@ fn decode(body: &[u8], requested: &[Pubkey]) -> Result<Decoded> {
         };
         ensure!(allowed.contains(&mint),"Jupiter returned unrequested mint {mint}");
         if !seen.insert(mint) {continue;}
-        rows.push(Token {
-            mint,created:date(payload.get("createdAt")),
-            updated:date(payload.get("updatedAt")),
-            liquidity:usd(payload.get("liquidity")),
-            mcap:usd(payload.get("mcap")),
-            holders:count(payload.get("holderCount")),
-            price:usd(payload.get("usdPrice")),
-        });
         records.push(DataRecord {
             identity:RecordIdentity::Mint{address:mint},tvl_usd:None,payload,
         });
     }
+    let found=records.len();
     Ok(Decoded{batch:DataBatch{source:SOURCE,
-        received_at_ms:now_unix_ms()?,records},rows,rejected})
+        received_at_ms:now_unix_ms()?,records},found,rejected})
 }
 struct Lane { key:String, next_due:Instant, in_flight:bool }
 struct Work {mints:Vec<Pubkey>, retry:u8}
@@ -235,8 +195,8 @@ impl Engine {
                     self.lanes[finished.lane].in_flight=false;
                     match finished.outcome {
                         Outcome::Success(decoded)=>{
-                            found+=decoded.rows.len() as u64;
-                            not_found+=(finished.work.mints.len()-decoded.rows.len()) as u64;
+                            found+=decoded.found as u64;
+                            not_found+=(finished.work.mints.len()-decoded.found) as u64;
                             Self::broadcast(output,decoded.batch);
                         },
                         Outcome::Retry{reason,delay} if finished.work.retry<MAX_RETRIES=>{
@@ -305,7 +265,7 @@ impl Engine {
                     for mint in &finished.work.mints {in_flight.remove(mint);}
                     match finished.outcome {
                         Outcome::Success(decoded)=>{
-                            let returned=decoded.rows.len();
+                            let returned=decoded.found;
                             fetched+=returned as u64;
                             Self::broadcast(output,decoded.batch);
                             crate::log_event!(Debug,
@@ -358,16 +318,3 @@ pub async fn run_backfill(http:Client,settings:Settings,mints:Vec<Pubkey>,
     engine.backfill(mints,&output).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn decode_requested_only() {
-        let mint:Pubkey="So11111111111111111111111111111111111111112".parse().unwrap();
-        let body=format!(r#"[{{"id":"{mint}","liquidity":4200,"mcap":10000,"holderCount":12}}]"#);
-        let parsed=decode(body.as_bytes(),&[mint]).unwrap();
-        assert_eq!(parsed.rows.len(),1);
-        assert_eq!(parsed.batch.records.len(),1);
-        assert_eq!(parsed.rows[0].liquidity.as_deref(),Some("4200"));
-    }
-}
