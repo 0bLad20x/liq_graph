@@ -2,7 +2,7 @@
 # No on-chain transactions are sent.  Runtime diagnostics and V10 simulation artifacts are saved.
 param(
     [ValidateRange(30,86400)][int]$DurationSeconds = 600,
-    [ValidateRange(1,1000)][int]$SimulationLimit = 100,
+    [ValidateRange(1,5000)][int]$SimulationLimit = 100,
     [ValidateRange(0,2147483647)][int]$PoolLimit = 750,
     [ValidateRange(0,1000000)][double]$ThresholdBps = 0,
     [string]$WalletPath = (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json'),
@@ -159,13 +159,13 @@ try {
         $wsObservations = [int64]$marketTotals[0].Matches[0].Groups[2].Value
     }
     $simulated = @($reports | Where-Object {
-        $_.outcome -in @('SimulatedNoDexCallObserved','SimulatedDexCallsObserved')
+        $_.outcome -in @('simulated_no_dex_call_observed','simulated_dex_calls_observed')
     }).Count
-    $failed = @($reports | Where-Object { $_.outcome -eq 'SimulationFailed' }).Count
+    $failed = @($reports | Where-Object { $_.outcome -eq 'simulation_failed' }).Count
     $runtimeComplete = [bool](Select-String -LiteralPath $log -Pattern 'runtime shutdown complete=true' -Quiet)
     $auditPassed = ($exitCode -eq 0 -and $runtimeComplete -and $lifecycleAccepted -gt 0 -and
         $preparedRefreshes -gt 0 -and $wsObservations -gt 0 -and $requests.Count -gt 0 -and
-        $reports.Count -eq $requests.Count)
+        $reports.Count -eq $requests.Count -and [bool]$execution.execution_integration_passed)
     $lifecycleStats = @(Select-String -LiteralPath $log -Pattern 'lifecycle stats .* timeouts=([0-9]+) late_responses=([0-9]+)' | Select-Object -Last 1)
     $lifecycleTimeouts = 0
     $lifecycleLateResponses = 0
