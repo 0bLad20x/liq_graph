@@ -178,16 +178,16 @@ WITH expected(venue, pool_address, checked_at_ms, validated_slot, status, wallet
     VALUES $values
 ), checks AS (
     SELECT e.*, p.pool_address IS NOT NULL
-        AND p.venue = e.venue AND p.status = e.status
-        AND p.validated_slot = e.validated_slot
-        AND (extract(epoch FROM p.completion_checked_at)*1000)::bigint = e.checked_at_ms
+        AND p.venue = e.venue AND (CASE WHEN p.completion IS NULL THEN 0 WHEN jsonb_typeof(p.completion->'manifest')='object' THEN 1 ELSE 2 END) = e.status
+        AND (p.completion->>'validated_slot')::bigint = e.validated_slot
+        AND (p.completion->>'checked_at_ms')::bigint = e.checked_at_ms
         AND (e.venue <> 11 OR e.status <> 1
-          OR p.descriptor->'evidence'->'payload'->>'v10_wallet' = e.wallet)
-        AND ((e.status = 1 AND p.completion_reason_code IS NULL
-              AND jsonb_typeof(p.descriptor->'manifest') = 'object')
-          OR (e.status = 2 AND p.completion_reason_code IS NOT NULL
-              AND p.completion_reason_code <> 'transient_failure'
-              AND p.descriptor->>'manifest' IS NULL)) AS matches
+          OR p.completion->'evidence'->'payload'->>'v10_wallet' = e.wallet)
+        AND ((e.status = 1 AND p.completion->>'reason_code' IS NULL
+              AND jsonb_typeof(p.completion->'manifest') = 'object')
+          OR (e.status = 2 AND p.completion->>'reason_code' IS NOT NULL
+              AND p.completion->>'reason_code' <> 'transient_failure'
+              AND p.completion->>'manifest' IS NULL)) AS matches
     FROM expected e LEFT JOIN public.pools p
       ON p.pool_address = e.pool_address
 )
