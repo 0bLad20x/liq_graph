@@ -46,19 +46,19 @@ if ($RequestPath) {
     $sql = @'
 SELECT COALESCE(jsonb_agg(jsonb_build_object(
   'manifest', jsonb_build_object('pool', w.address,
-    'mint_a', p.descriptor->'mints'->0->>'address',
-    'mint_b', p.descriptor->'mints'->1->>'address',
-    'validated_slot', p.validated_slot,
-    'bound_signer', COALESCE(p.descriptor->'bound_signer', CASE WHEN p.venue=11
-      THEN p.descriptor->'evidence'->'payload'->'v10_wallet' ELSE NULL END)
-  ) || (p.descriptor->'manifest'),
-  'mints', p.descriptor->'mints'
+    'mint_a', p.completion->'mints'->0->>'address',
+    'mint_b', p.completion->'mints'->1->>'address',
+    'validated_slot', (p.completion->>'validated_slot')::bigint,
+    'bound_signer', COALESCE(p.completion->'bound_signer', CASE WHEN p.venue=11
+      THEN p.completion->'evidence'->'payload'->'v10_wallet' ELSE NULL END)
+  ) || (p.completion->'manifest'),
+  'mints', p.completion->'mints'
 ) ORDER BY w.ordinal), '[]'::jsonb)
 FROM (VALUES (:'pool_a', 0),
              (:'pool_b', 1)) AS w(address,ordinal)
 JOIN public.pools p ON p.pool_address=w.address
-WHERE p.status=1 AND jsonb_typeof(p.descriptor->'manifest')='object'
-  AND jsonb_array_length(p.descriptor->'mints')=2;
+WHERE jsonb_typeof(p.completion->'manifest')='object'
+  AND jsonb_array_length(p.completion->'mints')=2;
 '@
     $raw = & (Join-Path $PSScriptRoot "cp3_db.ps1") -Action Query -Query $sql `
         -Variables @{ pool_a = $PoolA; pool_b = $PoolB } -TuplesOnly -NoAlign -PsqlPath $PsqlPath
