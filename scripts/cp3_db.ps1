@@ -15,35 +15,37 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
 function Get-ConfiguredDbUrl {
-    foreach ($key in @("LIQ_GRAPH_DATABASE_URL", "DATABASE_URL")) {
-        $value = [Environment]::GetEnvironmentVariable($key, "Process")
-        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
-    }
-    $envFile = Join-Path $root ".env"
-    if (-not (Test-Path -LiteralPath $envFile)) {
-        throw "No DB URL in process environment and .env is missing."
-    }
+    # dotenvy does NOT override process vars. Apply that merge per key,
+    # then choose LIQ_GRAPH_DATABASE_URL over DATABASE_URL.
     $options = @{}
-    foreach ($line in (Get-Content -LiteralPath $envFile)) {
-        if ($line -match '^\s*(?:export\s+)?(LIQ_GRAPH_DATABASE_URL|DATABASE_URL)\s*=\s*(.*)$') {
-            $key = $Matches[1]
-            $raw = $Matches[2].Trim()
-            if ($raw.Length -ge 2 -and
-                (($raw[0] -eq [char]34 -and $raw[$raw.Length-1] -eq [char]34) -or
-                 ($raw[0] -eq [char]39 -and $raw[$raw.Length-1] -eq [char]39))) {
-                $raw = $raw.Substring(1,$raw.Length-2)
-            } else {
-                $raw = ($raw -split '\s+#',2)[0].Trim()
+    $envFile = Join-Path $root ".env"
+    if (Test-Path -LiteralPath $envFile) {
+        foreach ($line in (Get-Content -LiteralPath $envFile)) {
+            if ($line -match '^\s*(?:export\s+)?(LIQ_GRAPH_DATABASE_URL|DATABASE_URL)\s*=\s*(.*)$') {
+                $key = $Matches[1]
+                $raw = $Matches[2].Trim()
+                if ($raw.Length -ge 2 -and
+                    (($raw[0] -eq [char]34 -and $raw[$raw.Length-1] -eq [char]34) -or
+                     ($raw[0] -eq [char]39 -and $raw[$raw.Length-1] -eq [char]39))) {
+                    $raw = $raw.Substring(1,$raw.Length-2)
+                } else {
+                    $raw = ($raw -split '\s+#',2)[0].Trim()
+                }
+                if ($raw) {$options[$key]=$raw}
             }
-            if ($raw) { $options[$key]=$raw }
         }
     }
     foreach ($key in @("LIQ_GRAPH_DATABASE_URL", "DATABASE_URL")) {
-        if ($options.ContainsKey($key)) { return $options[$key] }
+        $processValue = [Environment]::GetEnvironmentVariable($key,"Process")
+        if (-not [string]::IsNullOrWhiteSpace($processValue)) {
+            $options[$key]=$processValue
+        }
     }
-    throw "No LIQ_GRAPH_DATABASE_URL or DATABASE_URL in .env."
+    foreach ($key in @("LIQ_GRAPH_DATABASE_URL", "DATABASE_URL")) {
+        if ($options.ContainsKey($key)) {return $options[$key]}
+    }
+    throw "Database URL missing from .env and process environment."
 }
-
 $dsn = Get-ConfiguredDbUrl
 try {
     $url = [uri]$dsn
