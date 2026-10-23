@@ -153,6 +153,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let http=core::http_client()?;
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
+    let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
     let prepared:Vec<_>=restored.iter().filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();
     ensure!(!prepared.is_empty(),"no persisted Prepared pools; run the existing completion lifecycle first");
     let persisted_prepared=prepared.len();
@@ -200,7 +201,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         received_at_ms:0,pools:prepared,persist_identity:Vec::new()}))?;
     let mut registry_task=Task(tokio::spawn(pool_registry::run(source_rx,None,registry.clone(),updates.clone(),done,true)));
     let mut qualification=Task(tokio::spawn(mint_qualification::run(
-        qualification_rx,jupiter_rx,qualified_tx,target_tx)));
+        registry.snapshot(),mint_registry,qualification_rx,jupiter_rx,qualified_tx,target_tx)));
     let mut jupiter=Task(tokio::spawn(source_jupiter_mint::run_targeted(
         http,jupiter_settings,target_rx,jupiter_out.clone())));
     let mut dex=Task(tokio::spawn(source_dexscreener::run_live(qualified_rx,registry.clone(),source.clone())));
