@@ -431,6 +431,91 @@ impl Persistence {
         Ok(Self {client})
     }
 
+    /// Restore the durable Mint Registry state before producers are started.
+    pub async fn restore_mints(&self)->Result<Vec<MintState>> {
+        let mut after:Option<String>=None;
+        let mut result=Vec::new();
+        loop {
+            let rows=self.client.query(
+                "SELECT mint_address,token_program,decimals,created_at::text AS created,
+                        updated_at::text AS updated,
+                        liquidity_usd::double precision AS liquidity,
+                        market_cap_usd::double precision AS mcap,
+                        holder_count,usd_price::double precision AS price,
+                        (extract(epoch FROM fetched_at)*1000)::bigint AS fetched
+                 FROM public.mints WHERE ($1::text IS NULL OR mint_address>$1)
+                 ORDER BY mint_address LIMIT 8192",&[&after]).await
+                .context("restore mint catalog")?;
+            if rows.is_empty(){break;}
+            for row in rows {
+                let addr:String=row.get("mint_address");
+                let program:Option<String>=row.get("token_program");
+                let decimal:Option<i16>=row.get("decimals");
+                let holders:Option<i64>=row.get("holder_count");
+                let fetched:Option<i64>=row.get("fetched");
+                result.push(MintState{
+                    address:pubkey(&addr)?,
+                    token_program:program.as_deref().map(pubkey).transpose()?,
+                    decimals:decimal.map(u8::try_from).transpose()?,
+                    created_at:row.get("created"),
+                    updated_at:row.get("updated"),
+                    liquidity_usd:row.get("liquidity"),
+                    market_cap_usd:row.get("mcap"),
+                    holder_count:holders.map(u64::try_from).transpose()?,
+                    usd_price:row.get("price"),
+                    fetched_at_ms:fetched.map(u64::try_from).transpose()?.unwrap_or(0),
+                });
+                after=Some(addr);
+            }
+        }
+        crate::log_event!(Info,"persistence restored_mints={} table=public.mints",result.len());
+        Ok(result)
+    }
+
+    /// Sole PostgreSQL writer for Jupiter batches; sources only publish typed DataBatch.
+    pub async fn save_mint_batch(&self,batch:&DataBatch)->Result<u64> {
+        let mut keys=Vec::<String>::new();
+        let mut programs=Vec::<Option<String>>::new();
+        let mut decimals=Vec::<Option<i16>>::new();
+        let mut created=Vec::<Option<String>>::new();
+        let mut updated=Vec::<Option<String>>::new();
+        let mut liquidity=Vec::<Option<String>>::new();
+        let mut mcap=Vec::<Option<String>>::new();
+        let mut holders=Vec::<Option<i64>>::new();
+        let mut prices=Vec::<Option<String>>::new();
+        let mut fetched=Vec::<i64>::new();
+        let amount=|v:Option<&Value>|->Option<String>{
+            let raw=match v? {Value::Number(n)=>n.to_string(),Value::String(s)=>s.clone(),_=>return None};
+            let parsed=raw.parse::<f64>().ok()?;
+            (parsed.is_finite() && parsed>=0.0).then_some(raw)
+        };
+        let date=|v:Option<&Value>|->Option<String>{
+            match v? {Value::Number(n)=>Some(n.to_string()),
+                Value::String(s) if !s.trim().is_empty() && s.len()<=80=>Some(s.clone()),_=>None}
+        };
+        for record in &batch.records {
+            let RecordIdentity::Mint{address}=record.identity else {continue};
+            let payload=&record.payload;
+            keys.push(address.to_string());
+            programs.push(payload.get("tokenProgram").and_then(Value::as_str)
+                .and_then(|v|v.parse::<Pubkey>().ok()).map(|v|v.to_string()));
+            decimals.push(payload.get("decimals").and_then(Value::as_u64)
+                .and_then(|v|u8::try_from(v).ok()).map(i16::from));
+            created.push(date(payload.get("createdAt")));
+            updated.push(date(payload.get("updatedAt")));
+            liquidity.push(amount(payload.get("liquidity")));
+            mcap.push(amount(payload.get("mcap")));
+            holders.push(payload.get("holderCount").and_then(Value::as_u64)
+                .and_then(|v|i64::try_from(v).ok()));
+            prices.push(amount(payload.get("usdPrice")));
+            fetched.push(i64::try_from(batch.received_at_ms)?);
+        }
+        if keys.is_empty(){return Ok(0);}
+        self.client.execute(UPSERT_MINT,&[&keys,&programs,&decimals,
+            &created,&updated,&liquidity,&mcap,&holders,&prices,&fetched]).await
+            .context("persist Jupiter mint catalog")
+    }
+
     /// Incremental database pages bound SQL-response memory during large restores.
     /// Historical observations are kept separate; live TVL stays unknown on restart.
     pub async fn restore(&self) -> Result<Vec<PoolState>> {
@@ -587,7 +672,11 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn run(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>) -> Result<()> {
+    pub async fn run(self,rx:broadcast::Receiver<Arc<PoolUpdateBatch>>) -> Result<()> {
+        self.run_with_mints(rx,None).await
+    }
+    pub async fn run_with_mints(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>,
+        mut mint_rx:Option<broadcast::Receiver<Arc<DataBatch>>>) -> Result<()> {
         use std::collections::HashSet;
         let mut pending_identity=HashMap::with_capacity(BATCH_SIZE);
         let mut pending_completion=HashMap::with_capacity(BATCH_SIZE);
@@ -597,9 +686,16 @@ impl Persistence {
         let mut written_completion=0_usize;
         let mut ticker=interval(WRITE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
+        let mut pool_open=true;
+        while pool_open || mint_rx.is_some() {
             tokio::select! {
-                event=rx.recv()=>match event {
+                event=async {mint_rx.as_mut().expect("checked").recv().await},if mint_rx.is_some()=>match event {
+                    Ok(batch)=>{self.save_mint_batch(&batch).await?;},
+                    Err(broadcast::error::RecvError::Lagged(n))=>
+                        bail!("mint persistence lost {n} Jupiter batches"),
+                    Err(broadcast::error::RecvError::Closed)=>{mint_rx=None;},
+                },
+                event=rx.recv(),if pool_open=>match event {
                     Ok(batch)=>{
                         match batch.kind {
                             PoolUpdateKind::Source=>{
@@ -636,7 +732,7 @@ impl Persistence {
                     }
                     Err(broadcast::error::RecvError::Lagged(n))=>
                         bail!("persistence lost {n} accepted Registry batches"),
-                    Err(broadcast::error::RecvError::Closed)=>break,
+                    Err(broadcast::error::RecvError::Closed)=>pool_open=false,
                 },
                 _=ticker.tick(), if !pending_identity.is_empty() ||
                     !pending_completion.is_empty()=>{
