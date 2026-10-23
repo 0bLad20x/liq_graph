@@ -18,9 +18,9 @@ BEGIN
      OR (status IN (1,2) AND (validated_slot IS NULL OR descriptor IS NULL
          OR completion_checked_at IS NULL
          OR mint_a IS NULL OR mint_b IS NULL))
-     OR (status=1 AND (jsonb_typeof(descriptor->'manifest')<>'object'
-         OR jsonb_typeof(descriptor->'evidence')<>'object'
-         OR jsonb_typeof(descriptor->'mints')<>'array'
+     OR (status=1 AND (jsonb_typeof(descriptor->'manifest') IS DISTINCT FROM 'object'
+         OR jsonb_typeof(descriptor->'evidence') IS DISTINCT FROM 'object'
+         OR jsonb_typeof(descriptor->'mints') IS DISTINCT FROM 'array'
          OR completion_reason_code IS NOT NULL))
      OR (status=2 AND (descriptor->'manifest' IS DISTINCT FROM 'null'::jsonb
          OR completion_reason_code IS NULL));
@@ -51,13 +51,16 @@ ALTER TABLE public.pools
   DROP COLUMN descriptor,
   DROP COLUMN completion_checked_at,
   DROP COLUMN completion_reason_code;
+-- No historical WHERE/JOIN SQL remains on mint columns; keep only the PK index.
+DROP INDEX IF EXISTS public.pools_mint_a_idx;
+DROP INDEX IF EXISTS public.pools_mint_b_idx;
 -- The former status index is removed automatically with its column.
 ALTER TABLE public.pools ADD CONSTRAINT pools_completion_object_chk
-    CHECK (completion IS NULL OR jsonb_typeof(completion)='object');
+    CHECK (completion IS NULL OR jsonb_typeof(completion) IS NOT DISTINCT FROM 'object');
 ALTER TABLE public.pools ADD CONSTRAINT pools_completion_slot_chk
     CHECK (completion IS NULL OR
-        (jsonb_typeof(completion->'validated_slot')='number'
+        (jsonb_typeof(completion->'validated_slot') IS NOT DISTINCT FROM 'number'
          AND (completion->>'validated_slot')::bigint>=0
-         AND jsonb_typeof(completion->'checked_at_ms')='number'
+         AND jsonb_typeof(completion->'checked_at_ms') IS NOT DISTINCT FROM 'number'
          AND (completion->>'checked_at_ms')::bigint>0));
 COMMIT;
