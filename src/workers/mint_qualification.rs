@@ -168,9 +168,15 @@ pub async fn run(
                 if next.as_ref()!=jupiter_targets.borrow().as_ref(){
                     jupiter_targets.send_replace(next);
                 }
-                crate::log_event!(Info,"mint registry pools_mints={} catalog_mints={} qualified={} refresh_targets={}",
-                    known.len(),mints.entries.read().expect("mint lock").len(),
-                    qualified.len(),jupiter_targets.borrow().len());
+                let (catalog_mints, holders_known, usd_prices_known)={
+                    let guard=mints.entries.read().expect("mint lock");
+                    (guard.len(),
+                     guard.values().filter(|v|v.holder_count.is_some()).count(),
+                     guard.values().filter(|v|v.usd_price.is_some()).count())
+                };
+                crate::log_event!(Info,"mint registry pools_mints={} catalog_mints={} qualified={} refresh_targets={} holders_known={} prices_known={}",
+                    known.len(),catalog_mints,qualified.len(),jupiter_targets.borrow().len(),
+                    holders_known,usd_prices_known);
             }
         }
         if !pool_open&&!jupiter_open{break;}
