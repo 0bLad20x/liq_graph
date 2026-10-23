@@ -7,7 +7,7 @@ use std::{
     env,
     fs::{self, File},
     io::{BufWriter, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::core::{DataBatch, DataRecord, RecordIdentity};
+use crate::core::{DataBatch, RecordIdentity};
 
 const SAMPLES_PER_SOURCE_VENUE: usize = 8;
 
