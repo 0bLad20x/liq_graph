@@ -186,7 +186,9 @@ fn decode_accounts(value: &Value, name: &str) -> Result<Arc<[AccountMeta]>> {
 }
 
 fn encode_descriptor(pool: &PoolState) -> Result<String> {
-    pool.completion_validated_slot.context("completion slot missing")?;
+    let slot=pool.completion_validated_slot.context("completion slot missing")?;
+    let checked=pool.completion_checked_at_ms.context("completion check time missing")?;
+    ensure!(checked>0, "completion check time zero");
     let manifest = pool.execution_manifest.as_ref().map(|m| json!({
         "base_a":encode_accounts(&m.base_a), "base_b":encode_accounts(&m.base_b)
     }));
@@ -205,18 +207,17 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
         "evidence":evidence,
         "mints":mints,
         "reason":pool.completion_reason,
+        "reason_code":pool.completion_reason_code,
+        "validated_slot":slot,
+        "checked_at_ms":checked,
     });
     Ok(serde_json::to_string(&payload)?)
 }
 
 fn decode_descriptor(
-    address: Pubkey, a: Pubkey, b: Pubkey, status: CompletionState, slot: u64,
-    descriptor_version: i32, payload: &Value,
-    typed_reason: Option<String>, typed_checked_at_ms: Option<u64>
+    address: Pubkey, a: Pubkey, b: Pubkey, slot: u64, payload: &Value
 ) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
              Option<[MintProof;2]>, Option<String>, Option<CompletionReason>, Option<u64>)> {
-    ensure!(descriptor_version >= 3 || payload.get("validated_slot").and_then(Value::as_u64)==Some(slot),
-        "persisted validated_slot / descriptor mismatch");
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
         let value = &payload["manifest"];
         // Upgrade the old persisted wallet context once at the storage boundary.
@@ -230,30 +231,18 @@ fn decode_descriptor(
             base_b:decode_accounts(value,"base_b")?,
         }))
     } else { None };
-    // Read historic V1 DLMM payloads as opaque evidence; no BinArray decoder.
-    let evidence = if descriptor_version == 1 {
-        payload.get("inventory").filter(|v| !v.is_null()).map(|v| {
-            ensure!(v.is_object(), "legacy DLMM inventory must be an object");
-            Ok(Arc::new(CompletionEvidence {
-                kind: "meteora_dlmm_bin_arrays".to_owned(),
-                version: 1,
-                payload: Arc::new(v.clone()),
-            }))
-        }).transpose()?
-    } else {
-        payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
-            let kind = v.get("kind").and_then(Value::as_str)
-                .filter(|v| !v.is_empty()).context("completion evidence kind missing")?;
-            let version = u32::try_from(v.get("version").and_then(Value::as_u64)
-                .context("completion evidence version missing")?)?;
-            ensure!(version > 0, "invalid completion evidence version");
-            let data = v.get("payload").context("completion evidence payload missing")?;
-            ensure!(data.is_object(), "completion evidence payload must be an object");
-            Ok(Arc::new(CompletionEvidence {
-                kind: kind.to_owned(), version, payload: Arc::new(data.clone()),
-            }))
-        }).transpose()?
-    };
+    let evidence = payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
+        let kind = v.get("kind").and_then(Value::as_str)
+            .filter(|v| !v.is_empty()).context("completion evidence kind missing")?;
+        let version = u32::try_from(v.get("version").and_then(Value::as_u64)
+            .context("completion evidence version missing")?)?;
+        ensure!(version > 0, "invalid completion evidence version");
+        let data = v.get("payload").context("completion evidence payload missing")?;
+        ensure!(data.is_object(), "completion evidence payload must be an object");
+        Ok(Arc::new(CompletionEvidence {
+            kind: kind.to_owned(), version, payload: Arc::new(data.clone()),
+        }))
+    }).transpose()?;
     let mints = if let Some(v) = payload.get("mints").filter(|v|!v.is_null()) {
         let raw = v.as_array().context("invalid stored mint proofs")?;
         ensure!(raw.len()==2, "expected two persisted mint proofs");
@@ -277,40 +266,25 @@ fn decode_descriptor(
             "persisted mint proofs mismatch Pool identity");
         Some(pair)
     } else {None};
-    ensure!((status==CompletionState::Prepared)==manifest.is_some(),
-        "stored Prepared status and manifest disagree");
-    if status==CompletionState::Prepared {
+    if manifest.is_some() {
         ensure!(evidence.is_some() && mints.is_some(), "Prepared missing protocol evidence and mint proof");
     }
     let reason = payload.get("reason").filter(|v|!v.is_null())
         .map(|v|v.as_str().context("invalid persisted reason").map(str::to_owned))
         .transpose()?;
-    let reason_code=if descriptor_version>=3 {
-        typed_reason.map(|s|serde_json::from_value::<CompletionReason>(Value::String(s)))
-            .transpose()?
+    let reason_code=payload.get("reason_code").filter(|v|!v.is_null())
+        .map(|v|serde_json::from_value::<CompletionReason>(v.clone())).transpose()?;
+    let reason_code=if manifest.is_none() {
+        Some(reason_code.context("Incomplete completion requires reason_code")?)
     } else {
-        payload.get("reason_code").filter(|v|!v.is_null())
-            .map(|v|serde_json::from_value::<CompletionReason>(v.clone())).transpose()?
+        ensure!(reason_code.is_none(), "Prepared completion has reason_code");
+        None
     };
-    let reason_code=if status==CompletionState::Incomplete {
-        Some(reason_code.unwrap_or_else(||{
-            if mints.as_ref().is_some_and(|m|m.iter().any(|p|!p.unsupported.is_empty())) {
-                CompletionReason::UnsupportedConfiguration
-            } else {CompletionReason::LegacyUnclassified}
-        }))
-    } else {reason_code};
-    let checked_at_ms=if descriptor_version>=3 {
-        typed_checked_at_ms
-    } else {
-        payload.get("checked_at_ms").filter(|v|!v.is_null())
-            .map(|v|v.as_u64().filter(|at|*at>0).context("invalid completion check timestamp"))
-            .transpose()?
-    };
-    ensure!(status!=CompletionState::Prepared || reason_code.is_none(),
-        "Prepared descriptor has a failure code");
+    let checked_at_ms=payload.get("checked_at_ms").and_then(Value::as_u64)
+        .filter(|v|*v>0).context("completion requires positive checked_at_ms")?;
     ensure!(reason_code!=Some(CompletionReason::TransientFailure),
         "transient attempt is not a durable completion proof");
-    Ok((manifest, evidence, mints, reason, reason_code, checked_at_ms))
+    Ok((manifest, evidence, mints, reason, reason_code, Some(checked_at_ms)))
 }
 
 #[derive(Clone, Copy)]
