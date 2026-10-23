@@ -15,7 +15,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/v10-simulation-worker", "main") -or $tracked) {
+if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/v10-simulation-worker", "main", "cp3-central-persistence-dual-registry") -or $tracked) {
     throw "Use a clean, committed agent/v10-simulation-worker checkout, or main after merge."
 }
 Write-Host "V10 simulation branch=$branch head=$head broadcasts=false"
@@ -43,24 +43,6 @@ if ($RequestPath) {
         if ($address -cnotmatch '^[1-9A-HJ-NP-Za-km-z]{32,44}$') { throw "Supply two explicit pool addresses and a valid wallet." }
     }
     if ($PoolA -eq $PoolB) { throw "Select two different pools." }
-    if (-not $env:DATABASE_URL -and (Test-Path ".env")) {
-        foreach ($line in Get-Content ".env") {
-            if ($line -match '^\s*DATABASE_URL\s*=\s*(.*)$') {
-                $env:DATABASE_URL = $Matches[1].Trim().Trim('"').Trim("'")
-            }
-        }
-    }
-    if (-not $env:DATABASE_URL) { throw "DATABASE_URL is required for the manual cache export." }
-    function Pool-Hex([string]$address) {
-        $alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-        [System.Numerics.BigInteger]$number = 0
-        foreach ($character in $address.ToCharArray()) { $number = $number * 58 + $alphabet.IndexOf($character) }
-        $hex = [Convert]::ToHexString($number.ToByteArray($true, $true)).PadLeft(64, '0')
-        if ($hex.Length -ne 64) { throw "Invalid pool public key." }
-        return $hex
-    }
-    $hexA = Pool-Hex $PoolA
-    $hexB = Pool-Hex $PoolB
     $sql = @'
 SELECT COALESCE(jsonb_agg(jsonb_build_object(
   'manifest', jsonb_build_object('pool', w.address,
@@ -72,15 +54,15 @@ SELECT COALESCE(jsonb_agg(jsonb_build_object(
   ) || (p.descriptor->'manifest'),
   'mints', p.descriptor->'mints'
 ) ORDER BY w.ordinal), '[]'::jsonb)
-FROM (VALUES (decode(:'hex_a','hex'), :'pool_a', 0),
-             (decode(:'hex_b','hex'), :'pool_b', 1)) AS w(raw,address,ordinal)
-JOIN public.liq_graph_pool_cache p ON p.pool_address=w.raw
+FROM (VALUES (:'pool_a', 0),
+             (:'pool_b', 1)) AS w(address,ordinal)
+JOIN public.pools p ON p.pool_address=w.address
 WHERE p.status=1 AND jsonb_typeof(p.descriptor->'manifest')='object'
   AND jsonb_array_length(p.descriptor->'mints')=2;
 '@
-    $raw = $sql | & $PsqlPath --no-psqlrc --quiet --tuples-only --no-align --set=ON_ERROR_STOP=1 `
-        --dbname $env:DATABASE_URL --set "hex_a=$hexA" --set "hex_b=$hexB" --set "pool_a=$PoolA" --set "pool_b=$PoolB"
-    if ($LASTEXITCODE -ne 0) { throw "Manual pool export failed." }
+    $raw = & (Join-Path $PSScriptRoot "cp3_db.ps1") -Action Query -Query $sql `
+        -Variables @{ pool_a = $PoolA; pool_b = $PoolB } -TuplesOnly -NoAlign -PsqlPath $PsqlPath
+    if (-not $raw) { throw "Manual pool export returned no records." }
     $pools = @(($raw | Out-String | ConvertFrom-Json))
     if ($pools.Count -ne 2) { throw "Both explicitly selected pools must have persisted Prepared manifests and mint proofs." }
     $settlementMint = if ($Settlement -eq "WSOL") { "So11111111111111111111111111111111111111112" } else { "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" }
