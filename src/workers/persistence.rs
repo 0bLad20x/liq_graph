@@ -114,7 +114,7 @@ ON CONFLICT (pool_address) DO UPDATE SET
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
     first_seen_at=COALESCE(existing.first_seen_at,EXCLUDED.first_seen_at),
     last_seen_at=GREATEST(existing.last_seen_at,EXCLUDED.last_seen_at),
-    pool_config=CASE WHEN existing.pool_config='{}'::jsonb
+    pool_config=CASE WHEN EXCLUDED.pool_config<>'{}'::jsonb
                      THEN EXCLUDED.pool_config ELSE existing.pool_config END,
     tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
                AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
@@ -158,7 +158,7 @@ ON CONFLICT (pool_address) DO UPDATE SET
     completion_reason_code=EXCLUDED.completion_reason_code,
     first_seen_at=COALESCE(existing.first_seen_at,EXCLUDED.first_seen_at),
     last_seen_at=GREATEST(existing.last_seen_at,EXCLUDED.last_seen_at),
-    pool_config=CASE WHEN existing.pool_config='{}'::jsonb
+    pool_config=CASE WHEN EXCLUDED.pool_config<>'{}'::jsonb
                   THEN EXCLUDED.pool_config ELSE existing.pool_config END,
     tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
                AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
