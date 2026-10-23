@@ -13,126 +13,108 @@ use crate::{
         CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
 };
 
-const TABLE: &str = "public.liq_graph_pool_cache";
-const DESCRIPTOR_VERSION: i32 = 2;
-const PLANNER_VERSION: i32 = 1;
+
+const TABLE: &str = "public.pools";
 const BATCH_SIZE: usize = 512;
 const WRITE_INTERVAL: Duration = Duration::from_secs(1);
+const DESCRIPTOR_VERSION: i32 = 2;
+const PLANNER_VERSION: i32 = 1;
 
-const CREATE_TABLE: &str = r#"
-CREATE TABLE IF NOT EXISTS public.liq_graph_pool_cache (
-    pool_address BYTEA PRIMARY KEY CHECK (octet_length(pool_address) = 32),
+/// Only the project tables; never drop unrelated schemas or objects.
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS public.mints (
+    mint_address TEXT PRIMARY KEY,
+    token_program TEXT NULL,
+    decimals SMALLINT NULL CHECK (decimals BETWEEN 0 AND 255),
+    created_at TIMESTAMPTZ NULL,
+    updated_at TIMESTAMPTZ NULL,
+    liquidity_usd NUMERIC NULL,
+    market_cap_usd NUMERIC NULL,
+    holder_count BIGINT NULL CHECK (holder_count IS NULL OR holder_count >= 0),
+    usd_price NUMERIC NULL,
+    fetched_at TIMESTAMPTZ NULL,
+    token_extensions JSONB NULL,
+    transfer_fee_config JSONB NULL
+);
+CREATE TABLE IF NOT EXISTS public.pools (
+    pool_address TEXT PRIMARY KEY,
     venue SMALLINT NOT NULL,
-    mint_a BYTEA NULL CHECK (mint_a IS NULL OR octet_length(mint_a) = 32),
-    mint_b BYTEA NULL CHECK (mint_b IS NULL OR octet_length(mint_b) = 32),
-    status SMALLINT NOT NULL DEFAULT 0 CHECK (status IN (0, 1, 2)),
-    validated_slot BIGINT NULL CHECK (validated_slot IS NULL OR validated_slot >= 0),
-    descriptor_version INTEGER NOT NULL DEFAULT 1 CHECK (descriptor_version >= 1),
-    planner_version INTEGER NOT NULL DEFAULT 1 CHECK (planner_version >= 1),
-    descriptor JSONB NULL,
+    mint_a TEXT NULL,
+    mint_b TEXT NULL,
+    first_seen_at TIMESTAMPTZ NULL,
+    last_seen_at TIMESTAMPTZ NULL,
+    tvl_usd NUMERIC NULL,
+    tvl_source TEXT NULL,
+    tvl_observed_at TIMESTAMPTZ NULL,
     pool_config JSONB NOT NULL DEFAULT '{}'::jsonb,
-    last_observation JSONB NULL,
+    status SMALLINT NOT NULL DEFAULT 0 CHECK (status IN (0,1,2)),
+    validated_slot BIGINT NULL CHECK (validated_slot IS NULL OR validated_slot >= 0),
+    descriptor_version INTEGER NOT NULL DEFAULT 2,
+    planner_version INTEGER NOT NULL DEFAULT 1,
+    descriptor JSONB NULL,
+    completion_checked_at TIMESTAMPTZ NULL,
+    completion_reason_code TEXT NULL,
     CHECK (mint_a IS NULL OR mint_b IS NULL OR mint_a <> mint_b),
     CHECK (status <> 1 OR (
         mint_a IS NOT NULL AND mint_b IS NOT NULL
         AND validated_slot IS NOT NULL AND descriptor IS NOT NULL)),
     CHECK (status <> 0 OR (validated_slot IS NULL AND descriptor IS NULL))
-)"#;
-
-/// Idempotent expansion of the V1 completion-only table. No data is deleted.
-const MIGRATE_TABLE: &str = r#"
-BEGIN;
-ALTER TABLE public.liq_graph_pool_cache
-    ADD COLUMN IF NOT EXISTS pool_config JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE public.liq_graph_pool_cache
-    ADD COLUMN IF NOT EXISTS last_observation JSONB NULL;
-ALTER TABLE public.liq_graph_pool_cache
-    ALTER COLUMN mint_a DROP NOT NULL,
-    ALTER COLUMN mint_b DROP NOT NULL,
-    ALTER COLUMN validated_slot DROP NOT NULL,
-    ALTER COLUMN descriptor DROP NOT NULL,
-    ALTER COLUMN status SET DEFAULT 0,
-    ALTER COLUMN descriptor_version SET DEFAULT 1,
-    ALTER COLUMN planner_version SET DEFAULT 1;
-ALTER TABLE public.liq_graph_pool_cache
-    DROP CONSTRAINT IF EXISTS liq_graph_pool_cache_status_check;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-        WHERE conrelid='public.liq_graph_pool_cache'::regclass
-          AND conname='liq_graph_pool_cache_status_v2_check') THEN
-        ALTER TABLE public.liq_graph_pool_cache
-            ADD CONSTRAINT liq_graph_pool_cache_status_v2_check
-            CHECK (status IN (0,1,2));
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-        WHERE conrelid='public.liq_graph_pool_cache'::regclass
-          AND conname='liq_graph_pool_cache_prepared_v2_check') THEN
-        ALTER TABLE public.liq_graph_pool_cache
-            ADD CONSTRAINT liq_graph_pool_cache_prepared_v2_check
-            CHECK (status <> 1 OR (
-                mint_a IS NOT NULL AND mint_b IS NOT NULL
-                AND validated_slot IS NOT NULL AND descriptor IS NOT NULL));
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-        WHERE conrelid='public.liq_graph_pool_cache'::regclass
-          AND conname='liq_graph_pool_cache_unknown_v2_check') THEN
-        ALTER TABLE public.liq_graph_pool_cache
-            ADD CONSTRAINT liq_graph_pool_cache_unknown_v2_check
-            CHECK (status <> 0 OR (validated_slot IS NULL AND descriptor IS NULL));
-    END IF;
-END
-$migration$;
-COMMIT;
+);
+CREATE INDEX IF NOT EXISTS pools_mint_a_idx ON public.pools(mint_a);
+CREATE INDEX IF NOT EXISTS pools_mint_b_idx ON public.pools(mint_b);
+CREATE INDEX IF NOT EXISTS pools_status_idx ON public.pools(status);
 "#;
 
-/// Source events insert identities and update bounded provenance-rich TVL snapshots.
-/// Completion status and manifests are independent of market observations.
 const UPSERT_IDENTITY: &str = r#"
-INSERT INTO public.liq_graph_pool_cache AS existing
-(pool_address,venue,mint_a,mint_b,status,pool_config,last_observation)
-SELECT d.pool, d.venue, d.a, d.b, 0, d.config::jsonb, d.observation::jsonb
-FROM UNNEST($1::bytea[],$2::smallint[],$3::bytea[],$4::bytea[],
-            $5::text[],$6::text[])
-    AS d(pool,venue,a,b,config,observation)
-WHERE TRUE
+INSERT INTO public.pools AS existing
+ (pool_address,venue,mint_a,mint_b,first_seen_at,last_seen_at,
+  tvl_usd,tvl_source,tvl_observed_at,pool_config)
+SELECT d.pool,d.venue,d.a,d.b,
+       CASE WHEN d.first_ms IS NULL THEN NULL ELSE to_timestamp(d.first_ms / 1000.0) END,
+       CASE WHEN d.last_ms IS NULL THEN NULL ELSE to_timestamp(d.last_ms / 1000.0) END,
+       d.tvl::numeric,d.tvl_source,
+       CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END,
+       d.config::jsonb
+FROM UNNEST($1::text[],$2::smallint[],$3::text[],$4::text[],
+            $5::text[],$6::text[],$7::text[],$8::bigint[],
+            $9::bigint[],$10::bigint[]) AS d(pool,venue,a,b,config,tvl,tvl_source,tvl_ms,first_ms,last_ms)
 ON CONFLICT (pool_address) DO UPDATE SET
     mint_a=COALESCE(existing.mint_a,EXCLUDED.mint_a),
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
-    pool_config=CASE
-      WHEN existing.pool_config='{}'::jsonb THEN EXCLUDED.pool_config
-      ELSE existing.pool_config END,
-    last_observation=CASE
-      WHEN EXCLUDED.last_observation IS NOT NULL AND
-         (existing.last_observation IS NULL
-          OR COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
-             COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0))
-        THEN EXCLUDED.last_observation
-      ELSE existing.last_observation END
+    first_seen_at=COALESCE(existing.first_seen_at,EXCLUDED.first_seen_at),
+    last_seen_at=GREATEST(existing.last_seen_at,EXCLUDED.last_seen_at),
+    pool_config=CASE WHEN existing.pool_config='{}'::jsonb
+                     THEN EXCLUDED.pool_config ELSE existing.pool_config END,
+    tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_usd ELSE existing.tvl_usd END,
+    tvl_source=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_source ELSE existing.tvl_source END,
+    tvl_observed_at=GREATEST(existing.tvl_observed_at,EXCLUDED.tvl_observed_at)
 WHERE existing.venue=EXCLUDED.venue
   AND (existing.mint_a IS NULL OR EXCLUDED.mint_a IS NULL OR existing.mint_a=EXCLUDED.mint_a)
   AND (existing.mint_b IS NULL OR EXCLUDED.mint_b IS NULL OR existing.mint_b=EXCLUDED.mint_b)
-  AND (
-      (existing.mint_a IS NULL AND EXCLUDED.mint_a IS NOT NULL)
-   OR (existing.mint_b IS NULL AND EXCLUDED.mint_b IS NOT NULL)
-   OR (existing.pool_config='{}'::jsonb AND EXCLUDED.pool_config<>'{}'::jsonb)
-   OR (existing.last_observation IS NULL AND EXCLUDED.last_observation IS NOT NULL)
-   OR COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
-      COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0))
 "#;
 
-/// Only an accepted completion may update an execution descriptor, at a non-stale slot.
-/// Preserve independently acquired structure/observation fields and fill missing mints.
 const UPSERT_COMPLETION: &str = r#"
-INSERT INTO public.liq_graph_pool_cache AS existing
-(pool_address,venue,mint_a,mint_b,status,validated_slot,
- descriptor_version,planner_version,descriptor,pool_config,last_observation)
-SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,2,1,d.descriptor::jsonb,
-       d.config::jsonb,d.observation::jsonb
-FROM UNNEST($1::bytea[],$2::smallint[],$3::bytea[],$4::bytea[],
-            $5::smallint[],$6::bigint[],$7::text[],$8::text[],$9::text[])
-    AS d(pool,venue,a,b,status,slot,descriptor,config,observation)
-WHERE TRUE
+INSERT INTO public.pools AS existing
+ (pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,
+  planner_version,descriptor,pool_config,first_seen_at,last_seen_at,
+  tvl_usd,tvl_source,tvl_observed_at,completion_checked_at,completion_reason_code)
+SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,2,1,d.descriptor::jsonb,d.config::jsonb,
+       CASE WHEN d.first_ms IS NULL THEN NULL ELSE to_timestamp(d.first_ms / 1000.0) END,
+       CASE WHEN d.last_ms IS NULL THEN NULL ELSE to_timestamp(d.last_ms / 1000.0) END,
+       d.tvl::numeric,d.tvl_source,
+       CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END,
+       CASE WHEN d.checked_ms IS NULL THEN NULL ELSE to_timestamp(d.checked_ms / 1000.0) END,
+       d.reason
+FROM UNNEST($1::text[],$2::smallint[],$3::text[],$4::text[],
+            $5::smallint[],$6::bigint[],$7::text[],$8::text[],
+            $9::text[],$10::text[],$11::bigint[],$12::bigint[],
+            $13::bigint[],$14::bigint[],$15::text[])
+  AS d(pool,venue,a,b,status,slot,descriptor,config,tvl,tvl_source,tvl_ms,
+       first_ms,last_ms,checked_ms,reason)
 ON CONFLICT (pool_address) DO UPDATE SET
     mint_a=COALESCE(existing.mint_a,EXCLUDED.mint_a),
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
@@ -141,15 +123,19 @@ ON CONFLICT (pool_address) DO UPDATE SET
     descriptor_version=EXCLUDED.descriptor_version,
     planner_version=EXCLUDED.planner_version,
     descriptor=EXCLUDED.descriptor,
-    pool_config=CASE
-      WHEN existing.pool_config='{}'::jsonb THEN EXCLUDED.pool_config
-      ELSE existing.pool_config END,
-    last_observation=CASE
-      WHEN existing.last_observation IS NULL THEN EXCLUDED.last_observation
-      WHEN COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
-           COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0)
-        THEN EXCLUDED.last_observation
-      ELSE existing.last_observation END
+    completion_checked_at=EXCLUDED.completion_checked_at,
+    completion_reason_code=EXCLUDED.completion_reason_code,
+    first_seen_at=COALESCE(existing.first_seen_at,EXCLUDED.first_seen_at),
+    last_seen_at=GREATEST(existing.last_seen_at,EXCLUDED.last_seen_at),
+    pool_config=CASE WHEN existing.pool_config='{}'::jsonb
+                  THEN EXCLUDED.pool_config ELSE existing.pool_config END,
+    tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_usd ELSE existing.tvl_usd END,
+    tvl_source=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_source ELSE existing.tvl_source END,
+    tvl_observed_at=GREATEST(existing.tvl_observed_at,EXCLUDED.tvl_observed_at)
 WHERE existing.venue=EXCLUDED.venue
   AND (existing.mint_a IS NULL OR existing.mint_a=EXCLUDED.mint_a)
   AND (existing.mint_b IS NULL OR existing.mint_b=EXCLUDED.mint_b)
@@ -400,17 +386,7 @@ impl Persistence {
                 crate::log_event!(Warn,"persistence connection failed: {err}");
             }
         });
-        client.batch_execute(CREATE_TABLE).await.context("initialize liq_graph_pool_cache")?;
-        let v2:bool=client.query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-             WHERE table_schema='public' AND table_name='liq_graph_pool_cache'
-               AND column_name='pool_config')",&[]).await
-            .context("inspect persistence schema version")?.get(0);
-        if !v2 {
-            client.batch_execute(MIGRATE_TABLE).await
-                .context("migrate liq_graph_pool_cache V2")?;
-            crate::log_event!(Info,"persistence migrated_schema=V2");
-        }
+        client.batch_execute(SCHEMA).await.context("initialize mints and pools")?;
         Ok(Self {client})
     }
 
