@@ -1,137 +1,97 @@
-# CP3 — Central Persistence & Dual Registry
+# CP3 — 9-column Pool Cache (Draft)
 
-**Draft.** No acceptance without `cargo build --locked` on the feature branch and real-provider logs. This checkpoint does not change the V10 fee/route logic.
+## Storage contract
 
-## Architecture
+PostgreSQL is a bootstrap/persistence cache, NEVER a hotpath read dependency.
 
-```
-Discovery REST/RPC ------------> Pool Registry (RAM) -----> Persistence
-Jupiter API -------------------> Mint Registry (RAM) -----> Persistence
-                                      |                          |
-                              qualified mint watch               v
-                                      |                    public.mints
-                                 DexScreener               public.pools
-                                      |                          |
-                                      +----> Pool Registry <--- startup restore
-```
+`public.pools` contains exactly:
+`pool_address TEXT PRIMARY KEY`, `venue SMALLINT`, `mint_a TEXT`, `mint_b TEXT`,
+`tvl_usd NUMERIC`, `tvl_source TEXT`, `tvl_observed_at TIMESTAMPTZ`,
+`pool_config JSONB`, `completion JSONB NULL`.
 
-- Two project tables: `public.mints` and `public.pools`.
-- `src/workers/persistence.rs` owns all PostgreSQL SQL, DDL, batch writes, and restore.
-- Existing Discovery `DataBatch` contract remains in place.
-- `mint_qualification.rs` owns a RAM `MintRegistry`, receives restored mints/known pool identities and economic Jupiter events. The economic watch is independent of Graph Prepared selection.
-- Jupiter source and DexScreener source never open PostgreSQL connections.
-- Pool addresses and mint addresses are Base58 `TEXT`; USD fields are `NUMERIC`; times are `TIMESTAMPTZ`; variable protocol configuration and completion descriptors remain `JSONB`.
-- Historical saved TVL is *not* a current live TVL on boot. The Pool Registry reevaluates live admission as sources refresh.
-- `token_extensions` and `transfer_fee_config` are nullable and **not** asserted from unverified provider JSON. Validated Token-2022 metadata can be populated by a later on-chain enrichment.
+`public.mints` is unchanged in this increment.
 
-## Local preparation (PowerShell)
+`completion IS NULL` means Unknown. Presence of a structurally validated
+`completion.manifest` (plus evidence/mints) means Prepared; otherwise a completion
+with validated_slot, checked_at_ms and reason_code means Incomplete.
+The persistence worker decodes this object to the existing typed `PoolState` on
+startup. Existing RAM status, proof, slot, scheduling and V10 contracts remain.
+Historical stored TVL is never promoted to fresh live TVL on restore.
+
+**Scope:** This increment changes only the pool SQL schema, completion serialization,
+restore and queries using removed SQL fields. It does **not** yet change the
+Discovery output contracts or the incorrect Registry `pool_metadata` mapping.
+Those are the next, separate task.
+
+## Local update
 
 ```powershell
 cd C:\dev_projects\liq_graph
 git status --short
-git fetch origin
-git switch cp3-central-persistence-dual-registry
+git pull --ff-only
 git branch --show-current
 git rev-parse --short HEAD
 git status --short
+git diff -- Cargo.lock
 cargo build --locked
 ```
 
-Do **not** proceed to destructive database actions on a compilation error. If checkout is blocked by local files, first identify and preserve those files. Never run `git reset --hard` or `git clean` indiscriminately.
+A clean build does NOT prove functional correctness. The feature branch must be
+`cp3-central-persistence-dual-registry`. Do not reset/clean untracked user files.
 
-## Destructive project-table reset
+## One-time non-destructive SQL migration
 
-**Stop all liq_graph/Jupiter processes first. Verify the database target and take a backup if any data is valuable.** This destroys historical pool completion manifests and all Jupiter mint data. It does not affect unrelated tables, schemas, or databases.
+Stop all Rust processes (no old binary writers), back up the PostgreSQL database
+if the existing pool/mint data is valuable, then inspect the configured target:
 
 ```powershell
-# psql does NOT load .env. This wrapper reads LIQ_GRAPH_DATABASE_URL /
-# DATABASE_URL with Rust's priority and does not print the password.
 .\scripts\cp3_db.ps1 -Action Inspect
-# Only after verifying host, user, database and stopping running processes:
-.\scripts\cp3_db.ps1 -Action Reset -ConfirmReset
 ```
 
-`Persistence::connect` creates the two new tables on the next start; do not maintain separate duplicated CREATE DDL.
-
-## Live acceptance sequence
-
-1. **Pool Discovery + PostgreSQL** (real DEX REST responses, no RPC needed for this phase):
+Only after reviewing the target:
 
 ```powershell
-cargo run --locked --release -- --persistence-v2-live
+.\scripts\cp3_db.ps1 -Action SqlFile -SqlFile scripts/cp3_pools_9_columns_migrate.sql
 ```
 
-The `--persistence-v2-live` mode is a finite REST+Registry+Persistence pass. Inspect pool counts and check logs for `pool registry` and `persistence complete`.
+The migration uses a single PostgreSQL transaction, rejects invalid or legacy
+completion proofs, retains existing pool rows and mint rows, copies any current
+V3 completion descriptors into `completion` including their slot, check time
+and reason code, and drops only the removed pool columns and old indexes.
+It never deletes the tables or uses CASCADE. Do not execute twice.
 
-2. **Mint Registry, Jupiter and DexScreener** (requires Jupiter keys and the configured proxy transport):
+## Immediate read-only proof
 
 ```powershell
-$env:CP1_PROBE_DURATION_SECONDS="300"
+$sql = @'
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_schema='public' AND table_name='pools'
+ORDER BY ordinal_position;
+SELECT COUNT(*) AS pools,
+ COUNT(tvl_usd) AS tvl_known,
+ COUNT(*) FILTER (WHERE completion IS NOT NULL) AS completed,
+ COUNT(*) FILTER (WHERE jsonb_typeof(completion->'manifest')='object') AS prepared
+FROM public.pools;
+SELECT COUNT(*) AS mints FROM public.mints;
+'@
+.\scripts\cp3_db.ps1 -Action Query -Query $sql
+```
+
+Must show nine columns, no lost rows and no direct `status`,
+`validated_slot`, `planner_version`, `descriptor_version` or separate
+`descriptor` column.
+
+## Real live acceptance (after migration)
+
+```powershell
+.\scripts\cp3_db.ps1 -Action Verify
 cargo run --locked --release -- --cp1-live
 ```
 
-Find `persistence restored_mints`, `mint registry pools_mints`, `jupiter mode=watch`, `dexscreener cp1 continuous`, and `cp1 live complete=true`.
-
-3. **Completion manifest on real RPC** (start with DLMM to avoid unrelated venue settings):
-
-```powershell
-$env:COMPLETION_LIFECYCLE_LIVE_VENUE="dlmm"
-$env:RUN_DURATION_SECONDS="300"
-cargo run --locked --release -- --completion-lifecycle-live
-```
-
-Check the accepted Prepared/Incomplete proofs and persisted pool status; no mocks or simulation-only success counts qualify.
-
-4. **Restart/restore**:
-
-```powershell
-$env:CP1_MARKET_ENRICHMENT_ENABLED="true"
-$env:RUN_DURATION_SECONDS="120"
-cargo run --locked --release -- --run
-```
-
-Verify `persistence restored pools`, `persistence restored_mints`, qualified watch publishing, and continued Registry/DB updates after restore.
-
-## Read-only PostgreSQL checks
-
-Use `.\scripts\cp3_db.ps1 -Action Verify` for an immediate schema/pool/mint summary. To run any saved SQL file using the configured connection, use `.\scripts\cp3_db.ps1 -Action SqlFile -SqlFile scripts/completion_lifecycle_inspect.sql`. Neither command needs the password to be entered manually.
-
-### Read-only PostgreSQL checks
-
-```sql
-SELECT table_name
-FROM information_schema.tables
-WHERE table_schema='public'
-  AND table_name IN ('mints','pools','liq_graph_mint_catalog','liq_graph_pool_cache')
-ORDER BY table_name;
-
-SELECT COUNT(*) AS pools, COUNT(*) FILTER (WHERE status=1) AS prepared,
-       COUNT(*) FILTER (WHERE tvl_usd IS NOT NULL) AS historical_tvl_known
-FROM public.pools;
-
-SELECT COUNT(*) AS mints,
-       COUNT(*) FILTER (WHERE decimals IS NOT NULL) AS decimals_known,
-       COUNT(*) FILTER (WHERE token_program IS NOT NULL) AS program_known,
-       COUNT(*) FILTER (WHERE liquidity_usd>=2000 AND market_cap_usd>=10000) AS economically_qualified
-FROM public.mints;
-
-SELECT venue,status,COUNT(*) FROM public.pools GROUP BY venue,status ORDER BY venue,status;
-
-SELECT pool_address,venue,mint_a,mint_b,tvl_usd,tvl_source,tvl_observed_at,
-       completion_checked_at,completion_reason_code,
-       jsonb_typeof(pool_config) AS config_type,
-       jsonb_typeof(descriptor) AS descriptor_type
-FROM public.pools ORDER BY last_seen_at DESC NULLS LAST LIMIT 10;
-
-SELECT mint_address,token_program,decimals,liquidity_usd,market_cap_usd,fetched_at
-FROM public.mints ORDER BY fetched_at DESC NULLS LAST LIMIT 10;
-```
-
-## Acceptance gates
-
-- Two project tables only; no legacy `liq_graph_*` table.
-- Only `persistence.rs` contains PostgreSQL SQL calls.
-- Real token and pool records reach RAM registries and DB.
-- A restart restores both registries and any saved Prepared manifest without treating historical TVL as fresh.
-- `cargo build --locked` on the actual feature HEAD; real logs for Discovery → Registry → Persistence → Restore.
-- Do not mark this draft complete without the above. A CI job that never obtains a runner does **not** prove compilation.
+For Completion, use the existing `--completion-lifecycle-live` venue settings,
+then inspect `scripts/completion_lifecycle_inspect.sql` through `cp3_db.ps1`
+and restart the runtime to prove Prepared and Incomplete proof restore.
+The Completion-Lifecycle and V10 export SQL verification scripts now read
+`completion`. Any timeout, lag, incomplete finite run or missing real
+evidence is NOT acceptance. No database reset or new table recreation is needed.
