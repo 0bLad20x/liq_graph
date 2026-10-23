@@ -492,7 +492,8 @@ impl Persistence {
             updated.push(date(payload.get("updatedAt")));
             liquidity.push(amount(payload.get("liquidity")));
             mcap.push(amount(payload.get("mcap")));
-            holders.push(payload.get("holderCount").and_then(Value::as_u64)
+            holders.push(payload.get("holderCount").and_then(|v|
+                v.as_u64().or_else(||v.as_str().and_then(|s|s.parse::<u64>().ok())))
                 .and_then(|v|i64::try_from(v).ok()));
             prices.push(amount(payload.get("usdPrice")));
             fetched.push(i64::try_from(batch.received_at_ms)?);
