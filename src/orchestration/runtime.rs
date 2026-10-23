@@ -602,9 +602,10 @@ pub async fn run()->Result<()>{
             registry.clone(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
             qualified_tx,target_tx));
         let client=http.clone();
+        let jupiter_publisher=jupiter_out.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
             let client=client.clone();let targets=target_rx.clone();
-            let output=jupiter_out.clone();
+            let output=jupiter_publisher.clone();
             async move{
                 let settings=jupiter_settings()?.context("Jupiter keys disappeared")?;
                 source_jupiter_mint::run_targeted(client,settings,targets,output).await
