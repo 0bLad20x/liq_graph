@@ -1,8 +1,12 @@
 param(
-    [ValidateSet("Inspect","Reset","Verify","SqlFile")]
+    [ValidateSet("Inspect","Reset","Verify","SqlFile","Query")]
     [string]$Action = "Inspect",
     [switch]$ConfirmReset,
     [string]$SqlFile,
+    [string]$Query,
+    [hashtable]$Variables = @{},
+    [switch]$TuplesOnly,
+    [switch]$NoAlign,
     [string]$PsqlPath = "psql"
 )
 # Uses the same LIQ_GRAPH_DATABASE_URL -> DATABASE_URL precedence as Rust/dotenvy.
@@ -83,10 +87,29 @@ try {
         & $PsqlPath @common -c "SELECT COUNT(*) AS pools, COUNT(*) FILTER (WHERE status=1) AS prepared FROM public.pools;"
         if ($LASTEXITCODE -ne 0) {throw "psql pool count failed with exit code $LASTEXITCODE"}
         & $PsqlPath @common -c "SELECT COUNT(*) AS mints, COUNT(*) FILTER (WHERE decimals IS NOT NULL) AS decimals_known FROM public.mints;"
-    } else {
+    } elseif ($Action -eq "SqlFile") {
         if (-not $SqlFile) {throw "-SqlFile is required with -Action SqlFile."}
         $file = (Resolve-Path -LiteralPath $SqlFile).Path
         & $PsqlPath @common -f $file
+    } else {
+        if (-not $Query) {throw "-Query is required with -Action Query."}
+        $args = @($common)
+        if ($TuplesOnly) {$args += "--tuples-only"}
+        if ($NoAlign) {$args += "--no-align"}
+        foreach ($key in $Variables.Keys) {
+            if ($key -cnotmatch '^[a-z][a-z_0-9]*
+    if ($LASTEXITCODE -ne 0) { throw "psql exited with code $LASTEXITCODE. Check DB host/user and .env configuration." }
+} finally {
+    [Environment]::SetEnvironmentVariable("PGPASSWORD",$oldPass,"Process")
+    [Environment]::SetEnvironmentVariable("PGSSLMODE",$oldSsl,"Process")
+    $password=$null
+    $dsn=$null
+}
+) {throw "Invalid psql variable name."}
+            $args += "-v"
+            $args += "$key=$($Variables[$key])"
+        }
+        $Query | & $PsqlPath @args
     }
     if ($LASTEXITCODE -ne 0) { throw "psql exited with code $LASTEXITCODE. Check DB host/user and .env configuration." }
 } finally {
