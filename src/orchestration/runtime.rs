@@ -237,6 +237,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
     if configured.raydium_cpmm.is_some(){venues.push(Venue::RaydiumCpmm);}
     if configured.raydium_clmm.is_some(){venues.push(Venue::RaydiumClmm);}
     let database=persistence::Persistence::connect().await?;
+    let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
     let restored=database.restore().await?.into_iter()
         .filter(|p|venues.contains(&p.venue)).collect();
     let registry=pool_registry::PoolRegistry::default();
@@ -250,7 +251,10 @@ pub async fn completion_lifecycle_live()->Result<()> {
     let mut tasks=JoinSet::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
         registry.clone(),updates.clone(),done,true));
-    critical(&mut tasks,"persistence",database.run(updates.subscribe()));
+    let mut mint_stream=enrichment.as_ref().map(|_|broadcast::channel::<Arc<DataBatch>>(256));
+    let mint_store_rx=mint_stream.as_ref().map(|(out,_)|out.subscribe());
+    critical(&mut tasks,"persistence",database.run_with_mints(
+        updates.subscribe(),mint_store_rx));
     if selected=="all" {
         let (graph_out,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
         critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
@@ -265,9 +269,10 @@ pub async fn completion_lifecycle_live()->Result<()> {
         // observations and RPC vault balances never substitute canonical TVL.
         let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-        let (jupiter_out,jupiter_rx)=broadcast::channel(256);
+        let (jupiter_out,jupiter_rx)=mint_stream.take().context("missing Jupiter stream")?;
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
-            mint_qualification::run(updates.subscribe(),jupiter_rx,qualified_tx,target_tx)));
+            mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
+                jupiter_rx,qualified_tx,target_tx)));
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
             source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
         critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
@@ -371,6 +376,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
 pub async fn cp1_live() -> Result<()> {
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
+    let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
     let registry=pool_registry::PoolRegistry::default();
     let pool_count=registry.restore(restored)?;
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
@@ -378,12 +384,12 @@ pub async fn cp1_live() -> Result<()> {
     let (done,_) = watch::channel(false);
     let registry_task=tokio::spawn(pool_registry::run(
         source_rx,None,registry.clone(),updates.clone(),done,true));
-    let writer=tokio::spawn(database.run(updates.subscribe()));
+    let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
+    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe())));
     let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-    let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
     let qualification=tokio::spawn(mint_qualification::run(
-        updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
+        registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
     // This isolated checkpoint must not start an unbounded full backfill.
     let mut jupiter_settings=settings;
@@ -437,6 +443,8 @@ pub async fn run()->Result<()>{
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
+    let persisted_mints=database.restore_mints().await?;
+    let mint_registry=mint_qualification::MintRegistry::restore(persisted_mints)?;
     let hydration_only=enabled("IDENTITY_HYDRATION_ONLY")?;
     let venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
     // Every unresolved pool, independent of venue, is assigned to one hydration worker.
@@ -496,7 +504,9 @@ pub async fn run()->Result<()>{
     let mut tasks=JoinSet::<Result<()>>::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
         registry.clone(),updates.clone(),source_done,true));
-    critical(&mut tasks,"persistence",database.run(updates.subscribe()));
+    let (jupiter_out,jupiter_observer_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    critical(&mut tasks,"persistence",database.run_with_mints(
+        updates.subscribe(),Some(jupiter_out.subscribe())));
     critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
         updates.subscribe(),graph_tx,graph_settings));
     // Price observations are optional. The Registry and graph retain their own eligibility rules.
@@ -577,44 +587,34 @@ pub async fn run()->Result<()>{
     }));
     let cp1=enabled("CP1_MARKET_ENRICHMENT_ENABLED")?;
     let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-    let mut qualification_jupiter_rx=None;
-    let mut qualification_jupiter_tx=None;
-    let jupiter_mints=if jupiter_settings()?.is_some(){
-        let (mint_tx,mint_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-        let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    // Economic Mint Registry owns the entire known pool-mint universe,
+    // irrespective of Prepared state or liquidity-graph membership.
+    if jupiter_settings()?.is_some() {
+        let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let observer_sender=jupiter_out.clone();
-        let mut first_jupiter_observer=Some(jupiter_rx);
+        let mut first_jupiter_observer=Some(jupiter_observer_rx);
         tasks.spawn(supervise("observer.source_jupiter_mint",stop_rx.clone(),move||{
             let input=first_jupiter_observer.take()
                 .unwrap_or_else(||observer_sender.subscribe());
             async move{diagnostic_source::run(input,true).await}
         }));
-        if cp1 {
-            qualification_jupiter_rx=Some(jupiter_out.subscribe());
-            qualification_jupiter_tx=Some(mint_tx.clone());
-        }
+        critical(&mut tasks,"mint_registry",mint_qualification::run(
+            registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
+            qualified_tx,target_tx));
         let client=http.clone();
+        let jupiter_publisher=jupiter_out.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
-            let output=jupiter_out.clone();let client=client.clone();
-            let mints=mint_rx.clone();
+            let client=client.clone();let targets=target_rx.clone();
+            let output=jupiter_publisher.clone();
             async move{
                 let settings=jupiter_settings()?.context("Jupiter keys disappeared")?;
-                if cp1 {
-                    source_jupiter_mint::run_targeted(client,settings,mints,output).await
-                } else {
-                    source_jupiter_mint::run(client,settings,mints,output).await
-                }
+                source_jupiter_mint::run_targeted(client,settings,targets,output).await
             }
         }));
-        if cp1 {None} else {Some(mint_tx)}
-    }else{None};
+    }
     critical(&mut tasks,"graph_watch_catalog",graph_watch_catalog::run(
-        graph_rx,catalog_tx,jupiter_mints));
+        graph_rx,catalog_tx,None));
     if cp1 {
-        let jupiter_rx=qualification_jupiter_rx.context("CP1 requires Jupiter API keys")?;
-        let targets=qualification_jupiter_tx.context("CP1 Jupiter targets missing")?;
-        critical(&mut tasks,"mint_qualification",mint_qualification::run(
-            updates.subscribe(),jupiter_rx,qualified_tx,targets));
         let reg=registry.clone();let publisher=source.clone();
         tasks.spawn(supervise("source_dexscreener.cp1",stop_rx.clone(),move||{
             let selection=qualified_rx.clone();
@@ -739,7 +739,7 @@ pub async fn run()->Result<()>{
             async move{discovery_rpc_full::run(tx,settings).await}
         }));
     }
-    drop(source);drop(updates);drop(rpc);
+    drop(jupiter_out);drop(source);drop(updates);drop(rpc);
 
     // Operator termination uses q + Enter; finite RUN_DURATION_SECONDS supports
     // an automatic graceful live run without adding dependencies or lockfile changes.

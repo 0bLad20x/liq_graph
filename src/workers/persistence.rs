@@ -9,154 +9,136 @@ use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
-    core::{AccountMeta, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue,
+    core::{AccountMeta, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue, MintState, DataBatch, RecordIdentity,
         CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
 };
 
-const TABLE: &str = "public.liq_graph_pool_cache";
-const DESCRIPTOR_VERSION: i32 = 2;
-const PLANNER_VERSION: i32 = 1;
+
+const TABLE: &str = "public.pools";
 const BATCH_SIZE: usize = 512;
 const WRITE_INTERVAL: Duration = Duration::from_secs(1);
 
-const CREATE_TABLE: &str = r#"
-CREATE TABLE IF NOT EXISTS public.liq_graph_pool_cache (
-    pool_address BYTEA PRIMARY KEY CHECK (octet_length(pool_address) = 32),
+/// Only the project tables; never drop unrelated schemas or objects.
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS public.mints (
+    mint_address TEXT PRIMARY KEY,
+    token_program TEXT NULL,
+    decimals SMALLINT NULL CHECK (decimals BETWEEN 0 AND 255),
+    created_at TIMESTAMPTZ NULL,
+    updated_at TIMESTAMPTZ NULL,
+    liquidity_usd NUMERIC NULL,
+    market_cap_usd NUMERIC NULL,
+    holder_count BIGINT NULL CHECK (holder_count IS NULL OR holder_count >= 0),
+    usd_price NUMERIC NULL,
+    fetched_at TIMESTAMPTZ NULL,
+    token_extensions JSONB NULL,
+    transfer_fee_config JSONB NULL
+);
+CREATE TABLE IF NOT EXISTS public.pools (
+    pool_address TEXT PRIMARY KEY,
     venue SMALLINT NOT NULL,
-    mint_a BYTEA NULL CHECK (mint_a IS NULL OR octet_length(mint_a) = 32),
-    mint_b BYTEA NULL CHECK (mint_b IS NULL OR octet_length(mint_b) = 32),
-    status SMALLINT NOT NULL DEFAULT 0 CHECK (status IN (0, 1, 2)),
-    validated_slot BIGINT NULL CHECK (validated_slot IS NULL OR validated_slot >= 0),
-    descriptor_version INTEGER NOT NULL DEFAULT 1 CHECK (descriptor_version >= 1),
-    planner_version INTEGER NOT NULL DEFAULT 1 CHECK (planner_version >= 1),
-    descriptor JSONB NULL,
+    mint_a TEXT NULL,
+    mint_b TEXT NULL,
+    tvl_usd NUMERIC NULL,
+    tvl_source TEXT NULL,
+    tvl_observed_at TIMESTAMPTZ NULL,
     pool_config JSONB NOT NULL DEFAULT '{}'::jsonb,
-    last_observation JSONB NULL,
+    completion JSONB NULL,
     CHECK (mint_a IS NULL OR mint_b IS NULL OR mint_a <> mint_b),
-    CHECK (status <> 1 OR (
-        mint_a IS NOT NULL AND mint_b IS NOT NULL
-        AND validated_slot IS NOT NULL AND descriptor IS NOT NULL)),
-    CHECK (status <> 0 OR (validated_slot IS NULL AND descriptor IS NULL))
-)"#;
-
-/// Idempotent expansion of the V1 completion-only table. No data is deleted.
-const MIGRATE_TABLE: &str = r#"
-BEGIN;
-ALTER TABLE public.liq_graph_pool_cache
-    ADD COLUMN IF NOT EXISTS pool_config JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE public.liq_graph_pool_cache
-    ADD COLUMN IF NOT EXISTS last_observation JSONB NULL;
-ALTER TABLE public.liq_graph_pool_cache
-    ALTER COLUMN mint_a DROP NOT NULL,
-    ALTER COLUMN mint_b DROP NOT NULL,
-    ALTER COLUMN validated_slot DROP NOT NULL,
-    ALTER COLUMN descriptor DROP NOT NULL,
-    ALTER COLUMN status SET DEFAULT 0,
-    ALTER COLUMN descriptor_version SET DEFAULT 1,
-    ALTER COLUMN planner_version SET DEFAULT 1;
-ALTER TABLE public.liq_graph_pool_cache
-    DROP CONSTRAINT IF EXISTS liq_graph_pool_cache_status_check;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-        WHERE conrelid='public.liq_graph_pool_cache'::regclass
-          AND conname='liq_graph_pool_cache_status_v2_check') THEN
-        ALTER TABLE public.liq_graph_pool_cache
-            ADD CONSTRAINT liq_graph_pool_cache_status_v2_check
-            CHECK (status IN (0,1,2));
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-        WHERE conrelid='public.liq_graph_pool_cache'::regclass
-          AND conname='liq_graph_pool_cache_prepared_v2_check') THEN
-        ALTER TABLE public.liq_graph_pool_cache
-            ADD CONSTRAINT liq_graph_pool_cache_prepared_v2_check
-            CHECK (status <> 1 OR (
-                mint_a IS NOT NULL AND mint_b IS NOT NULL
-                AND validated_slot IS NOT NULL AND descriptor IS NOT NULL));
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-        WHERE conrelid='public.liq_graph_pool_cache'::regclass
-          AND conname='liq_graph_pool_cache_unknown_v2_check') THEN
-        ALTER TABLE public.liq_graph_pool_cache
-            ADD CONSTRAINT liq_graph_pool_cache_unknown_v2_check
-            CHECK (status <> 0 OR (validated_slot IS NULL AND descriptor IS NULL));
-    END IF;
-END
-$migration$;
-COMMIT;
+    CHECK (completion IS NULL OR jsonb_typeof(completion) IS NOT DISTINCT FROM 'object'),
+    CHECK (completion IS NULL OR
+        (jsonb_typeof(completion->'validated_slot') IS NOT DISTINCT FROM 'number'
+         AND (completion->>'validated_slot')::bigint>=0
+         AND jsonb_typeof(completion->'checked_at_ms') IS NOT DISTINCT FROM 'number'
+         AND (completion->>'checked_at_ms')::bigint>0))
+);
 "#;
 
-/// Source events insert identities and update bounded provenance-rich TVL snapshots.
-/// Completion status and manifests are independent of market observations.
+const UPSERT_MINT: &str = r#"
+INSERT INTO public.mints AS old
+ (mint_address,token_program,decimals,created_at,updated_at,
+  liquidity_usd,market_cap_usd,holder_count,usd_price,fetched_at)
+SELECT d.mint,d.program,d.decimals,
+ CASE WHEN d.created ~ '^-?[0-9]{1,16}$' THEN to_timestamp(d.created::double precision /
+    CASE WHEN length(trim(leading '-' from d.created))>=13 THEN 1000.0 ELSE 1.0 END)
+      WHEN pg_input_is_valid(d.created,'timestamp with time zone') THEN d.created::timestamptz
+      ELSE NULL END,
+ CASE WHEN d.updated ~ '^-?[0-9]{1,16}$' THEN to_timestamp(d.updated::double precision /
+    CASE WHEN length(trim(leading '-' from d.updated))>=13 THEN 1000.0 ELSE 1.0 END)
+      WHEN pg_input_is_valid(d.updated,'timestamp with time zone') THEN d.updated::timestamptz
+      ELSE NULL END,
+ d.liq::numeric,d.mcap::numeric,d.holders,d.price::numeric,
+ to_timestamp(d.fetched_ms / 1000.0)
+FROM UNNEST($1::text[],$2::text[],$3::smallint[],$4::text[],$5::text[],
+            $6::text[],$7::text[],$8::bigint[],$9::text[],$10::bigint[])
+  AS d(mint,program,decimals,created,updated,liq,mcap,holders,price,fetched_ms)
+ON CONFLICT (mint_address) DO UPDATE SET
+ token_program=COALESCE(EXCLUDED.token_program,old.token_program),
+ decimals=COALESCE(EXCLUDED.decimals,old.decimals),
+ created_at=COALESCE(EXCLUDED.created_at,old.created_at),
+ updated_at=COALESCE(EXCLUDED.updated_at,old.updated_at),
+ liquidity_usd=EXCLUDED.liquidity_usd,
+ market_cap_usd=EXCLUDED.market_cap_usd,
+ holder_count=EXCLUDED.holder_count,
+ usd_price=EXCLUDED.usd_price,
+ fetched_at=EXCLUDED.fetched_at
+WHERE old.fetched_at IS NULL OR EXCLUDED.fetched_at >= old.fetched_at
+"#;
+
 const UPSERT_IDENTITY: &str = r#"
-INSERT INTO public.liq_graph_pool_cache AS existing
-(pool_address,venue,mint_a,mint_b,status,pool_config,last_observation)
-SELECT d.pool, d.venue, d.a, d.b, 0, d.config::jsonb, d.observation::jsonb
-FROM UNNEST($1::bytea[],$2::smallint[],$3::bytea[],$4::bytea[],
-            $5::text[],$6::text[])
-    AS d(pool,venue,a,b,config,observation)
-WHERE TRUE
+INSERT INTO public.pools AS existing
+ (pool_address,venue,mint_a,mint_b,tvl_usd,tvl_source,tvl_observed_at,pool_config)
+SELECT d.pool,d.venue,d.a,d.b,d.tvl::numeric,d.tvl_source,
+       CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END,
+       d.config::jsonb
+FROM UNNEST($1::text[],$2::smallint[],$3::text[],$4::text[],
+            $5::text[],$6::text[],$7::text[],$8::bigint[])
+  AS d(pool,venue,a,b,config,tvl,tvl_source,tvl_ms)
 ON CONFLICT (pool_address) DO UPDATE SET
     mint_a=COALESCE(existing.mint_a,EXCLUDED.mint_a),
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
-    pool_config=CASE
-      WHEN existing.pool_config='{}'::jsonb THEN EXCLUDED.pool_config
-      ELSE existing.pool_config END,
-    last_observation=CASE
-      WHEN EXCLUDED.last_observation IS NOT NULL AND
-         (existing.last_observation IS NULL
-          OR COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
-             COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0))
-        THEN EXCLUDED.last_observation
-      ELSE existing.last_observation END
+    pool_config=CASE WHEN EXCLUDED.pool_config<>'{}'::jsonb
+                     THEN EXCLUDED.pool_config ELSE existing.pool_config END,
+    tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_usd ELSE existing.tvl_usd END,
+    tvl_source=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_source ELSE existing.tvl_source END,
+    tvl_observed_at=GREATEST(existing.tvl_observed_at,EXCLUDED.tvl_observed_at)
 WHERE existing.venue=EXCLUDED.venue
   AND (existing.mint_a IS NULL OR EXCLUDED.mint_a IS NULL OR existing.mint_a=EXCLUDED.mint_a)
   AND (existing.mint_b IS NULL OR EXCLUDED.mint_b IS NULL OR existing.mint_b=EXCLUDED.mint_b)
-  AND (
-      (existing.mint_a IS NULL AND EXCLUDED.mint_a IS NOT NULL)
-   OR (existing.mint_b IS NULL AND EXCLUDED.mint_b IS NOT NULL)
-   OR (existing.pool_config='{}'::jsonb AND EXCLUDED.pool_config<>'{}'::jsonb)
-   OR (existing.last_observation IS NULL AND EXCLUDED.last_observation IS NOT NULL)
-   OR COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
-      COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0))
 "#;
 
-/// Only an accepted completion may update an execution descriptor, at a non-stale slot.
-/// Preserve independently acquired structure/observation fields and fill missing mints.
 const UPSERT_COMPLETION: &str = r#"
-INSERT INTO public.liq_graph_pool_cache AS existing
-(pool_address,venue,mint_a,mint_b,status,validated_slot,
- descriptor_version,planner_version,descriptor,pool_config,last_observation)
-SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,2,1,d.descriptor::jsonb,
-       d.config::jsonb,d.observation::jsonb
-FROM UNNEST($1::bytea[],$2::smallint[],$3::bytea[],$4::bytea[],
-            $5::smallint[],$6::bigint[],$7::text[],$8::text[],$9::text[])
-    AS d(pool,venue,a,b,status,slot,descriptor,config,observation)
-WHERE TRUE
+INSERT INTO public.pools AS existing
+ (pool_address,venue,mint_a,mint_b,completion,pool_config,tvl_usd,tvl_source,tvl_observed_at)
+SELECT d.pool,d.venue,d.a,d.b,d.completion::jsonb,d.config::jsonb,
+       d.tvl::numeric,d.tvl_source,
+       CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END
+FROM UNNEST($1::text[],$2::smallint[],$3::text[],$4::text[],
+            $5::text[],$6::text[],$7::text[],$8::bigint[],$9::text[])
+  AS d(pool,venue,a,b,config,tvl,tvl_source,tvl_ms,completion)
 ON CONFLICT (pool_address) DO UPDATE SET
     mint_a=COALESCE(existing.mint_a,EXCLUDED.mint_a),
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
-    status=EXCLUDED.status,
-    validated_slot=EXCLUDED.validated_slot,
-    descriptor_version=EXCLUDED.descriptor_version,
-    planner_version=EXCLUDED.planner_version,
-    descriptor=EXCLUDED.descriptor,
-    pool_config=CASE
-      WHEN existing.pool_config='{}'::jsonb THEN EXCLUDED.pool_config
-      ELSE existing.pool_config END,
-    last_observation=CASE
-      WHEN existing.last_observation IS NULL THEN EXCLUDED.last_observation
-      WHEN COALESCE((EXCLUDED.last_observation->>'observed_at_ms')::bigint,0)>
-           COALESCE((existing.last_observation->>'observed_at_ms')::bigint,0)
-        THEN EXCLUDED.last_observation
-      ELSE existing.last_observation END
+    completion=EXCLUDED.completion,
+    pool_config=CASE WHEN EXCLUDED.pool_config<>'{}'::jsonb
+                  THEN EXCLUDED.pool_config ELSE existing.pool_config END,
+    tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_usd ELSE existing.tvl_usd END,
+    tvl_source=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
+               AND (existing.tvl_observed_at IS NULL OR EXCLUDED.tvl_observed_at >= existing.tvl_observed_at)
+               THEN EXCLUDED.tvl_source ELSE existing.tvl_source END,
+    tvl_observed_at=GREATEST(existing.tvl_observed_at,EXCLUDED.tvl_observed_at)
 WHERE existing.venue=EXCLUDED.venue
   AND (existing.mint_a IS NULL OR existing.mint_a=EXCLUDED.mint_a)
   AND (existing.mint_b IS NULL OR existing.mint_b=EXCLUDED.mint_b)
-  AND (existing.validated_slot IS NULL
-       OR existing.validated_slot < EXCLUDED.validated_slot
-       OR (existing.validated_slot=EXCLUDED.validated_slot
-           AND existing.planner_version<=EXCLUDED.planner_version))
+  AND (existing.completion IS NULL
+       OR (EXCLUDED.completion->>'validated_slot')::bigint >
+          (existing.completion->>'validated_slot')::bigint)
 "#;
 
 fn venue_code(venue: Venue) -> i16 {
@@ -174,26 +156,8 @@ fn venue_from(code: i16) -> Result<Venue> {
         7=>Ok(Venue::OrcaWhirlpool), 8=>Ok(Venue::PancakeSwapClmm), 9=>Ok(Venue::ByrealClmm), 10=>Ok(Venue::Manifest), 11=>Ok(Venue::PumpSwap), _=>bail!("unsupported persisted venue {code}") }
 }
 
-fn status_code(status: CompletionState) -> Result<i16> {
-    match status {
-        CompletionState::Prepared => Ok(1),
-        CompletionState::Incomplete => Ok(2),
-        CompletionState::Unknown => bail!("Unknown is not a persisted completion result"),
-    }
-}
-
-fn status_from(code: i16) -> Result<CompletionState> {
-    match code {
-        0 => Ok(CompletionState::Unknown),
-        1 => Ok(CompletionState::Prepared),
-        2 => Ok(CompletionState::Incomplete),
-        _ => bail!("invalid persisted completion status {code}"),
-    }
-}
-
-fn pubkey(bytes: &[u8]) -> Result<Pubkey> {
-    let value: [u8; 32] = bytes.try_into().context("persisted Pubkey is not exactly 32 bytes")?;
-    Ok(Pubkey::new_from_array(value))
+fn pubkey(bytes: &str) -> Result<Pubkey> {
+    bytes.parse::<Pubkey>().context("invalid persisted Base58 Pubkey")
 }
 
 fn json_key(value: &Value) -> Result<Pubkey> {
@@ -222,7 +186,9 @@ fn decode_accounts(value: &Value, name: &str) -> Result<Arc<[AccountMeta]>> {
 }
 
 fn encode_descriptor(pool: &PoolState) -> Result<String> {
-    let slot = pool.completion_validated_slot.context("completion slot missing")?;
+    let slot=pool.completion_validated_slot.context("completion slot missing")?;
+    let checked=pool.completion_checked_at_ms.context("completion check time missing")?;
+    ensure!(checked>0, "completion check time zero");
     let manifest = pool.execution_manifest.as_ref().map(|m| json!({
         "base_a":encode_accounts(&m.base_a), "base_b":encode_accounts(&m.base_b)
     }));
@@ -236,25 +202,22 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
         "extensions":m.extensions, "unsupported":m.unsupported
     })).collect::<Vec<_>>());
     let payload = json!({
-        "validated_slot":slot,
         "manifest":manifest,
         "bound_signer":pool.execution_manifest.as_ref().and_then(|m|m.bound_signer).map(|wallet|wallet.to_string()),
         "evidence":evidence,
         "mints":mints,
         "reason":pool.completion_reason,
         "reason_code":pool.completion_reason_code,
-        "checked_at_ms":pool.completion_checked_at_ms,
+        "validated_slot":slot,
+        "checked_at_ms":checked,
     });
     Ok(serde_json::to_string(&payload)?)
 }
 
 fn decode_descriptor(
-    address: Pubkey, a: Pubkey, b: Pubkey, status: CompletionState, slot: u64,
-    descriptor_version: i32, payload: &Value
+    address: Pubkey, a: Pubkey, b: Pubkey, slot: u64, payload: &Value
 ) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
              Option<[MintProof;2]>, Option<String>, Option<CompletionReason>, Option<u64>)> {
-    ensure!(payload.get("validated_slot").and_then(Value::as_u64)==Some(slot),
-        "persisted validated_slot / descriptor mismatch");
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
         let value = &payload["manifest"];
         // Upgrade the old persisted wallet context once at the storage boundary.
@@ -268,30 +231,18 @@ fn decode_descriptor(
             base_b:decode_accounts(value,"base_b")?,
         }))
     } else { None };
-    // Read historic V1 DLMM payloads as opaque evidence; no BinArray decoder.
-    let evidence = if descriptor_version == 1 {
-        payload.get("inventory").filter(|v| !v.is_null()).map(|v| {
-            ensure!(v.is_object(), "legacy DLMM inventory must be an object");
-            Ok(Arc::new(CompletionEvidence {
-                kind: "meteora_dlmm_bin_arrays".to_owned(),
-                version: 1,
-                payload: Arc::new(v.clone()),
-            }))
-        }).transpose()?
-    } else {
-        payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
-            let kind = v.get("kind").and_then(Value::as_str)
-                .filter(|v| !v.is_empty()).context("completion evidence kind missing")?;
-            let version = u32::try_from(v.get("version").and_then(Value::as_u64)
-                .context("completion evidence version missing")?)?;
-            ensure!(version > 0, "invalid completion evidence version");
-            let data = v.get("payload").context("completion evidence payload missing")?;
-            ensure!(data.is_object(), "completion evidence payload must be an object");
-            Ok(Arc::new(CompletionEvidence {
-                kind: kind.to_owned(), version, payload: Arc::new(data.clone()),
-            }))
-        }).transpose()?
-    };
+    let evidence = payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
+        let kind = v.get("kind").and_then(Value::as_str)
+            .filter(|v| !v.is_empty()).context("completion evidence kind missing")?;
+        let version = u32::try_from(v.get("version").and_then(Value::as_u64)
+            .context("completion evidence version missing")?)?;
+        ensure!(version > 0, "invalid completion evidence version");
+        let data = v.get("payload").context("completion evidence payload missing")?;
+        ensure!(data.is_object(), "completion evidence payload must be an object");
+        Ok(Arc::new(CompletionEvidence {
+            kind: kind.to_owned(), version, payload: Arc::new(data.clone()),
+        }))
+    }).transpose()?;
     let mints = if let Some(v) = payload.get("mints").filter(|v|!v.is_null()) {
         let raw = v.as_array().context("invalid stored mint proofs")?;
         ensure!(raw.len()==2, "expected two persisted mint proofs");
@@ -315,9 +266,7 @@ fn decode_descriptor(
             "persisted mint proofs mismatch Pool identity");
         Some(pair)
     } else {None};
-    ensure!((status==CompletionState::Prepared)==manifest.is_some(),
-        "stored Prepared status and manifest disagree");
-    if status==CompletionState::Prepared {
+    if manifest.is_some() {
         ensure!(evidence.is_some() && mints.is_some(), "Prepared missing protocol evidence and mint proof");
     }
     let reason = payload.get("reason").filter(|v|!v.is_null())
@@ -325,21 +274,17 @@ fn decode_descriptor(
         .transpose()?;
     let reason_code=payload.get("reason_code").filter(|v|!v.is_null())
         .map(|v|serde_json::from_value::<CompletionReason>(v.clone())).transpose()?;
-    let reason_code=if status==CompletionState::Incomplete {
-        Some(reason_code.unwrap_or_else(||{
-            if mints.as_ref().is_some_and(|m|m.iter().any(|p|!p.unsupported.is_empty())) {
-                CompletionReason::UnsupportedConfiguration
-            } else {CompletionReason::LegacyUnclassified}
-        }))
-    } else {reason_code};
-    let checked_at_ms=payload.get("checked_at_ms").filter(|v|!v.is_null())
-        .map(|v|v.as_u64().filter(|at|*at>0).context("invalid completion check timestamp"))
-        .transpose()?;
-    ensure!(status!=CompletionState::Prepared || reason_code.is_none(),
-        "Prepared descriptor has a failure code");
+    let reason_code=if manifest.is_none() {
+        Some(reason_code.context("Incomplete completion requires reason_code")?)
+    } else {
+        ensure!(reason_code.is_none(), "Prepared completion has reason_code");
+        None
+    };
+    let checked_at_ms=payload.get("checked_at_ms").and_then(Value::as_u64)
+        .filter(|v|*v>0).context("completion requires positive checked_at_ms")?;
     ensure!(reason_code!=Some(CompletionReason::TransientFailure),
         "transient attempt is not a durable completion proof");
-    Ok((manifest, evidence, mints, reason, reason_code, checked_at_ms))
+    Ok((manifest, evidence, mints, reason, reason_code, Some(checked_at_ms)))
 }
 
 #[derive(Clone, Copy)]
@@ -364,24 +309,12 @@ fn encoded_config(pool:&PoolState) -> Result<String> {
     Ok(config.map(ToString::to_string).unwrap_or_else(||"{}".into()))
 }
 
-fn encoded_observation(pool:&PoolState) -> Option<String> {
-    // Preserve the canonical TVL source and its own observation timestamp.
-    // Never relabel a DexScreener value as a venue REST observation (or vice versa).
-    if pool.last_observation.as_ref().is_some_and(|o|
-        o.get("observed_at_ms").is_some()) {
-        return pool.last_observation.as_ref().map(ToString::to_string);
-    }
-    if pool.last_seen_ms>0 && pool.source!="persistence_restore" {
-        Some(json!({"tvl_usd":pool.tvl_usd,
-            "first_seen_ms":pool.first_seen_ms,
-            "observed_at_ms":pool.last_seen_ms,"source":pool.source}).to_string())
-    } else {
-        pool.last_observation.as_ref().map(ToString::to_string)
-    }
-}
-
-fn bytes_key(key:Option<Pubkey>) -> Option<Vec<u8>> {
-    key.map(|v|v.to_bytes().to_vec())
+fn observation_values(pool:&PoolState)->Result<(Option<String>,Option<String>,Option<i64>)> {
+    let observation=pool.last_observation.as_deref();
+    let tvl=pool.tvl_usd.or_else(||observation.and_then(|v|v.get("tvl_usd")).and_then(Value::as_f64));
+    let source=observation.and_then(|v|v.get("source")).and_then(Value::as_str).map(str::to_owned);
+    let at=observation.and_then(|v|v.get("observed_at_ms")).and_then(Value::as_u64);
+    Ok((tvl.map(|v|v.to_string()),source,at.map(i64::try_from).transpose()?))
 }
 
 pub struct Persistence {
@@ -400,91 +333,172 @@ impl Persistence {
                 crate::log_event!(Warn,"persistence connection failed: {err}");
             }
         });
-        client.batch_execute(CREATE_TABLE).await.context("initialize liq_graph_pool_cache")?;
-        let v2:bool=client.query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-             WHERE table_schema='public' AND table_name='liq_graph_pool_cache'
-               AND column_name='pool_config')",&[]).await
-            .context("inspect persistence schema version")?.get(0);
-        if !v2 {
-            client.batch_execute(MIGRATE_TABLE).await
-                .context("migrate liq_graph_pool_cache V2")?;
-            crate::log_event!(Info,"persistence migrated_schema=V2");
-        }
+        client.batch_execute(SCHEMA).await.context("initialize mints and pools")?;
         Ok(Self {client})
+    }
+
+    /// Restore the durable Mint Registry state before producers are started.
+    pub async fn restore_mints(&self)->Result<Vec<MintState>> {
+        let mut after:Option<String>=None;
+        let mut result=Vec::new();
+        loop {
+            let rows=self.client.query(
+                "SELECT mint_address,token_program,decimals,created_at::text AS created,
+                        updated_at::text AS updated,
+                        liquidity_usd::double precision AS liquidity,
+                        market_cap_usd::double precision AS mcap,
+                        holder_count,usd_price::double precision AS price,
+                        (extract(epoch FROM fetched_at)*1000)::bigint AS fetched
+                 FROM public.mints WHERE ($1::text IS NULL OR mint_address>$1)
+                 ORDER BY mint_address LIMIT 8192",&[&after]).await
+                .context("restore mint catalog")?;
+            if rows.is_empty(){break;}
+            for row in rows {
+                let addr:String=row.get("mint_address");
+                let program:Option<String>=row.get("token_program");
+                let decimal:Option<i16>=row.get("decimals");
+                let holders:Option<i64>=row.get("holder_count");
+                let fetched:Option<i64>=row.get("fetched");
+                result.push(MintState{
+                    address:pubkey(&addr)?,
+                    token_program:program.as_deref().map(pubkey).transpose()?,
+                    decimals:decimal.map(u8::try_from).transpose()?,
+                    created_at:row.get("created"),
+                    updated_at:row.get("updated"),
+                    liquidity_usd:row.get("liquidity"),
+                    market_cap_usd:row.get("mcap"),
+                    holder_count:holders.map(u64::try_from).transpose()?,
+                    usd_price:row.get("price"),
+                    fetched_at_ms:fetched.map(u64::try_from).transpose()?.unwrap_or(0),
+                });
+                after=Some(addr);
+            }
+        }
+        crate::log_event!(Info,"persistence restored_mints={} table=public.mints",result.len());
+        Ok(result)
+    }
+
+    /// Sole PostgreSQL writer for Jupiter batches; sources only publish typed DataBatch.
+    pub async fn save_mint_batch(&self,batch:&DataBatch)->Result<u64> {
+        let mut keys=Vec::<String>::new();
+        let mut programs=Vec::<Option<String>>::new();
+        let mut decimals=Vec::<Option<i16>>::new();
+        let mut created=Vec::<Option<String>>::new();
+        let mut updated=Vec::<Option<String>>::new();
+        let mut liquidity=Vec::<Option<String>>::new();
+        let mut mcap=Vec::<Option<String>>::new();
+        let mut holders=Vec::<Option<i64>>::new();
+        let mut prices=Vec::<Option<String>>::new();
+        let mut fetched=Vec::<i64>::new();
+        let amount=|v:Option<&Value>|->Option<String>{
+            let raw=match v? {Value::Number(n)=>n.to_string(),Value::String(s)=>s.clone(),_=>return None};
+            let parsed=raw.parse::<f64>().ok()?;
+            (parsed.is_finite() && parsed>=0.0).then_some(raw)
+        };
+        let date=|v:Option<&Value>|->Option<String>{
+            match v? {Value::Number(n)=>Some(n.to_string()),
+                Value::String(s) if !s.trim().is_empty() && s.len()<=80=>Some(s.clone()),_=>None}
+        };
+        for record in &batch.records {
+            let RecordIdentity::Mint{address}=&record.identity else {continue};
+            let payload=&record.payload;
+            keys.push(address.to_string());
+            programs.push(payload.get("tokenProgram").and_then(Value::as_str)
+                .and_then(|v|v.parse::<Pubkey>().ok()).map(|v|v.to_string()));
+            decimals.push(payload.get("decimals").and_then(Value::as_u64)
+                .and_then(|v|u8::try_from(v).ok()).map(i16::from));
+            created.push(date(payload.get("createdAt")));
+            updated.push(date(payload.get("updatedAt")));
+            liquidity.push(amount(payload.get("liquidity")));
+            mcap.push(amount(payload.get("mcap")));
+            holders.push(payload.get("holderCount").and_then(|v|
+                v.as_u64().or_else(||v.as_str().and_then(|s|s.parse::<u64>().ok())))
+                .and_then(|v|i64::try_from(v).ok()));
+            prices.push(amount(payload.get("usdPrice")));
+            fetched.push(i64::try_from(batch.received_at_ms)?);
+        }
+        if keys.is_empty(){return Ok(0);}
+        self.client.execute(UPSERT_MINT,&[&keys,&programs,&decimals,
+            &created,&updated,&liquidity,&mcap,&holders,&prices,&fetched]).await
+            .context("persist Jupiter mint catalog")
     }
 
     /// Incremental database pages bound SQL-response memory during large restores.
     /// Historical observations are kept separate; live TVL stays unknown on restart.
     pub async fn restore(&self) -> Result<Vec<PoolState>> {
         let mut pools=Vec::new();
-        let mut after:Option<Vec<u8>>=None;
+        let mut after:Option<String>=None;
         let mut prepared=0_usize;
         let mut incomplete=0_usize;
         let mut unknown=0_usize;
         let query=format!(
-            "SELECT pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,planner_version,descriptor::text AS payload, pool_config::text AS config, last_observation::text AS observation
-            FROM {TABLE}
-            WHERE ($1::bytea IS NULL OR pool_address > $1)
-            ORDER BY pool_address LIMIT 8192");
+            "SELECT pool_address,venue,mint_a,mint_b,
+                completion::text AS payload,pool_config::text AS config,
+                tvl_usd::double precision AS historical_tvl,tvl_source,
+                (extract(epoch FROM tvl_observed_at)*1000)::bigint AS observed_ms
+             FROM {TABLE}
+             WHERE ($1::text IS NULL OR pool_address > $1)
+             ORDER BY pool_address LIMIT 8192");
         loop {
             let rows=self.client.query(&query,&[&after]).await
                 .context("read persistence bootstrap page")?;
             if rows.is_empty(){break;}
             for row in rows {
-                let raw_address:Vec<u8>=row.get("pool_address");
+                let raw_address:String=row.get("pool_address");
                 let address=pubkey(&raw_address)?;
-                let a=row.get::<_,Option<Vec<u8>>>("mint_a")
-                    .map(|b|pubkey(&b)).transpose()?;
-                let b=row.get::<_,Option<Vec<u8>>>("mint_b")
-                    .map(|b|pubkey(&b)).transpose()?;
+                let a=row.get::<_,Option<String>>("mint_a").as_deref()
+                    .map(pubkey).transpose()?;
+                let b=row.get::<_,Option<String>>("mint_b").as_deref()
+                    .map(pubkey).transpose()?;
                 ensure!(address!=Pubkey::default() &&
                     a.is_none_or(|v|v!=Pubkey::default()) &&
                     b.is_none_or(|v|v!=Pubkey::default()) &&
                     !(a.is_some() && a==b), "invalid stored pool identity");
                 let venue=venue_from(row.get("venue"))?;
-                let status=status_from(row.get("status"))?;
-                let slot=row.get::<_,Option<i64>>("validated_slot")
-                    .map(|v|u64::try_from(v).context("negative persisted slot")).transpose()?;
-                let version:i32=row.get("descriptor_version");
-                let planner:i32=row.get("planner_version");
-                ensure!((1..=DESCRIPTOR_VERSION).contains(&version) && planner==PLANNER_VERSION,
-                    "unsupported persisted descriptor/planner version pool={address}");
-                let raw_descriptor:Option<String>=row.get("payload");
-                let (manifest,evidence,mints,reason,reason_code,checked_at_ms)=match (status,slot,raw_descriptor) {
-                    (CompletionState::Unknown,None,None) => {
-                        unknown+=1; (None,None,None,None,None,None)
-                    }
-                    (CompletionState::Prepared|CompletionState::Incomplete,Some(slot),Some(raw))=>{
+                let raw_completion:Option<String>=row.get("payload");
+                let (status,slot,manifest,evidence,mints,reason,reason_code,checked_at_ms)=
+                    if let Some(raw)=raw_completion {
                         let a=a.context("completed pool mint A missing")?;
                         let b=b.context("completed pool mint B missing")?;
                         let payload:Value=serde_json::from_str(&raw)
-                            .with_context(||format!("decode descriptor pool={address}"))?;
-                        let decoded=decode_descriptor(address,a,b,status,slot,version,&payload)
-                            .with_context(||format!("restore pool={address}"))?;
-                        if status==CompletionState::Prepared{prepared+=1;}else{incomplete+=1;}
-                        decoded
-                    }
-                    _ => bail!("inconsistent persisted pool status/slot/descriptor: {address}"),
-                };
+                            .with_context(||format!("decode completion pool={address}"))?;
+                        ensure!(payload.is_object(), "completion must be JSON object");
+                        let slot=payload.get("validated_slot").and_then(Value::as_u64)
+                            .context("completion validated_slot missing")?;
+                        let status=if payload.get("manifest").is_some_and(|v|v.is_object()) {
+                            prepared+=1;
+                            CompletionState::Prepared
+                        } else {
+                            ensure!(payload.get("manifest").is_none_or(Value::is_null),
+                                "invalid completion manifest");
+                            incomplete+=1;
+                            CompletionState::Incomplete
+                        };
+                        let (manifest,evidence,mints,reason,reason_code,checked)=
+                            decode_descriptor(address,a,b,slot,&payload)
+                                .with_context(||format!("restore pool={address}"))?;
+                        (status,Some(slot),manifest,evidence,mints,reason,reason_code,checked)
+                    }else{
+                        unknown+=1;
+                        (CompletionState::Unknown,None,None,None,None,None,None,None)
+                    };
                 let raw_config:String=row.get("config");
                 let config:Value=serde_json::from_str(&raw_config)?;
                 ensure!(config.is_object(), "stored pool_config must be an object");
                 let pool_config=if config.as_object().is_some_and(|v|v.is_empty()){
                     None
                 }else{Some(Arc::new(config))};
-                let last_observation=row.get::<_,Option<String>>("observation")
-                    .map(|raw|serde_json::from_str::<Value>(&raw))
-                    .transpose()?
-                    .map(Arc::new);
-                ensure!(last_observation.as_ref().is_none_or(|v|v.is_object()),
-                    "stored observation must be an object");
-                let first_seen_ms=last_observation.as_ref()
-                    .and_then(|v|v.get("first_seen_ms"))
-                    .and_then(Value::as_u64).unwrap_or(0);
+                let historical_tvl:Option<f64>=row.get("historical_tvl");
+                let tvl_source:Option<String>=row.get("tvl_source");
+                let observed_ms:Option<i64>=row.get("observed_ms");
+                let last_observation=if let (Some(value),Some(source),Some(at))=
+                    (historical_tvl,tvl_source,observed_ms) {
+                    Some(Arc::new(json!({"tvl_usd":value,"source":source,
+                        "observed_at_ms":at})))
+                } else {None};
                 pools.push(PoolState{
                     address,venue,mint_a:a,mint_b:b,source:"persistence_restore",
-                    first_seen_ms,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
+                    first_seen_ms:0,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
                     completion_admission:CompletionAdmission::from_inputs(a,b,None),
                     pool_config,last_observation,
                     completion_state:status,completion_validated_slot:slot,
@@ -510,35 +524,33 @@ impl Persistence {
             let mut mint_a=Vec::with_capacity(batch.len());
             let mut mint_b=Vec::with_capacity(batch.len());
             let mut configs=Vec::with_capacity(batch.len());
-            let mut observations=Vec::with_capacity(batch.len());
+            let mut tvls=Vec::with_capacity(batch.len());
+            let mut sources=Vec::with_capacity(batch.len());
+            let mut tvl_times=Vec::with_capacity(batch.len());
             for pool in &batch {
-                addresses.push(pool.address.to_bytes().to_vec());
+                addresses.push(pool.address.to_string());
                 venues.push(venue_code(pool.venue));
-                mint_a.push(bytes_key(pool.mint_a));
-                mint_b.push(bytes_key(pool.mint_b));
+                mint_a.push(pool.mint_a.map(|m|m.to_string()));
+                mint_b.push(pool.mint_b.map(|m|m.to_string()));
                 configs.push(encoded_config(pool)?);
-                observations.push(encoded_observation(pool));
+                let (tvl,source,at)=observation_values(pool)?;
+                tvls.push(tvl);sources.push(source);tvl_times.push(at);
             }
             let changed=match kind {
                 WriteKind::Identity=>{
                     self.client.execute(UPSERT_IDENTITY,&[
-                        &addresses,&venues,&mint_a,&mint_b,&configs,&observations
+                        &addresses,&venues,&mint_a,&mint_b,&configs,&tvls,&sources,
+                        &tvl_times,
                     ]).await.context("batch upsert pool identities")?
                 }
                 WriteKind::Completion=>{
-                    let mut states=Vec::with_capacity(batch.len());
-                    let mut slots=Vec::with_capacity(batch.len());
-                    let mut descriptors=Vec::with_capacity(batch.len());
+                    let mut completions=Vec::with_capacity(batch.len());
                     for pool in &batch {
-                        states.push(status_code(pool.completion_state)?);
-                        slots.push(i64::try_from(pool.completion_validated_slot
-                            .context("completed pool missing validation slot")?)
-                            .context("Solana slot exceeds PostgreSQL BIGINT")?);
-                        descriptors.push(encode_descriptor(pool)?);
+                        completions.push(encode_descriptor(pool)?);
                     }
                     self.client.execute(UPSERT_COMPLETION,&[
-                        &addresses,&venues,&mint_a,&mint_b,&states,&slots,&descriptors,
-                        &configs,&observations
+                        &addresses,&venues,&mint_a,&mint_b,&configs,&tvls,&sources,
+                        &tvl_times,&completions,
                     ]).await.context("batch upsert execution completions")?
                 }
             };
@@ -551,7 +563,11 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn run(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>) -> Result<()> {
+    pub async fn run(self,rx:broadcast::Receiver<Arc<PoolUpdateBatch>>) -> Result<()> {
+        self.run_with_mints(rx,None).await
+    }
+    pub async fn run_with_mints(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>,
+        mut mint_rx:Option<broadcast::Receiver<Arc<DataBatch>>>) -> Result<()> {
         use std::collections::HashSet;
         let mut pending_identity=HashMap::with_capacity(BATCH_SIZE);
         let mut pending_completion=HashMap::with_capacity(BATCH_SIZE);
@@ -561,9 +577,17 @@ impl Persistence {
         let mut written_completion=0_usize;
         let mut ticker=interval(WRITE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
+        let mut pool_open=true;
+        while pool_open || mint_rx.is_some() {
+            let mint_open=mint_rx.is_some();
             tokio::select! {
-                event=rx.recv()=>match event {
+                event=async {mint_rx.as_mut().expect("mint channel").recv().await},if mint_open=>match event {
+                    Ok(batch)=>{self.save_mint_batch(&batch).await?;},
+                    Err(broadcast::error::RecvError::Lagged(n))=>
+                        bail!("mint persistence lost {n} Jupiter batches"),
+                    Err(broadcast::error::RecvError::Closed)=>{mint_rx=None;},
+                },
+                event=rx.recv(),if pool_open=>match event {
                     Ok(batch)=>{
                         match batch.kind {
                             PoolUpdateKind::Source=>{
@@ -600,7 +624,7 @@ impl Persistence {
                     }
                     Err(broadcast::error::RecvError::Lagged(n))=>
                         bail!("persistence lost {n} accepted Registry batches"),
-                    Err(broadcast::error::RecvError::Closed)=>break,
+                    Err(broadcast::error::RecvError::Closed)=>pool_open=false,
                 },
                 _=ticker.tick(), if !pending_identity.is_empty() ||
                     !pending_completion.is_empty()=>{

@@ -1,216 +1,186 @@
-//! CP1: read-only economic mint selection, independent of Prepared graph state.
-//! The database remains the source of truth; no new table or persisted flag.
-use std::{collections::{HashMap, HashSet}, env, sync::Arc, time::Duration};
-use anyhow::{Context, Result};
+//! Central RAM Mint Registry: discovery identities + Jupiter economic updates.
+//! No PostgreSQL, REST transport or Graph dependencies.
+//! Persistence is the only durable owner; restored MintState is injected on boot.
+use std::{collections::{HashMap,HashSet},sync::{Arc,RwLock},time::Duration};
+use anyhow::{Result,ensure};
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, time::{interval, MissedTickBehavior}};
-use tokio_postgres::NoTls;
-use crate::core::{DataBatch, PoolUpdateBatch, RecordIdentity};
+use serde_json::Value;
+use tokio::sync::{broadcast,watch};
+use crate::core::{DataBatch,MintState,PoolState,PoolUpdateBatch,RecordIdentity};
 
-const SELECT_QUALIFIED: &str = r#"
-WITH edges AS (
-    SELECT mint_a AS mint FROM public.liq_graph_pool_cache WHERE mint_a IS NOT NULL
-    UNION ALL
-    SELECT mint_b AS mint FROM public.liq_graph_pool_cache WHERE mint_b IS NOT NULL
-), topology AS (
-    SELECT mint, COUNT(*) AS pools FROM edges GROUP BY mint
-)
-SELECT m.mint_address
-FROM public.liq_graph_mint_catalog m
-JOIN topology t ON t.mint=m.mint_address
-WHERE m.updated_at BETWEEN NOW()-INTERVAL '90 days' AND NOW()
-  AND (t.pools<>1 OR m.created_at IS NULL
-       OR m.created_at < TIMESTAMPTZ '2020-01-01'
-       OR m.created_at > m.updated_at
-       OR m.created_at >= NOW()-INTERVAL '30 days')
-  AND (m.holder_count>=10 OR m.holder_count IS NULL)
-  AND m.liquidity_usd>=2000
-  AND m.market_cap_usd>=10000
-ORDER BY m.mint_address
-"#;
+const MIN_LIQUIDITY_USD:f64=2000.0;
+const MIN_MARKET_CAP_USD:f64=10000.0;
+const MISSING_TARGET_BATCH:usize=20000;
 
-const MAX_PENDING_MINTS: usize = 20_000;
-const SCAN_PAGE_POOLS: i64 = 2_000;
-const PENDING_RETRY_AGE: Duration = Duration::from_secs(900);
-const SCAN_MINT_IDENTITIES: &str = r#"
-SELECT pool_address,mint_a,mint_b
-FROM public.liq_graph_pool_cache
-WHERE pool_address > $1::bytea
-ORDER BY pool_address LIMIT $2
-"#;
-const KNOWN_MINTS: &str = r#"
-SELECT mint_address FROM public.liq_graph_mint_catalog
-WHERE mint_address=ANY($1::bytea[])
-  AND updated_at IS NOT NULL
-  AND liquidity_usd IS NOT NULL
-  AND market_cap_usd IS NOT NULL
-"#;
-
-fn key(bytes: Vec<u8>) -> Result<Pubkey> {
-    let value: [u8;32] = bytes.try_into().map_err(|_|anyhow::anyhow!("invalid mint address length"))?;
-    Ok(Pubkey::new_from_array(value))
+#[derive(Clone,Default)]
+pub struct MintRegistry {
+    entries:Arc<RwLock<HashMap<Pubkey,MintState>>>,
 }
-
-fn env_seconds(name: &str, default: u64) -> Result<u64> {
-    let n=env::var(name).unwrap_or_else(|_|default.to_string()).parse::<u64>()
-        .with_context(||format!("invalid {name}"))?;
-    anyhow::ensure!(n>=10 && n<=86400,"{name} must be 10..86400");
-    Ok(n)
-}
-
-/// Rebuild the economic set at boot, on time boundaries and after catalog changes.
-/// Targeted Jupiter requests share the existing lanes. Indexed reconciliation
-/// also catches restored / overflowed pool identities without triggering a
-/// remote full-catalogue backfill.
-pub async fn run(
-    mut pool_updates: broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    mut jupiter_updates: broadcast::Receiver<Arc<DataBatch>>,
-    qualified_tx: watch::Sender<Arc<[Pubkey]>>,
-    jupiter_targets: watch::Sender<Arc<[Pubkey]>>,
-) -> Result<()> {
-    let url=env::var("LIQ_GRAPH_DATABASE_URL").or_else(|_|env::var("DATABASE_URL"))
-        .context("CP1 qualification requires LIQ_GRAPH_DATABASE_URL or DATABASE_URL")?;
-    let (db,connection)=tokio_postgres::connect(&url,NoTls).await
-        .context("qualification Postgres connect")?;
-    tokio::spawn(async move {
-        if let Err(e)=connection.await {crate::log_event!(Error,"qualification database connection error={e:#}");}
-    });
-    let refresh_secs=env_seconds("MINT_QUALIFICATION_REFRESH_SECONDS",60)?;
-    let mut pulse=interval(Duration::from_secs(10));
-    pulse.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut qualified=Arc::<[Pubkey]>::from([]);
-    // Bounded in-flight catalogue misses, not a permanent "seen" cache.
-    // Persisted pool identities are scanned with a PK cursor so even updates
-    // missed at capacity (and pools restored after a restart) are revisited.
-    let mut candidate_missing=HashMap::<Pubkey,tokio::time::Instant>::new();
-    let mut pool_cursor=vec![0_u8;32];
-    let mut scan_pools=0_u64;
-    let mut dirty=true;
-    let mut elapsed=refresh_secs;
-    loop {
-        tokio::select! {
-            event=pool_updates.recv()=>{
-                match event {
-                    Ok(batch)=>{
-                        // TVL-only enrichment cannot introduce new mint identities.
-                        // Do not turn price refreshes into Jupiter queue churn.
-                        if batch.source=="dexscreener_token_pairs"
-                            || batch.source=="tvl_freshness" {continue}
-                        // Even an existing pool can gain previously unknown mint identities.
-                        for p in &batch.pools {
-                            for mint in [p.mint_a,p.mint_b].into_iter().flatten() {
-                                if candidate_missing.len()<MAX_PENDING_MINTS {
-                                    candidate_missing.entry(mint).or_insert_with(tokio::time::Instant::now);
-                                }
-                            }
-                        }
-                        dirty=true;
-                    },
-                    Err(broadcast::error::RecvError::Lagged(n))=>{
-                        // Only this receiver missed the broadcast updates. The existing
-                        // cursor scan revisits persisted pool identities; a catalogue
-                        // refresh also reconciles the current qualified mint set.
-                        // This is not proof that any mint identity was lost permanently.
-                        dirty=true;
-                        crate::log_event!(Warn,
-                            "mint qualification registry_lagged missed_batches={n} reconciliation=periodic_sql");
-                    },
-                    Err(broadcast::error::RecvError::Closed)=>break,
-                }
-            },
-            event=jupiter_updates.recv()=>{
-                match event {
-                    Ok(batch)=>{
-                        if batch.records.iter().any(|r|matches!(&r.identity,RecordIdentity::Mint{..})) {
-                            dirty=true;
-                        }
-                    },
-                    Err(broadcast::error::RecvError::Lagged(_))=>{
-                        // The periodic SQL snapshot remains authoritative.
-                        dirty=true;
-                    },
-                    Err(broadcast::error::RecvError::Closed)=>break,
-                }
-            },
-            _=pulse.tick()=>{
-                elapsed=elapsed.saturating_add(10);
-                // Absence of an API result must not block reconciliation forever.
-                // Expired misses will be rediscovered on subsequent PK scans.
-                candidate_missing.retain(|_,enqueued|
-                    enqueued.elapsed()<PENDING_RETRY_AGE);
-                if candidate_missing.len()<MAX_PENDING_MINTS {
-                    let rows=db.query(SCAN_MINT_IDENTITIES,
-                        &[&pool_cursor,&SCAN_PAGE_POOLS]).await
-                        .context("scan persisted pool identities for missing Jupiter mints")?;
-                    if rows.is_empty() {
-                        pool_cursor=vec![0_u8;32];
-                        crate::log_event!(Info,
-                            "mint qualification reconciliation_wrap scanned_pools={scan_pools}");
-                        scan_pools=0;
-                    } else {
-                        let mut found=HashSet::<Pubkey>::new();
-                        for row in &rows {
-                            pool_cursor=row.get::<_,Vec<u8>>(0);
-                            for column in [1_usize,2_usize] {
-                                if let Some(bytes)=row.get::<_,Option<Vec<u8>>>(column) {
-                                    let mint=key(bytes)?;
-                                    if !candidate_missing.contains_key(&mint) {
-                                        found.insert(mint);
-                                    }
-                                }
-                            }
-                        }
-                        scan_pools+=rows.len() as u64;
-                        if !found.is_empty() {
-                            let keys=found.iter().map(|m|m.to_bytes().to_vec()).collect::<Vec<_>>();
-                            let complete=db.query(KNOWN_MINTS,&[&keys]).await
-                                .context("check reconciled Jupiter catalog records")?;
-                            for row in complete {
-                                found.remove(&key(row.get::<_,Vec<u8>>(0))?);
-                            }
-                            for mint in found {
-                                if candidate_missing.len()>=MAX_PENDING_MINTS {break}
-                                candidate_missing.entry(mint)
-                                    .or_insert_with(tokio::time::Instant::now);
-                            }
-                        }
-                    }
-                }
-                if elapsed>=refresh_secs || (dirty && elapsed>=30) {
-                    let rows=db.query(SELECT_QUALIFIED,&[]).await.context("qualify Jupiter catalog")?;
-                    let mut v=Vec::with_capacity(rows.len());
-                    for row in rows {v.push(key(row.get::<_,Vec<u8>>(0))?);}
-                    let new: Arc<[Pubkey]>=Arc::from(v);
-                    if new.as_ref()!=qualified.as_ref() {
-                        qualified=new;
-                        qualified_tx.send_replace(qualified.clone());
-                    }
-                    elapsed=0;
-                    dirty=false;
-                    crate::log_event!(Info,"mint qualification published qualified={} pending_candidates={}",
-                        qualified.len(),candidate_missing.len());
-                }
-                // Check only NEW registry mint addresses against the existing catalog.
-                // No full-table Jupiter scan is required for these requests.
-                if !candidate_missing.is_empty() {
-                    let keys:Vec<Vec<u8>>=candidate_missing.keys().map(|m|m.to_bytes().to_vec()).collect();
-                    let known=db.query(KNOWN_MINTS,&[&keys]).await
-                        .context("check targeted Jupiter catalog misses")?;
-                    for row in known {
-                        candidate_missing.remove(&key(row.get::<_,Vec<u8>>(0))?);
-                    }
-                }
-                let mut targets=Vec::with_capacity(candidate_missing.len()+qualified.len());
-                let mut missing:Vec<_>=candidate_missing.keys().copied().collect();
-                missing.sort_unstable();
-                targets.extend(missing);
-                targets.extend(qualified.iter().copied().filter(|mint|!candidate_missing.contains_key(mint)));
-                let next:Arc<[Pubkey]>=Arc::from(targets);
-                if next.as_ref()!=jupiter_targets.borrow().as_ref() {
-                    jupiter_targets.send_replace(next);
-                }
+impl MintRegistry {
+    pub fn restore(rows:Vec<MintState>)->Result<Self> {
+        let mut entries=HashMap::with_capacity(rows.len());
+        for row in rows {
+            ensure!(row.address!=Pubkey::default(),"invalid restored mint identity");
+            ensure!(entries.insert(row.address,row).is_none(),"duplicate restored mint");
+        }
+        Ok(Self{entries:Arc::new(RwLock::new(entries))})
+    }
+    pub fn get(&self,address:Pubkey)->Option<MintState> {
+        self.entries.read().expect("mint registry lock poisoned").get(&address).cloned()
+    }
+    pub fn snapshot(&self)->Vec<MintState> {
+        self.entries.read().expect("mint registry lock poisoned").values().cloned().collect()
+    }
+    fn apply(&self,batch:&DataBatch)->Vec<Pubkey> {
+        fn amount(v:Option<&Value>)->Option<f64> {
+            let v=v?;
+            let n=v.as_f64().or_else(||v.as_str()?.parse::<f64>().ok())?;
+            (n.is_finite()&&n>=0.0).then_some(n)
+        }
+        fn date(v:Option<&Value>)->Option<String> {
+            match v? {
+                Value::Number(n)=>Some(n.to_string()),
+                Value::String(s) if !s.trim().is_empty()=>Some(s.clone()),
+                _=>None,
             }
         }
+        let mut entries=self.entries.write().expect("mint registry lock poisoned");
+        let mut changed=Vec::new();
+        for record in &batch.records {
+            let RecordIdentity::Mint{address}=&record.identity else{continue};
+            let v=&record.payload;
+            let previous=entries.get(address);
+            if previous.is_some_and(|v|v.fetched_at_ms>batch.received_at_ms){continue;}
+            let state=MintState{
+                address:*address,
+                token_program:v.get("tokenProgram").and_then(Value::as_str)
+                    .and_then(|s|s.parse::<Pubkey>().ok())
+                    .or_else(||previous.and_then(|v|v.token_program)),
+                decimals:v.get("decimals").and_then(Value::as_u64)
+                    .and_then(|n|u8::try_from(n).ok())
+                    .or_else(||previous.and_then(|v|v.decimals)),
+                created_at:date(v.get("createdAt"))
+                    .or_else(||previous.and_then(|v|v.created_at.clone())),
+                updated_at:date(v.get("updatedAt"))
+                    .or_else(||previous.and_then(|v|v.updated_at.clone())),
+                liquidity_usd:amount(v.get("liquidity")),
+                market_cap_usd:amount(v.get("mcap")),
+                holder_count:v.get("holderCount").and_then(|v|
+                    v.as_u64().or_else(||v.as_str().and_then(|s|s.parse::<u64>().ok()))),
+                usd_price:amount(v.get("usdPrice")),
+                fetched_at_ms:batch.received_at_ms,
+            };
+            entries.insert(*address,state);
+            changed.push(*address);
+        }
+        changed
+    }
+}
+fn eligible(v:&MintState)->bool {
+    v.liquidity_usd.is_some_and(|n|n>=MIN_LIQUIDITY_USD)
+        && v.market_cap_usd.is_some_and(|n|n>=MIN_MARKET_CAP_USD)
+}
+
+/// One authoritative continuously updated economic set. Registry signals only
+/// add mint identities; their economic state is owned by the RAM Mint Registry.
+/// Jupiter is given new/missing and qualified mints; no database scan is needed.
+pub async fn run(
+    restored_pools:Vec<PoolState>,
+    mints:MintRegistry,
+    mut pool_updates:broadcast::Receiver<Arc<PoolUpdateBatch>>,
+    mut jupiter_updates:broadcast::Receiver<Arc<DataBatch>>,
+    qualified_tx:watch::Sender<Arc<[Pubkey]>>,
+    jupiter_targets:watch::Sender<Arc<[Pubkey]>>,
+)->Result<()> {
+    let mut known=HashSet::<Pubkey>::new();
+    for pool in restored_pools {
+        for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){known.insert(mint);}
+    }
+    let mut qualified=HashSet::<Pubkey>::new();
+    for state in mints.snapshot(){if known.contains(&state.address)&&eligible(&state){
+        qualified.insert(state.address);
+    }}
+    let mut ticker=tokio::time::interval(Duration::from_secs(10));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut missing_cursor=0_usize;
+    let mut dirty=true;
+    let mut pool_open=true;
+    let mut jupiter_open=true;
+    loop {
+        tokio::select! {
+            event=pool_updates.recv(),if pool_open=>match event {
+                Ok(batch)=>{
+                    for pool in &batch.pools {
+                        for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){
+                            if known.insert(mint) {
+                                if mints.get(mint).as_ref().is_some_and(eligible) {
+                                    qualified.insert(mint);
+                                }
+                                dirty=true;
+                            }
+                        }
+                    }
+                },
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    anyhow::bail!("mint registry lost {n} pool updates; cannot infer undiscovered identities"),
+                Err(broadcast::error::RecvError::Closed)=>pool_open=false,
+            },
+            event=jupiter_updates.recv(),if jupiter_open=>match event {
+                Ok(batch)=>{
+                    for mint in mints.apply(&batch){
+                        if !known.contains(&mint){continue;}
+                        if mints.get(mint).as_ref().is_some_and(eligible){
+                            qualified.insert(mint);
+                        }else{
+                            qualified.remove(&mint);
+                        }
+                        dirty=true;
+                    }
+                },
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    anyhow::bail!("mint registry lost {n} Jupiter economic updates"),
+                Err(broadcast::error::RecvError::Closed)=>jupiter_open=false,
+            },
+            _=ticker.tick()=>{
+                if dirty {
+                    let mut v=qualified.iter().copied().collect::<Vec<_>>();
+                    v.sort_unstable();
+                    let next:Arc<[Pubkey]>=Arc::from(v);
+                    if next.as_ref()!=qualified_tx.borrow().as_ref(){
+                        qualified_tx.send_replace(next);
+                    }
+                    dirty=false;
+                }
+                // High priority: qualified mints continuously refreshed.
+                let mut targets=qualified.iter().copied().collect::<Vec<_>>();
+                targets.sort_unstable();
+                let mut missing=known.iter().copied().filter(|a|mints.get(*a).is_none())
+                    .collect::<Vec<_>>();
+                missing.sort_unstable();
+                if !missing.is_empty(){
+                    if missing_cursor>=missing.len(){missing_cursor=0;}
+                    for i in 0..MISSING_TARGET_BATCH.min(missing.len()){
+                        targets.push(missing[(missing_cursor+i)%missing.len()]);
+                    }
+                    missing_cursor=(missing_cursor+MISSING_TARGET_BATCH)%missing.len();
+                }
+                targets.sort_unstable();targets.dedup();
+                let next:Arc<[Pubkey]>=Arc::from(targets);
+                if next.as_ref()!=jupiter_targets.borrow().as_ref(){
+                    jupiter_targets.send_replace(next);
+                }
+                let (catalog_mints, holders_known, usd_prices_known)={
+                    let guard=mints.entries.read().expect("mint lock");
+                    (guard.len(),
+                     guard.values().filter(|v|v.holder_count.is_some()).count(),
+                     guard.values().filter(|v|v.usd_price.is_some()).count())
+                };
+                crate::log_event!(Info,"mint registry pools_mints={} catalog_mints={} qualified={} refresh_targets={} holders_known={} prices_known={}",
+                    known.len(),catalog_mints,qualified.len(),jupiter_targets.borrow().len(),
+                    holders_known,usd_prices_known);
+            }
+        }
+        if !pool_open&&!jupiter_open{break;}
     }
     Ok(())
 }

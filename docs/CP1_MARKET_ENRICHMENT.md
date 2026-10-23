@@ -1,3 +1,9 @@
+> **Historische CP1-Dokumentation (vor CP3).** Der aktuelle Branch
+> `cp3-central-persistence-dual-registry` ersetzt SQL-Mint-Qualifikation,
+> `last_observation` und die BYTEA-Tabellen durch RAM-Mint-Registry und
+> `public.mints` / `public.pools`. Diese alten CP1-Verträge/Testqueries
+> sind keine gültige CP3-Abnahme. Siehe `docs/CP3_CENTRAL_PERSISTENCE.md`.
+
 # CP1 – Mint-Qualifizierung und Pool-TVL-Enrichment
 
 Umfang: Jupiter (gezielte neue/unvollständige Mints), SQL-Qualifizierung,
@@ -85,17 +91,11 @@ Das ist ein **lokaler, inkrementeller SQL-Scan**, kein Jupiter-API-Vollbackfill.
 SELECT
     venue,
     COUNT(*) AS pools,
-    COUNT(*) FILTER (
-      WHERE last_observation->>'tvl_usd' IS NOT NULL
-    ) AS pools_with_persisted_tvl,
-    COUNT(*) FILTER (
-      WHERE last_observation->>'source' = 'dexscreener_token_pairs'
-    ) AS last_tvl_from_dexscreener,
-    COUNT(*) FILTER (
-      WHERE last_observation->>'source' IS NOT NULL
-        AND last_observation->>'source' <> 'dexscreener_token_pairs'
-    ) AS last_tvl_from_other_sources
-FROM public.liq_graph_pool_cache
+    COUNT(*) FILTER (WHERE tvl_usd IS NOT NULL) AS pools_with_persisted_tvl,
+    COUNT(*) FILTER (WHERE tvl_source = 'dexscreener_token_pairs') AS last_tvl_from_dexscreener,
+    COUNT(*) FILTER (WHERE tvl_source IS NOT NULL
+                     AND tvl_source <> 'dexscreener_token_pairs') AS last_tvl_from_other_sources
+FROM public.pools
 GROUP BY venue ORDER BY venue;
 ```
 

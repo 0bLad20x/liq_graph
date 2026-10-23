@@ -108,6 +108,22 @@ pub fn now_unix_ms() -> Result<u64> {
     Ok(u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?)
 }
 
+/// Persisted economic/static mint state shared by Mint Registry and Persistence.
+/// Values are optional when the provider cannot attest them; absence is not zero.
+#[derive(Clone, Debug)]
+pub struct MintState {
+    pub address: Pubkey,
+    pub token_program: Option<Pubkey>,
+    pub decimals: Option<u8>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub liquidity_usd: Option<f64>,
+    pub market_cap_usd: Option<f64>,
+    pub holder_count: Option<u64>,
+    pub usd_price: Option<f64>,
+    pub fetched_at_ms: u64,
+}
+
 /// Generic HTTP client; no DEX or protocol logic.
 pub fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
