@@ -494,7 +494,7 @@ impl Persistence {
                 Value::String(s) if !s.trim().is_empty() && s.len()<=80=>Some(s.clone()),_=>None}
         };
         for record in &batch.records {
-            let RecordIdentity::Mint{address}=record.identity else {continue};
+            let RecordIdentity::Mint{address}=&record.identity else {continue};
             let payload=&record.payload;
             keys.push(address.to_string());
             programs.push(payload.get("tokenProgram").and_then(Value::as_str)
