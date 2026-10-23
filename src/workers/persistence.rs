@@ -701,8 +701,9 @@ impl Persistence {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut pool_open=true;
         while pool_open || mint_rx.is_some() {
+            let mint_open=mint_rx.is_some();
             tokio::select! {
-                event=async {mint_rx.as_mut().expect("checked").recv().await},if mint_rx.is_some()=>match event {
+                event=async {mint_rx.as_mut().expect("mint channel").recv().await},if mint_open=>match event {
                     Ok(batch)=>{self.save_mint_batch(&batch).await?;},
                     Err(broadcast::error::RecvError::Lagged(n))=>
                         bail!("mint persistence lost {n} Jupiter batches"),
