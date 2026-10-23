@@ -309,9 +309,6 @@ fn encoded_config(pool:&PoolState) -> Result<String> {
     Ok(config.map(ToString::to_string).unwrap_or_else(||"{}".into()))
 }
 
-fn timestamp_ms(ms:u64)->Result<Option<i64>> {
-    if ms==0 {Ok(None)} else {Ok(Some(i64::try_from(ms).context("timestamp overflow")?))}
-}
 fn observation_values(pool:&PoolState)->Result<(Option<String>,Option<String>,Option<i64>)> {
     let observation=pool.last_observation.as_deref();
     let tvl=pool.tvl_usd.or_else(||observation.and_then(|v|v.get("tvl_usd")).and_then(Value::as_f64));
@@ -435,16 +432,13 @@ impl Persistence {
         let mut incomplete=0_usize;
         let mut unknown=0_usize;
         let query=format!(
-            "SELECT pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,planner_version,
-                descriptor::text AS payload, pool_config::text AS config,
+            "SELECT pool_address,venue,mint_a,mint_b,
+                completion::text AS payload,pool_config::text AS config,
                 tvl_usd::double precision AS historical_tvl,tvl_source,
-                (extract(epoch FROM tvl_observed_at)*1000)::bigint AS observed_ms,
-                (extract(epoch FROM first_seen_at)*1000)::bigint AS first_seen_ms,
-                completion_reason_code,
-                (extract(epoch FROM completion_checked_at)*1000)::bigint AS completion_checked_ms
-            FROM {TABLE}
-            WHERE ($1::text IS NULL OR pool_address > $1)
-            ORDER BY pool_address LIMIT 8192");
+                (extract(epoch FROM tvl_observed_at)*1000)::bigint AS observed_ms
+             FROM {TABLE}
+             WHERE ($1::text IS NULL OR pool_address > $1)
+             ORDER BY pool_address LIMIT 8192");
         loop {
             let rows=self.client.query(&query,&[&after]).await
                 .context("read persistence bootstrap page")?;
@@ -461,34 +455,33 @@ impl Persistence {
                     b.is_none_or(|v|v!=Pubkey::default()) &&
                     !(a.is_some() && a==b), "invalid stored pool identity");
                 let venue=venue_from(row.get("venue"))?;
-                let status=status_from(row.get("status"))?;
-                let slot=row.get::<_,Option<i64>>("validated_slot")
-                    .map(|v|u64::try_from(v).context("negative persisted slot")).transpose()?;
-                let version:i32=row.get("descriptor_version");
-                let planner:i32=row.get("planner_version");
-                ensure!((1..=DESCRIPTOR_VERSION).contains(&version) && planner==PLANNER_VERSION,
-                    "unsupported persisted descriptor/planner version pool={address}");
-                let raw_descriptor:Option<String>=row.get("payload");
-                let (manifest,evidence,mints,reason,reason_code,checked_at_ms)=match (status,slot,raw_descriptor) {
-                    (CompletionState::Unknown,None,None) => {
-                        unknown+=1; (None,None,None,None,None,None)
-                    }
-                    (CompletionState::Prepared|CompletionState::Incomplete,Some(slot),Some(raw))=>{
+                let raw_completion:Option<String>=row.get("payload");
+                let (status,slot,manifest,evidence,mints,reason,reason_code,checked_at_ms)=
+                    if let Some(raw)=raw_completion {
                         let a=a.context("completed pool mint A missing")?;
                         let b=b.context("completed pool mint B missing")?;
                         let payload:Value=serde_json::from_str(&raw)
-                            .with_context(||format!("decode descriptor pool={address}"))?;
-                        let typed_reason:Option<String>=row.get("completion_reason_code");
-                        let typed_checked=row.get::<_,Option<i64>>("completion_checked_ms")
-                            .map(u64::try_from).transpose()?;
-                        let decoded=decode_descriptor(address,a,b,status,slot,version,&payload,
-                            typed_reason,typed_checked)
-                            .with_context(||format!("restore pool={address}"))?;
-                        if status==CompletionState::Prepared{prepared+=1;}else{incomplete+=1;}
-                        decoded
-                    }
-                    _ => bail!("inconsistent persisted pool status/slot/descriptor: {address}"),
-                };
+                            .with_context(||format!("decode completion pool={address}"))?;
+                        ensure!(payload.is_object(), "completion must be JSON object");
+                        let slot=payload.get("validated_slot").and_then(Value::as_u64)
+                            .context("completion validated_slot missing")?;
+                        let status=if payload.get("manifest").is_some_and(|v|v.is_object()) {
+                            prepared+=1;
+                            CompletionState::Prepared
+                        } else {
+                            ensure!(payload.get("manifest").is_none_or(Value::is_null),
+                                "invalid completion manifest");
+                            incomplete+=1;
+                            CompletionState::Incomplete
+                        };
+                        let (manifest,evidence,mints,reason,reason_code,checked)=
+                            decode_descriptor(address,a,b,slot,&payload)
+                                .with_context(||format!("restore pool={address}"))?;
+                        (status,Some(slot),manifest,evidence,mints,reason,reason_code,checked)
+                    }else{
+                        unknown+=1;
+                        (CompletionState::Unknown,None,None,None,None,None,None,None)
+                    };
                 let raw_config:String=row.get("config");
                 let config:Value=serde_json::from_str(&raw_config)?;
                 ensure!(config.is_object(), "stored pool_config must be an object");
@@ -498,16 +491,14 @@ impl Persistence {
                 let historical_tvl:Option<f64>=row.get("historical_tvl");
                 let tvl_source:Option<String>=row.get("tvl_source");
                 let observed_ms:Option<i64>=row.get("observed_ms");
-                let first_seen_ms:u64=row.get::<_,Option<i64>>("first_seen_ms")
-                    .map_or(Ok(0),|v|u64::try_from(v).context("negative first_seen_ms"))?;
                 let last_observation=if let (Some(value),Some(source),Some(at))=
                     (historical_tvl,tvl_source,observed_ms) {
                     Some(Arc::new(json!({"tvl_usd":value,"source":source,
-                        "observed_at_ms":at,"first_seen_ms":first_seen_ms})))
+                        "observed_at_ms":at})))
                 } else {None};
                 pools.push(PoolState{
                     address,venue,mint_a:a,mint_b:b,source:"persistence_restore",
-                    first_seen_ms,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
+                    first_seen_ms:0,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
                     completion_admission:CompletionAdmission::from_inputs(a,b,None),
                     pool_config,last_observation,
                     completion_state:status,completion_validated_slot:slot,
@@ -536,8 +527,6 @@ impl Persistence {
             let mut tvls=Vec::with_capacity(batch.len());
             let mut sources=Vec::with_capacity(batch.len());
             let mut tvl_times=Vec::with_capacity(batch.len());
-            let mut first_seen=Vec::with_capacity(batch.len());
-            let mut last_seen=Vec::with_capacity(batch.len());
             for pool in &batch {
                 addresses.push(pool.address.to_string());
                 venues.push(venue_code(pool.venue));
@@ -546,36 +535,22 @@ impl Persistence {
                 configs.push(encoded_config(pool)?);
                 let (tvl,source,at)=observation_values(pool)?;
                 tvls.push(tvl);sources.push(source);tvl_times.push(at);
-                first_seen.push(timestamp_ms(pool.first_seen_ms)?);
-                last_seen.push(timestamp_ms(pool.last_seen_ms)?);
             }
             let changed=match kind {
                 WriteKind::Identity=>{
                     self.client.execute(UPSERT_IDENTITY,&[
                         &addresses,&venues,&mint_a,&mint_b,&configs,&tvls,&sources,
-                        &tvl_times,&first_seen,&last_seen,
+                        &tvl_times,
                     ]).await.context("batch upsert pool identities")?
                 }
                 WriteKind::Completion=>{
-                    let mut states=Vec::with_capacity(batch.len());
-                    let mut slots=Vec::with_capacity(batch.len());
-                    let mut descriptors=Vec::with_capacity(batch.len());
-                    let mut checked=Vec::with_capacity(batch.len());
-                    let mut reasons=Vec::with_capacity(batch.len());
+                    let mut completions=Vec::with_capacity(batch.len());
                     for pool in &batch {
-                        states.push(status_code(pool.completion_state)?);
-                        slots.push(i64::try_from(pool.completion_validated_slot
-                            .context("completed pool missing validation slot")?)
-                            .context("Solana slot exceeds PostgreSQL BIGINT")?);
-                        descriptors.push(encode_descriptor(pool)?);
-                        checked.push(pool.completion_checked_at_ms.map(i64::try_from).transpose()?);
-                        reasons.push(pool.completion_reason_code.map(|r|serde_json::to_value(r))
-                            .transpose()?.and_then(|v|v.as_str().map(str::to_owned)));
+                        completions.push(encode_descriptor(pool)?);
                     }
                     self.client.execute(UPSERT_COMPLETION,&[
-                        &addresses,&venues,&mint_a,&mint_b,&states,&slots,&descriptors,
-                        &configs,&tvls,&sources,&tvl_times,&first_seen,&last_seen,
-                        &checked,&reasons,
+                        &addresses,&venues,&mint_a,&mint_b,&configs,&tvls,&sources,
+                        &tvl_times,&completions,
                     ]).await.context("batch upsert execution completions")?
                 }
             };
