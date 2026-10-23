@@ -10,7 +10,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/cp2-lifecycle-final", "main") -or $tracked) {
+if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/cp2-lifecycle-final", "main", "cp3-central-persistence-dual-registry") -or $tracked) {
     throw "Use a clean, committed agent/cp2-lifecycle-final checkout, or main after merging this checkpoint."
 }
 cargo build --locked --release
@@ -132,7 +132,7 @@ if ($requiredVenues -contains "PumpSwap") {
     if (-not $walletRecord.Success) { throw "Missing configured PumpSwap wallet in $log" }
     $pumpWallet = $walletRecord.Groups[1].Value
 }
-$pattern = 'lifecycle accepted .*pool_hex=([0-9a-f]{64}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|Manifest|PumpSwap) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
+$pattern = 'lifecycle accepted .*pool=([1-9A-HJ-NP-Za-km-z]{32,44}) pool_hex=[0-9a-f]{64} venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|Manifest|PumpSwap) work=(Initial|Recheck|Refresh|Retry) status=(Prepared|Incomplete) .*checked_at_ms=Some\(([0-9]+)\) .*slot=Some\(([0-9]+)\)'
 $latest = @{}
 $refreshCounts = @{}
 $acceptedCounts = @{}
@@ -143,15 +143,15 @@ if (-not $finalAccepted.Success -or $proofMatches.Count -ne [long]$finalAccepted
     throw "Accepted proof records differ from final lifecycle accounting; inspect $log"
 }
 foreach ($match in $proofMatches) {
-    $hex = $match.Groups[1].Value
+    $poolAddress = $match.Groups[1].Value
     $protocol = $match.Groups[2].Value
     $status = if ($match.Groups[4].Value -eq "Prepared") { 1 } else { 2 }
     $code = $venueCodes[$protocol]
     $acceptedCounts[$protocol] = 1 + [int]$acceptedCounts[$protocol]
     $walletSql = if ($protocol -eq "PumpSwap") { "'$pumpWallet'::text" } else { "NULL::text" }
-    $latest[$hex] = "(${code}::smallint, '$hex', $($match.Groups[5].Value)::bigint, $($match.Groups[6].Value)::bigint, ${status}::smallint, $walletSql)"
+    $latest[$poolAddress] = "(${code}::smallint, '$poolAddress', $($match.Groups[5].Value)::bigint, $($match.Groups[6].Value)::bigint, ${status}::smallint, $walletSql)"
     if ($match.Groups[3].Value -eq "Refresh" -and $status -eq 1) {
-        $key = "$protocol|$hex"
+        $key = "$protocol|$poolAddress"
         $refreshCounts[$key] = 1 + [int]$refreshCounts[$key]
     } elseif ($match.Groups[3].Value -eq "Refresh" -and $status -eq 2) {
         $refreshWithdrawals++
@@ -174,22 +174,22 @@ $values = ($latest.Values | Sort-Object) -join ",`n    "
 -- CP2 branch=$branch head=$head start_ms=$startMs
 -- Read-only. Run against the same database immediately after this live run.
 -- Expected: proofs_expected = exact_matches; mismatches = 0.
-WITH expected(venue, pool_hex, checked_at_ms, validated_slot, status, wallet) AS (
+WITH expected(venue, pool_address, checked_at_ms, validated_slot, status, wallet) AS (
     VALUES $values
 ), checks AS (
     SELECT e.*, p.pool_address IS NOT NULL
         AND p.venue = e.venue AND p.status = e.status
         AND p.validated_slot = e.validated_slot
-        AND (p.descriptor->>'checked_at_ms')::bigint = e.checked_at_ms
+        AND (extract(epoch FROM p.completion_checked_at)*1000)::bigint = e.checked_at_ms
         AND (e.venue <> 11 OR e.status <> 1
           OR p.descriptor->'evidence'->'payload'->>'v10_wallet' = e.wallet)
-        AND ((e.status = 1 AND p.descriptor->>'reason_code' IS NULL
+        AND ((e.status = 1 AND p.completion_reason_code IS NULL
               AND jsonb_typeof(p.descriptor->'manifest') = 'object')
           OR (e.status = 2 AND p.descriptor->>'reason_code' IS NOT NULL
               AND p.descriptor->>'reason_code' <> 'transient_failure'
               AND p.descriptor->>'manifest' IS NULL)) AS matches
-    FROM expected e LEFT JOIN public.liq_graph_pool_cache p
-      ON p.pool_address = decode(e.pool_hex, 'hex')
+    FROM expected e LEFT JOIN public.pools p
+      ON p.pool_address = e.pool_address
 )
 SELECT COUNT(*) AS proofs_expected,
        COUNT(*) FILTER (WHERE matches IS TRUE) AS exact_matches,
