@@ -43,6 +43,25 @@ fn record_tvl(quotes:&mut HashMap<Pubkey,PoolQuotes>,address:Pubkey,
     select_tvl(state,at)
 }
 
+/// Preserve only protocol-scoped parameters from Discovery, never the full
+/// REST response. Runtime prices/reserves remain observations, not config.
+fn pool_metadata(payload:&Value,source:&str)->Option<Arc<Value>> {
+    if source=="dexscreener_token_pairs" || source=="tvl_freshness" {return None;}
+    let mut fields=serde_json::Map::new();
+    for name in [
+        "bin_step","binStep","base_fee","baseFee","feeRate","tradeFeeRate",
+        "protocolFeeRate","protocol_fee","fee","fees",
+        "tickSpacing","tick_spacing","ammConfig","poolConfig","config",
+    ] {
+        if let Some(value)=payload.get(name).filter(|v|!v.is_null()){
+            fields.insert(name.to_string(),value.clone());
+        }
+    }
+    if fields.is_empty(){return None;}
+    fields.insert("source".to_string(),json!(source));
+    Some(Arc::new(Value::Object(fields)))
+}
+
 /// The write owner is the registry worker. Consumers can only request typed snapshots.
 #[derive(Clone, Default)]
 pub struct PoolRegistry {
@@ -190,6 +209,7 @@ impl PoolRegistry {
             }
 
             let observed_tvl = record.tvl_usd.filter(|v|v.is_finite() && *v>=0.0);
+            let metadata=pool_metadata(&record.payload,batch.source);
             match entries.get_mut(address) {
                 None => {
                     let selected=record_tvl(&mut quotes,*address,batch.source,
@@ -206,7 +226,7 @@ impl PoolRegistry {
                         tvl_usd: selected.map(|v|v.value),
                         completion_admission: CompletionAdmission::from_inputs(
                             *mint_a,*mint_b,selected.map(|v|v.value)),
-                        pool_config: None,
+                        pool_config: metadata.clone(),
                         last_observation: selected.map(|v|Arc::new(json!({
                             "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
                             "first_seen_ms":batch.received_at_ms
@@ -245,6 +265,13 @@ impl PoolRegistry {
                         batch.received_at_ms,observed_tvl);
                     let mut changed = false;
                     let mut identity_changed = false;
+                    if let Some(config)=metadata {
+                        if current.pool_config.as_deref()!=Some(config.as_ref()) {
+                            current.pool_config=Some(config);
+                            changed=true;
+                            identity_changed=true;
+                        }
+                    }
                     if current.mint_a.is_none() && mint_a.is_some() {
                         current.mint_a = *mint_a;
                         changed = true;
