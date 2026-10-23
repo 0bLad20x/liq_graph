@@ -65,7 +65,8 @@ impl MintRegistry {
                     .or_else(||previous.and_then(|v|v.updated_at.clone())),
                 liquidity_usd:amount(v.get("liquidity")),
                 market_cap_usd:amount(v.get("mcap")),
-                holder_count:v.get("holderCount").and_then(Value::as_u64),
+                holder_count:v.get("holderCount").and_then(|v|
+                    v.as_u64().or_else(||v.as_str().and_then(|s|s.parse::<u64>().ok()))),
                 usd_price:amount(v.get("usdPrice")),
                 fetched_at_ms:batch.received_at_ms,
             };
