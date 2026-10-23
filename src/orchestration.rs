@@ -453,6 +453,20 @@ fn spawn_jupiter(
     keepalive: watch::Sender<Arc<[Pubkey]>>,
 ) {
     let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(32);
+    let persistence_rx=output.subscribe();
+    tasks.spawn(async move {
+        let db=persistence::Persistence::connect().await?;
+        let mut rx=persistence_rx;
+        loop {
+            match rx.recv().await {
+                Ok(batch)=>{db.save_mint_batch(&batch).await?;},
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    bail!("legacy Jupiter persistence lost {n} batches"),
+                Err(broadcast::error::RecvError::Closed)=>break,
+            }
+        }
+        Ok(())
+    });
     tasks.spawn(diagnostic_source::run(input, false));
     // Jupiter must outlive a finite graph restore. Its own task retains the
     // watch sender without requiring the catalog producer to stay running.
@@ -537,20 +551,45 @@ pub async fn run() -> Result<()> {
     if args.len()==1 && args[0]=="--completion-lifecycle-live" {
         return runtime::completion_lifecycle_live().await;
     }
-    // Finite standalone Jupiter catalog import. No Graph/Registry/Completion is started.
-    if (args.len() == 1 && args[0] == "--jupiter-mint-backfill")
-        || (args.len() == 2 && args[0] == "--test" && args[1] == "jupiter_mint_backfill")
-    {
-        return source_jupiter_mint::run_backfill(
-            core::http_client()?, source_jupiter_mint::Settings::from_env()?
-        ).await;
+    // Standalone backfill: the source only calls Jupiter; persistence owns SQL.
+    if (args.len()==1 && args[0]=="--jupiter-mint-backfill")
+        || (args.len()==2 && args[0]=="--test" && args[1]=="jupiter_mint_backfill") {
+        let db=persistence::Persistence::connect().await?;
+        let mut mints=std::collections::BTreeSet::<Pubkey>::new();
+        for p in db.restore().await? {
+            if let Some(m)=p.mint_a{mints.insert(m);}
+            if let Some(m)=p.mint_b{mints.insert(m);}
+        }
+        let settings=source_jupiter_mint::Settings::from_env()?;
+        let mut mints=mints.into_iter().collect::<Vec<_>>();
+        if settings.backfill_limit>0{mints.truncate(settings.backfill_limit);}
+        let (out,mut rx)=broadcast::channel::<Arc<core::DataBatch>>(4096);
+        let writer=tokio::spawn(async move {
+            let mut written=0_u64;
+            loop {
+                match rx.recv().await {
+                    Ok(batch)=>written+=db.save_mint_batch(&batch).await?,
+                    Err(broadcast::error::RecvError::Lagged(n))=>
+                        bail!("Jupiter backfill persistence lost {n} batches"),
+                    Err(broadcast::error::RecvError::Closed)=>break,
+                }
+            }
+            crate::log_event!(Info,"jupiter backfill persisted_mints={written}");
+            Ok::<(),anyhow::Error>(())
+        });
+        let result=source_jupiter_mint::run_backfill(core::http_client()?,settings,mints,out).await;
+        writer.await.context("Jupiter persistence task panicked")??;
+        return result;
     }
     // CP2: standalone DexScreener HTTP/proxy source, typed output and local JSONL.
     // No Pool Registry, Completion, Graph or DB writes.
     if (args.len()==1 && args[0]=="--dexscreener-live")
         || (args.len()==2 && args[0]=="--test" && args[1]=="source_dexscreener")
     {
-        return source_dexscreener::live_diagnostic().await;
+        let db=persistence::Persistence::connect().await?;
+        let registry=pool_registry::PoolRegistry::default();
+        registry.restore(db.restore().await?)?;
+        return source_dexscreener::live_diagnostic(registry).await;
     }
     if args.first().map(String::as_str) == Some("--test") {
         ensure!(args.len()>=2,"--test requires a module name");
