@@ -17,8 +17,6 @@ use crate::{
 const TABLE: &str = "public.pools";
 const BATCH_SIZE: usize = 512;
 const WRITE_INTERVAL: Duration = Duration::from_secs(1);
-const DESCRIPTOR_VERSION: i32 = 3;
-const PLANNER_VERSION: i32 = 1;
 
 /// Only the project tables; never drop unrelated schemas or objects.
 const SCHEMA: &str = r#"
@@ -41,28 +39,19 @@ CREATE TABLE IF NOT EXISTS public.pools (
     venue SMALLINT NOT NULL,
     mint_a TEXT NULL,
     mint_b TEXT NULL,
-    first_seen_at TIMESTAMPTZ NULL,
-    last_seen_at TIMESTAMPTZ NULL,
     tvl_usd NUMERIC NULL,
     tvl_source TEXT NULL,
     tvl_observed_at TIMESTAMPTZ NULL,
     pool_config JSONB NOT NULL DEFAULT '{}'::jsonb,
-    status SMALLINT NOT NULL DEFAULT 0 CHECK (status IN (0,1,2)),
-    validated_slot BIGINT NULL CHECK (validated_slot IS NULL OR validated_slot >= 0),
-    descriptor_version INTEGER NOT NULL DEFAULT 3,
-    planner_version INTEGER NOT NULL DEFAULT 1,
-    descriptor JSONB NULL,
-    completion_checked_at TIMESTAMPTZ NULL,
-    completion_reason_code TEXT NULL,
+    completion JSONB NULL,
     CHECK (mint_a IS NULL OR mint_b IS NULL OR mint_a <> mint_b),
-    CHECK (status <> 1 OR (
-        mint_a IS NOT NULL AND mint_b IS NOT NULL
-        AND validated_slot IS NOT NULL AND descriptor IS NOT NULL)),
-    CHECK (status <> 0 OR (validated_slot IS NULL AND descriptor IS NULL))
+    CHECK (completion IS NULL OR jsonb_typeof(completion)='object'),
+    CHECK (completion IS NULL OR
+        (jsonb_typeof(completion->'validated_slot')='number'
+         AND (completion->>'validated_slot')::bigint>=0
+         AND jsonb_typeof(completion->'checked_at_ms')='number'
+         AND (completion->>'checked_at_ms')::bigint>0))
 );
-CREATE INDEX IF NOT EXISTS pools_mint_a_idx ON public.pools(mint_a);
-CREATE INDEX IF NOT EXISTS pools_mint_b_idx ON public.pools(mint_b);
-CREATE INDEX IF NOT EXISTS pools_status_idx ON public.pools(status);
 "#;
 
 const UPSERT_MINT: &str = r#"
@@ -98,22 +87,16 @@ WHERE old.fetched_at IS NULL OR EXCLUDED.fetched_at >= old.fetched_at
 
 const UPSERT_IDENTITY: &str = r#"
 INSERT INTO public.pools AS existing
- (pool_address,venue,mint_a,mint_b,first_seen_at,last_seen_at,
-  tvl_usd,tvl_source,tvl_observed_at,pool_config)
-SELECT d.pool,d.venue,d.a,d.b,
-       CASE WHEN d.first_ms IS NULL THEN NULL ELSE to_timestamp(d.first_ms / 1000.0) END,
-       CASE WHEN d.last_ms IS NULL THEN NULL ELSE to_timestamp(d.last_ms / 1000.0) END,
-       d.tvl::numeric,d.tvl_source,
+ (pool_address,venue,mint_a,mint_b,tvl_usd,tvl_source,tvl_observed_at,pool_config)
+SELECT d.pool,d.venue,d.a,d.b,d.tvl::numeric,d.tvl_source,
        CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END,
        d.config::jsonb
 FROM UNNEST($1::text[],$2::smallint[],$3::text[],$4::text[],
-            $5::text[],$6::text[],$7::text[],$8::bigint[],
-            $9::bigint[],$10::bigint[]) AS d(pool,venue,a,b,config,tvl,tvl_source,tvl_ms,first_ms,last_ms)
+            $5::text[],$6::text[],$7::text[],$8::bigint[])
+  AS d(pool,venue,a,b,config,tvl,tvl_source,tvl_ms)
 ON CONFLICT (pool_address) DO UPDATE SET
     mint_a=COALESCE(existing.mint_a,EXCLUDED.mint_a),
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
-    first_seen_at=COALESCE(existing.first_seen_at,EXCLUDED.first_seen_at),
-    last_seen_at=GREATEST(existing.last_seen_at,EXCLUDED.last_seen_at),
     pool_config=CASE WHEN EXCLUDED.pool_config<>'{}'::jsonb
                      THEN EXCLUDED.pool_config ELSE existing.pool_config END,
     tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
@@ -130,34 +113,17 @@ WHERE existing.venue=EXCLUDED.venue
 
 const UPSERT_COMPLETION: &str = r#"
 INSERT INTO public.pools AS existing
- (pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,
-  planner_version,descriptor,pool_config,first_seen_at,last_seen_at,
-  tvl_usd,tvl_source,tvl_observed_at,completion_checked_at,completion_reason_code)
-SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,3,1,d.descriptor::jsonb,d.config::jsonb,
-       CASE WHEN d.first_ms IS NULL THEN NULL ELSE to_timestamp(d.first_ms / 1000.0) END,
-       CASE WHEN d.last_ms IS NULL THEN NULL ELSE to_timestamp(d.last_ms / 1000.0) END,
+ (pool_address,venue,mint_a,mint_b,completion,pool_config,tvl_usd,tvl_source,tvl_observed_at)
+SELECT d.pool,d.venue,d.a,d.b,d.completion::jsonb,d.config::jsonb,
        d.tvl::numeric,d.tvl_source,
-       CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END,
-       CASE WHEN d.checked_ms IS NULL THEN NULL ELSE to_timestamp(d.checked_ms / 1000.0) END,
-       d.reason
+       CASE WHEN d.tvl_ms IS NULL THEN NULL ELSE to_timestamp(d.tvl_ms / 1000.0) END
 FROM UNNEST($1::text[],$2::smallint[],$3::text[],$4::text[],
-            $5::smallint[],$6::bigint[],$7::text[],$8::text[],
-            $9::text[],$10::text[],$11::bigint[],$12::bigint[],
-            $13::bigint[],$14::bigint[],$15::text[])
-  AS d(pool,venue,a,b,status,slot,descriptor,config,tvl,tvl_source,tvl_ms,
-       first_ms,last_ms,checked_ms,reason)
+            $5::text[],$6::text[],$7::text[],$8::bigint[],$9::text[])
+  AS d(pool,venue,a,b,config,tvl,tvl_source,tvl_ms,completion)
 ON CONFLICT (pool_address) DO UPDATE SET
     mint_a=COALESCE(existing.mint_a,EXCLUDED.mint_a),
     mint_b=COALESCE(existing.mint_b,EXCLUDED.mint_b),
-    status=EXCLUDED.status,
-    validated_slot=EXCLUDED.validated_slot,
-    descriptor_version=EXCLUDED.descriptor_version,
-    planner_version=EXCLUDED.planner_version,
-    descriptor=EXCLUDED.descriptor,
-    completion_checked_at=EXCLUDED.completion_checked_at,
-    completion_reason_code=EXCLUDED.completion_reason_code,
-    first_seen_at=COALESCE(existing.first_seen_at,EXCLUDED.first_seen_at),
-    last_seen_at=GREATEST(existing.last_seen_at,EXCLUDED.last_seen_at),
+    completion=EXCLUDED.completion,
     pool_config=CASE WHEN EXCLUDED.pool_config<>'{}'::jsonb
                   THEN EXCLUDED.pool_config ELSE existing.pool_config END,
     tvl_usd=CASE WHEN EXCLUDED.tvl_observed_at IS NOT NULL
@@ -170,10 +136,9 @@ ON CONFLICT (pool_address) DO UPDATE SET
 WHERE existing.venue=EXCLUDED.venue
   AND (existing.mint_a IS NULL OR existing.mint_a=EXCLUDED.mint_a)
   AND (existing.mint_b IS NULL OR existing.mint_b=EXCLUDED.mint_b)
-  AND (existing.validated_slot IS NULL
-       OR existing.validated_slot < EXCLUDED.validated_slot
-       OR (existing.validated_slot=EXCLUDED.validated_slot
-           AND existing.planner_version<=EXCLUDED.planner_version))
+  AND (existing.completion IS NULL
+       OR (EXCLUDED.completion->>'validated_slot')::bigint >
+          (existing.completion->>'validated_slot')::bigint)
 "#;
 
 fn venue_code(venue: Venue) -> i16 {
@@ -189,23 +154,6 @@ fn venue_from(code: i16) -> Result<Venue> {
         3=>Ok(Venue::RaydiumAmmV4), 4=>Ok(Venue::RaydiumCpmm),
         5=>Ok(Venue::RaydiumClmm), 6=>Ok(Venue::RaydiumStable),
         7=>Ok(Venue::OrcaWhirlpool), 8=>Ok(Venue::PancakeSwapClmm), 9=>Ok(Venue::ByrealClmm), 10=>Ok(Venue::Manifest), 11=>Ok(Venue::PumpSwap), _=>bail!("unsupported persisted venue {code}") }
-}
-
-fn status_code(status: CompletionState) -> Result<i16> {
-    match status {
-        CompletionState::Prepared => Ok(1),
-        CompletionState::Incomplete => Ok(2),
-        CompletionState::Unknown => bail!("Unknown is not a persisted completion result"),
-    }
-}
-
-fn status_from(code: i16) -> Result<CompletionState> {
-    match code {
-        0 => Ok(CompletionState::Unknown),
-        1 => Ok(CompletionState::Prepared),
-        2 => Ok(CompletionState::Incomplete),
-        _ => bail!("invalid persisted completion status {code}"),
-    }
 }
 
 fn pubkey(bytes: &str) -> Result<Pubkey> {
