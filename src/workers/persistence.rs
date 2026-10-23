@@ -17,7 +17,7 @@ use crate::{
 const TABLE: &str = "public.pools";
 const BATCH_SIZE: usize = 512;
 const WRITE_INTERVAL: Duration = Duration::from_secs(1);
-const DESCRIPTOR_VERSION: i32 = 2;
+const DESCRIPTOR_VERSION: i32 = 3;
 const PLANNER_VERSION: i32 = 1;
 
 /// Only the project tables; never drop unrelated schemas or objects.
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS public.pools (
     pool_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     status SMALLINT NOT NULL DEFAULT 0 CHECK (status IN (0,1,2)),
     validated_slot BIGINT NULL CHECK (validated_slot IS NULL OR validated_slot >= 0),
-    descriptor_version INTEGER NOT NULL DEFAULT 2,
+    descriptor_version INTEGER NOT NULL DEFAULT 3,
     planner_version INTEGER NOT NULL DEFAULT 1,
     descriptor JSONB NULL,
     completion_checked_at TIMESTAMPTZ NULL,
@@ -133,7 +133,7 @@ INSERT INTO public.pools AS existing
  (pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,
   planner_version,descriptor,pool_config,first_seen_at,last_seen_at,
   tvl_usd,tvl_source,tvl_observed_at,completion_checked_at,completion_reason_code)
-SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,2,1,d.descriptor::jsonb,d.config::jsonb,
+SELECT d.pool,d.venue,d.a,d.b,d.status,d.slot,3,1,d.descriptor::jsonb,d.config::jsonb,
        CASE WHEN d.first_ms IS NULL THEN NULL ELSE to_timestamp(d.first_ms / 1000.0) END,
        CASE WHEN d.last_ms IS NULL THEN NULL ELSE to_timestamp(d.last_ms / 1000.0) END,
        d.tvl::numeric,d.tvl_source,
@@ -238,7 +238,7 @@ fn decode_accounts(value: &Value, name: &str) -> Result<Arc<[AccountMeta]>> {
 }
 
 fn encode_descriptor(pool: &PoolState) -> Result<String> {
-    let slot = pool.completion_validated_slot.context("completion slot missing")?;
+    pool.completion_validated_slot.context("completion slot missing")?;
     let manifest = pool.execution_manifest.as_ref().map(|m| json!({
         "base_a":encode_accounts(&m.base_a), "base_b":encode_accounts(&m.base_b)
     }));
@@ -252,24 +252,22 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
         "extensions":m.extensions, "unsupported":m.unsupported
     })).collect::<Vec<_>>());
     let payload = json!({
-        "validated_slot":slot,
         "manifest":manifest,
         "bound_signer":pool.execution_manifest.as_ref().and_then(|m|m.bound_signer).map(|wallet|wallet.to_string()),
         "evidence":evidence,
         "mints":mints,
         "reason":pool.completion_reason,
-        "reason_code":pool.completion_reason_code,
-        "checked_at_ms":pool.completion_checked_at_ms,
     });
     Ok(serde_json::to_string(&payload)?)
 }
 
 fn decode_descriptor(
     address: Pubkey, a: Pubkey, b: Pubkey, status: CompletionState, slot: u64,
-    descriptor_version: i32, payload: &Value
+    descriptor_version: i32, payload: &Value,
+    typed_reason: Option<String>, typed_checked_at_ms: Option<u64>
 ) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
              Option<[MintProof;2]>, Option<String>, Option<CompletionReason>, Option<u64>)> {
-    ensure!(payload.get("validated_slot").and_then(Value::as_u64)==Some(slot),
+    ensure!(descriptor_version >= 3 || payload.get("validated_slot").and_then(Value::as_u64)==Some(slot),
         "persisted validated_slot / descriptor mismatch");
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
         let value = &payload["manifest"];
@@ -339,8 +337,13 @@ fn decode_descriptor(
     let reason = payload.get("reason").filter(|v|!v.is_null())
         .map(|v|v.as_str().context("invalid persisted reason").map(str::to_owned))
         .transpose()?;
-    let reason_code=payload.get("reason_code").filter(|v|!v.is_null())
-        .map(|v|serde_json::from_value::<CompletionReason>(v.clone())).transpose()?;
+    let reason_code=if descriptor_version>=3 {
+        typed_reason.map(|s|serde_json::from_value::<CompletionReason>(Value::String(s)))
+            .transpose()?
+    } else {
+        payload.get("reason_code").filter(|v|!v.is_null())
+            .map(|v|serde_json::from_value::<CompletionReason>(v.clone())).transpose()?
+    };
     let reason_code=if status==CompletionState::Incomplete {
         Some(reason_code.unwrap_or_else(||{
             if mints.as_ref().is_some_and(|m|m.iter().any(|p|!p.unsupported.is_empty())) {
@@ -348,9 +351,13 @@ fn decode_descriptor(
             } else {CompletionReason::LegacyUnclassified}
         }))
     } else {reason_code};
-    let checked_at_ms=payload.get("checked_at_ms").filter(|v|!v.is_null())
-        .map(|v|v.as_u64().filter(|at|*at>0).context("invalid completion check timestamp"))
-        .transpose()?;
+    let checked_at_ms=if descriptor_version>=3 {
+        typed_checked_at_ms
+    } else {
+        payload.get("checked_at_ms").filter(|v|!v.is_null())
+            .map(|v|v.as_u64().filter(|at|*at>0).context("invalid completion check timestamp"))
+            .transpose()?
+    };
     ensure!(status!=CompletionState::Prepared || reason_code.is_none(),
         "Prepared descriptor has a failure code");
     ensure!(reason_code!=Some(CompletionReason::TransientFailure),
@@ -529,7 +536,9 @@ impl Persistence {
                 descriptor::text AS payload, pool_config::text AS config,
                 tvl_usd::double precision AS historical_tvl,tvl_source,
                 (extract(epoch FROM tvl_observed_at)*1000)::bigint AS observed_ms,
-                (extract(epoch FROM first_seen_at)*1000)::bigint AS first_seen_ms
+                (extract(epoch FROM first_seen_at)*1000)::bigint AS first_seen_ms,
+                completion_reason_code,
+                (extract(epoch FROM completion_checked_at)*1000)::bigint AS completion_checked_ms
             FROM {TABLE}
             WHERE ($1::text IS NULL OR pool_address > $1)
             ORDER BY pool_address LIMIT 8192");
@@ -566,7 +575,11 @@ impl Persistence {
                         let b=b.context("completed pool mint B missing")?;
                         let payload:Value=serde_json::from_str(&raw)
                             .with_context(||format!("decode descriptor pool={address}"))?;
-                        let decoded=decode_descriptor(address,a,b,status,slot,version,&payload)
+                        let typed_reason:Option<String>=row.get("completion_reason_code");
+                        let typed_checked=row.get::<_,Option<i64>>("completion_checked_ms")
+                            .map(u64::try_from).transpose()?;
+                        let decoded=decode_descriptor(address,a,b,status,slot,version,&payload,
+                            typed_reason,typed_checked)
                             .with_context(||format!("restore pool={address}"))?;
                         if status==CompletionState::Prepared{prepared+=1;}else{incomplete+=1;}
                         decoded
