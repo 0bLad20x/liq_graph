@@ -23,7 +23,7 @@ $finished = Select-String -Path $log -Pattern 'cp1 live complete=true persisted=
 if (-not $finished) { throw "CP1 missing successful live proof; inspect $log" }
 $started = Select-String -Path $log -Pattern 'dexscreener cp1 continuous started=true' | Select-Object -First 1
 if (-not $started) { throw "CP1 continuous DexScreener scheduler did not start" }
-$qualified = Select-String -Path $log -Pattern 'mint qualification published qualified=[1-9]' | Select-Object -First 1
+$qualified = Select-String -Path $log -Pattern 'mint registry pools_mints=[1-9][0-9]* catalog_mints=[1-9][0-9]* qualified=[1-9]' | Select-Object -First 1
 if (-not $qualified) { throw "CP1 mint qualification did not publish any targets" }
 $registry = Select-String -Path $log -Pattern 'pool registry complete .*conflicts=0 lagged_batches=0' | Select-Object -Last 1
 if (-not $registry) { throw "CP1 Registry had conflicts/losses or no final accounting" }
