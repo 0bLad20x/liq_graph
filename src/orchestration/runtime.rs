@@ -237,6 +237,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
     if configured.raydium_cpmm.is_some(){venues.push(Venue::RaydiumCpmm);}
     if configured.raydium_clmm.is_some(){venues.push(Venue::RaydiumClmm);}
     let database=persistence::Persistence::connect().await?;
+    let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
     let restored=database.restore().await?.into_iter()
         .filter(|p|venues.contains(&p.venue)).collect();
     let registry=pool_registry::PoolRegistry::default();
@@ -250,7 +251,10 @@ pub async fn completion_lifecycle_live()->Result<()> {
     let mut tasks=JoinSet::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
         registry.clone(),updates.clone(),done,true));
-    critical(&mut tasks,"persistence",database.run(updates.subscribe()));
+    let mut mint_stream=enrichment.as_ref().map(|_|broadcast::channel::<Arc<DataBatch>>(256));
+    let mint_store_rx=mint_stream.as_ref().map(|(out,_)|out.subscribe());
+    critical(&mut tasks,"persistence",database.run_with_mints(
+        updates.subscribe(),mint_store_rx));
     if selected=="all" {
         let (graph_out,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
         critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
@@ -265,9 +269,10 @@ pub async fn completion_lifecycle_live()->Result<()> {
         // observations and RPC vault balances never substitute canonical TVL.
         let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-        let (jupiter_out,jupiter_rx)=broadcast::channel(256);
+        let (jupiter_out,jupiter_rx)=mint_stream.take().context("missing Jupiter stream")?;
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
-            mint_qualification::run(updates.subscribe(),jupiter_rx,qualified_tx,target_tx)));
+            mint_qualification::run(registry.clone(),mint_registry,updates.subscribe(),
+                jupiter_rx,qualified_tx,target_tx)));
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
             source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
         critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
@@ -371,6 +376,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
 pub async fn cp1_live() -> Result<()> {
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
+    let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
     let registry=pool_registry::PoolRegistry::default();
     let pool_count=registry.restore(restored)?;
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
@@ -378,12 +384,12 @@ pub async fn cp1_live() -> Result<()> {
     let (done,_) = watch::channel(false);
     let registry_task=tokio::spawn(pool_registry::run(
         source_rx,None,registry.clone(),updates.clone(),done,true));
-    let writer=tokio::spawn(database.run(updates.subscribe()));
+    let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
+    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe())));
     let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-    let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
     let qualification=tokio::spawn(mint_qualification::run(
-        updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
+        registry.clone(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
     // This isolated checkpoint must not start an unbounded full backfill.
     let mut jupiter_settings=settings;
