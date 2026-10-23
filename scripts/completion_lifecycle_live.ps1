@@ -185,8 +185,8 @@ WITH expected(venue, pool_address, checked_at_ms, validated_slot, status, wallet
           OR p.descriptor->'evidence'->'payload'->>'v10_wallet' = e.wallet)
         AND ((e.status = 1 AND p.completion_reason_code IS NULL
               AND jsonb_typeof(p.descriptor->'manifest') = 'object')
-          OR (e.status = 2 AND p.descriptor->>'reason_code' IS NOT NULL
-              AND p.descriptor->>'reason_code' <> 'transient_failure'
+          OR (e.status = 2 AND p.completion_reason_code IS NOT NULL
+              AND p.completion_reason_code <> 'transient_failure'
               AND p.descriptor->>'manifest' IS NULL)) AS matches
     FROM expected e LEFT JOIN public.pools p
       ON p.pool_address = e.pool_address
