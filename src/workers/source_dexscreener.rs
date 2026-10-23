@@ -10,11 +10,11 @@ use futures_util::{stream, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
-use tokio::{sync::broadcast, time::sleep, task::JoinHandle};
-use tokio_postgres::{Client as Db, NoTls};
+use tokio::{sync::broadcast, time::sleep};
 
 use super::http_transport::{self, HttpHandle, HttpRequest, RoutePolicy};
-use crate::core::now_unix_ms;
+use crate::core::{now_unix_ms,CompletionState};
+use super::pool_registry::PoolRegistry;
 
 const SOURCE: &str = "dexscreener_token_pairs";
 const HOST: &str = "api.dexscreener.com";
@@ -185,62 +185,27 @@ fn decode(body:&[u8],requested:Pubkey)->Result<Decoded> {
     Ok(Decoded{pairs,rejected})
 }
 
-async fn connect_db()->Result<(Db,JoinHandle<()>)> {
-    let url=env::var("LIQ_GRAPH_DATABASE_URL").or_else(|_|env::var("DATABASE_URL"))
-        .context("LIQ_GRAPH_DATABASE_URL or DATABASE_URL required")?;
-    let (db,conn)=tokio_postgres::connect(&url,NoTls)
-        .await.context("DexScreener database connect")?;
-    let task=tokio::spawn(async move {
-        if let Err(error)=conn.await {
-            crate::log_event!(Error,"dexscreener database connection error={error:#}");
+fn mint_sample(registry:&PoolRegistry,limit:usize)->Result<Vec<Pubkey>> {
+    let pools=registry.snapshot();
+    let mut prepared=std::collections::BTreeSet::new();
+    let mut others=std::collections::BTreeSet::new();
+    for p in pools {
+        for mint in [p.mint_a,p.mint_b].into_iter().flatten(){
+            if p.completion_state==CompletionState::Prepared{
+                prepared.insert(mint);
+            }else{others.insert(mint);}
         }
-    });
-    Ok((db,task))
-}
-fn decode_db_key(bytes:Vec<u8>)->Result<Pubkey> {
-    let bytes:[u8;32]=bytes.try_into()
-        .map_err(|_|anyhow::anyhow!("invalid 32-byte Solana key in DB"))?;
-    Ok(Pubkey::new_from_array(bytes))
-}
-async fn mint_sample(db:&Db, limit:usize)->Result<Vec<Pubkey>> {
-    // Retain the original 100-Mint test's deterministic Prepared-pool sample.
-    // If there are fewer Prepared mints than requested, fill from the remaining
-    // distinct pool-catalog mints without duplicating any address.
-    const PREPARED:&str="SELECT mint FROM (
-        SELECT mint_a AS mint FROM public.liq_graph_pool_cache
-            WHERE status=1 AND mint_a IS NOT NULL
-        UNION
-        SELECT mint_b AS mint FROM public.liq_graph_pool_cache
-            WHERE status=1 AND mint_b IS NOT NULL
-    ) AS m ORDER BY mint LIMIT $1";
-    const ALL:&str="SELECT mint FROM (
-        SELECT mint_a AS mint FROM public.liq_graph_pool_cache WHERE mint_a IS NOT NULL
-        UNION
-        SELECT mint_b AS mint FROM public.liq_graph_pool_cache WHERE mint_b IS NOT NULL
-    ) AS m ORDER BY mint LIMIT $1";
-    let rows=db.query(PREPARED,&[&(limit as i64)]).await
-        .context("read distinct Prepared-pool mints")?;
+    }
     let mut result=Vec::with_capacity(limit);
-    let mut seen=HashSet::with_capacity(limit);
-    for row in rows {
-        let mint=decode_db_key(row.get::<_,Vec<u8>>(0))?;
-        if seen.insert(mint){result.push(mint);}
+    let mut seen=HashSet::new();
+    for mint in prepared{if seen.insert(mint){result.push(mint);if result.len()==limit{break;}}}
+    let prepared_count=result.len();
+    if result.len()<limit{
+        for mint in others{if seen.insert(mint){result.push(mint);if result.len()==limit{break;}}}
     }
-    let from_prepared=result.len();
-    if result.len()<limit {
-        let rows=db.query(ALL,&[&(limit as i64)]).await
-            .context("fill benchmark from distinct known pool mints")?;
-        for row in rows {
-            let mint=decode_db_key(row.get::<_,Vec<u8>>(0))?;
-            if seen.insert(mint){result.push(mint);}
-            if result.len()==limit {break;}
-        }
-    }
-    ensure!(result.len()==limit,
-        "only {} unique pool mints available; {limit} requested",result.len());
-    crate::log_event!(Info,
-        "dexscreener mint sample selected={} prepared_mints={} other_pool_mints={}",
-        result.len(),from_prepared,result.len()-from_prepared);
+    ensure!(result.len()==limit,"only {} unique pool mints available; {limit} requested",result.len());
+    crate::log_event!(Info,"dexscreener mint sample selected={} prepared_mints={} other_pool_mints={}",
+        result.len(),prepared_count,result.len()-prepared_count);
     Ok(result)
 }
 
@@ -380,38 +345,12 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
     Ok(())
 }
 
-struct RegistryPool {
-    venue:i16,
-    mint_a:Option<Pubkey>,
-    mint_b:Option<Pubkey>,
-}
-async fn known_pools(db:&Db,pairs:&[Pubkey])->Result<HashMap<Pubkey,RegistryPool>> {
-    let mut out=HashMap::new();
-    for group in pairs.chunks(1000) {
-        let ids=group.iter().map(|p|p.to_bytes().to_vec()).collect::<Vec<_>>();
-        let rows=db.query(
-            "SELECT pool_address,venue,mint_a,mint_b FROM public.liq_graph_pool_cache
-             WHERE pool_address=ANY($1::bytea[])",
-             &[&ids]).await.context("resolve DexScreener pair against Pool Registry")?;
-        for row in rows {
-            let address=decode_db_key(row.get("pool_address"))?;
-            let mint_a=row.get::<_,Option<Vec<u8>>>("mint_a")
-                .map(decode_db_key).transpose()?;
-            let mint_b=row.get::<_,Option<Vec<u8>>>("mint_b")
-                .map(decode_db_key).transpose()?;
-            out.insert(address,RegistryPool {
-                venue:row.get("venue"),mint_a,mint_b,
-            });
-        }
-    }
-    Ok(out)
-}
 fn window_json(value:&WindowMetrics)->Value {
     json!({"volumeUsd":value.volume_usd,
         "priceChangePct":value.price_change_pct,
         "buys":value.buys,"sells":value.sells})
 }
-async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
+async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,registry:PoolRegistry,
     report_file:PathBuf)->Result<()> {
     let mut pairs=HashMap::<Pubkey,(Pubkey,u64,String,String,DexPair)>::new();
     let mut received=0;
@@ -437,7 +376,6 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
     }
     let mut addresses=pairs.keys().copied().collect::<Vec<_>>();
     addresses.sort_unstable();
-    let known=known_pools(&db,&addresses).await?;
     if let Some(parent)=report_file.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).context("create DexScreener report directory")?;
@@ -451,9 +389,9 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
     for address in addresses {
         let (requested,at,route,proxy_ip,pair)=pairs.remove(&address).context("missing decoded pair")?;
         *dex_counts.entry(pair.dex_id.clone()).or_default()+=1;
-        let db_pool=known.get(&address);
+        let db_pool=registry.get(address);
         if db_pool.is_some(){known_pairs+=1;}
-        let identity_match=db_pool.map(|p|{
+        let identity_match=db_pool.as_ref().map(|p|{
             let direct=p.mint_a==Some(pair.mint_a)&&p.mint_b==Some(pair.mint_b);
             let reverse=p.mint_a==Some(pair.mint_b)&&p.mint_b==Some(pair.mint_a);
             if p.mint_a.is_none()||p.mint_b.is_none(){None}
@@ -472,7 +410,7 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
             "labels":pair.labels,
             "baseMint":pair.mint_a.to_string(),"quoteMint":pair.mint_b.to_string(),
             "knownInRegistry":db_pool.is_some(),
-            "registryVenue":db_pool.map(|p|p.venue),
+            "registryVenue":db_pool.as_ref().map(|p|format!("{:?}",p.venue)),
             "mintIdentityMatch":identity_match,
             "priceNative":pair.price_native,"priceUsd":pair.price_usd,
             "liquidityUsd":pair.liquidity_usd,
@@ -495,10 +433,9 @@ async fn observe(mut rx:broadcast::Receiver<Arc<DexPairBatch>>,db:Db,
 }
 
 /// Standalone finite CP2 checkpoint; owns the only typed stream consumer.
-pub async fn live_diagnostic()->Result<()> {
+pub async fn live_diagnostic(registry:PoolRegistry)->Result<()> {
     let settings=Settings::from_env()?;
-    let (db,db_task)=connect_db().await?;
-    let mints=mint_sample(&db,settings.mint_limit).await?;
+    let mints=mint_sample(&registry,settings.mint_limit)?;
     let mut transport=http_transport::Settings::from_env()?;
     // Keep longer benchmarks readable: regular transport snapshots once/minute,
     // with source progress reported every 1000 completions / 30 seconds.
@@ -526,13 +463,12 @@ pub async fn live_diagnostic()->Result<()> {
         mints.len(),handle.working_set().len(),
         settings.per_proxy_ip_rpm,settings.parallel,settings.max_proxy_latency_ms);
     let (tx,rx)=broadcast::channel::<Arc<DexPairBatch>>(128);
-    let observer=tokio::spawn(observe(rx,db,settings.report_file));
+    let observer=tokio::spawn(observe(rx,registry,settings.report_file));
     let result=fetch_all(handle.clone(),mints,settings.parallel,tx.clone()).await;
     drop(tx);
     let observed=observer.await.context("DexScreener observer task panicked")?;
     drop(cycles);drop(handle);
     task.await.context("DexScreener HTTP transport task panicked")??;
-    db_task.await.context("DexScreener DB connection task panicked")?;
     result?;
     observed?;
     Ok(())
