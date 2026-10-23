@@ -738,7 +738,7 @@ pub async fn run()->Result<()>{
             async move{discovery_rpc_full::run(tx,settings).await}
         }));
     }
-    drop(source);drop(updates);drop(rpc);
+    drop(jupiter_out);drop(source);drop(updates);drop(rpc);
 
     // Operator termination uses q + Enter; finite RUN_DURATION_SECONDS supports
     // an automatic graceful live run without adding dependencies or lockfile changes.
