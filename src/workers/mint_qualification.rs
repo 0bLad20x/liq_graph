@@ -6,8 +6,7 @@ use anyhow::{Result,ensure};
 use solana_pubkey::Pubkey;
 use serde_json::Value;
 use tokio::sync::{broadcast,watch};
-use crate::core::{DataBatch,MintState,PoolUpdateBatch,RecordIdentity};
-use super::pool_registry::PoolRegistry;
+use crate::core::{DataBatch,MintState,PoolState,PoolUpdateBatch,RecordIdentity};
 
 const MIN_LIQUIDITY_USD:f64=2000.0;
 const MIN_MARKET_CAP_USD:f64=10000.0;
@@ -85,7 +84,7 @@ fn eligible(v:&MintState)->bool {
 /// add mint identities; their economic state is owned by the RAM Mint Registry.
 /// Jupiter is given new/missing and qualified mints; no database scan is needed.
 pub async fn run(
-    pools:PoolRegistry,
+    restored_pools:Vec<PoolState>,
     mints:MintRegistry,
     mut pool_updates:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     mut jupiter_updates:broadcast::Receiver<Arc<DataBatch>>,
@@ -93,7 +92,7 @@ pub async fn run(
     jupiter_targets:watch::Sender<Arc<[Pubkey]>>,
 )->Result<()> {
     let mut known=HashSet::<Pubkey>::new();
-    for pool in pools.snapshot(){
+    for pool in restored_pools {
         for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){known.insert(mint);}
     }
     let mut qualified=HashSet::<Pubkey>::new();
@@ -121,18 +120,8 @@ pub async fn run(
                         }
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(n))=>{
-                    // A bounded full RAM reconciliation is only needed on loss.
-                    crate::log_event!(Warn,"mint registry lost_pool_updates={n} resync=true");
-                    for pool in pools.snapshot(){
-                        for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){
-                            if known.insert(mint) && mints.get(mint).as_ref().is_some_and(eligible){
-                                qualified.insert(mint);
-                            }
-                        }
-                    }
-                    dirty=true;
-                },
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    anyhow::bail!("mint registry lost {n} pool updates; cannot infer undiscovered identities"),
                 Err(broadcast::error::RecvError::Closed)=>pool_open=false,
             },
             event=jupiter_updates.recv(),if jupiter_open=>match event {
