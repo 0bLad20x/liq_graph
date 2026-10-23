@@ -9,7 +9,7 @@ use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
-    core::{AccountMeta, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue,
+    core::{AccountMeta, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue, MintState, DataBatch, RecordIdentity,
         CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
 };
 
@@ -63,6 +63,37 @@ CREATE TABLE IF NOT EXISTS public.pools (
 CREATE INDEX IF NOT EXISTS pools_mint_a_idx ON public.pools(mint_a);
 CREATE INDEX IF NOT EXISTS pools_mint_b_idx ON public.pools(mint_b);
 CREATE INDEX IF NOT EXISTS pools_status_idx ON public.pools(status);
+"#;
+
+const UPSERT_MINT: &str = r#"
+INSERT INTO public.mints AS old
+ (mint_address,token_program,decimals,created_at,updated_at,
+  liquidity_usd,market_cap_usd,holder_count,usd_price,fetched_at)
+SELECT d.mint,d.program,d.decimals,
+ CASE WHEN d.created ~ '^-?[0-9]{1,16}$' THEN to_timestamp(d.created::double precision /
+    CASE WHEN length(trim(leading '-' from d.created))>=13 THEN 1000.0 ELSE 1.0 END)
+      WHEN pg_input_is_valid(d.created,'timestamp with time zone') THEN d.created::timestamptz
+      ELSE NULL END,
+ CASE WHEN d.updated ~ '^-?[0-9]{1,16}$' THEN to_timestamp(d.updated::double precision /
+    CASE WHEN length(trim(leading '-' from d.updated))>=13 THEN 1000.0 ELSE 1.0 END)
+      WHEN pg_input_is_valid(d.updated,'timestamp with time zone') THEN d.updated::timestamptz
+      ELSE NULL END,
+ d.liq::numeric,d.mcap::numeric,d.holders,d.price::numeric,
+ to_timestamp(d.fetched_ms / 1000.0)
+FROM UNNEST($1::text[],$2::text[],$3::smallint[],$4::text[],$5::text[],
+            $6::text[],$7::text[],$8::bigint[],$9::text[],$10::bigint[])
+  AS d(mint,program,decimals,created,updated,liq,mcap,holders,price,fetched_ms)
+ON CONFLICT (mint_address) DO UPDATE SET
+ token_program=COALESCE(EXCLUDED.token_program,old.token_program),
+ decimals=COALESCE(EXCLUDED.decimals,old.decimals),
+ created_at=COALESCE(EXCLUDED.created_at,old.created_at),
+ updated_at=COALESCE(EXCLUDED.updated_at,old.updated_at),
+ liquidity_usd=EXCLUDED.liquidity_usd,
+ market_cap_usd=EXCLUDED.market_cap_usd,
+ holder_count=EXCLUDED.holder_count,
+ usd_price=EXCLUDED.usd_price,
+ fetched_at=EXCLUDED.fetched_at
+WHERE old.fetched_at IS NULL OR EXCLUDED.fetched_at >= old.fetched_at
 "#;
 
 const UPSERT_IDENTITY: &str = r#"
@@ -177,9 +208,8 @@ fn status_from(code: i16) -> Result<CompletionState> {
     }
 }
 
-fn pubkey(bytes: &[u8]) -> Result<Pubkey> {
-    let value: [u8; 32] = bytes.try_into().context("persisted Pubkey is not exactly 32 bytes")?;
-    Ok(Pubkey::new_from_array(value))
+fn pubkey(bytes: &str) -> Result<Pubkey> {
+    bytes.parse::<Pubkey>().context("invalid persisted Base58 Pubkey")
 }
 
 fn json_key(value: &Value) -> Result<Pubkey> {
@@ -370,6 +400,17 @@ fn bytes_key(key:Option<Pubkey>) -> Option<Vec<u8>> {
     key.map(|v|v.to_bytes().to_vec())
 }
 
+fn timestamp_ms(ms:u64)->Result<Option<i64>> {
+    if ms==0 {Ok(None)} else {Ok(Some(i64::try_from(ms).context("timestamp overflow")?))}
+}
+fn observation_values(pool:&PoolState)->Result<(Option<String>,Option<String>,Option<i64>)> {
+    let observation=pool.last_observation.as_deref();
+    let tvl=pool.tvl_usd.or_else(||observation.and_then(|v|v.get("tvl_usd")).and_then(Value::as_f64));
+    let source=observation.and_then(|v|v.get("source")).and_then(Value::as_str).map(str::to_owned);
+    let at=observation.and_then(|v|v.get("observed_at_ms")).and_then(Value::as_u64);
+    Ok((tvl.map(|v|v.to_string()),source,at.map(i64::try_from).transpose()?))
+}
+
 pub struct Persistence {
     client:Client,
 }
@@ -394,26 +435,30 @@ impl Persistence {
     /// Historical observations are kept separate; live TVL stays unknown on restart.
     pub async fn restore(&self) -> Result<Vec<PoolState>> {
         let mut pools=Vec::new();
-        let mut after:Option<Vec<u8>>=None;
+        let mut after:Option<String>=None;
         let mut prepared=0_usize;
         let mut incomplete=0_usize;
         let mut unknown=0_usize;
         let query=format!(
-            "SELECT pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,planner_version,descriptor::text AS payload, pool_config::text AS config, last_observation::text AS observation
+            "SELECT pool_address,venue,mint_a,mint_b,status,validated_slot,descriptor_version,planner_version,
+                descriptor::text AS payload, pool_config::text AS config,
+                tvl_usd::double precision AS historical_tvl,tvl_source,
+                (extract(epoch FROM tvl_observed_at)*1000)::bigint AS observed_ms,
+                (extract(epoch FROM first_seen_at)*1000)::bigint AS first_seen_ms
             FROM {TABLE}
-            WHERE ($1::bytea IS NULL OR pool_address > $1)
+            WHERE ($1::text IS NULL OR pool_address > $1)
             ORDER BY pool_address LIMIT 8192");
         loop {
             let rows=self.client.query(&query,&[&after]).await
                 .context("read persistence bootstrap page")?;
             if rows.is_empty(){break;}
             for row in rows {
-                let raw_address:Vec<u8>=row.get("pool_address");
+                let raw_address:String=row.get("pool_address");
                 let address=pubkey(&raw_address)?;
-                let a=row.get::<_,Option<Vec<u8>>>("mint_a")
-                    .map(|b|pubkey(&b)).transpose()?;
-                let b=row.get::<_,Option<Vec<u8>>>("mint_b")
-                    .map(|b|pubkey(&b)).transpose()?;
+                let a=row.get::<_,Option<String>>("mint_a").as_deref()
+                    .map(pubkey).transpose()?;
+                let b=row.get::<_,Option<String>>("mint_b").as_deref()
+                    .map(pubkey).transpose()?;
                 ensure!(address!=Pubkey::default() &&
                     a.is_none_or(|v|v!=Pubkey::default()) &&
                     b.is_none_or(|v|v!=Pubkey::default()) &&
@@ -449,15 +494,16 @@ impl Persistence {
                 let pool_config=if config.as_object().is_some_and(|v|v.is_empty()){
                     None
                 }else{Some(Arc::new(config))};
-                let last_observation=row.get::<_,Option<String>>("observation")
-                    .map(|raw|serde_json::from_str::<Value>(&raw))
-                    .transpose()?
-                    .map(Arc::new);
-                ensure!(last_observation.as_ref().is_none_or(|v|v.is_object()),
-                    "stored observation must be an object");
-                let first_seen_ms=last_observation.as_ref()
-                    .and_then(|v|v.get("first_seen_ms"))
-                    .and_then(Value::as_u64).unwrap_or(0);
+                let historical_tvl:Option<f64>=row.get("historical_tvl");
+                let tvl_source:Option<String>=row.get("tvl_source");
+                let observed_ms:Option<i64>=row.get("observed_ms");
+                let first_seen_ms:u64=row.get::<_,Option<i64>>("first_seen_ms")
+                    .map_or(Ok(0),|v|u64::try_from(v).context("negative first_seen_ms"))?;
+                let last_observation=if let (Some(value),Some(source),Some(at))=
+                    (historical_tvl,tvl_source,observed_ms) {
+                    Some(Arc::new(json!({"tvl_usd":value,"source":source,
+                        "observed_at_ms":at,"first_seen_ms":first_seen_ms})))
+                } else {None};
                 pools.push(PoolState{
                     address,venue,mint_a:a,mint_b:b,source:"persistence_restore",
                     first_seen_ms,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
@@ -486,35 +532,49 @@ impl Persistence {
             let mut mint_a=Vec::with_capacity(batch.len());
             let mut mint_b=Vec::with_capacity(batch.len());
             let mut configs=Vec::with_capacity(batch.len());
-            let mut observations=Vec::with_capacity(batch.len());
+            let mut tvls=Vec::with_capacity(batch.len());
+            let mut sources=Vec::with_capacity(batch.len());
+            let mut tvl_times=Vec::with_capacity(batch.len());
+            let mut first_seen=Vec::with_capacity(batch.len());
+            let mut last_seen=Vec::with_capacity(batch.len());
             for pool in &batch {
-                addresses.push(pool.address.to_bytes().to_vec());
+                addresses.push(pool.address.to_string());
                 venues.push(venue_code(pool.venue));
-                mint_a.push(bytes_key(pool.mint_a));
-                mint_b.push(bytes_key(pool.mint_b));
+                mint_a.push(pool.mint_a.map(|m|m.to_string()));
+                mint_b.push(pool.mint_b.map(|m|m.to_string()));
                 configs.push(encoded_config(pool)?);
-                observations.push(encoded_observation(pool));
+                let (tvl,source,at)=observation_values(pool)?;
+                tvls.push(tvl);sources.push(source);tvl_times.push(at);
+                first_seen.push(timestamp_ms(pool.first_seen_ms)?);
+                last_seen.push(timestamp_ms(pool.last_seen_ms)?);
             }
             let changed=match kind {
                 WriteKind::Identity=>{
                     self.client.execute(UPSERT_IDENTITY,&[
-                        &addresses,&venues,&mint_a,&mint_b,&configs,&observations
+                        &addresses,&venues,&mint_a,&mint_b,&configs,&tvls,&sources,
+                        &tvl_times,&first_seen,&last_seen,
                     ]).await.context("batch upsert pool identities")?
                 }
                 WriteKind::Completion=>{
                     let mut states=Vec::with_capacity(batch.len());
                     let mut slots=Vec::with_capacity(batch.len());
                     let mut descriptors=Vec::with_capacity(batch.len());
+                    let mut checked=Vec::with_capacity(batch.len());
+                    let mut reasons=Vec::with_capacity(batch.len());
                     for pool in &batch {
                         states.push(status_code(pool.completion_state)?);
                         slots.push(i64::try_from(pool.completion_validated_slot
                             .context("completed pool missing validation slot")?)
                             .context("Solana slot exceeds PostgreSQL BIGINT")?);
                         descriptors.push(encode_descriptor(pool)?);
+                        checked.push(pool.completion_checked_at_ms.map(i64::try_from).transpose()?);
+                        reasons.push(pool.completion_reason_code.map(|r|serde_json::to_value(r))
+                            .transpose()?.and_then(|v|v.as_str().map(str::to_owned)));
                     }
                     self.client.execute(UPSERT_COMPLETION,&[
                         &addresses,&venues,&mint_a,&mint_b,&states,&slots,&descriptors,
-                        &configs,&observations
+                        &configs,&tvls,&sources,&tvl_times,&first_seen,&last_seen,
+                        &checked,&reasons,
                     ]).await.context("batch upsert execution completions")?
                 }
             };
