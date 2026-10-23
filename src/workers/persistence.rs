@@ -45,11 +45,11 @@ CREATE TABLE IF NOT EXISTS public.pools (
     pool_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     completion JSONB NULL,
     CHECK (mint_a IS NULL OR mint_b IS NULL OR mint_a <> mint_b),
-    CHECK (completion IS NULL OR jsonb_typeof(completion)='object'),
+    CHECK (completion IS NULL OR jsonb_typeof(completion) IS NOT DISTINCT FROM 'object'),
     CHECK (completion IS NULL OR
-        (jsonb_typeof(completion->'validated_slot')='number'
+        (jsonb_typeof(completion->'validated_slot') IS NOT DISTINCT FROM 'number'
          AND (completion->>'validated_slot')::bigint>=0
-         AND jsonb_typeof(completion->'checked_at_ms')='number'
+         AND jsonb_typeof(completion->'checked_at_ms') IS NOT DISTINCT FROM 'number'
          AND (completion->>'checked_at_ms')::bigint>0))
 );
 "#;
