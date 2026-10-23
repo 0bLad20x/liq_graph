@@ -2,7 +2,7 @@
 //! share API-key lanes, decoding, Postgres upserts and one process-wide DB lease.
 //! Exactly one mode dispatches HTTP requests at a time.
 use std::{collections::{HashSet, VecDeque}, env, sync::Arc, time::Duration};
-use anyhow::{anyhow, bail, Context, Result, ensure};
+use anyhow::{bail, Context, Result, ensure};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use solana_pubkey::Pubkey;
