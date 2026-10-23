@@ -52,7 +52,9 @@ try {
         -not $url.AbsolutePath.Trim('/')) {
         throw "Invalid PostgreSQL connection URL."
     }
-    $credentials = $url.UserInfo.Split(@(':'),2)
+    $separator=$url.UserInfo.IndexOf(':')
+    if ($separator -lt 0) {throw "PostgreSQL URL must contain a user and password."}
+    $credentials=@($url.UserInfo.Substring(0,$separator),$url.UserInfo.Substring($separator+1))
     if ($credentials.Count -ne 2) {throw "PostgreSQL URL must contain a user and password."}
     $userName = [uri]::UnescapeDataString($credentials[0])
     $password = [uri]::UnescapeDataString($credentials[1])
@@ -97,15 +99,7 @@ try {
         if ($TuplesOnly) {$args += "--tuples-only"}
         if ($NoAlign) {$args += "--no-align"}
         foreach ($key in $Variables.Keys) {
-            if ($key -cnotmatch '^[a-z][a-z_0-9]*
-    if ($LASTEXITCODE -ne 0) { throw "psql exited with code $LASTEXITCODE. Check DB host/user and .env configuration." }
-} finally {
-    [Environment]::SetEnvironmentVariable("PGPASSWORD",$oldPass,"Process")
-    [Environment]::SetEnvironmentVariable("PGSSLMODE",$oldSsl,"Process")
-    $password=$null
-    $dsn=$null
-}
-) {throw "Invalid psql variable name."}
+            if ($key -cnotmatch '^[a-z][a-z_0-9]*$') { throw "Invalid psql variable name." }
             $args += "-v"
             $args += "$key=$($Variables[$key])"
         }
