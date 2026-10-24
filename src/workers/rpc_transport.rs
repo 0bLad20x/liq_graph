@@ -390,7 +390,7 @@ impl HttpProvider {
     }
     fn schedulable(&self,bit:u64)->bool {
         self.eligible(bit) && self.cooldown.try_lock().map_or(true,|guard|
-            guard.is_none_or(|until|until<=Instant::now()))
+            guard.as_ref().is_none_or(|until|*until<=Instant::now()))
     }
     fn latency_cell(&self,bit:u64)->&AtomicU64 {
         if bit==1 {&self.multiple_latency_ms} else {&self.other_latency_ms}
@@ -464,8 +464,9 @@ impl HttpProvider {
                 Ok(body)=>body,
                 Err(error)=>{
                     self.observe_http(operation.bit(),sent.elapsed());
-                    previous=Some(anyhow!("RPC HTTP response body: {error}"));
-                    continue;
+                    // Body timeout usually means an overloaded provider; let
+                    // the transport fail over instead of repeating slow reads.
+                    return Err(anyhow!("RPC HTTP response body: {error}"));
                 }
             };
             self.observe_http(operation.bit(),sent.elapsed());
