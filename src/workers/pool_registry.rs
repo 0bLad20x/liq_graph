@@ -523,6 +523,7 @@ impl PoolRegistry {
                         batch.received_at_ms,observed_tvl);
                     let mut changed = false;
                     let mut identity_changed = false;
+                    let mut mint_identity_changed = false;
                     if let Some(config)=metadata {
                         let config=combine_metadata(current.pool_config.as_ref(),config,batch.received_at_ms);
                         if current.pool_config.as_deref()!=Some(config.as_ref()) {
@@ -535,11 +536,13 @@ impl PoolRegistry {
                         current.mint_a = *mint_a;
                         changed = true;
                         identity_changed = true;
+                        mint_identity_changed = true;
                     }
                     if current.mint_b.is_none() && mint_b.is_some() {
                         current.mint_b = *mint_b;
                         changed = true;
                         identity_changed = true;
+                        mint_identity_changed = true;
                     }
                     if let Some(chosen)=selected {
                         let prior=current.last_observation.as_ref();
@@ -569,7 +572,9 @@ impl PoolRegistry {
                     }
 
                     current.last_seen_ms = current.last_seen_ms.max(batch.received_at_ms);
-                    admission.index(current.address,current.mint_a,current.mint_b);
+                    if mint_identity_changed {
+                        admission.index(current.address,current.mint_a,current.mint_b);
+                    }
                     let previous_admission=current.completion_admission;
                     current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
@@ -799,8 +804,11 @@ pub async fn run(
     while source_open || completion_open {
         tokio::select! {
             event=async {
-                qualified.as_mut().expect("qualified channel").changed().await
-            }, if qualified.is_some()=>{
+                match qualified.as_mut() {
+                    Some(receiver)=>receiver.changed().await,
+                    None=>std::future::pending().await,
+                }
+            }=>{
                 match event {
                     Ok(())=>{
                         let next=qualified.as_mut().expect("qualified channel")
