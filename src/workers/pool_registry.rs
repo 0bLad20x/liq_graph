@@ -3,7 +3,7 @@
 //! select graph routes, or retain arbitrary API payloads.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -26,6 +26,70 @@ struct PoolQuotes { protocol:Option<Quote>, dex:Option<Quote>, last_persisted:u6
 const TVL_SOURCE_MAX_AGE_MS: u64 = 3_600_000;
 const TVL_PERSIST_INTERVAL_MS: u64 = 900_000;
 const DEX_SOURCE: &str = "dexscreener_token_pairs";
+const MIN_NATIVE_TVL_USD: f64 = 10.0;
+
+/// Native pool TVL sources; Manifest has no meaningful TVL and PumpSwap uses RPC.
+fn native_source(venue: Venue) -> Option<&'static str> {
+    match venue {
+        Venue::MeteoraDlmm => Some("meteora_dlmm_api"),
+        Venue::MeteoraDammV2 => Some("meteora_damm_v2_api"),
+        Venue::RaydiumAmmV4 | Venue::RaydiumCpmm |
+        Venue::RaydiumClmm | Venue::RaydiumStable => Some("raydium_api"),
+        Venue::OrcaWhirlpool => Some("orca_whirlpool_api"),
+        Venue::PancakeSwapClmm => Some("pancakeswap_api"),
+        Venue::ByrealClmm => Some("byreal_api"),
+        Venue::Manifest | Venue::PumpSwap => None,
+    }
+}
+fn reference_mints() -> &'static [Pubkey; 2] {
+    static EXCLUDED: std::sync::OnceLock<[Pubkey; 2]> = std::sync::OnceLock::new();
+    EXCLUDED.get_or_init(||[
+        "So11111111111111111111111111111111111111112".parse().expect("WSOL pubkey"),
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().expect("USDC pubkey"),
+    ])
+}
+
+/// Private RAM index, native TVL evidence independent of canonical/DexScreener TVL.
+#[derive(Default)]
+struct AdmissionIndex {
+    qualified: HashSet<Pubkey>,
+    pools_by_mint: HashMap<Pubkey, HashSet<Pubkey>>,
+    native_tvl: HashMap<Pubkey, f64>,
+}
+impl AdmissionIndex {
+    fn index(&mut self, pool: Pubkey, a: Option<Pubkey>, b: Option<Pubkey>) {
+        for mint in [a, b].into_iter().flatten() {
+            self.pools_by_mint.entry(mint).or_default().insert(pool);
+        }
+    }
+    fn restore_native(&mut self, pool: &PoolState) {
+        let Some(source)=native_source(pool.venue) else {return};
+        let Some(observation)=pool.last_observation.as_deref() else {return};
+        if observation.get("source").and_then(Value::as_str)!=Some(source) {return;}
+        if let Some(value)=observation.get("tvl_usd").and_then(Value::as_f64)
+            .filter(|v|v.is_finite() && *v>=0.0) {
+            self.native_tvl.insert(pool.address,value);
+        }
+    }
+    fn observe_native(&mut self, pool: Pubkey, venue: Venue,
+        source: &str, value: Option<f64>) {
+        if native_source(venue)!=Some(source) {return;}
+        if let Some(value)=value {
+            self.native_tvl.insert(pool,value);
+        } else {
+            self.native_tvl.remove(&pool);
+        }
+    }
+    fn admission(&self, pool: &PoolState) -> CompletionAdmission {
+        let mint_qualified=[pool.mint_a,pool.mint_b].into_iter().flatten()
+            .any(|mint| !reference_mints().contains(&mint) && self.qualified.contains(&mint));
+        let native_below_minimum=native_source(pool.venue).is_some()
+            && self.native_tvl.get(&pool.address).is_some_and(|v|*v<MIN_NATIVE_TVL_USD);
+        CompletionAdmission::from_qualification(
+            pool.mint_a,pool.mint_b,mint_qualified,native_below_minimum)
+    }
+}
+
 
 fn select_tvl(quotes:&PoolQuotes, now:u64)->Option<Quote> {
     let recent=|q:Quote|q.at<=now && now.saturating_sub(q.at)<=TVL_SOURCE_MAX_AGE_MS;
@@ -228,6 +292,7 @@ fn combine_metadata(
 pub struct PoolRegistry {
     entries: Arc<RwLock<HashMap<Pubkey, PoolState>>>,
     quotes: Arc<RwLock<HashMap<Pubkey,PoolQuotes>>>,
+    admission: Arc<RwLock<AdmissionIndex>>,
 }
 
 impl PoolRegistry {
@@ -251,11 +316,13 @@ impl PoolRegistry {
     pub fn restore(&self, pools: Vec<PoolState>) -> Result<usize> {
         use anyhow::ensure;
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
+        let mut admission = self.admission.write().expect("admission index lock poisoned");
         ensure!(entries.is_empty(), "Registry restore requires an empty RAM state");
         let mut restored = HashMap::with_capacity(pools.len());
         for mut pool in pools {
-            pool.completion_admission=CompletionAdmission::from_inputs(
-                pool.mint_a,pool.mint_b,pool.tvl_usd);
+            admission.index(pool.address,pool.mint_a,pool.mint_b);
+            admission.restore_native(&pool);
+            pool.completion_admission=admission.admission(&pool);
             ensure!(pool.address != Pubkey::default(), "invalid restored pool address");
             let a = pool.mint_a;
             let b = pool.mint_b;
@@ -319,15 +386,8 @@ impl PoolRegistry {
                     .and_then(Value::as_str);
                 if pool.tvl_usd!=selected.map(|q|q.value)
                     || selected.is_some_and(|q|source!=Some(q.source)) {
-                    let previous_admission=pool.completion_admission;
+                    // DexScreener/canonical TVL expiry must not change native admission.
                     pool.tvl_usd=selected.map(|q|q.value);
-                    pool.completion_admission=CompletionAdmission::from_inputs(
-                        pool.mint_a,pool.mint_b,pool.tvl_usd);
-                    if pool.completion_admission!=previous_admission {
-                        crate::log_event!(Debug,
-                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
-                            pool.address,pool.venue,pool.completion_admission,pool.tvl_usd,pool.execution_manifest.is_some());
-                    }
                     if let Some(q)=selected {
                         pool.last_observation=Some(Arc::new(json!({
                             "tvl_usd":q.value,"source":q.source,
@@ -351,10 +411,43 @@ impl PoolRegistry {
         (updates,persist)
     }
 
+    /// Update only pools touched by changed qualified Mint identities.
+    fn apply_qualified(&self, mints: &[Pubkey], now: u64) -> Vec<PoolState> {
+        let mut entries=self.entries.write().expect("pool registry lock poisoned");
+        let mut admission=self.admission.write().expect("admission index lock poisoned");
+        let next:HashSet<Pubkey>=mints.iter().copied().collect();
+        let changed=admission.qualified.symmetric_difference(&next)
+            .copied().collect::<Vec<_>>();
+        let mut affected=HashSet::new();
+        for mint in &changed {
+            if let Some(pools)=admission.pools_by_mint.get(mint) {
+                affected.extend(pools.iter().copied());
+            }
+        }
+        let affected_count=affected.len();
+        admission.qualified=next;
+        let mut updates=Vec::new();
+        for address in affected {
+            if let Some(pool)=entries.get_mut(&address) {
+                let decision=admission.admission(pool);
+                if decision!=pool.completion_admission {
+                    pool.completion_admission=decision;
+                    pool.last_changed_ms=now;
+                    updates.push(pool.clone());
+                }
+            }
+        }
+        crate::log_event!(Info,
+            "pool registry mint_admission qualified={} changed_mints={} affected_pools={} admission_updates={}",
+            admission.qualified.len(),changed.len(),affected_count,updates.len());
+        updates
+    }
+
     fn apply(&self, batch: &DataBatch) -> BatchStats {
         let mut stats = BatchStats::default();
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
         let mut quotes = self.quotes.write().expect("pool market state lock poisoned");
+        let mut admission = self.admission.write().expect("admission index lock poisoned");
         let mut updates = Vec::new();
 
         for record in &batch.records {
@@ -373,9 +466,10 @@ impl PoolRegistry {
             let metadata=pool_metadata(&record.payload,batch.source,*venue,batch.received_at_ms);
             match entries.get_mut(address) {
                 None => {
+                    admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
-                    let state = PoolState {
+                    let mut state = PoolState {
                         address: *address,
                         venue: *venue,
                         mint_a: *mint_a,
@@ -386,7 +480,7 @@ impl PoolRegistry {
                         last_changed_ms: batch.received_at_ms,
                         tvl_usd: selected.map(|v|v.value),
                         completion_admission: CompletionAdmission::from_inputs(
-                            *mint_a,*mint_b,selected.map(|v|v.value)),
+                            *mint_a,*mint_b,None),
                         pool_config: metadata.clone(),
                         last_observation: selected.map(|v|Arc::new(json!({
                             "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
@@ -401,6 +495,8 @@ impl PoolRegistry {
                         completion_reason_code: None,
                         completion_checked_at_ms: None,
                     };
+                    admission.index(*address,*mint_a,*mint_b);
+                    state.completion_admission=admission.admission(&state);
                     updates.push(state.clone());
                     stats.identity.push(*address);
                     entries.insert(*address, state);
@@ -422,6 +518,7 @@ impl PoolRegistry {
                         crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
                         continue;
                     }
+                    admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
                     let mut changed = false;
@@ -472,9 +569,9 @@ impl PoolRegistry {
                     }
 
                     current.last_seen_ms = current.last_seen_ms.max(batch.received_at_ms);
+                    admission.index(current.address,current.mint_a,current.mint_b);
                     let previous_admission=current.completion_admission;
-                    current.completion_admission=CompletionAdmission::from_inputs(
-                        current.mint_a,current.mint_b,current.tvl_usd);
+                    current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
                         changed=true;
                         crate::log_event!(Debug,
@@ -665,6 +762,7 @@ pub async fn run(
     output: broadcast::Sender<Arc<PoolUpdateBatch>>,
     source_done: watch::Sender<bool>,
     fail_on_lag: bool,
+    mut qualified: Option<watch::Receiver<Arc<[Pubkey]>>>,
 ) -> Result<()> {
     let mut batches = 0_u64;
     let mut input_records = 0_u64;
@@ -700,6 +798,30 @@ pub async fn run(
 
     while source_open || completion_open {
         tokio::select! {
+            event=async {
+                qualified.as_mut().expect("qualified channel").changed().await
+            }, if qualified.is_some()=>{
+                match event {
+                    Ok(())=>{
+                        let next=qualified.as_mut().expect("qualified channel")
+                            .borrow_and_update().clone();
+                        let changed=registry.apply_qualified(&next,now_unix_ms()?);
+                        for pools in changed.chunks(2048) {
+                            output.send(Arc::new(PoolUpdateBatch{
+                                kind:PoolUpdateKind::Source,
+                                source:"mint_admission",
+                                received_at_ms:now_unix_ms()?,
+                                pools:pools.to_vec(),
+                                persist_identity:Vec::new(),
+                            })).map_err(|_|anyhow::anyhow!("Registry mint admission has no subscriber"))?;
+                        }
+                    }
+                    Err(_)=>{
+                        crate::log_event!(Warn,"pool registry mint_qualification channel_closed");
+                        qualified=None;
+                    }
+                }
+            },
             _=freshness.tick()=>{
                 let (invalidated,persist)=registry.refresh_tvl(now_unix_ms()?);
                 if !invalidated.is_empty() {
@@ -803,8 +925,8 @@ pub async fn run(
     let prepared_admitted=snapshot.iter().filter(|p|p.completion_admission.is_admitted()
         && p.completion_state==CompletionState::Prepared).count();
     crate::log_event!(Info,
-        "completion_contracts min_tvl_usd={} admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
-        crate::core::COMPLETION_MIN_TVL_USD);
+        "completion_contracts min_native_tvl_usd={} mint_qualification=true admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
+        MIN_NATIVE_TVL_USD);
     crate::log_event!(Info,
         "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",
         snapshot.len(),
