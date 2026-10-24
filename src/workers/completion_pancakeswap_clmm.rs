@@ -9,7 +9,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
-    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
+    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -419,6 +419,11 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
+async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
+    process(rpc,pools,settings).await.into_iter().map(CompletionOutcome::Proof).collect()
+}
+
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
@@ -437,12 +442,10 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                         "PancakeSwap CLMM request has wrong venue or missing admission");
                     let rpc=rpc.clone();
                     tasks.spawn(async move {
-                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                         let results=match tokio::time::timeout(batch.timeout,
-                            process(&rpc,pools,settings)).await {
+                            process_optimized(&rpc,&batch.requests,settings)).await {
                             Ok(results)=>results,
-                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
-                                "PancakeSwap CLMM lifecycle request timed out")).collect(),
+                            Err(_)=>batch.requests.iter().map(|r|CompletionOutcome::Proof(retry(r.pool.address,"PancakeSwap CLMM lifecycle request timed out"))).collect(),
                         };
                         (batch.requests,results)
                     });
@@ -453,17 +456,19 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                 let (requests,results)=done.context("missing PancakeSwap CLMM request task")?
                     .context("PancakeSwap CLMM request task panicked")?;
                 ensure!(requests.len()==results.len(),"PancakeSwap CLMM request/result count mismatch");
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate PancakeSwap CLMM pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("PancakeSwap CLMM request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "pancakeswap_clmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,
-                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_pancakeswap_clmm completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:SOURCE,responses}).await
