@@ -89,6 +89,7 @@ struct Counters {
     refreshes:u64,
     repeated_refreshes:u64,
     withdrawals:u64,
+    withdrawn_in_flight:u64,
     timeouts:u64,
     late_responses:u64,
 }
@@ -245,6 +246,16 @@ impl Scheduler {
             let flight=entry.flight.as_ref().context("response for idle lifecycle pool")?;
             ensure!(flight.id==response.id && flight.terminal.is_none(),
                 "duplicate or mismatched lifecycle response pool={}",result.pool);
+            // Admission can be withdrawn while RPC reads are in flight.
+            // Never advance or persist a completion for a withdrawn pool.
+            if !entry.pool.completion_admission.is_admitted() {
+                self.counters.withdrawn_in_flight+=1;
+                self.entries.remove(&result.pool);
+                crate::log_event!(Info,
+                    "lifecycle withdrawn_response_dropped request_id={} pool={} proof_retained=true",
+                    response.id,result.pool);
+                continue;
+            }
             if result.status==CompletionStatus::Retryable {
                 ensure!(result.reason_code==Some(CompletionReason::TransientFailure)
                     && result.checked_at_ms.is_none() && result.manifest.is_none(),
@@ -319,9 +330,9 @@ impl Scheduler {
         let oldest=self.due.first().map_or(0,|(at,_)|now.saturating_sub(*at));
         let c=&self.counters;
         crate::log_event!(Info,
-            "lifecycle stats final={final_report} tracked={} in_flight={in_flight} overdue={overdue} oldest_overdue_ms={oldest} dispatched={} accepted={} prepared={} incomplete={} retryable={} non_advancing={} timeouts={} late_responses={} prepared_refreshes={} repeated_prepared_refreshes={} admission_withdrawals={}",
+            "lifecycle stats final={final_report} tracked={} in_flight={in_flight} overdue={overdue} oldest_overdue_ms={oldest} dispatched={} accepted={} prepared={} incomplete={} retryable={} non_advancing={} timeouts={} late_responses={} prepared_refreshes={} repeated_prepared_refreshes={} admission_withdrawals={} withdrawn_in_flight={}",
             self.entries.len(),c.dispatched,c.accepted,c.prepared,c.incomplete,c.retryable,c.non_advancing,
-            c.timeouts,c.late_responses,c.refreshes,c.repeated_refreshes,c.withdrawals);
+            c.timeouts,c.late_responses,c.refreshes,c.repeated_refreshes,c.withdrawals,c.withdrawn_in_flight);
         let mut venues:Vec<Venue>=self.entries.values().map(|e|e.pool.venue).collect();
         venues.sort_unstable_by_key(|v|format!("{v:?}"));venues.dedup();
         for venue in venues {
@@ -398,6 +409,10 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
             crate::log_event!(Warn,
                 "lifecycle request_timeout request_id={id} pool={pool} venue={venue:?} elapsed_ms={age} awaiting_registry={awaiting_registry} retry_at_ms={due:?} proof_retained=true");
         }
+        // A withdrawn pool whose final RPC/ack timeout elapsed must not remain
+        // as an idle entry until a further external update happens.
+        scheduler.entries.retain(|_,entry|
+            entry.flight.is_some() || entry.pool.completion_admission.is_admitted());
         tokio::select! {
             update=input.recv(),if input_open=>match update {
                 Ok(batch)=>{
@@ -429,7 +444,8 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         }
     }
     ensure!(scheduler.counters.dispatched==scheduler.counters.accepted
-        +scheduler.counters.retryable+scheduler.counters.non_advancing+scheduler.counters.timeouts,
+        +scheduler.counters.retryable+scheduler.counters.non_advancing
+        +scheduler.counters.timeouts+scheduler.counters.withdrawn_in_flight,
         "lifecycle final accounting has unacknowledged requests");
     scheduler.report(&executors,now_unix_ms()?,true);
     Ok(())
