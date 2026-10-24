@@ -294,8 +294,67 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
 async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
-    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
-    process(rpc,pools,settings).await.into_iter().map(CompletionOutcome::Proof).collect()
+    let program:Pubkey=PROGRAM.parse().expect("known Manifest program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind=="manifest_market_v10" && e.version==1)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut result=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty(){
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        match read_rpc(rpc,eligible.iter().map(|r|r.pool.address).collect(),min_slot).await {
+            Ok((slot,accounts))=>{
+                for (r,account) in eligible.iter().zip(accounts.iter()){
+                    let p=&r.pool;
+                    let valid=(||->Result<bool>{
+                        let market=account.as_ref().context("Manifest market missing")?;
+                        let current=decode_market(market,p,program)?;
+                        if spare_node(&market.bytes).is_none(){return Ok(false);}
+                        let ev=p.completion_evidence.as_ref().context("missing evidence")?;
+                        if ev.payload["base_mint"].as_str()!=Some(current.mints[0].to_string().as_str())
+                            || ev.payload["quote_mint"].as_str()!=Some(current.mints[1].to_string().as_str())
+                            || ev.payload["base_vault"].as_str()!=Some(current.vaults[0].to_string().as_str())
+                            || ev.payload["quote_vault"].as_str()!=Some(current.vaults[1].to_string().as_str()) {
+                            return Ok(false);
+                        }
+                        let m=p.execution_manifest.as_ref().context("missing manifest")?;
+                        let [a,b]=[p.mint_a.context("mint A")?,p.mint_b.context("mint B")?];
+                        let ro=|address|AccountMeta{address,writable:false};
+                        let rw=|address|AccountMeta{address,writable:true};
+                        let vault=|mint:Pubkey|if current.mints[0]==mint{
+                            current.vaults[0]
+                        }else{current.vaults[1]};
+                        let block=|base:Pubkey,quote:Pubkey|{
+                            Arc::<[AccountMeta]>::from(vec![ro(program),ro(base),rw(current.address),
+                                rw(vault(quote)),rw(vault(base))])
+                        };
+                        Ok(m.mint_a==a && m.mint_b==b && m.bound_signer.is_none()
+                            && m.base_a==block(a,b) && m.base_b==block(b,a))
+                    })().unwrap_or(false);
+                    if valid {
+                        if let Some(u)=CompletionUnchanged::from_pool(p,slot){
+                            result.insert(p.address,CompletionOutcome::Unchanged(u));
+                        }
+                    }
+                }
+            },
+            Err(error)=>for r in &eligible {
+                result.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("Manifest light market RPC: {error:#}"))));
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!result.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty() {
+        for proof in process(rpc,pending,settings).await {
+            result.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|result.remove(&r.pool.address).expect("Manifest completion result")).collect()
 }
 
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
