@@ -368,6 +368,11 @@ struct HttpProvider {
     gate:Mutex<Instant>, concurrent:Semaphore,
     cooldown:Mutex<Option<Instant>>, request_id:AtomicU64,
     disabled:AtomicU64,
+    // Assigned requests include requests still waiting for HTTP RPS/concurrency.
+    pending:AtomicUsize,
+    // Actual HTTP attempt duration, excluding transport scheduling and retries.
+    multiple_latency_ms:AtomicU64,
+    other_latency_ms:AtomicU64,
 }
 impl HttpProvider {
     fn new(cfg:HttpSettings)->Result<Self> {
@@ -375,10 +380,36 @@ impl HttpProvider {
             .timeout(Duration::from_millis(cfg.timeout_ms)).build()?;
         Ok(Self{concurrent:Semaphore::new(cfg.max_in_flight),
             gate:Mutex::new(Instant::now()),cooldown:Mutex::new(None),
-            request_id:AtomicU64::new(1),disabled:AtomicU64::new(0),client,cfg})
+            request_id:AtomicU64::new(1),disabled:AtomicU64::new(0),
+            pending:AtomicUsize::new(0),
+            multiple_latency_ms:AtomicU64::new(0),other_latency_ms:AtomicU64::new(0),
+            client,cfg})
     }
     fn eligible(&self,bit:u64)->bool {
         self.cfg.capabilities&bit!=0 && self.disabled.load(Ordering::Relaxed)&bit==0
+    }
+    fn schedulable(&self,bit:u64)->bool {
+        self.eligible(bit) && self.cooldown.try_lock().map_or(true,|guard|
+            guard.is_none_or(|until|until<=Instant::now()))
+    }
+    fn latency_cell(&self,bit:u64)->&AtomicU64 {
+        if bit==1 {&self.multiple_latency_ms} else {&self.other_latency_ms}
+    }
+    fn observe_http(&self,bit:u64,duration:Duration) {
+        let ms=duration.as_millis().clamp(1,120_000) as u64;
+        let cell=self.latency_cell(bit);
+        let _=cell.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|old|
+            Some(if old==0 {ms} else {old.saturating_mul(7).saturating_add(ms)/8}));
+    }
+    /// Predicted queue completion cost: account for both per-provider RPS and
+    /// actual concurrency-limited HTTP response time, not a round-robin slot.
+    fn estimated_queue_ms(&self,bit:u64)->u128 {
+        let assigned=(self.pending.load(Ordering::Relaxed) as u128).saturating_add(1);
+        let observed=self.latency_cell(bit).load(Ordering::Relaxed);
+        let latency=if observed==0 {1_000_u128} else {u128::from(observed)};
+        let service=(latency*assigned).div_ceil(self.cfg.max_in_flight as u128);
+        let rate=(1_000_u128*assigned).div_ceil(self.cfg.rps as u128);
+        service.max(rate)
     }
     async fn request(&self,operation:&RpcOperation,params:&Value)->Result<Value> {
         let method=operation.method();
@@ -389,23 +420,31 @@ impl HttpProvider {
             }
             if attempt>0 {sleep(Duration::from_millis(200_u64.saturating_mul(1 << attempt.min(7)))).await;}
             let _permit=self.concurrent.acquire().await?;
-            let mut next=self.gate.lock().await;
-            sleep_until(*next).await;
-            *next=Instant::now()+Duration::from_secs_f64(1.0/f64::from(self.cfg.rps));
-            drop(next);
-
+            // Reserve a distinct request start slot, releasing the gate mutex
+            // before sleeping. The semaphore remains held so delayed slots
+            // cannot turn into a burst above the configured RPS.
+            let due={
+                let mut next=self.gate.lock().await;
+                let due=(*next).max(Instant::now());
+                *next=due+Duration::from_secs_f64(1.0/f64::from(self.cfg.rps));
+                due
+            };
+            sleep_until(due).await;
             let id=self.request_id.fetch_add(1,Ordering::Relaxed);
+            let sent=Instant::now();
             let outcome=self.client.post(&self.cfg.url)
                 .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
                 .send().await;
             let response=match outcome {
                 Ok(value)=>value,
                 Err(error)=>{
+                    self.observe_http(operation.bit(),sent.elapsed());
                     previous=Some(anyhow!("transport error: {}",error.without_url()));
                     continue;
                 }
             };
             if response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.observe_http(operation.bit(),sent.elapsed());
                 let retry_after=response.headers().get(reqwest::header::RETRY_AFTER)
                     .and_then(|s|s.to_str().ok()).and_then(|s|s.parse::<u64>().ok())
                     .unwrap_or(2).max(1);
@@ -413,6 +452,7 @@ impl HttpProvider {
                 bail!("HTTP 429 provider={} cooldown_s={retry_after}",self.cfg.name);
             }
             if !response.status().is_success() {
+                self.observe_http(operation.bit(),sent.elapsed());
                 let status=response.status();
                 if status.is_server_error() {
                     previous=Some(anyhow!("HTTP {status} at provider {}",self.cfg.name));
@@ -420,7 +460,15 @@ impl HttpProvider {
                 }
                 bail!("HTTP {status} at provider {}",self.cfg.name);
             }
-            let body=response.bytes().await.context("RPC HTTP response body")?;
+            let body=match response.bytes().await {
+                Ok(body)=>body,
+                Err(error)=>{
+                    self.observe_http(operation.bit(),sent.elapsed());
+                    previous=Some(anyhow!("RPC HTTP response body: {error}"));
+                    continue;
+                }
+            };
+            self.observe_http(operation.bit(),sent.elapsed());
             let value:Value=serde_json::from_slice(&body).context("invalid RPC response JSON")?;
             ensure!(value.get("jsonrpc").and_then(Value::as_str)==Some("2.0")
                 && value.get("id")==Some(&json!(id)), "JSON-RPC envelope id/version mismatch");
