@@ -628,40 +628,97 @@ fn report_rpc(stats:&RpcStats) {
     }
 }
 
+/// A per-request assignment is tracked from dispatch through response or task
+/// cancellation. This prevents a slow provider from accumulating an invisible
+/// FIFO queue while faster configured providers have spare capacity.
+struct ProviderLease { provider:Arc<HttpProvider> }
+impl ProviderLease {
+    fn new(provider:Arc<HttpProvider>)->Self {
+        provider.pending.fetch_add(1,Ordering::Relaxed);
+        Self{provider}
+    }
+}
+impl Drop for ProviderLease {
+    fn drop(&mut self) {
+        self.provider.pending.fetch_sub(1,Ordering::Relaxed);
+    }
+}
+fn reserve_provider(
+    eligible:&[Arc<HttpProvider>], attempted:&[bool], cursor:usize, bit:u64,
+)->Option<(usize,ProviderLease)> {
+    let count=eligible.len();
+    let (idx,provider)=eligible.iter().enumerate()
+        .filter(|(i,p)| !attempted[*i] && p.schedulable(bit))
+        .min_by_key(|(i,p)| (
+            p.estimated_queue_ms(bit),
+            (*i+count-(cursor%count))%count,
+        ))?;
+    Some((idx,ProviderLease::new(provider.clone())))
+}
+
 async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     let providers=settings.http.into_iter().map(HttpProvider::new)
         .map(|r|r.map(Arc::new)).collect::<Result<Vec<_>>>()?;
+    let enabled_multiple=providers.iter().filter(|p|p.eligible(1)).collect::<Vec<_>>();
+    let total_rps: u64=enabled_multiple.iter().map(|p|u64::from(p.cfg.rps)).sum();
+    let total_parallel:usize=enabled_multiple.iter().map(|p|p.cfg.max_in_flight).sum();
+    crate::log_event!(Info,
+        "rpc http effective_plan providers={} get_multiple_accounts={} configured_multiple_rps={} configured_multiple_parallel={} weighted_queue=true",
+        providers.len(),enabled_multiple.len(),total_rps,total_parallel);
+    for p in &providers {
+        crate::log_event!(Info,
+            "rpc http provider={} multiple={} rps={} max_in_flight={} timeout_ms={} retries={}",
+            p.cfg.name,p.eligible(1),p.cfg.rps,p.cfg.max_in_flight,
+            p.cfg.timeout_ms,p.cfg.retries);
+    }
     let mut tasks=tokio::task::JoinSet::new();
     let next=Arc::new(AtomicUsize::new(0));
     let stats:RpcStats=Arc::new(StdMutex::new(HashMap::new()));
     let stats_interval:u64=var("RPC_STATS_INTERVAL_SECONDS",30)?;
     ensure!((1..=3600).contains(&stats_interval), "RPC_STATS_INTERVAL_SECONDS must be 1..=3600");
     let report_stats=stats.clone();
+    let report_providers=providers.clone();
     let reporter=tokio::spawn(async move {
         let mut ticker=tokio::time::interval(Duration::from_secs(stats_interval));
         ticker.tick().await;
         loop {
             ticker.tick().await;
             report_rpc(&report_stats);
+            for p in &report_providers {
+                crate::log_event!(Info,
+                    "rpc provider_load provider={} assigned={} multiple_http_ema_ms={} other_http_ema_ms={} rps={} max_in_flight={} multiple_enabled={}",
+                    p.cfg.name,p.pending.load(Ordering::Relaxed),
+                    p.multiple_latency_ms.load(Ordering::Relaxed),
+                    p.other_latency_ms.load(Ordering::Relaxed),
+                    p.cfg.rps,p.cfg.max_in_flight,p.eligible(1));
+            }
         }
     });
     while let Some(Call{operation,reply})=rx.recv().await {
-        // A semaphore inside each provider limits concurrency independently.
-        let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(operation.bit()))
+        let bit=operation.bit();
+        let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(bit))
             .cloned().collect();
         let params=operation.params(&settings.commitment,settings.account_batch_size,settings.v2_page_limit);
         let cursor=next.fetch_add(1,Ordering::Relaxed);
+        // Reserve the initial provider before spawning: otherwise a burst of
+        // new calls would all see the same zero-load selection.
+        let mut attempted=vec![false;eligible.len()];
+        let first=reserve_provider(&eligible,&attempted,cursor,bit);
         let stats=stats.clone();
         tasks.spawn(async move {
             let answer=async {
                 let params=params?;
                 ensure!(!eligible.is_empty(),"no configured RPC provider supports {}",operation.method());
                 let mut error=None;
-                for offset in 0..eligible.len() {
-                    let provider=&eligible[(cursor+offset)%eligible.len()];
-                    if !provider.eligible(operation.bit()) {continue;}
+                let mut ticket=first;
+                while let Some((index,lease))=ticket {
+                    attempted[index]=true;
+                    let provider=lease.provider.clone();
                     let started=Instant::now();
-                    match provider.request(&operation,&params).await {
+                    let result=provider.request(&operation,&params).await;
+                    // Drop the assignment before selecting a failover provider.
+                    drop(lease);
+                    match result {
                         Ok(value)=>match interpret(operation.clone(),value) {
                             Ok(answer)=>{
                                 record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),None);
@@ -685,6 +742,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                             error=Some(err);
                         }
                     }
+                    ticket=reserve_provider(&eligible,&attempted,cursor,bit);
                 }
                 Err(error.unwrap_or_else(||anyhow!("no healthy eligible RPC provider")))
             }.await;
