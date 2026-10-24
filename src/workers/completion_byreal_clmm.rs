@@ -521,7 +521,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                     for (r,layout) in eligible.iter().zip(layouts.iter()){
                                         let Some(l)=layout else{continue};
                                         let p=&r.pool;
-                                        let valid=(||->Result<bool>{
+                                        let valid=(||->Result<(usize,usize)>{
                                             ensure!(l.decay_fee_flag&0b10000==0,"dynamic_fee_requires_swap_v3");
                                             let mut present=Vec::<Pubkey>::new();
                                             for (start,addr) in arrays(*l,owner) {
@@ -556,18 +556,23 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                                 };
                                             }
                                             ensure!(candidate==**m,"stored_manifest_differs");
-                                            Ok(true)
+                                            let dynamic_arrays=present.iter().filter(|addr|
+                                                lookup.get(addr).and_then(Option::as_ref)
+                                                    .is_some_and(|a|a.bytes[..8]==DYN_ARRAY_DISC)
+                                            ).count();
+                                            Ok((present.len(),dynamic_arrays))
                                         })();
                                         match valid {
-                                            Ok(true)=>{
+                                            Ok((total,dynamic))=>{
                                                 if let Some(u)=CompletionUnchanged::from_pool(p,slot){
+                                                    crate::log_event!(Debug,
+                                                        "byreal light unchanged pool={} arrays={} dynamic_arrays={} fixed_arrays={} observed_slot={}",
+                                                        p.address,total,dynamic,total-dynamic,slot);
                                                     outcomes.insert(p.address,CompletionOutcome::Unchanged(u));
                                                 } else {
                                                     crate::log_event!(Debug,"byreal light fallback pool={} reason=unchanged_baseline_unavailable",p.address);
                                                 }
                                             },
-                                            Ok(false)=>crate::log_event!(Debug,
-                                                "byreal light fallback pool={} reason=unclassified",p.address),
                                             Err(error)=>crate::log_event!(Debug,
                                                 "byreal light fallback pool={} reason=verification_failed detail={error:#}",p.address),
                                         }
