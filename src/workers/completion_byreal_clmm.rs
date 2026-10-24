@@ -370,7 +370,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     if l.decay_fee_flag & 0b10000 != 0 {
         return result(pool.address,CompletionStatus::Incomplete,Some(slot),
             Some("Byreal swap-dynamic-fee requires swap_v3_dyn Pyth accounts not present in V10 CLMM builder".into()),
-            Some(ev),Some(proofs),None).with_reason_code(CompletionReason::UnsupportedConfiguration);
+            Some(ev),Some(proofs),None).with_reason_code(CompletionReason::DynamicModeUnsupported);
     }
     let is_v2=ma.owner==token_2022||mb.owner==token_2022;
     let manifest=make_manifest(l,slot,&tick_arrays,&tick_arrays,is_v2,owner);
