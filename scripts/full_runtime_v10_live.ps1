@@ -121,18 +121,17 @@ try {
         & $binary --run 2>&1 | ForEach-Object {
             $line = "$_"
             if ($line -match 'lifecycle unchanged request_id=.* venue=([A-Za-z0-9]+) work=Refresh state=Prepared') {
-        $preparedRefreshes++
-        $venue = $matches[1]
-        if (-not $acceptedByVenue.ContainsKey($venue)) { $acceptedByVenue[$venue] = 0 }
-        $acceptedByVenue[$venue]++
-    }
-    if ($line -match 'lifecycle accepted request_id=.* venue=([A-Za-z0-9]+) work=(\w+) status=(\w+)') {
+                $preparedRefreshes++
+                $venue = $matches[1]
+                if (-not $acceptedByVenue.ContainsKey($venue)) { $acceptedByVenue[$venue] = 0 }
+                $acceptedByVenue[$venue]++
+            }
+            if ($line -match 'lifecycle accepted request_id=.* venue=([A-Za-z0-9]+) work=(\w+) status=(\w+)') {
                 $lifecycleAccepted++
                 $venue = $matches[1]
                 if (-not $acceptedByVenue.ContainsKey($venue)) { $acceptedByVenue[$venue] = 0 }
                 $acceptedByVenue[$venue]++
                 if ($matches[2] -eq 'Refresh' -and $matches[3] -eq 'Prepared') { $preparedRefreshes++ }
-        # Unchanged refreshes are counted below from the independent lifecycle log.
             } else {
                 Write-Output $line
             }
