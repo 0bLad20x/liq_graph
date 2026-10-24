@@ -10,7 +10,7 @@ use tokio::{sync::{broadcast,mpsc}, task::JoinSet};
 use crate::{
     core::{CompletionReason, Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
         CompletionStatus, CompletionResult, CompletionResultBatch,
-        CompletionRequestBatch, CompletionResponse, CompletionResponseBatch, PoolState},
+        CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch, PoolState},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
@@ -661,6 +661,12 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
 
 /// Execute explicit lifecycle requests. Protocol decoding/validation remains local;
 /// scheduling, retries and Prepared refresh decisions belong to the lifecycle.
+async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
+    process(rpc,&pools,settings).await
+        .into_iter().map(CompletionOutcome::Proof).collect()
+}
+
 pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
     rpc: RpcHandle, settings: Settings,
     output: mpsc::Sender<CompletionResponseBatch>) -> Result<()> {
@@ -685,10 +691,10 @@ pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
                         tasks.spawn(async move {
                             let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                             let results=match tokio::time::timeout(batch.timeout,
-                                process(&rpc,&pools,settings)).await {
+                                process_optimized(&rpc,&batch.requests,settings)).await {
                                 Ok(results)=>results,
-                                Err(_)=>pools.iter().map(|p|retryable(p.address,
-                                    "DLMM lifecycle request timed out")).collect(),
+                                Err(_)=>pools.iter().map(|p|CompletionOutcome::Proof(retryable(p.address,
+                                    "DLMM lifecycle request timed out"))).collect(),
                             };
                             (batch.requests,results)
                         });
@@ -702,16 +708,19 @@ pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
                 ensure!(requests.len()==results.len(),"DLMM request/result count mismatch");
                 // process() partitions its output internally; correlate by address,
                 // never by the order in which RPC partitions completed.
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate DLMM pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("DLMM request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "dlmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,result.validated_slot);
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_meteora_dlmm completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:"dlmm_execution_completion",responses})
