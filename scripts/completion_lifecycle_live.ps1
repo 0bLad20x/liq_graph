@@ -10,7 +10,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $branch = git branch --show-current
 $head = git rev-parse HEAD
 $tracked = git status --short --untracked-files=no
-if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/cp2-lifecycle-final", "main", "cp3-central-persistence-dual-registry") -or $tracked) {
+if ($LASTEXITCODE -ne 0 -or $branch -notin @("agent/cp2-lifecycle-final", "main", "cp3-central-persistence-dual-registry", "cp1-completion-state-aware-refresh") -or $tracked) {
     throw "Use a clean, committed agent/cp2-lifecycle-final checkout, or main after merging this checkpoint."
 }
 cargo build --locked --release
@@ -59,6 +59,7 @@ $settings = @{
     COMPLETION_LIFECYCLE_LIVE_VENUE = $selector
     COMPLETION_LIFECYCLE_POOL_LIMIT = "$PoolLimit"
     COMPLETION_LIFECYCLE_REFRESH_SECONDS = "30"
+    COMPLETION_LIFECYCLE_FULL_REFRESH_SECONDS = "90"
     COMPLETION_LIFECYCLE_RECHECK_SECONDS = "45"
     COMPLETION_LIFECYCLE_RETRY_SECONDS = "5"
     COMPLETION_LIFECYCLE_RETRY_MAX_SECONDS = "30"
@@ -138,9 +139,15 @@ $refreshCounts = @{}
 $acceptedCounts = @{}
 $refreshWithdrawals = 0
 $proofMatches = [regex]::Matches($text, $pattern)
+$lightPattern = 'lifecycle unchanged request_id=[0-9]+ pool=([1-9A-HJ-NP-Za-km-z]{32,44}) venue=(MeteoraDlmm|MeteoraDammV2|RaydiumAmmV4|RaydiumCpmm|RaydiumClmm|OrcaWhirlpool|PancakeSwapClmm|ByrealClmm|Manifest|PumpSwap) work=(Initial|Recheck|Refresh|Retry) state=(Prepared|Incomplete) '
+$lightMatches = [regex]::Matches($text,$lightPattern)
+if ($text -notmatch 'lifecycle stats final=true [^\r\n]*unchanged_prepared=[1-9][0-9]*') {
+    throw "No successful lightweight Prepared verification; CP1 optimization not accepted."
+}
+
 $finalAccepted = [regex]::Match($text, 'lifecycle stats final=true [^\r\n]*\baccepted=([0-9]+) ')
-if (-not $finalAccepted.Success -or $proofMatches.Count -ne [long]$finalAccepted.Groups[1].Value) {
-    throw "Accepted proof records differ from final lifecycle accounting; inspect $log"
+if (-not $finalAccepted.Success -or ($proofMatches.Count + $lightMatches.Count) -ne [long]$finalAccepted.Groups[1].Value) {
+    throw "Full and unchanged acknowledgements differ from final lifecycle accounting; inspect $log"
 }
 foreach ($match in $proofMatches) {
     $poolAddress = $match.Groups[1].Value
@@ -157,6 +164,16 @@ foreach ($match in $proofMatches) {
         $refreshWithdrawals++
     }
 }
+
+foreach ($match in $lightMatches) {
+    $poolAddress = $match.Groups[1].Value
+    $protocol = $match.Groups[2].Value
+    $acceptedCounts[$protocol] = 1 + [int]$acceptedCounts[$protocol]
+    if ($match.Groups[3].Value -eq "Refresh" -and $match.Groups[4].Value -eq "Prepared") {
+        $key = "$protocol|$poolAddress"
+        $refreshCounts[$key] = 1 + [int]$refreshCounts[$key]
+    }
+}
 $summary = @()
 foreach ($protocol in $selectedVenues) {
     $repeated = @($refreshCounts.Keys | Where-Object {
@@ -166,7 +183,7 @@ foreach ($protocol in $selectedVenues) {
         throw "No repeated successful Prepared refresh for $protocol. Inspect $log; this protocol is not accepted."
     }
     $required = $protocol -in $requiredVenues
-    $summary += "CP2 protocol=$protocol connected=true accepted=$([int]$acceptedCounts[$protocol]) repeated_refresh_pools=$($repeated.Count) refresh_required=$required"
+    $summary += "CP1 protocol=$protocol connected=true accepted=$([int]$acceptedCounts[$protocol]) repeated_refresh_pools=$($repeated.Count) refresh_required=$required"
 }
 if ($latest.Count -eq 0) { throw "No accepted proof records found in $log" }
 $values = ($latest.Values | Sort-Object) -join ",`n    "
@@ -197,9 +214,9 @@ SELECT COUNT(*) AS proofs_expected,
 FROM checks;
 "@ | Set-Content -Encoding UTF8 $verification
 $summary | Tee-Object -FilePath $log -Append
-"CP2 refresh_to_incomplete_observed=$refreshWithdrawals proofs_expected=$($latest.Count) deferred_refresh=$($deferredVenues -join ',')" |
+"CP1 refresh_to_incomplete_observed=$refreshWithdrawals proofs_expected=$($latest.Count) deferred_refresh=$($deferredVenues -join ',')" |
     Tee-Object -FilePath $log -Append
-Write-Host "CP2 live refresh path passed for head=$head. Run the read-only $verification to verify the exact stored proofs."
+Write-Host "CP1 live refresh path passed for head=$head. Run the read-only $verification to verify the exact stored proofs."
 if ($deferredVenues.Count -gt 0) {
     Write-Host "Manifest TVL/refresh proof is explicitly deferred; runtime errors remain fatal and any accepted Manifest proofs are included in SQL."
 }
