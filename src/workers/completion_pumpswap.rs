@@ -460,9 +460,122 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
 }
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
-async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
-    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
-    process(rpc,pools,settings).await.into_iter().map(CompletionOutcome::Proof).collect()
+async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let program:Pubkey=PUMP.parse().expect("known PumpSwap program");
+    let spl:Pubkey=TOKEN.parse().expect("known SPL token program");
+    let token_2022:Pubkey=TOKEN_2022.parse().expect("known Token-2022 program");
+    let associated:Pubkey=ASSOCIATED.parse().expect("known ATA program");
+    let global_addr=global_key(program);
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.as_ref().is_some_and(|m|m.bound_signer==settings.wallet)
+        && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind=="pumpswap_pool_validated_v1"&&e.version==1)
+        && r.pool.completion_validated_slot.is_some() && settings.wallet.is_some())
+        .collect::<Vec<_>>();
+    let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty(){
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        let addresses=std::iter::once(global_addr).chain(eligible.iter().map(|r|r.pool.address))
+            .collect::<Vec<_>>();
+        match read(rpc,addresses,min_slot).await {
+            Err(error)=>for r in &eligible{
+                outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("PumpSwap light pool/global: {error:#}"))));
+            },
+            Ok((parent_slot,accounts))=>{
+                if let Some(global)=accounts.get(&global_addr).and_then(Option::as_ref){
+                    if global.owner==program && global.bytes.len()>=675 {
+                        let global_bytes=&global.bytes;
+                        let buyback=key(global_bytes,643).unwrap_or_default();
+                        let mut checked=Vec::new();
+                        let mut wanted=Vec::new();let mut seen=HashSet::new();
+                        for r in &eligible{
+                            let p=&r.pool;
+                            let Some(layout)=accounts.get(&p.address).and_then(Option::as_ref)
+                                .and_then(|a|pool_layout(a,p,program).ok()) else{continue};
+                            let Some(proofs)=p.mint_proofs.as_ref() else{continue};
+                            let quote_program=if proofs[1].token_2022{token_2022}else{spl};
+                            let Ok(recipients)=fee_candidates(global_bytes,layout.mayhem) else{continue};
+                            let buybacks=if !layout.cashback
+                                && (layout.mints[1].to_string()==WSOL || layout.mints[1].to_string()==USDC)
+                                && quote_program==spl {
+                                match buyback_candidates(global_bytes){Ok(v)=>v,Err(_)=>continue}
+                            }else{Vec::new()};
+                            for wallet in recipients.iter().chain(buybacks.iter()){
+                                let addr=ata(*wallet,layout.mints[1],quote_program,associated);
+                                if seen.insert(addr){wanted.push(addr);}
+                            }
+                            checked.push((*r,layout,quote_program,recipients,buybacks));
+                        }
+                        let mut fee_accounts=HashMap::new();
+                        let mut last_slot=parent_slot;
+                        let mut fee_error=None;
+                        for chunk in wanted.chunks(settings.account_batch_size){
+                            match read(rpc,chunk.to_vec(),Some(parent_slot)).await {
+                                Ok((slot,accounts))=>{
+                                    last_slot=last_slot.max(slot);
+                                    fee_accounts.extend(accounts);
+                                },
+                                Err(error)=>{fee_error=Some(format!("{error:#}"));break;},
+                            }
+                        }
+                        if let Some(error)=fee_error {
+                            for (r,_,_,_,_) in &checked {
+                                outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                                    format!("PumpSwap light fee accounts: {error}"))));
+                            }
+                        }else{
+                            for (r,layout,quote_program,recipients,buybacks) in checked {
+                                let p=&r.pool;
+                                let initialized=recipients.iter().copied().filter(|recipient|{
+                                    let addr=ata(*recipient,layout.mints[1],quote_program,associated);
+                                    fee_accounts.get(&addr).and_then(Option::as_ref)
+                                        .is_some_and(|a|token_account_ok(a,layout.mints[1],*recipient,quote_program))
+                                }).collect::<Vec<_>>();
+                                let recipient=initialized.first().copied().unwrap_or(recipients[0]);
+                                let warmed=buybacks.iter().copied().find(|recipient|{
+                                    let addr=ata(*recipient,layout.mints[1],quote_program,associated);
+                                    fee_accounts.get(&addr).and_then(Option::as_ref)
+                                        .is_some_and(|a|token_account_ok(a,layout.mints[1],*recipient,quote_program))
+                                });
+                                let use_v2=warmed.is_some();
+                                let selected_buyback=warmed.unwrap_or(buyback);
+                                let ev=p.completion_evidence.as_ref().expect("eligible evidence");
+                                let previous_creator=ev.payload["coin_creator"].as_str();
+                                let matched=previous_creator==Some(layout.creator.to_string().as_str())
+                                    && ev.payload["is_mayhem_mode"].as_bool()==Some(layout.mayhem)
+                                    && ev.payload["is_cashback_coin"].as_bool()==Some(layout.cashback)
+                                    && ev.payload["base_vault"].as_str()==Some(layout.vaults[0].to_string().as_str())
+                                    && ev.payload["quote_vault"].as_str()==Some(layout.vaults[1].to_string().as_str())
+                                    && p.execution_manifest.as_ref().is_some_and(|cached|{
+                                        let wallet=settings.wallet.expect("eligible wallet");
+                                        let fresh=manifest(layout,cached.validated_slot,wallet,recipient,
+                                            selected_buyback,quote_program,use_v2,program,associated);
+                                        fresh==**cached
+                                    });
+                                if matched {
+                                    if let Some(u)=CompletionUnchanged::from_pool(p,last_slot){
+                                        outcomes.insert(p.address,CompletionOutcome::Unchanged(u));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!outcomes.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,pending,settings).await{
+            outcomes.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|outcomes.remove(&r.pool.address).expect("PumpSwap result")).collect()
 }
 
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
