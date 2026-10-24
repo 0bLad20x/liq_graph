@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc, watch};
 use crate::core::{now_unix_ms, CompletionRequest, CompletionRequestBatch,
-    CompletionResponseBatch, CompletionResult, CompletionResultBatch,
+    CompletionResponseBatch, CompletionOutcome, CompletionResult, CompletionResultBatch,
     CompletionReason, CompletionState, CompletionStatus, CompletionWork,
     PoolState, PoolUpdateBatch, Venue};
 
@@ -24,6 +24,8 @@ pub struct Executor {
 pub struct Settings {
     refresh_ms: u64,
     recheck_ms: u64,
+    full_refresh_ms: u64,
+    recheck_paused_once: bool,
     retry_ms: u64,
     retry_max_ms: u64,
     acknowledgement_ms: u64,
@@ -49,9 +51,21 @@ impl Settings {
             .unwrap_or_else(|_|"0".into()).parse::<usize>()
             .context("invalid COMPLETION_LIFECYCLE_POOL_LIMIT")?;
         ensure!(pool_limit<=100000,"lifecycle pool limit must be 0..100000");
+        let recheck_paused_once=match env::var("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE") {
+            Err(env::VarError::NotPresent)=>false,
+            Ok(v) if v=="true"||v=="1"=>true,
+            Ok(v) if v=="false"||v=="0"=>false,
+            _=>bail!("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE must be true or false"),
+        };
+        if recheck_paused_once {
+            ensure!(pool_limit>0 && env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").ok().as_deref()==Some("byreal"),
+                "paused legacy Byreal recheck is allowed only in bounded Byreal live mode");
+        }
         Ok(Self {
+            recheck_paused_once,
             refresh_ms:seconds("COMPLETION_LIFECYCLE_REFRESH_SECONDS",900)?,
             recheck_ms:seconds("COMPLETION_LIFECYCLE_RECHECK_SECONDS",300)?,
+            full_refresh_ms:seconds("COMPLETION_LIFECYCLE_FULL_REFRESH_SECONDS",3600)?,
             retry_ms,retry_max_ms,
             acknowledgement_ms:seconds("COMPLETION_LIFECYCLE_ACK_SECONDS",120)?,
             attempt_timeout:Duration::from_millis(seconds("COMPLETION_LIFECYCLE_ATTEMPT_SECONDS",180)?),
@@ -63,6 +77,7 @@ impl Settings {
 struct Flight {
     id:u64,
     work:CompletionWork,
+    force_full:bool,
     previous_checked:Option<u64>,
     previous_slot:Option<u64>,
     sent_at:u64,
@@ -77,6 +92,7 @@ struct Entry {
     flight:Option<Flight>,
     // Most recent timed-out request for this pool; older executor replies must not overwrite proofs.
     last_expired:Option<u64>,
+    last_light_checked_at_ms:Option<u64>,
 }
 #[derive(Default)]
 struct Counters {
@@ -84,11 +100,14 @@ struct Counters {
     accepted:u64,
     prepared:u64,
     incomplete:u64,
+    unchanged_prepared:u64,
+    unchanged_incomplete:u64,
     retryable:u64,
     non_advancing:u64,
     refreshes:u64,
     repeated_refreshes:u64,
     withdrawals:u64,
+    withdrawn_in_flight:u64,
     timeouts:u64,
     late_responses:u64,
 }
@@ -133,6 +152,9 @@ impl Scheduler {
         let key=pool.address;
         if !self.entries.contains_key(&key) {
             if !pool.completion_admission.is_admitted(){return;}
+            let legacy_byreal=settings.recheck_paused_once && pool.venue==Venue::ByrealClmm
+                && pool.completion_state==CompletionState::Incomplete
+                && pool.completion_reason_code==Some(CompletionReason::UnsupportedConfiguration);
             if managed && settings.pool_limit>0 {
                 if !self.selected.iter().any(|(venue,_)|*venue==pool.venue) {
                     self.selected.push((pool.venue,HashSet::new()));
@@ -141,14 +163,15 @@ impl Scheduler {
                     .find(|(venue,_)|*venue==pool.venue).expect("registered cohort").1;
                 // A paused unsupported pool must not consume the finite cohort.
                 if !selected.contains(&key) {
-                    if !Self::recheckable(pool.completion_reason_code,configuration_ready)
+                    if (!legacy_byreal && !Self::recheckable(pool.completion_reason_code,configuration_ready))
                         || selected.len()>=settings.pool_limit{return;}
                     selected.insert(key);
                 }
             }
-            let (work,due)=Self::plan(pool,configuration_ready,settings,now);
+            let (work,due)=if legacy_byreal{(CompletionWork::Recheck,Some(now))}
+                else{Self::plan(pool,configuration_ready,settings,now)};
             crate::log_event!(Debug,"lifecycle plan pool={} venue={:?} executing={managed} work={work:?} due_at_ms={due:?}",key,pool.venue);
-            self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None,last_expired:None});
+            self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None,last_expired:None,last_light_checked_at_ms:None});
             if managed {if let Some(at)=due{self.due.insert((at,key));}}
             return;
         }
@@ -167,6 +190,7 @@ impl Scheduler {
                 key,pool.venue,entry.flight.is_some());
         }
         entry.pool=pool.clone();
+        if proof_changed {entry.last_light_checked_at_ms=None;}
         let acknowledged=entry.flight.as_ref().and_then(|f|f.terminal.as_ref())
             .is_some_and(|result|result.checked_at_ms==pool.completion_checked_at_ms
                 && result.validated_slot==pool.completion_validated_slot
@@ -201,6 +225,10 @@ impl Scheduler {
             if reactivated || proof_changed {entry.failures=0;}
             if acknowledged || proof_changed || reactivated || (policy_changed && entry.failures==0) {
                 (entry.work,entry.due)=Self::plan(pool,configuration_ready,settings,now);
+                if let Some(last)=entry.last_light_checked_at_ms {
+                    let interval=if pool.completion_state==CompletionState::Prepared {settings.refresh_ms}else{settings.recheck_ms};
+                    entry.due=entry.due.map(|due|due.max(last.saturating_add(interval)));
+                }
             }
             if !pool.completion_admission.is_admitted() {
                 self.entries.remove(&key);
@@ -224,13 +252,13 @@ impl Scheduler {
         ->Result<CompletionResultBatch> {
         let mut forward=Vec::with_capacity(batch.responses.len());
         for response in batch.responses {
-            let result=response.result;
-            let Some(entry)=self.entries.get_mut(&result.pool) else {
+            let pool=response.outcome.pool();
+            let Some(entry)=self.entries.get_mut(&pool) else {
                 // A pool can lose admission while its executor request is still running.
                 self.counters.late_responses+=1;
                 crate::log_event!(Warn,
                     "lifecycle orphan_response_dropped request_id={} pool={} reason=pool_no_longer_tracked",
-                    response.id,result.pool);
+                    response.id,pool);
                 continue;
             };
             if entry.last_expired.is_some_and(|expired|response.id<=expired) {
@@ -239,12 +267,67 @@ impl Scheduler {
                 self.counters.late_responses+=1;
                 crate::log_event!(Warn,
                     "lifecycle late_response_dropped request_id={} pool={} latest_expired_id={:?} proof_retained=true",
-                    response.id,result.pool,entry.last_expired);
+                    response.id,pool,entry.last_expired);
                 continue;
             }
             let flight=entry.flight.as_ref().context("response for idle lifecycle pool")?;
             ensure!(flight.id==response.id && flight.terminal.is_none(),
-                "duplicate or mismatched lifecycle response pool={}",result.pool);
+                "duplicate or mismatched lifecycle response pool={}",pool);
+            // Admission can be withdrawn while RPC reads are in flight.
+            // Never advance or persist a completion for a withdrawn pool.
+            if !entry.pool.completion_admission.is_admitted() {
+                self.counters.withdrawn_in_flight+=1;
+                self.entries.remove(&pool);
+                crate::log_event!(Info,
+                    "lifecycle withdrawn_response_dropped request_id={} pool={} proof_retained=true",
+                    response.id,pool);
+                continue;
+            }
+            if let CompletionOutcome::Unchanged(check)=&response.outcome {
+                let baseline_matches=!flight.force_full
+                    && entry.pool.completion_validated_slot==Some(check.baseline_validated_slot)
+                    && entry.pool.completion_checked_at_ms==Some(check.baseline_checked_at_ms)
+                    && entry.pool.completion_state==check.baseline_state
+                    && check.baseline_state!=CompletionState::Unknown
+                    && check.observed_slot>check.baseline_validated_slot
+                    && check.checked_at_ms>=check.baseline_checked_at_ms
+                    && check.checked_at_ms<=now.saturating_add(5000)
+                    && (check.baseline_state!=CompletionState::Prepared
+                        || (entry.pool.execution_manifest.is_some() && entry.pool.mint_proofs.is_some()));
+                if !baseline_matches {
+                    self.counters.non_advancing+=1;
+                    Self::retry(entry,settings,now);
+                    if let Some(at)=entry.due{self.due.insert((at,pool));}
+                    crate::log_event!(Warn,"lifecycle unchanged_baseline_mismatch request_id={} pool={} retry_at_ms={:?}",response.id,pool,entry.due);
+                    continue;
+                }
+                let work=entry.flight.as_ref().expect("checked flight").work;
+                entry.flight=None;
+                entry.failures=0;
+                entry.last_light_checked_at_ms=Some(check.checked_at_ms);
+                self.counters.accepted+=1;
+                match check.baseline_state {
+                    CompletionState::Prepared=>{
+                        self.counters.unchanged_prepared+=1;
+                        if work==CompletionWork::Refresh {
+                            self.counters.refreshes+=1;
+                            if !self.refreshed.insert(pool){self.counters.repeated_refreshes+=1;}
+                        }
+                    },
+                    CompletionState::Incomplete=>self.counters.unchanged_incomplete+=1,
+                    CompletionState::Unknown=>unreachable!(),
+                }
+                let (next_work,normal_due)=Self::plan(&entry.pool,true,settings,now);
+                entry.work=next_work;
+                let interval=if check.baseline_state==CompletionState::Prepared {settings.refresh_ms}else{settings.recheck_ms};
+                entry.due=normal_due.map(|due|due.max(check.checked_at_ms.saturating_add(interval)));
+                if let Some(at)=entry.due{self.due.insert((at,pool));}
+                crate::log_event!(Info,"lifecycle unchanged request_id={} pool={} venue={:?} work={:?} state={:?} baseline_slot={} observed_slot={} checked_at_ms={} next_due_ms={:?} db_write=false",
+                    response.id,pool,entry.pool.venue,work,check.baseline_state,
+                    check.baseline_validated_slot,check.observed_slot,check.checked_at_ms,entry.due);
+                continue;
+            }
+            let CompletionOutcome::Proof(result)=response.outcome else{unreachable!()};
             if result.status==CompletionStatus::Retryable {
                 ensure!(result.reason_code==Some(CompletionReason::TransientFailure)
                     && result.checked_at_ms.is_none() && result.manifest.is_none(),
@@ -252,17 +335,17 @@ impl Scheduler {
                 self.counters.retryable+=1;
                 Self::retry(entry,settings,now);
                 crate::log_event!(Info,"lifecycle retry request_id={} pool={} next_due_ms={:?} failures={} proof_retained=true",
-                    response.id,result.pool,entry.due,entry.failures);
-                if let Some(at)=entry.due{self.due.insert((at,result.pool));}
+                    response.id,pool,entry.due,entry.failures);
+                if let Some(at)=entry.due{self.due.insert((at,pool));}
             } else if result.validated_slot.is_some_and(|slot|
                 entry.pool.completion_validated_slot.is_some_and(|old|slot<=old)) {
                 // Same-slot re-reads cannot renew the accepted proof. Wait for a
                 // newer slot, without sending a known-stale write to the Registry.
                 self.counters.non_advancing+=1;
                 Self::retry(entry,settings,now);
-                if let Some(at)=entry.due{self.due.insert((at,result.pool));}
+                if let Some(at)=entry.due{self.due.insert((at,pool));}
                 crate::log_event!(Info,"lifecycle non_advancing request_id={} pool={} slot={:?} next_due_ms={:?}",
-                    response.id,result.pool,result.validated_slot,entry.due);
+                    response.id,pool,result.validated_slot,entry.due);
                 continue;
             } else {
                 let flight=entry.flight.as_mut().expect("validated lifecycle response");
@@ -300,12 +383,16 @@ impl Scheduler {
                     if let Some(at)=entry.due.take(){self.due.remove(&(at,key));}
                     self.next_id=self.next_id.checked_add(1).context("lifecycle request id overflow")?;
                     let id=self.next_id;
-                    entry.flight=Some(Flight{id,work:entry.work,
+                    let force_full=entry.pool.completion_state==CompletionState::Unknown
+                        || entry.pool.completion_validated_slot.is_none()
+                        || entry.pool.completion_checked_at_ms.is_none_or(|at|
+                            now.saturating_sub(at)>=settings.full_refresh_ms);
+                    entry.flight=Some(Flight{id,work:entry.work,force_full,
                         previous_checked:entry.pool.completion_checked_at_ms,
                         previous_slot:entry.pool.completion_validated_slot,sent_at:now,terminal:None});
-                    crate::log_event!(Debug,"lifecycle dispatch request_id={id} pool={key} venue={:?} work={:?}",
+                    crate::log_event!(Debug,"lifecycle dispatch request_id={id} pool={key} venue={:?} work={:?} force_full={force_full}",
                         entry.pool.venue,entry.work);
-                    requests.push(CompletionRequest{id,work:entry.work,pool:entry.pool.clone()});
+                    requests.push(CompletionRequest{id,work:entry.work,force_full,pool:entry.pool.clone()});
                 }
                 self.counters.dispatched+=requests.len() as u64;
                 permit.send(CompletionRequestBatch{requests,timeout:settings.attempt_timeout});
@@ -319,9 +406,9 @@ impl Scheduler {
         let oldest=self.due.first().map_or(0,|(at,_)|now.saturating_sub(*at));
         let c=&self.counters;
         crate::log_event!(Info,
-            "lifecycle stats final={final_report} tracked={} in_flight={in_flight} overdue={overdue} oldest_overdue_ms={oldest} dispatched={} accepted={} prepared={} incomplete={} retryable={} non_advancing={} timeouts={} late_responses={} prepared_refreshes={} repeated_prepared_refreshes={} admission_withdrawals={}",
+            "lifecycle stats final={final_report} tracked={} in_flight={in_flight} overdue={overdue} oldest_overdue_ms={oldest} dispatched={} accepted={} prepared={} incomplete={} retryable={} non_advancing={} timeouts={} late_responses={} prepared_refreshes={} repeated_prepared_refreshes={} unchanged_prepared={} unchanged_incomplete={} admission_withdrawals={} withdrawn_in_flight={}",
             self.entries.len(),c.dispatched,c.accepted,c.prepared,c.incomplete,c.retryable,c.non_advancing,
-            c.timeouts,c.late_responses,c.refreshes,c.repeated_refreshes,c.withdrawals);
+            c.timeouts,c.late_responses,c.refreshes,c.repeated_refreshes,c.unchanged_prepared,c.unchanged_incomplete,c.withdrawals,c.withdrawn_in_flight);
         let mut venues:Vec<Venue>=self.entries.values().map(|e|e.pool.venue).collect();
         venues.sort_unstable_by_key(|v|format!("{v:?}"));venues.dedup();
         for venue in venues {
@@ -356,9 +443,9 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
     }
     let configuration_ready=executors.iter().filter(|e|e.configuration_ready)
         .map(|e|e.venue).collect::<Vec<_>>();
-    crate::log_event!(Info,"lifecycle started managed={registered:?} configuration_ready={configuration_ready:?} refresh_ms={} recheck_ms={} retry_ms={} retry_max_ms={} pool_limit={} attempt_limit={} finite={} max_age_enforced=false",
+    crate::log_event!(Info,"lifecycle started managed={registered:?} configuration_ready={configuration_ready:?} refresh_ms={} recheck_ms={} retry_ms={} retry_max_ms={} full_refresh_ms={} pool_limit={} attempt_limit={} finite={} max_age_enforced=false",
         settings.refresh_ms,settings.recheck_ms,settings.retry_ms,settings.retry_max_ms,
-        settings.pool_limit,settings.attempt_limit,settings.finite);
+        settings.full_refresh_ms,settings.pool_limit,settings.attempt_limit,settings.finite);
     let mut input_open=true;
     let mut stopping=*stop.borrow();
     let mut pulse=tokio::time::interval(Duration::from_millis(250));
@@ -398,6 +485,10 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
             crate::log_event!(Warn,
                 "lifecycle request_timeout request_id={id} pool={pool} venue={venue:?} elapsed_ms={age} awaiting_registry={awaiting_registry} retry_at_ms={due:?} proof_retained=true");
         }
+        // A withdrawn pool whose final RPC/ack timeout elapsed must not remain
+        // as an idle entry until a further external update happens.
+        scheduler.entries.retain(|_,entry|
+            entry.flight.is_some() || entry.pool.completion_admission.is_admitted());
         tokio::select! {
             update=input.recv(),if input_open=>match update {
                 Ok(batch)=>{
@@ -429,7 +520,8 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         }
     }
     ensure!(scheduler.counters.dispatched==scheduler.counters.accepted
-        +scheduler.counters.retryable+scheduler.counters.non_advancing+scheduler.counters.timeouts,
+        +scheduler.counters.retryable+scheduler.counters.non_advancing
+        +scheduler.counters.timeouts+scheduler.counters.withdrawn_in_flight,
         "lifecycle final accounting has unacknowledged requests");
     scheduler.report(&executors,now_unix_ms()?,true);
     Ok(())

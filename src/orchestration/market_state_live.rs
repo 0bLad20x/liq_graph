@@ -199,7 +199,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         account_control,account_events,prices.clone(),settings,stop_rx,enabled)));
     updates.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,source:"market_live_restore",
         received_at_ms:0,pools:prepared,persist_identity:Vec::new()}))?;
-    let mut registry_task=Task(tokio::spawn(pool_registry::run(source_rx,None,registry.clone(),updates.clone(),done,true)));
+    let mut registry_task=Task(tokio::spawn(pool_registry::run(source_rx,None,registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone()))));
     let mut qualification=Task(tokio::spawn(mint_qualification::run(
         registry.snapshot(),mint_registry,qualification_rx,jupiter_rx,qualified_tx,target_tx)));
     let mut jupiter=Task(tokio::spawn(source_jupiter_mint::run_targeted(

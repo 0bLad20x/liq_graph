@@ -7,7 +7,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
-    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch,
+    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch,
         CompletionResponse, CompletionResponseBatch, CompletionStatus, ExecutionManifest, MintProof,
         PoolState, Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -293,6 +293,70 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
+async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let program:Pubkey=PROGRAM.parse().expect("known Manifest program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind=="manifest_market_v10" && e.version==1)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut result=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty(){
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        match read_rpc(rpc,eligible.iter().map(|r|r.pool.address).collect(),min_slot).await {
+            Ok((slot,accounts))=>{
+                for (r,account) in eligible.iter().zip(accounts.iter()){
+                    let p=&r.pool;
+                    let valid=(||->Result<bool>{
+                        let market=account.as_ref().context("Manifest market missing")?;
+                        let current=decode_market(market,p,program)?;
+                        if spare_node(&market.bytes).is_none(){return Ok(false);}
+                        let ev=p.completion_evidence.as_ref().context("missing evidence")?;
+                        if ev.payload["base_mint"].as_str()!=Some(current.mints[0].to_string().as_str())
+                            || ev.payload["quote_mint"].as_str()!=Some(current.mints[1].to_string().as_str())
+                            || ev.payload["base_vault"].as_str()!=Some(current.vaults[0].to_string().as_str())
+                            || ev.payload["quote_vault"].as_str()!=Some(current.vaults[1].to_string().as_str()) {
+                            return Ok(false);
+                        }
+                        let m=p.execution_manifest.as_ref().context("missing manifest")?;
+                        let [a,b]=[p.mint_a.context("mint A")?,p.mint_b.context("mint B")?];
+                        let ro=|address|AccountMeta{address,writable:false};
+                        let rw=|address|AccountMeta{address,writable:true};
+                        let vault=|mint:Pubkey|if current.mints[0]==mint{
+                            current.vaults[0]
+                        }else{current.vaults[1]};
+                        let block=|base:Pubkey,quote:Pubkey|{
+                            Arc::<[AccountMeta]>::from(vec![ro(program),ro(base),rw(current.address),
+                                rw(vault(quote)),rw(vault(base))])
+                        };
+                        Ok(m.mint_a==a && m.mint_b==b && m.bound_signer.is_none()
+                            && m.base_a==block(a,b) && m.base_b==block(b,a))
+                    })().unwrap_or(false);
+                    if valid {
+                        if let Some(u)=CompletionUnchanged::from_pool(p,slot){
+                            result.insert(p.address,CompletionOutcome::Unchanged(u));
+                        }
+                    }
+                }
+            },
+            Err(error)=>for r in &eligible {
+                result.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("Manifest light market RPC: {error:#}"))));
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!result.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty() {
+        for proof in process(rpc,pending,settings).await {
+            result.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|result.remove(&r.pool.address).expect("Manifest completion result")).collect()
+}
+
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
@@ -311,12 +375,10 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                         "Manifest request has wrong venue or missing admission");
                     let rpc=rpc.clone();
                     tasks.spawn(async move {
-                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                         let results=match tokio::time::timeout(batch.timeout,
-                            process(&rpc,pools,settings)).await {
+                            process_optimized(&rpc,&batch.requests,settings)).await {
                             Ok(results)=>results,
-                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
-                                "Manifest lifecycle request timed out")).collect(),
+                            Err(_)=>batch.requests.iter().map(|r|CompletionOutcome::Proof(retry(r.pool.address,"Manifest lifecycle request timed out"))).collect(),
                         };
                         (batch.requests,results)
                     });
@@ -327,17 +389,19 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                 let (requests,results)=done.context("missing Manifest request task")?
                     .context("Manifest request task panicked")?;
                 ensure!(requests.len()==results.len(),"Manifest request/result count mismatch");
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate Manifest pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("Manifest request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "manifest executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,
-                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_manifest completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:SOURCE,responses}).await

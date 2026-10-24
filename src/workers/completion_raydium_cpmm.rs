@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     core::{CompletionReason,
-        AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
+        AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue,
     },
@@ -384,6 +384,56 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
+async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let program:Pubkey=PROGRAM.parse().expect("known CPMM program");
+    let authority=Pubkey::find_program_address(&[b"vault_and_lp_mint_auth_seed"],&program).0;
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="raydium_cpmm_pool"&&e.version==1)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut result=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty() {
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        let addresses=eligible.iter().map(|r|r.pool.address).collect();
+        match read(rpc,addresses,min_slot).await {
+            Ok(batch)=>{
+                for (r,account) in eligible.iter().zip(batch.accounts.iter()) {
+                    let p=&r.pool;
+                    let valid=account.as_ref().and_then(|a|decode_pool(a,p,program).ok())
+                        .is_some_and(|layout|{
+                            let ev=p.completion_evidence.as_ref().expect("eligible evidence");
+                            let m=p.execution_manifest.as_ref().expect("eligible manifest");
+                            let fresh=manifest(layout,p,m.validated_slot,program,authority);
+                            ev.payload["token_program_0"].as_str()==Some(layout.programs[0].to_string().as_str())
+                                && ev.payload["token_program_1"].as_str()==Some(layout.programs[1].to_string().as_str())
+                                && ev.payload["amm_config"].as_str()==Some(layout.config.to_string().as_str())
+                                && fresh==**m
+                        });
+                    if valid {
+                        if let Some(u)=CompletionUnchanged::from_pool(p,batch.slot) {
+                            result.insert(p.address,CompletionOutcome::Unchanged(u));
+                        }
+                    }
+                }
+            },
+            Err(error)=>for r in &eligible {
+                result.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("CPMM light RPC: {error:#}"))));
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!result.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty() {
+        for proof in process(rpc,pending,settings).await {
+            result.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|result.remove(&r.pool.address).expect("CPMM result")).collect()
+}
+
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
@@ -402,12 +452,10 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                         "Raydium CPMM request has wrong venue or missing admission");
                     let rpc=rpc.clone();
                     tasks.spawn(async move {
-                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                         let results=match tokio::time::timeout(batch.timeout,
-                            process(&rpc,pools,settings)).await {
+                            process_optimized(&rpc,&batch.requests,settings)).await {
                             Ok(results)=>results,
-                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
-                                "Raydium CPMM lifecycle request timed out")).collect(),
+                            Err(_)=>batch.requests.iter().map(|r|CompletionOutcome::Proof(retry(r.pool.address,"Raydium CPMM lifecycle request timed out"))).collect(),
                         };
                         (batch.requests,results)
                     });
@@ -418,17 +466,19 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                 let (requests,results)=done.context("missing Raydium CPMM request task")?
                     .context("Raydium CPMM request task panicked")?;
                 ensure!(requests.len()==results.len(),"Raydium CPMM request/result count mismatch");
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate Raydium CPMM pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("Raydium CPMM request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "raydium_cpmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,
-                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_raydium_cpmm completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:SOURCE,responses}).await

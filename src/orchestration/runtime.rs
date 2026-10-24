@@ -248,9 +248,10 @@ pub async fn completion_lifecycle_live()->Result<()> {
     let (results,result_rx)=broadcast::channel(256);
     let (done,done_rx)=watch::channel(false);
     let (stop,stop_rx)=watch::channel(false);
+    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let mut tasks=JoinSet::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
-        registry.clone(),updates.clone(),done,true));
+        registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone())));
     let mut mint_stream=enrichment.as_ref().map(|_|broadcast::channel::<Arc<DataBatch>>(256));
     let mint_store_rx=mint_stream.as_ref().map(|(out,_)|out.subscribe());
     critical(&mut tasks,"persistence",database.run_with_mints(
@@ -267,7 +268,6 @@ pub async fn completion_lifecycle_live()->Result<()> {
     if let Some(enrichment)=enrichment {
         // Reuse the existing CP1 mint rules and TVL provider. Historical DB
         // observations and RPC vault balances never substitute canonical TVL.
-        let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let (jupiter_out,jupiter_rx)=mint_stream.take().context("missing Jupiter stream")?;
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
@@ -278,6 +278,15 @@ pub async fn completion_lifecycle_live()->Result<()> {
         critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
             source_dexscreener::run_live(qualified_rx,registry.clone(),sources.clone())));
         crate::log_event!(Info,"lifecycle live enrichment=cp1");
+    } else {
+        // The restored RAM Mint Registry remains authoritative even when
+        // standalone Completion has no Jupiter API credentials.
+        let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(16);
+        let (target_tx,_target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+        critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
+            mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
+                jupiter_rx,qualified_tx,target_tx)));
+        let _keep_jupiter_sender=jupiter_out;
     }
     if configured.pumpswap.is_some() {
         critical(&mut tasks,"discovery.pumpswap_rolling",until_stop(stop_rx.clone(),
@@ -382,11 +391,11 @@ pub async fn cp1_live() -> Result<()> {
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
     let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
     let (done,_) = watch::channel(false);
+    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let registry_task=tokio::spawn(pool_registry::run(
-        source_rx,None,registry.clone(),updates.clone(),done,true));
+        source_rx,None,registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone())));
     let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
     let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe())));
-    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let qualification=tokio::spawn(mint_qualification::run(
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
@@ -462,7 +471,7 @@ pub async fn run()->Result<()>{
         let hydrate_rx=updates.subscribe();
         let (done,_) = watch::channel(false);
         let registry_task=tokio::spawn(pool_registry::run(source_rx,None,registry,
-            updates.clone(),done,true));
+            updates.clone(),done,true,None));
         let writer_task=tokio::spawn(database.run(db_rx));
         crate::log_event!(Info,
             "multi venue hydration standalone restored={} requested={}",
@@ -501,9 +510,10 @@ pub async fn run()->Result<()>{
     let (source_done,done_rx)=watch::channel(false);
     let (graph_tx,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
     let (catalog_tx,catalog_rx)=watch::channel(Arc::new(graph_watch_catalog::WatchCatalog::empty()));
+    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let mut tasks=JoinSet::<Result<()>>::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
-        registry.clone(),updates.clone(),source_done,true));
+        registry.clone(),updates.clone(),source_done,true,Some(qualified_rx.clone())));
     let (jupiter_out,jupiter_observer_rx)=broadcast::channel::<Arc<DataBatch>>(256);
     critical(&mut tasks,"persistence",database.run_with_mints(
         updates.subscribe(),Some(jupiter_out.subscribe())));
@@ -586,11 +596,13 @@ pub async fn run()->Result<()>{
         async move{graph_watch_catalog::observe(input).await}
     }));
     let cp1=enabled("CP1_MARKET_ENRICHMENT_ENABLED")?;
-    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-    // Economic Mint Registry owns the entire known pool-mint universe,
-    // irrespective of Prepared state or liquidity-graph membership.
+    // Economic Mint Registry owns qualification even without online Jupiter
+    // credentials: bootstrapped persisted states still populate this channel.
+    let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    critical(&mut tasks,"mint_registry",mint_qualification::run(
+        registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
+        qualified_tx,target_tx));
     if jupiter_settings()?.is_some() {
-        let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         let observer_sender=jupiter_out.clone();
         let mut first_jupiter_observer=Some(jupiter_observer_rx);
         tasks.spawn(supervise("observer.source_jupiter_mint",stop_rx.clone(),move||{
@@ -598,9 +610,6 @@ pub async fn run()->Result<()>{
                 .unwrap_or_else(||observer_sender.subscribe());
             async move{diagnostic_source::run(input,true).await}
         }));
-        critical(&mut tasks,"mint_registry",mint_qualification::run(
-            registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
-            qualified_tx,target_tx));
         let client=http.clone();
         let jupiter_publisher=jupiter_out.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{

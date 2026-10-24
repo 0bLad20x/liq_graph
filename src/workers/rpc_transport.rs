@@ -368,6 +368,11 @@ struct HttpProvider {
     gate:Mutex<Instant>, concurrent:Semaphore,
     cooldown:Mutex<Option<Instant>>, request_id:AtomicU64,
     disabled:AtomicU64,
+    // Assigned requests include requests still waiting for HTTP RPS/concurrency.
+    pending:AtomicUsize,
+    // Actual HTTP attempt duration, excluding transport scheduling and retries.
+    multiple_latency_ms:AtomicU64,
+    other_latency_ms:AtomicU64,
 }
 impl HttpProvider {
     fn new(cfg:HttpSettings)->Result<Self> {
@@ -375,10 +380,36 @@ impl HttpProvider {
             .timeout(Duration::from_millis(cfg.timeout_ms)).build()?;
         Ok(Self{concurrent:Semaphore::new(cfg.max_in_flight),
             gate:Mutex::new(Instant::now()),cooldown:Mutex::new(None),
-            request_id:AtomicU64::new(1),disabled:AtomicU64::new(0),client,cfg})
+            request_id:AtomicU64::new(1),disabled:AtomicU64::new(0),
+            pending:AtomicUsize::new(0),
+            multiple_latency_ms:AtomicU64::new(0),other_latency_ms:AtomicU64::new(0),
+            client,cfg})
     }
     fn eligible(&self,bit:u64)->bool {
         self.cfg.capabilities&bit!=0 && self.disabled.load(Ordering::Relaxed)&bit==0
+    }
+    fn schedulable(&self,bit:u64)->bool {
+        self.eligible(bit) && self.cooldown.try_lock().map_or(true,|guard|
+            guard.as_ref().is_none_or(|until|*until<=Instant::now()))
+    }
+    fn latency_cell(&self,bit:u64)->&AtomicU64 {
+        if bit==1 {&self.multiple_latency_ms} else {&self.other_latency_ms}
+    }
+    fn observe_http(&self,bit:u64,duration:Duration) {
+        let ms=duration.as_millis().clamp(1,120_000) as u64;
+        let cell=self.latency_cell(bit);
+        let _=cell.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|old|
+            Some(if old==0 {ms} else {old.saturating_mul(7).saturating_add(ms)/8}));
+    }
+    /// Predicted queue completion cost: account for both per-provider RPS and
+    /// actual concurrency-limited HTTP response time, not a round-robin slot.
+    fn estimated_queue_ms(&self,bit:u64)->u128 {
+        let assigned=(self.pending.load(Ordering::Relaxed) as u128).saturating_add(1);
+        let observed=self.latency_cell(bit).load(Ordering::Relaxed);
+        let latency=if observed==0 {1_000_u128} else {u128::from(observed)};
+        let service=(latency*assigned).div_ceil(self.cfg.max_in_flight as u128);
+        let rate=(1_000_u128*assigned).div_ceil(self.cfg.rps as u128);
+        service.max(rate)
     }
     async fn request(&self,operation:&RpcOperation,params:&Value)->Result<Value> {
         let method=operation.method();
@@ -389,23 +420,31 @@ impl HttpProvider {
             }
             if attempt>0 {sleep(Duration::from_millis(200_u64.saturating_mul(1 << attempt.min(7)))).await;}
             let _permit=self.concurrent.acquire().await?;
-            let mut next=self.gate.lock().await;
-            sleep_until(*next).await;
-            *next=Instant::now()+Duration::from_secs_f64(1.0/f64::from(self.cfg.rps));
-            drop(next);
-
+            // Reserve a distinct request start slot, releasing the gate mutex
+            // before sleeping. The semaphore remains held so delayed slots
+            // cannot turn into a burst above the configured RPS.
+            let due={
+                let mut next=self.gate.lock().await;
+                let due=(*next).max(Instant::now());
+                *next=due+Duration::from_secs_f64(1.0/f64::from(self.cfg.rps));
+                due
+            };
+            sleep_until(due).await;
             let id=self.request_id.fetch_add(1,Ordering::Relaxed);
+            let sent=Instant::now();
             let outcome=self.client.post(&self.cfg.url)
                 .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
                 .send().await;
             let response=match outcome {
                 Ok(value)=>value,
                 Err(error)=>{
+                    self.observe_http(operation.bit(),sent.elapsed());
                     previous=Some(anyhow!("transport error: {}",error.without_url()));
                     continue;
                 }
             };
             if response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.observe_http(operation.bit(),sent.elapsed());
                 let retry_after=response.headers().get(reqwest::header::RETRY_AFTER)
                     .and_then(|s|s.to_str().ok()).and_then(|s|s.parse::<u64>().ok())
                     .unwrap_or(2).max(1);
@@ -413,6 +452,7 @@ impl HttpProvider {
                 bail!("HTTP 429 provider={} cooldown_s={retry_after}",self.cfg.name);
             }
             if !response.status().is_success() {
+                self.observe_http(operation.bit(),sent.elapsed());
                 let status=response.status();
                 if status.is_server_error() {
                     previous=Some(anyhow!("HTTP {status} at provider {}",self.cfg.name));
@@ -420,7 +460,16 @@ impl HttpProvider {
                 }
                 bail!("HTTP {status} at provider {}",self.cfg.name);
             }
-            let body=response.bytes().await.context("RPC HTTP response body")?;
+            let body=match response.bytes().await {
+                Ok(body)=>body,
+                Err(error)=>{
+                    self.observe_http(operation.bit(),sent.elapsed());
+                    // Body timeout usually means an overloaded provider; let
+                    // the transport fail over instead of repeating slow reads.
+                    return Err(anyhow!("RPC HTTP response body: {error}"));
+                }
+            };
+            self.observe_http(operation.bit(),sent.elapsed());
             let value:Value=serde_json::from_slice(&body).context("invalid RPC response JSON")?;
             ensure!(value.get("jsonrpc").and_then(Value::as_str)==Some("2.0")
                 && value.get("id")==Some(&json!(id)), "JSON-RPC envelope id/version mismatch");
@@ -580,40 +629,97 @@ fn report_rpc(stats:&RpcStats) {
     }
 }
 
+/// A per-request assignment is tracked from dispatch through response or task
+/// cancellation. This prevents a slow provider from accumulating an invisible
+/// FIFO queue while faster configured providers have spare capacity.
+struct ProviderLease { provider:Arc<HttpProvider> }
+impl ProviderLease {
+    fn new(provider:Arc<HttpProvider>)->Self {
+        provider.pending.fetch_add(1,Ordering::Relaxed);
+        Self{provider}
+    }
+}
+impl Drop for ProviderLease {
+    fn drop(&mut self) {
+        self.provider.pending.fetch_sub(1,Ordering::Relaxed);
+    }
+}
+fn reserve_provider(
+    eligible:&[Arc<HttpProvider>], attempted:&[bool], cursor:usize, bit:u64,
+)->Option<(usize,ProviderLease)> {
+    let count=eligible.len();
+    let (idx,provider)=eligible.iter().enumerate()
+        .filter(|(i,p)| !attempted[*i] && p.schedulable(bit))
+        .min_by_key(|(i,p)| (
+            p.estimated_queue_ms(bit),
+            (*i+count-(cursor%count))%count,
+        ))?;
+    Some((idx,ProviderLease::new(provider.clone())))
+}
+
 async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     let providers=settings.http.into_iter().map(HttpProvider::new)
         .map(|r|r.map(Arc::new)).collect::<Result<Vec<_>>>()?;
+    let enabled_multiple=providers.iter().filter(|p|p.eligible(1)).collect::<Vec<_>>();
+    let total_rps: u64=enabled_multiple.iter().map(|p|u64::from(p.cfg.rps)).sum();
+    let total_parallel:usize=enabled_multiple.iter().map(|p|p.cfg.max_in_flight).sum();
+    crate::log_event!(Info,
+        "rpc http effective_plan providers={} get_multiple_accounts={} configured_multiple_rps={} configured_multiple_parallel={} weighted_queue=true",
+        providers.len(),enabled_multiple.len(),total_rps,total_parallel);
+    for p in &providers {
+        crate::log_event!(Info,
+            "rpc http provider={} multiple={} rps={} max_in_flight={} timeout_ms={} retries={}",
+            p.cfg.name,p.eligible(1),p.cfg.rps,p.cfg.max_in_flight,
+            p.cfg.timeout_ms,p.cfg.retries);
+    }
     let mut tasks=tokio::task::JoinSet::new();
     let next=Arc::new(AtomicUsize::new(0));
     let stats:RpcStats=Arc::new(StdMutex::new(HashMap::new()));
     let stats_interval:u64=var("RPC_STATS_INTERVAL_SECONDS",30)?;
     ensure!((1..=3600).contains(&stats_interval), "RPC_STATS_INTERVAL_SECONDS must be 1..=3600");
     let report_stats=stats.clone();
+    let report_providers=providers.clone();
     let reporter=tokio::spawn(async move {
         let mut ticker=tokio::time::interval(Duration::from_secs(stats_interval));
         ticker.tick().await;
         loop {
             ticker.tick().await;
             report_rpc(&report_stats);
+            for p in &report_providers {
+                crate::log_event!(Info,
+                    "rpc provider_load provider={} assigned={} multiple_http_ema_ms={} other_http_ema_ms={} rps={} max_in_flight={} multiple_enabled={}",
+                    p.cfg.name,p.pending.load(Ordering::Relaxed),
+                    p.multiple_latency_ms.load(Ordering::Relaxed),
+                    p.other_latency_ms.load(Ordering::Relaxed),
+                    p.cfg.rps,p.cfg.max_in_flight,p.eligible(1));
+            }
         }
     });
     while let Some(Call{operation,reply})=rx.recv().await {
-        // A semaphore inside each provider limits concurrency independently.
-        let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(operation.bit()))
+        let bit=operation.bit();
+        let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(bit))
             .cloned().collect();
         let params=operation.params(&settings.commitment,settings.account_batch_size,settings.v2_page_limit);
         let cursor=next.fetch_add(1,Ordering::Relaxed);
+        // Reserve the initial provider before spawning: otherwise a burst of
+        // new calls would all see the same zero-load selection.
+        let mut attempted=vec![false;eligible.len()];
+        let first=reserve_provider(&eligible,&attempted,cursor,bit);
         let stats=stats.clone();
         tasks.spawn(async move {
             let answer=async {
                 let params=params?;
                 ensure!(!eligible.is_empty(),"no configured RPC provider supports {}",operation.method());
                 let mut error=None;
-                for offset in 0..eligible.len() {
-                    let provider=&eligible[(cursor+offset)%eligible.len()];
-                    if !provider.eligible(operation.bit()) {continue;}
+                let mut ticket=first;
+                while let Some((index,lease))=ticket {
+                    attempted[index]=true;
+                    let provider=lease.provider.clone();
                     let started=Instant::now();
-                    match provider.request(&operation,&params).await {
+                    let result=provider.request(&operation,&params).await;
+                    // Drop the assignment before selecting a failover provider.
+                    drop(lease);
+                    match result {
                         Ok(value)=>match interpret(operation.clone(),value) {
                             Ok(answer)=>{
                                 record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),None);
@@ -637,6 +743,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                             error=Some(err);
                         }
                     }
+                    ticket=reserve_provider(&eligible,&attempted,cursor,bit);
                 }
                 Err(error.unwrap_or_else(||anyhow!("no healthy eligible RPC provider")))
             }.await;

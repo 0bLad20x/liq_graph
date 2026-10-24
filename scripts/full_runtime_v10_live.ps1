@@ -120,6 +120,12 @@ try {
         # All warning/error lines, lifecycle aggregates, timing and V10 result lines remain.
         & $binary --run 2>&1 | ForEach-Object {
             $line = "$_"
+            if ($line -match 'lifecycle unchanged request_id=.* venue=([A-Za-z0-9]+) work=Refresh state=Prepared') {
+                $preparedRefreshes++
+                $venue = $matches[1]
+                if (-not $acceptedByVenue.ContainsKey($venue)) { $acceptedByVenue[$venue] = 0 }
+                $acceptedByVenue[$venue]++
+            }
             if ($line -match 'lifecycle accepted request_id=.* venue=([A-Za-z0-9]+) work=(\w+) status=(\w+)') {
                 $lifecycleAccepted++
                 $venue = $matches[1]

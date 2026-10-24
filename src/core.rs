@@ -10,29 +10,37 @@ use anyhow::Result;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 
-/// Shared completion contract. TVL is the Registry's current canonical value;
-/// callers must never substitute a historical observation or provider payload.
-pub const COMPLETION_MIN_TVL_USD: f64 = 500.0;
-
+/// Admission is a Registry-owned decision. The Mint Registry supplies qualified
+/// identities; only a venue-native TVL below the policy floor can veto admission.
+/// DexScreener TVL and the canonical (possibly fallback) TVL are not policy inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionAdmission {
     Admitted,
     MissingIdentity,
-    TvlUnavailable,
-    BelowMinimumTvl,
+    MintNotQualified,
+    NativeTvlBelowMinimum,
 }
 
 impl CompletionAdmission {
-    pub fn from_inputs(a: Option<Pubkey>, b: Option<Pubkey>, tvl: Option<f64>) -> Self {
+    /// Bootstrap placeholder used by Persistence before the Mint Registry has
+    /// published its classification. No restored TVL value grants admission.
+    pub fn from_inputs(a: Option<Pubkey>, b: Option<Pubkey>, _tvl: Option<f64>) -> Self {
+        Self::from_qualification(a, b, false, false)
+    }
+
+    /// Shared typed result only. Venue policy, token thresholds and provenance
+    /// remain private to their owning workers.
+    pub fn from_qualification(
+        a: Option<Pubkey>, b: Option<Pubkey>,
+        mint_qualified: bool, native_tvl_below_minimum: bool,
+    ) -> Self {
         let (Some(a), Some(b)) = (a, b) else { return Self::MissingIdentity };
         if a == b || a == Pubkey::default() || b == Pubkey::default() {
             return Self::MissingIdentity;
         }
-        match tvl {
-            Some(v) if v.is_finite() && v >= COMPLETION_MIN_TVL_USD => Self::Admitted,
-            Some(v) if v.is_finite() && v >= 0.0 => Self::BelowMinimumTvl,
-            _ => Self::TvlUnavailable,
-        }
+        if !mint_qualified { return Self::MintNotQualified; }
+        if native_tvl_below_minimum { return Self::NativeTvlBelowMinimum; }
+        Self::Admitted
     }
 
     pub fn is_admitted(self) -> bool { self == Self::Admitted }
@@ -46,6 +54,8 @@ pub enum CompletionReason {
     ValidationFailed,
     MissingExecutionAccounts,
     UnsupportedConfiguration,
+    /// On-chain feature mode can change while the required V10 instruction variant is unavailable.
+    DynamicModeUnsupported,
     ConfigurationRequired,
     LegacyUnclassified,
 }
@@ -234,6 +244,8 @@ pub enum CompletionWork { Initial, Recheck, Refresh, Retry }
 pub struct CompletionRequest {
     pub id: u64,
     pub work: CompletionWork,
+    /// Revalidate all protocol prerequisites; never use a cached shortcut.
+    pub force_full: bool,
     pub pool: PoolState,
 }
 
@@ -243,10 +255,51 @@ pub struct CompletionRequestBatch {
     pub timeout: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct CompletionUnchanged {
+    pub pool: Pubkey,
+    pub baseline_validated_slot: u64,
+    pub baseline_checked_at_ms: u64,
+    pub baseline_state: CompletionState,
+    pub observed_slot: u64,
+    pub checked_at_ms: u64,
+}
+
+impl CompletionUnchanged {
+    /// A successful lightweight check confirms only existing structure, not a new full proof.
+    pub fn from_pool(pool: &PoolState, observed_slot: u64) -> Option<Self> {
+        let validated = pool.completion_validated_slot?;
+        let checked = pool.completion_checked_at_ms?;
+        if pool.completion_state == CompletionState::Unknown || observed_slot <= validated {
+            return None;
+        }
+        Some(Self {
+            pool: pool.address, baseline_validated_slot: validated,
+            baseline_checked_at_ms: checked, baseline_state: pool.completion_state,
+            observed_slot, checked_at_ms: now_unix_ms().ok()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum CompletionOutcome {
+    Proof(CompletionResult),
+    Unchanged(CompletionUnchanged),
+}
+
+impl CompletionOutcome {
+    pub fn pool(&self) -> Pubkey {
+        match self {
+            Self::Proof(result) => result.pool,
+            Self::Unchanged(check) => check.pool,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CompletionResponse {
     pub id: u64,
-    pub result: CompletionResult,
+    pub outcome: CompletionOutcome,
 }
 
 #[derive(Debug)]

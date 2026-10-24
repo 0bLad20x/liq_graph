@@ -9,7 +9,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
-    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
+    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -419,6 +419,115 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
+async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let owner:Pubkey=PROGRAM.parse().expect("known PancakeSwap CLMM program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind=="pancakeswap_clmm_tick_arrays" && e.version==1)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty() {
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        match read(rpc,eligible.iter().map(|r|r.pool.address).collect(),min_slot).await {
+            Err(error)=>for r in &eligible {
+                outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("PancakeSwap CLMM light PoolState: {error:#}"))));
+            },
+            Ok((parent_slot,parents))=>{
+                let layouts=eligible.iter().zip(parents.iter()).map(|(r,a)|
+                    a.as_ref().and_then(|a|decode_pool(a,&r.pool,owner).ok())).collect::<Vec<_>>();
+                let mut keys=Vec::new();
+                let mut seen=HashSet::new();
+                for l in layouts.iter().flatten(){
+                    for (_,addr) in arrays(*l,owner){
+                        if seen.insert(addr){keys.push(addr);}
+                    }
+                }
+                if !keys.is_empty() && keys.len()<=settings.account_batch_size {
+                    let answer=rpc.call(RpcOperation::Multiple {
+                        addresses:keys.clone(),view:AccountView::Slice{offset:0,length:44},
+                        min_context_slot:Some(parent_slot),
+                    }).await;
+                    match answer {
+                        Ok(response)=>{
+                            if let RpcAnswer::Multiple{slot,accounts}=response.answer {
+                                if accounts.len()==keys.len(){
+                                    let lookup=keys.into_iter().zip(accounts).collect::<HashMap<_,_>>();
+                                    for (r,layout) in eligible.iter().zip(layouts.iter()){
+                                        let Some(l)=layout else{continue};
+                                        let p=&r.pool;
+                                        let valid=(||->Result<bool>{
+                                            
+                                            let mut present=Vec::<Pubkey>::new();
+                                            for (start,addr) in arrays(*l,owner) {
+                                                let Some(account)=lookup.get(&addr).and_then(Option::as_ref) else{continue};
+                                                if account.address!=addr || account.owner!=owner
+                                                    || account.original_len!=Some(ARRAY_LEN)
+                                                    || account.bytes.len()<44
+                                                    || account.bytes[..8]!=ARRAY_DISC
+                                                    || key(&account.bytes,8)?!=l.pool
+                                                    || i32::from_le_bytes(account.bytes[40..44].try_into()?)!=start {
+                                                    return Ok(false);
+                                                }
+                                                present.push(addr);
+                                            }
+                                            if present.is_empty(){return Ok(false);}
+                                            let ev=p.completion_evidence.as_ref().context("no evidence")?;
+                                            let paths=serde_json::json!(present.iter().map(ToString::to_string).collect::<Vec<_>>());
+                                            if ev.payload["base_a_array_addresses"]!=paths
+                                                || ev.payload["base_b_array_addresses"]!=paths
+                                                || ev.payload["config"].as_str()!=Some(l.config.to_string().as_str())
+                                                || ev.payload["observation"].as_str()!=Some(l.observation.to_string().as_str())
+                                                || ev.payload["vault0"].as_str()!=Some(l.vaults[0].to_string().as_str())
+                                                || ev.payload["vault1"].as_str()!=Some(l.vaults[1].to_string().as_str()) {
+                                                return Ok(false);
+                                            }
+                                            let proofs=p.mint_proofs.as_ref().context("no MintProof")?;
+                                            let is_v2=proofs[0].token_2022 || proofs[1].token_2022;
+                                            let m=p.execution_manifest.as_ref().context("no manifest")?;
+                                            let mut candidate=make_manifest(*l,m.validated_slot,&present,&present,is_v2,owner);
+                                            if p.mint_a!=Some(l.mints[0]) {
+                                                candidate=ExecutionManifest{
+                                                    pool:candidate.pool,mint_a:p.mint_a.context("mint A")?,
+                                                    mint_b:p.mint_b.context("mint B")?,
+                                                    validated_slot:candidate.validated_slot,
+                                                    bound_signer:candidate.bound_signer,
+                                                    base_a:candidate.base_b,base_b:candidate.base_a,
+                                                };
+                                            }
+                                            Ok(candidate==**m)
+                                        })().unwrap_or(false);
+                                        if valid {
+                                            if let Some(u)=CompletionUnchanged::from_pool(p,slot){
+                                                outcomes.insert(p.address,CompletionOutcome::Unchanged(u));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        Err(error)=>for r in &eligible {
+                            outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                                format!("PancakeSwap CLMM light candidate RPC: {error:#}"))));
+                        },
+                    }
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!outcomes.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,pending,settings).await {
+            outcomes.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|outcomes.remove(&r.pool.address).expect("PancakeSwap CLMM result")).collect()
+}
+
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
@@ -437,12 +546,10 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                         "PancakeSwap CLMM request has wrong venue or missing admission");
                     let rpc=rpc.clone();
                     tasks.spawn(async move {
-                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                         let results=match tokio::time::timeout(batch.timeout,
-                            process(&rpc,pools,settings)).await {
+                            process_optimized(&rpc,&batch.requests,settings)).await {
                             Ok(results)=>results,
-                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
-                                "PancakeSwap CLMM lifecycle request timed out")).collect(),
+                            Err(_)=>batch.requests.iter().map(|r|CompletionOutcome::Proof(retry(r.pool.address,"PancakeSwap CLMM lifecycle request timed out"))).collect(),
                         };
                         (batch.requests,results)
                     });
@@ -453,17 +560,19 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                 let (requests,results)=done.context("missing PancakeSwap CLMM request task")?
                     .context("PancakeSwap CLMM request task panicked")?;
                 ensure!(requests.len()==results.len(),"PancakeSwap CLMM request/result count mismatch");
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate PancakeSwap CLMM pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("PancakeSwap CLMM request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "pancakeswap_clmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,
-                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_pancakeswap_clmm completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:SOURCE,responses}).await

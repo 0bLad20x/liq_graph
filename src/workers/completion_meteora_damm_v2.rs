@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     core::{CompletionReason,
-        AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch,
+        AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch,
         CompletionResponse, CompletionResponseBatch, CompletionStatus, ExecutionManifest,
         MintProof, PoolState, Venue,
     },
@@ -322,6 +322,57 @@ async fn process(rpc: &RpcHandle, pools: Vec<PoolState>, settings: Settings)
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
+async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let program:Pubkey=PROGRAM.parse().expect("known DAMM v2 program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="meteora_damm_v2_pool"&&e.version==1)
+        && r.pool.completion_validated_slot.is_some()
+    ).collect::<Vec<_>>();
+    let mut result=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty() {
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        let addresses=eligible.iter().map(|r|r.pool.address).collect();
+        match read(rpc,addresses,min_slot).await {
+            Ok(batch)=>{
+                for (r,account) in eligible.iter().zip(batch.accounts.iter()) {
+                    let p=&r.pool;
+                    let valid=account.as_ref().and_then(|a|decode_pool(a,p,program).ok())
+                        .is_some_and(|layout|{
+                            let ev=p.completion_evidence.as_ref().expect("eligible evidence");
+                            let m=p.execution_manifest.as_ref().expect("eligible manifest");
+                            let fresh=manifest(layout,m.validated_slot,program);
+                            ev.payload["vault_a"].as_str()==Some(layout.vault_a.to_string().as_str())
+                                && ev.payload["vault_b"].as_str()==Some(layout.vault_b.to_string().as_str())
+                                && fresh==**m
+                        });
+                    if valid {
+                        if let Some(unchanged)=CompletionUnchanged::from_pool(p,batch.slot) {
+                            result.insert(p.address,CompletionOutcome::Unchanged(unchanged));
+                        }
+                    }
+                }
+            },
+            Err(error)=>{
+                for r in &eligible {
+                    result.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                        format!("DAMM v2 light RPC: {error:#}"))));
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!result.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,pending,settings).await {
+            result.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|result.remove(&r.pool.address).expect("DAMM v2 result")).collect()
+}
+
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
@@ -340,12 +391,10 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                         "DAMM v2 request has wrong venue or missing admission");
                     let rpc=rpc.clone();
                     tasks.spawn(async move {
-                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                         let results=match tokio::time::timeout(batch.timeout,
-                            process(&rpc,pools,settings)).await {
+                            process_optimized(&rpc,&batch.requests,settings)).await {
                             Ok(results)=>results,
-                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
-                                "DAMM v2 lifecycle request timed out")).collect(),
+                            Err(_)=>batch.requests.iter().map(|r|CompletionOutcome::Proof(retry(r.pool.address,"DAMM v2 lifecycle request timed out"))).collect(),
                         };
                         (batch.requests,results)
                     });
@@ -356,17 +405,19 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                 let (requests,results)=done.context("missing DAMM v2 request task")?
                     .context("DAMM v2 request task panicked")?;
                 ensure!(requests.len()==results.len(),"DAMM v2 request/result count mismatch");
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate DAMM v2 pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("DAMM v2 request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "damm_v2 executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,
-                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_meteora_damm_v2 completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:SOURCE,responses}).await

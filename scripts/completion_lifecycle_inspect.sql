@@ -27,3 +27,16 @@ WHERE venue IN (1,2,3,4,5,7,8,9,10,11)
     OR (jsonb_typeof(completion->'manifest') IS DISTINCT FROM 'object'
         AND (completion->>'reason_code' IS NULL
              OR completion->>'reason_code'='transient_failure')));
+
+-- CP1 read-only proof invariants. A successful Unchanged refresh must not rewrite completion.
+SELECT venue,
+       COUNT(*) FILTER (WHERE completion IS NOT NULL) AS full_proofs,
+       COUNT(*) FILTER (WHERE jsonb_typeof(completion->'manifest')='object') AS prepared,
+       COUNT(*) FILTER (WHERE completion->>'reason_code'='dynamic_mode_unsupported') AS dynamic_mode_paused_or_recheckable,
+       COUNT(*) FILTER (WHERE jsonb_typeof(completion->'manifest')='object'
+           AND (completion->'manifest'->>'validated_slot')::bigint
+               <> (completion->>'validated_slot')::bigint) AS invalid_manifest_slots,
+       MAX((completion->>'checked_at_ms')::bigint) AS latest_full_check_ms
+FROM public.pools
+WHERE venue IN (1,2,3,4,5,7,8,9,10,11)
+GROUP BY venue ORDER BY venue;

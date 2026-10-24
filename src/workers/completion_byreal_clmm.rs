@@ -9,7 +9,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
-    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
+    core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue},
     workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
@@ -241,6 +241,33 @@ fn validate_array(account:&AccountData,l:Layout,start:i32,program:Pubkey)->Resul
     Ok(())
 }
 
+/// A short recheck verifies only identity and account layout for the current
+/// V10 candidate list. Complete tick contents remain a Full-Completion concern.
+fn validate_light_array_header(account:&AccountData,l:Layout,start:i32,program:Pubkey)->Result<()> {
+    ensure!(account.owner==program && account.bytes.len()>=110,
+        "Byreal light array owner or 110-byte header invalid");
+    ensure!(key(&account.bytes,8)?==l.pool
+        && i32::from_le_bytes(account.bytes[40..44].try_into()?)==start,
+        "Byreal light array pool/start mismatch");
+    let size=account.original_len.context("Byreal light array original size unavailable")?;
+    if account.bytes[..8]==ARRAY_DISC {
+        ensure!(size==ARRAY_LEN,"Byreal fixed TickArray size invalid");
+    } else if account.bytes[..8]==DYN_ARRAY_DISC {
+        // DynTickArrayState has a 216-byte header, 60 offset indices at
+        // 48..108 and allocation/initialization counts at 108 and 109.
+        let allocated=account.bytes[108];
+        let initialized=account.bytes[109];
+        ensure!(allocated<=60 && initialized<=allocated
+            && size==216+usize::from(allocated)*168,
+            "Byreal dynamic TickArray allocation/length invalid");
+        ensure!(account.bytes[48..108].iter().all(|index|*index<=allocated),
+            "Byreal dynamic TickArray offset index invalid");
+    } else {
+        bail!("Byreal light array unsupported discriminator");
+    }
+    Ok(())
+}
+
 fn read(rpc:&RpcHandle,addresses:Vec<Pubkey>,min_slot:Option<u64>)
     -> impl std::future::Future<Output=Result<(u64,Vec<Option<AccountData>>)>> + '_ {
     async move {
@@ -370,7 +397,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     if l.decay_fee_flag & 0b10000 != 0 {
         return result(pool.address,CompletionStatus::Incomplete,Some(slot),
             Some("Byreal swap-dynamic-fee requires swap_v3_dyn Pyth accounts not present in V10 CLMM builder".into()),
-            Some(ev),Some(proofs),None).with_reason_code(CompletionReason::UnsupportedConfiguration);
+            Some(ev),Some(proofs),None).with_reason_code(CompletionReason::DynamicModeUnsupported);
     }
     let is_v2=ma.owner==token_2022||mb.owner==token_2022;
     let manifest=make_manifest(l,slot,&tick_arrays,&tick_arrays,is_v2,owner);
@@ -441,6 +468,137 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
+async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let owner:Pubkey=PROGRAM.parse().expect("known Byreal CLMM program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind=="byreal_clmm_tick_arrays" && e.version==1)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty() {
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        match read(rpc,eligible.iter().map(|r|r.pool.address).collect(),min_slot).await {
+            Err(error)=>for r in &eligible {
+                outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("Byreal CLMM light PoolState: {error:#}"))));
+            },
+            Ok((parent_slot,parents))=>{
+                let layouts=eligible.iter().zip(parents.iter()).map(|(r,a)|{
+                    let decoded=a.as_ref().context("parent account absent")
+                        .and_then(|account|decode_pool(account,&r.pool,owner));
+                    match decoded {
+                        Ok(layout)=>Some(layout),
+                        Err(error)=>{
+                            crate::log_event!(Debug,"byreal light fallback pool={} reason=parent_decode_error detail={error:#}",r.pool.address);
+                            None
+                        },
+                    }
+                }).collect::<Vec<_>>();
+                let mut keys=Vec::new();
+                let mut seen=HashSet::new();
+                for l in layouts.iter().flatten(){
+                    for (_,addr) in arrays(*l,owner){
+                        if seen.insert(addr){keys.push(addr);}
+                    }
+                }
+                if keys.len()>settings.account_batch_size {
+                    crate::log_event!(Debug,"byreal light fallback reason=candidate_batch_overflow accounts={} limit={}",
+                        keys.len(),settings.account_batch_size);
+                }
+                if !keys.is_empty() && keys.len()<=settings.account_batch_size {
+                    let answer=rpc.call(RpcOperation::Multiple {
+                        addresses:keys.clone(),view:AccountView::Slice{offset:0,length:110},
+                        min_context_slot:Some(parent_slot),
+                    }).await;
+                    match answer {
+                        Ok(response)=>{
+                            if let RpcAnswer::Multiple{slot,accounts}=response.answer {
+                                if accounts.len()==keys.len(){
+                                    let lookup=keys.into_iter().zip(accounts).collect::<HashMap<_,_>>();
+                                    for (r,layout) in eligible.iter().zip(layouts.iter()){
+                                        let Some(l)=layout else{continue};
+                                        let p=&r.pool;
+                                        let valid=(||->Result<(usize,usize)>{
+                                            ensure!(l.decay_fee_flag&0b10000==0,"dynamic_fee_requires_swap_v3");
+                                            let mut present=Vec::<Pubkey>::new();
+                                            for (start,addr) in arrays(*l,owner) {
+                                                let Some(account)=lookup.get(&addr).and_then(Option::as_ref) else{continue};
+                                                ensure!(account.address==addr,"candidate address mismatch");
+                                                validate_light_array_header(account,*l,start,owner)
+                                                    .with_context(||format!("array_start={start}"))?;
+                                                present.push(addr);
+                                            }
+                                            ensure!(!present.is_empty(),"no_candidate_tick_arrays");
+                                            let ev=p.completion_evidence.as_ref().context("no evidence")?;
+                                            let paths=serde_json::json!(present.iter().map(ToString::to_string).collect::<Vec<_>>());
+                                            if ev.payload["base_a_array_addresses"]!=paths
+                                                || ev.payload["base_b_array_addresses"]!=paths
+                                                || ev.payload["config"].as_str()!=Some(l.config.to_string().as_str())
+                                                || ev.payload["observation"].as_str()!=Some(l.observation.to_string().as_str())
+                                                || ev.payload["vault0"].as_str()!=Some(l.vaults[0].to_string().as_str())
+                                                || ev.payload["vault1"].as_str()!=Some(l.vaults[1].to_string().as_str()) {
+                                                bail!("stored_evidence_differs");
+                                            }
+                                            let proofs=p.mint_proofs.as_ref().context("no MintProof")?;
+                                            let is_v2=proofs[0].token_2022 || proofs[1].token_2022;
+                                            let m=p.execution_manifest.as_ref().context("no manifest")?;
+                                            let mut candidate=make_manifest(*l,m.validated_slot,&present,&present,is_v2,owner);
+                                            if p.mint_a!=Some(l.mints[0]) {
+                                                candidate=ExecutionManifest{
+                                                    pool:candidate.pool,mint_a:p.mint_a.context("mint A")?,
+                                                    mint_b:p.mint_b.context("mint B")?,
+                                                    validated_slot:candidate.validated_slot,
+                                                    bound_signer:candidate.bound_signer,
+                                                    base_a:candidate.base_b,base_b:candidate.base_a,
+                                                };
+                                            }
+                                            ensure!(candidate==**m,"stored_manifest_differs");
+                                            let dynamic_arrays=present.iter().filter(|addr|
+                                                lookup.get(*addr).and_then(Option::as_ref)
+                                                    .is_some_and(|a|a.bytes[..8]==DYN_ARRAY_DISC)
+                                            ).count();
+                                            Ok((present.len(),dynamic_arrays))
+                                        })();
+                                        match valid {
+                                            Ok((total,dynamic))=>{
+                                                if let Some(u)=CompletionUnchanged::from_pool(p,slot){
+                                                    crate::log_event!(Debug,
+                                                        "byreal light unchanged pool={} arrays={} dynamic_arrays={} fixed_arrays={} observed_slot={}",
+                                                        p.address,total,dynamic,total-dynamic,slot);
+                                                    outcomes.insert(p.address,CompletionOutcome::Unchanged(u));
+                                                } else {
+                                                    crate::log_event!(Debug,"byreal light fallback pool={} reason=unchanged_baseline_unavailable",p.address);
+                                                }
+                                            },
+                                            Err(error)=>crate::log_event!(Debug,
+                                                "byreal light fallback pool={} reason=verification_failed detail={error:#}",p.address),
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        Err(error)=>for r in &eligible {
+                            outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                                format!("Byreal CLMM light candidate RPC: {error:#}"))));
+                        },
+                    }
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!outcomes.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,pending,settings).await {
+            outcomes.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|outcomes.remove(&r.pool.address).expect("Byreal CLMM result")).collect()
+}
+
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     rpc:RpcHandle,settings:Settings,output:mpsc::Sender<CompletionResponseBatch>)->Result<()> {
     let mut tasks=JoinSet::new();
@@ -459,12 +617,10 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                         "Byreal CLMM request has wrong venue or missing admission");
                     let rpc=rpc.clone();
                     tasks.spawn(async move {
-                        let pools=batch.requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
                         let results=match tokio::time::timeout(batch.timeout,
-                            process(&rpc,pools,settings)).await {
+                            process_optimized(&rpc,&batch.requests,settings)).await {
                             Ok(results)=>results,
-                            Err(_)=>batch.requests.iter().map(|r|retry(r.pool.address,
-                                "Byreal CLMM lifecycle request timed out")).collect(),
+                            Err(_)=>batch.requests.iter().map(|r|CompletionOutcome::Proof(retry(r.pool.address,"Byreal CLMM lifecycle request timed out"))).collect(),
                         };
                         (batch.requests,results)
                     });
@@ -475,17 +631,19 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                 let (requests,results)=done.context("missing Byreal CLMM request task")?
                     .context("Byreal CLMM request task panicked")?;
                 ensure!(requests.len()==results.len(),"Byreal CLMM request/result count mismatch");
-                let mut by_pool=results.into_iter().map(|r|(r.pool,r)).collect::<HashMap<_,_>>();
+                let mut by_pool=results.into_iter().map(|outcome|(outcome.pool(),outcome)).collect::<HashMap<_,_>>();
                 ensure!(by_pool.len()==requests.len(),"duplicate Byreal CLMM pool result");
                 let mut responses=Vec::with_capacity(requests.len());
                 for request in requests {
-                    let result=by_pool.remove(&request.pool.address)
-                        .context("Byreal CLMM request has no matching pool result")?;
-                    crate::log_event!(Debug,
-                        "byreal_clmm executor result request_id={} pool={} work={:?} status={:?} reason_code={:?} slot={:?} reason={}",
-                        request.id,result.pool,request.work,result.status,result.reason_code,
-                        result.validated_slot,result.reason.as_deref().unwrap_or("-"));
-                    responses.push(CompletionResponse{id:request.id,result});
+                    let outcome=by_pool.remove(&request.pool.address)
+                        .context("Completion request has no matching pool result")?;
+                    let kind=match &outcome {
+                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
+                    };
+                    crate::log_event!(Debug,"completion_byreal_clmm completion request_id={} pool={} work={:?} outcome={}",
+                        request.id,request.pool.address,request.work,kind);
+                    responses.push(CompletionResponse{id:request.id,outcome});
                 }
                 processed+=responses.len();
                 output.send(CompletionResponseBatch{source:SOURCE,responses}).await

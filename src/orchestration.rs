@@ -379,7 +379,7 @@ fn spawn_sources(
         tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
     }
     tasks.spawn(pool_registry::run(registry_input, completion_input, registry,
-        registry_output, source_done_tx, strict_lag));
+        registry_output, source_done_tx, strict_lag, None));
     if matches!(source_set, SourceSet::Raydium | SourceSet::All) {
         let rps: u32 = env::var("RAYDIUM_API_RPS")
             .unwrap_or_else(|_| "10".into()).parse().context("invalid RAYDIUM_API_RPS")?;
@@ -543,6 +543,8 @@ pub async fn run() -> Result<()> {
         return market_state_live::run(true).await;
     }
     if args.len() == 1 && args[0] == "--run" {
+        anyhow::ensure!(!matches!(env::var("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE").as_deref(),Ok("true"|"1")),
+            "legacy Byreal one-shot recheck may not run in production; use bounded --completion-lifecycle-live");
         return runtime::run().await;
     }
     if args.len()==1 && args[0]=="--cp1-live" {
@@ -612,7 +614,7 @@ pub async fn run() -> Result<()> {
         let mut tasks = JoinSet::new();
         tasks.spawn(diagnostic_source::run(source_rx, true));
         tasks.spawn(db.run(writer_rx));
-        tasks.spawn(pool_registry::run(registry_rx, None, registry, updates.clone(), source_done, true));
+        tasks.spawn(pool_registry::run(registry_rx, None, registry, updates.clone(), source_done, true, None));
         drop(updates);
         let scanned = discovery_rpc_full::run(source, settings).await;
         let mut downstream = Ok(());
