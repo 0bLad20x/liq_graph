@@ -364,9 +364,110 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)->Vec<Com
 
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
-async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
-    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
-    process(rpc,pools,settings).await.into_iter().map(CompletionOutcome::Proof).collect()
+async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
+    let owner:Pubkey=PROGRAM.parse().expect("known Orca program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="orca_whirlpool_tick_arrays"&&e.version==3)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty(){
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        match read(rpc,eligible.iter().map(|r|r.pool.address).collect(),min_slot).await {
+            Err(error)=>for r in &eligible {
+                outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                    format!("Orca light Whirlpool: {error:#}"))));
+            },
+            Ok((parent_slot,parents))=>{
+                let layouts=eligible.iter().zip(parents.iter()).map(|(r,a)|
+                    a.as_ref().and_then(|a|decode_pool(a,&r.pool,owner).ok())).collect::<Vec<_>>();
+                let mut keys=Vec::new();let mut seen=HashSet::new();
+                for layout in layouts.iter().flatten() {
+                    for (_,addr) in array_addresses(*layout,owner,settings.radius){
+                        if seen.insert(addr){keys.push(addr);}
+                    }
+                }
+                if !keys.is_empty() && keys.len()<=settings.account_batch_size {
+                    let answer=rpc.call(RpcOperation::Multiple{
+                        addresses:keys.clone(),view:AccountView::Slice{offset:0,length:12},
+                        min_context_slot:Some(parent_slot),
+                    }).await;
+                    match answer {
+                        Err(error)=>for r in &eligible {
+                            outcomes.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                                format!("Orca light TickArray: {error:#}"))));
+                        },
+                        Ok(response)=>{
+                            if let RpcAnswer::Multiple{slot,accounts}=response.answer {
+                                if accounts.len()==keys.len(){
+                                    let lookup=keys.into_iter().zip(accounts).collect::<HashMap<_,_>>();
+                                    for (r,layout) in eligible.iter().zip(layouts.iter()){
+                                        let Some(l)=layout else{continue};
+                                        let p=&r.pool;
+                                        let valid=(||->Result<bool>{
+                                            let width=l.tick_spacing*88;
+                                            let center=l.tick_current.div_euclid(width)*width;
+                                            let shifted=l.tick_current+l.tick_spacing>=center+width;
+                                            let up_center=if shifted{center+width}else{center};
+                                            let mut present=HashMap::<i32,Pubkey>::new();
+                                            for (start,addr) in array_addresses(*l,owner,settings.radius){
+                                                let Some(a)=lookup.get(&addr).and_then(Option::as_ref) else{continue};
+                                                let size=a.original_len.context("missing array length")?;
+                                                if a.address!=addr || a.owner!=owner
+                                                    || a.bytes.len()<12
+                                                    || i32::from_le_bytes(a.bytes[8..12].try_into()?)!=start
+                                                    || !(a.bytes[..8]==FIXED_DISC && size==FIXED_LEN
+                                                        || a.bytes[..8]==DYNAMIC_DISC
+                                                        && (DYNAMIC_MIN_LEN..=DYNAMIC_MAX_LEN).contains(&size)){
+                                                    return Ok(false);
+                                                }
+                                                present.insert(start,addr);
+                                            }
+                                            if !present.contains_key(&center)||!present.contains_key(&up_center){
+                                                return Ok(false);
+                                            }
+                                            let down=(0..=settings.radius).map(|i|center-i*width)
+                                                .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+                                            let up=(0..=settings.radius).map(|i|up_center+i*width)
+                                                .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+                                            let ev=p.completion_evidence.as_ref().context("missing evidence")?;
+                                            if ev.payload["base_a_start_ticks"]!=serde_json::json!(up)
+                                                || ev.payload["base_b_start_ticks"]!=serde_json::json!(down)
+                                                || ev.payload["vault_a"].as_str()!=Some(l.vault_a.to_string().as_str())
+                                                || ev.payload["vault_b"].as_str()!=Some(l.vault_b.to_string().as_str())
+                                                || ev.payload["radius"].as_i64()!=Some(i64::from(settings.radius)){
+                                                return Ok(false);
+                                            }
+                                            let arrays_a=up.iter().map(|start|present[start]).collect::<Vec<_>>();
+                                            let arrays_b=down.iter().map(|start|present[start]).collect::<Vec<_>>();
+                                            let m=p.execution_manifest.as_ref().context("missing manifest")?;
+                                            let candidate=make_manifest(*l,m.validated_slot,&arrays_a,&arrays_b,owner);
+                                            Ok(candidate==**m)
+                                        })().unwrap_or(false);
+                                        if valid{
+                                            if let Some(u)=CompletionUnchanged::from_pool(p,slot){
+                                                outcomes.insert(p.address,CompletionOutcome::Unchanged(u));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!outcomes.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,pending,settings).await{
+            outcomes.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|outcomes.remove(&r.pool.address).expect("Orca completion result")).collect()
 }
 
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
