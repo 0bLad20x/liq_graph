@@ -323,9 +323,54 @@ async fn process(rpc: &RpcHandle, pools: Vec<PoolState>, settings: Settings)
 /// Protocol executor only. The shared lifecycle owns admission scheduling,
 /// retry/backoff, reactivation and Prepared refresh.
 async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
-    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
-    process(rpc,pools,settings).await
-        .into_iter().map(CompletionOutcome::Proof).collect()
+    let program:Pubkey=PROGRAM.parse().expect("known DAMM v2 program");
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="meteora_damm_v2_pool"&&e.version==1)
+        && r.pool.completion_validated_slot.is_some()
+    ).collect::<Vec<_>>();
+    let mut result=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty() {
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        let addresses=eligible.iter().map(|r|r.pool.address).collect();
+        match read(rpc,addresses,min_slot).await {
+            Ok(batch)=>{
+                for (r,account) in eligible.iter().zip(batch.accounts.iter()) {
+                    let p=&r.pool;
+                    let valid=account.as_ref().and_then(|a|decode_pool(a,p,program).ok())
+                        .is_some_and(|layout|{
+                            let ev=p.completion_evidence.as_ref().expect("eligible evidence");
+                            let m=p.execution_manifest.as_ref().expect("eligible manifest");
+                            let fresh=manifest(layout,m.validated_slot,program);
+                            ev.payload["vault_a"].as_str()==Some(layout.vault_a.to_string().as_str())
+                                && ev.payload["vault_b"].as_str()==Some(layout.vault_b.to_string().as_str())
+                                && fresh==**m
+                        });
+                    if valid {
+                        if let Some(unchanged)=CompletionUnchanged::from_pool(p,batch.slot) {
+                            result.insert(p.address,CompletionOutcome::Unchanged(unchanged));
+                        }
+                    }
+                }
+            },
+            Err(error)=>{
+                for r in &eligible {
+                    result.insert(r.pool.address,CompletionOutcome::Proof(retry(r.pool.address,
+                        format!("DAMM v2 light RPC: {error:#}"))));
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!result.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,pending,settings).await {
+            result.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|result.remove(&r.pool.address).expect("DAMM v2 result")).collect()
 }
 
 pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
