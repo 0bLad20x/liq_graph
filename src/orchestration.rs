@@ -543,6 +543,8 @@ pub async fn run() -> Result<()> {
         return market_state_live::run(true).await;
     }
     if args.len() == 1 && args[0] == "--run" {
+        anyhow::ensure!(!matches!(env::var("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE").as_deref(),Ok("true"|"1")),
+            "legacy Byreal one-shot recheck may not run in production; use bounded --completion-lifecycle-live");
         return runtime::run().await;
     }
     if args.len()==1 && args[0]=="--cp1-live" {
