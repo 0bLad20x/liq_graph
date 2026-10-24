@@ -557,7 +557,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                             }
                                             ensure!(candidate==**m,"stored_manifest_differs");
                                             let dynamic_arrays=present.iter().filter(|addr|
-                                                lookup.get(addr).and_then(Option::as_ref)
+                                                lookup.get(*addr).and_then(Option::as_ref)
                                                     .is_some_and(|a|a.bytes[..8]==DYN_ARRAY_DISC)
                                             ).count();
                                             Ok((present.len(),dynamic_arrays))
