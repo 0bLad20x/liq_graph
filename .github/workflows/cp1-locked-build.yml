@@ -1,0 +1,14 @@
+name: CP1 locked build
+on:
+  push:
+    branches: [cp1-completion-state-aware-refresh]
+  workflow_dispatch:
+jobs:
+  locked-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
+      - run: cargo build --locked
