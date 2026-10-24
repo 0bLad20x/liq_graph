@@ -669,8 +669,11 @@ async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],setting
     };
     let eligible=requests.iter().filter(|r|!r.force_full
         && r.work!=crate::core::CompletionWork::Initial
-        && r.pool.completion_state==crate::core::CompletionState::Prepared
-        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && (r.pool.completion_state==crate::core::CompletionState::Prepared
+            && r.pool.execution_manifest.is_some()
+            || r.pool.completion_state==crate::core::CompletionState::Incomplete
+                && r.pool.completion_reason_code==Some(CompletionReason::MissingExecutionAccounts))
+        && r.pool.mint_proofs.is_some()
         && r.pool.completion_evidence.as_ref().is_some_and(|e|
             e.kind=="meteora_dlmm_bin_arrays" && e.version==1)
         && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
@@ -706,7 +709,10 @@ async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],setting
                                     is_initialized(&layout,extension,*idx).unwrap_or(false))
                                     .map(|idx|pda(p.address,b"bin_array",Some(idx),&owner))
                                     .collect::<Vec<_>>();
-                                if arrays.is_empty(){return Ok(false);}
+                                if arrays.is_empty(){
+                                    return Ok(p.completion_state==crate::core::CompletionState::Incomplete
+                                        && p.completion_reason_code==Some(CompletionReason::MissingExecutionAccounts));
+                                }
                                 let proof=p.mint_proofs.as_ref().context("missing MintProof")?;
                                 if layout.token_2022_a!=proof[0].token_2022
                                     || layout.token_2022_b!=proof[1].token_2022 {return Ok(false);}
