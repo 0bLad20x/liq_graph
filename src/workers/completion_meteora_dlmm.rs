@@ -662,9 +662,79 @@ fn validate(plan: &Plan, accounts: &[Option<AccountData>], slot: u64,
 /// Execute explicit lifecycle requests. Protocol decoding/validation remains local;
 /// scheduling, retries and Prepared refresh decisions belong to the lifecycle.
 async fn process_optimized(rpc:&RpcHandle, requests:&[CompletionRequest],settings:Settings)->Vec<CompletionOutcome>{
-    let pools=requests.iter().map(|r|r.pool.clone()).collect::<Vec<_>>();
-    process(rpc,&pools,settings).await
-        .into_iter().map(CompletionOutcome::Proof).collect()
+    let owner=match program(){
+        Ok(owner)=>owner,
+        Err(_)=>return requests.iter().map(|r|CompletionOutcome::Proof(retryable(r.pool.address,
+            "DLMM program ID unavailable"))).collect(),
+    };
+    let eligible=requests.iter().filter(|r|!r.force_full
+        && r.work!=crate::core::CompletionWork::Initial
+        && r.pool.completion_state==crate::core::CompletionState::Prepared
+        && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|
+            e.kind=="meteora_dlmm_bin_arrays" && e.version==1)
+        && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
+    let mut outcome=HashMap::<Pubkey,CompletionOutcome>::new();
+    if !eligible.is_empty() {
+        let min_slot=eligible.iter().filter_map(|r|r.pool.completion_validated_slot).max();
+        let first=read(rpc,eligible.iter().map(|r|r.pool.address).collect(),min_slot).await;
+        match first {
+            Err(error)=>for r in &eligible {
+                outcome.insert(r.pool.address,CompletionOutcome::Proof(retryable(r.pool.address,
+                    format!("DLMM light LbPair: {error:#}"))));
+            },
+            Ok(first)=>{
+                let extensions=eligible.iter().map(|r|
+                    pda(r.pool.address,b"bitmap",None,&owner)).collect::<Vec<_>>();
+                match read(rpc,extensions,Some(first.slot)).await {
+                    Err(error)=>for r in &eligible {
+                        outcome.insert(r.pool.address,CompletionOutcome::Proof(retryable(r.pool.address,
+                            format!("DLMM light bitmap: {error:#}"))));
+                    },
+                    Ok(bitmap_batch)=>{
+                        for ((r,account),bitmap) in eligible.iter()
+                            .zip(first.accounts.iter()).zip(bitmap_batch.accounts.iter()) {
+                            let p=&r.pool;
+                            let valid=(||->Result<bool>{
+                                let layout=decode_pool(account.as_ref().context("LbPair missing")?,p,&owner)?;
+                                let extension=bitmap.as_ref();
+                                if let Some(x)=extension {decode_bitmap(x,p.address,&owner)?;}
+                                let initialized=bitmap_indices(&layout,extension)?;
+                                let selected=select_indices(&initialized,layout.active_id.div_euclid(70),
+                                    settings.below,settings.above);
+                                let arrays=selected.iter().copied().filter(|idx|
+                                    is_initialized(&layout,extension,*idx).unwrap_or(false))
+                                    .map(|idx|pda(p.address,b"bin_array",Some(idx),&owner))
+                                    .collect::<Vec<_>>();
+                                if arrays.is_empty(){return Ok(false);}
+                                let proof=p.mint_proofs.as_ref().context("missing MintProof")?;
+                                if layout.token_2022_a!=proof[0].token_2022
+                                    || layout.token_2022_b!=proof[1].token_2022 {return Ok(false);}
+                                let current=manifest(&layout,
+                                    p.completion_validated_slot.context("no validated slot")?,
+                                    &arrays,extension.map(|x|x.address),owner)?;
+                                Ok(p.execution_manifest.as_ref()
+                                    .is_some_and(|cached| current==**cached))
+                            })().unwrap_or(false);
+                            if valid {
+                                if let Some(unchanged)=CompletionUnchanged::from_pool(p,bitmap_batch.slot) {
+                                    outcome.insert(p.address,CompletionOutcome::Unchanged(unchanged));
+                                }
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+    let pending=requests.iter().filter(|r|!outcome.contains_key(&r.pool.address))
+        .map(|r|r.pool.clone()).collect::<Vec<_>>();
+    if !pending.is_empty(){
+        for proof in process(rpc,&pending,settings).await{
+            outcome.insert(proof.pool,CompletionOutcome::Proof(proof));
+        }
+    }
+    requests.iter().map(|r|outcome.remove(&r.pool.address).expect("DLMM completion result")).collect()
 }
 
 pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
