@@ -25,6 +25,7 @@ pub struct Settings {
     refresh_ms: u64,
     recheck_ms: u64,
     full_refresh_ms: u64,
+    recheck_paused_once: bool,
     retry_ms: u64,
     retry_max_ms: u64,
     acknowledgement_ms: u64,
@@ -50,7 +51,18 @@ impl Settings {
             .unwrap_or_else(|_|"0".into()).parse::<usize>()
             .context("invalid COMPLETION_LIFECYCLE_POOL_LIMIT")?;
         ensure!(pool_limit<=100000,"lifecycle pool limit must be 0..100000");
+        let recheck_paused_once=match env::var("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE") {
+            Err(env::VarError::NotPresent)=>false,
+            Ok(v) if v=="true"||v=="1"=>true,
+            Ok(v) if v=="false"||v=="0"=>false,
+            _=>bail!("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE must be true or false"),
+        };
+        if recheck_paused_once {
+            ensure!(pool_limit>0 && env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").ok().as_deref()==Some("byreal"),
+                "paused legacy Byreal recheck is allowed only in bounded Byreal live mode");
+        }
         Ok(Self {
+            recheck_paused_once,
             refresh_ms:seconds("COMPLETION_LIFECYCLE_REFRESH_SECONDS",900)?,
             recheck_ms:seconds("COMPLETION_LIFECYCLE_RECHECK_SECONDS",300)?,
             full_refresh_ms:seconds("COMPLETION_LIFECYCLE_FULL_REFRESH_SECONDS",3600)?,
@@ -139,6 +151,9 @@ impl Scheduler {
         let key=pool.address;
         if !self.entries.contains_key(&key) {
             if !pool.completion_admission.is_admitted(){return;}
+            let legacy_byreal=settings.recheck_paused_once && pool.venue==Venue::ByrealClmm
+                && pool.completion_state==CompletionState::Incomplete
+                && pool.completion_reason_code==Some(CompletionReason::UnsupportedConfiguration);
             if managed && settings.pool_limit>0 {
                 if !self.selected.iter().any(|(venue,_)|*venue==pool.venue) {
                     self.selected.push((pool.venue,HashSet::new()));
@@ -147,12 +162,13 @@ impl Scheduler {
                     .find(|(venue,_)|*venue==pool.venue).expect("registered cohort").1;
                 // A paused unsupported pool must not consume the finite cohort.
                 if !selected.contains(&key) {
-                    if !Self::recheckable(pool.completion_reason_code,configuration_ready)
+                    if (!legacy_byreal && !Self::recheckable(pool.completion_reason_code,configuration_ready))
                         || selected.len()>=settings.pool_limit{return;}
                     selected.insert(key);
                 }
             }
-            let (work,due)=Self::plan(pool,configuration_ready,settings,now);
+            let (work,due)=if legacy_byreal{(CompletionWork::Recheck,Some(now))}
+                else{Self::plan(pool,configuration_ready,settings,now)};
             crate::log_event!(Debug,"lifecycle plan pool={} venue={:?} executing={managed} work={work:?} due_at_ms={due:?}",key,pool.venue);
             self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None,last_expired:None,last_light_checked_at_ms:None});
             if managed {if let Some(at)=due{self.due.insert((at,key));}}
