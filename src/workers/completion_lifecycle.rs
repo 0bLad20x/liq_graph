@@ -77,6 +77,7 @@ impl Settings {
 struct Flight {
     id:u64,
     work:CompletionWork,
+    force_full:bool,
     previous_checked:Option<u64>,
     previous_slot:Option<u64>,
     sent_at:u64,
@@ -283,7 +284,8 @@ impl Scheduler {
                 continue;
             }
             if let CompletionOutcome::Unchanged(check)=&response.outcome {
-                let baseline_matches=entry.pool.completion_validated_slot==Some(check.baseline_validated_slot)
+                let baseline_matches=!flight.force_full
+                    && entry.pool.completion_validated_slot==Some(check.baseline_validated_slot)
                     && entry.pool.completion_checked_at_ms==Some(check.baseline_checked_at_ms)
                     && entry.pool.completion_state==check.baseline_state
                     && check.baseline_state!=CompletionState::Unknown
@@ -381,15 +383,15 @@ impl Scheduler {
                     if let Some(at)=entry.due.take(){self.due.remove(&(at,key));}
                     self.next_id=self.next_id.checked_add(1).context("lifecycle request id overflow")?;
                     let id=self.next_id;
-                    entry.flight=Some(Flight{id,work:entry.work,
-                        previous_checked:entry.pool.completion_checked_at_ms,
-                        previous_slot:entry.pool.completion_validated_slot,sent_at:now,terminal:None});
-                    crate::log_event!(Debug,"lifecycle dispatch request_id={id} pool={key} venue={:?} work={:?}",
-                        entry.pool.venue,entry.work);
                     let force_full=entry.pool.completion_state==CompletionState::Unknown
                         || entry.pool.completion_validated_slot.is_none()
                         || entry.pool.completion_checked_at_ms.is_none_or(|at|
                             now.saturating_sub(at)>=settings.full_refresh_ms);
+                    entry.flight=Some(Flight{id,work:entry.work,force_full,
+                        previous_checked:entry.pool.completion_checked_at_ms,
+                        previous_slot:entry.pool.completion_validated_slot,sent_at:now,terminal:None});
+                    crate::log_event!(Debug,"lifecycle dispatch request_id={id} pool={key} venue={:?} work={:?} force_full={force_full}",
+                        entry.pool.venue,entry.work);
                     requests.push(CompletionRequest{id,work:entry.work,force_full,pool:entry.pool.clone()});
                 }
                 self.counters.dispatched+=requests.len() as u64;
