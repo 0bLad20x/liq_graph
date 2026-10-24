@@ -242,6 +242,8 @@ pub enum CompletionWork { Initial, Recheck, Refresh, Retry }
 pub struct CompletionRequest {
     pub id: u64,
     pub work: CompletionWork,
+    /// Revalidate all protocol prerequisites; never use a cached shortcut.
+    pub force_full: bool,
     pub pool: PoolState,
 }
 
@@ -251,10 +253,51 @@ pub struct CompletionRequestBatch {
     pub timeout: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct CompletionUnchanged {
+    pub pool: Pubkey,
+    pub baseline_validated_slot: u64,
+    pub baseline_checked_at_ms: u64,
+    pub baseline_state: CompletionState,
+    pub observed_slot: u64,
+    pub checked_at_ms: u64,
+}
+
+impl CompletionUnchanged {
+    /// A successful lightweight check confirms only existing structure, not a new full proof.
+    pub fn from_pool(pool: &PoolState, observed_slot: u64) -> Option<Self> {
+        let validated = pool.completion_validated_slot?;
+        let checked = pool.completion_checked_at_ms?;
+        if pool.completion_state == CompletionState::Unknown || observed_slot <= validated {
+            return None;
+        }
+        Some(Self {
+            pool: pool.address, baseline_validated_slot: validated,
+            baseline_checked_at_ms: checked, baseline_state: pool.completion_state,
+            observed_slot, checked_at_ms: now_unix_ms().ok()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum CompletionOutcome {
+    Proof(CompletionResult),
+    Unchanged(CompletionUnchanged),
+}
+
+impl CompletionOutcome {
+    pub fn pool(&self) -> Pubkey {
+        match self {
+            Self::Proof(result) => result.pool,
+            Self::Unchanged(check) => check.pool,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CompletionResponse {
     pub id: u64,
-    pub result: CompletionResult,
+    pub outcome: CompletionOutcome,
 }
 
 #[derive(Debug)]
