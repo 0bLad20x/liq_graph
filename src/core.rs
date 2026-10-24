@@ -54,6 +54,8 @@ pub enum CompletionReason {
     ValidationFailed,
     MissingExecutionAccounts,
     UnsupportedConfiguration,
+    /// On-chain feature mode can change while the required V10 instruction variant is unavailable.
+    DynamicModeUnsupported,
     ConfigurationRequired,
     LegacyUnclassified,
 }
