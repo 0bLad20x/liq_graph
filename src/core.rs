@@ -10,29 +10,37 @@ use anyhow::Result;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 
-/// Shared completion contract. TVL is the Registry's current canonical value;
-/// callers must never substitute a historical observation or provider payload.
-pub const COMPLETION_MIN_TVL_USD: f64 = 500.0;
-
+/// Admission is a Registry-owned decision. The Mint Registry supplies qualified
+/// identities; only a venue-native TVL below the policy floor can veto admission.
+/// DexScreener TVL and the canonical (possibly fallback) TVL are not policy inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionAdmission {
     Admitted,
     MissingIdentity,
-    TvlUnavailable,
-    BelowMinimumTvl,
+    MintNotQualified,
+    NativeTvlBelowMinimum,
 }
 
 impl CompletionAdmission {
-    pub fn from_inputs(a: Option<Pubkey>, b: Option<Pubkey>, tvl: Option<f64>) -> Self {
+    /// Bootstrap placeholder used by Persistence before the Mint Registry has
+    /// published its classification. No restored TVL value grants admission.
+    pub fn from_inputs(a: Option<Pubkey>, b: Option<Pubkey>, _tvl: Option<f64>) -> Self {
+        Self::from_qualification(a, b, false, false)
+    }
+
+    /// Shared typed result only. Venue policy, token thresholds and provenance
+    /// remain private to their owning workers.
+    pub fn from_qualification(
+        a: Option<Pubkey>, b: Option<Pubkey>,
+        mint_qualified: bool, native_tvl_below_minimum: bool,
+    ) -> Self {
         let (Some(a), Some(b)) = (a, b) else { return Self::MissingIdentity };
         if a == b || a == Pubkey::default() || b == Pubkey::default() {
             return Self::MissingIdentity;
         }
-        match tvl {
-            Some(v) if v.is_finite() && v >= COMPLETION_MIN_TVL_USD => Self::Admitted,
-            Some(v) if v.is_finite() && v >= 0.0 => Self::BelowMinimumTvl,
-            _ => Self::TvlUnavailable,
-        }
+        if !mint_qualified { return Self::MintNotQualified; }
+        if native_tvl_below_minimum { return Self::NativeTvlBelowMinimum; }
+        Self::Admitted
     }
 
     pub fn is_admitted(self) -> bool { self == Self::Admitted }
