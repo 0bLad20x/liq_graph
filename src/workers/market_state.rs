@@ -1,11 +1,11 @@
 //! Indicative market state: Prepared pool inputs -> account watches -> typed prices.
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::{Arc,RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
-use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
+use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue, MintReader,
     market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, rpc_transport::{RpcAnswer, RpcHandle, RpcOperation},
     graph_watch_catalog::{WatchCatalog,RouteKind}};
@@ -89,7 +89,6 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
     }
     Ok(records)
 }
-type MintDecimals=Arc<RwLock<HashMap<String,u8>>>;
 #[derive(Clone)]struct Watch {address:String,venue:Venue}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
@@ -461,7 +460,7 @@ impl Engine{
         let offset=self.pools.len();for sub in &mut part.subs{sub.pool+=offset;}
         self.pools.extend(part.pools);self.subs.extend(part.subs);self.index();
     }
-    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool,mint_cache:&MintDecimals)->Result<Self>{
+    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool,mints:&dyn MintReader)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
         let pool_records=fetch_batch(rpc,&pool_addrs).await?;
         let mut raw_pools=Vec::new();let mut details=Vec::<String>::new();
@@ -557,36 +556,26 @@ impl Engine{
             details.push(a.clone());details.push(b.clone());
             raw_pools.push((a,b,state,acc.slot));
         }
-        // Mint decimals were already on-chain verified in earlier batches.
-        // The price worker owns this immutable mint cache; vaults are never cached.
+        // One authoritative Mint Registry. Only dynamic vault accounts are read here;
+        // onchain Mint verification and decimals are owned by the Mint-enrichment worker.
         let mint_addresses:HashSet<String>=raw_pools.iter().flat_map(|(a,b,_,_)|
             [a.clone(),b.clone()]).collect();
-        let cached={
-            let cache=mint_cache.read().expect("market mint cache poisoned");
-            mint_addresses.iter().filter_map(|address|
-                cache.get(address).map(|decimals|(address.clone(),*decimals))).collect::<HashMap<_,_>>()
-        };
+        let mut verified=HashMap::new();
+        for address in mint_addresses {
+            let key:Pubkey=address.parse()?;
+            let state=mints.mint(key).and_then(|state|state.onchain)
+                .with_context(||format!("Mint onchain proof missing {address}"))?;
+            ensure!(state.address==key,"Mint proof identity mismatch");
+            verified.insert(address,state.decimals);
+        }
         let mut unique=Vec::new();let mut seen=HashSet::new();
         for address in details {
-            if seen.insert(address.clone()) &&
-                (!mint_addresses.contains(&address) || !cached.contains_key(&address)) {
+            if seen.insert(address.clone()) && !verified.contains_key(&address) {
                 unique.push(address);
             }
         }
         let records=fetch_batch(rpc,&unique).await?;
         let dict:HashMap<String,RpcAccount>=unique.into_iter().zip(records).collect();
-        let mut verified=cached;
-        for mint in mint_addresses {
-            if !verified.contains_key(&mint) {
-                if let Some(account)=dict.get(&mint) {
-                    verified.insert(mint,mint_dec(account)?);
-                }
-            }
-        }
-        {
-            let mut cache=mint_cache.write().expect("market mint cache poisoned");
-            for (mint,decimals) in &verified {cache.entry(mint.clone()).or_insert(*decimals);}
-        }
         let mut pools=Vec::new();let mut subs=Vec::new();
         for (idx,(watch,(a,b,mut state,pool_slot))) in cfg.watches.iter().zip(raw_pools).enumerate(){
             let da=*verified.get(&a).context("token A mint decimals missing")?;
@@ -816,7 +805,7 @@ impl Engine{
 pub struct Settings {pub pool_limit:usize,pub trace:bool}
 impl Settings {
     pub fn from_env()->Result<Self> {Ok(Self{
-        pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",1000)?,
+        pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",5000)?,
         trace:env_parse::<u8>("MARKET_STATE_TRACE",0)?!=0,
     })}
 }
@@ -841,11 +830,108 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
     if let Some(p)=current {candidates.insert(address,p);}else{candidates.remove(&address);}
     true
 }
-fn select(candidates:&HashMap<Pubkey,PoolInput>,limit:usize)->Vec<PoolInput> {
-    let mut pools:Vec<_>=candidates.values().copied().collect();
-    pools.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
-    if limit>0 {pools.truncate(limit);}
-    pools
+fn watch_cost(v:CoreVenue)->usize {
+    match v {CoreVenue::PumpSwap|CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
+}
+/// Select complete V10 routes before extra alternatives. No new Pool/Mint state;
+/// all structural facts are read from the existing WatchCatalog and Registry.
+fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
+    limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput> {
+    let max_pools=if limit==0 {usize::MAX}else{limit};
+    let old:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
+    let mut picked=HashSet::<Pubkey>::new();
+    let mut used_accounts=0_usize;
+    let mut by_target=BTreeMap::<(Pubkey,Pubkey),Vec<usize>>::new();
+    for (id,g) in catalog.graph.groups.iter().enumerate() {
+        by_target.entry((g.settlement,g.target)).or_default().push(id);
+    }
+    // Rotate through settlement/target pairs rather than letting one prolific
+    // pair monopolize the 5000-pool budget.
+    for group_ids in by_target.values_mut() {
+        group_ids.sort_by_key(|&id|{
+            let g=&catalog.graph.groups[id];
+            let legs=if g.bridge.is_some(){if g.conversion.is_some(){4}else{3}}
+                else if g.conversion.is_some(){3}else{2};
+            (legs,std::cmp::Reverse(g.route_options),id)
+        });
+    }
+    let choose=|options:&[Pubkey],number:usize,picked:&HashSet<Pubkey>,
+        local:&mut Vec<Pubkey>|->bool {
+        let mut ordered:Vec<Pubkey>=options.iter().copied()
+            .filter(|p|candidates.contains_key(p)).collect();
+        ordered.sort_by(|a,b|{
+            let sa=(picked.contains(a)||local.contains(a),old.contains(a));
+            let sb=(picked.contains(b)||local.contains(b),old.contains(b));
+            sb.cmp(&sa)
+                .then_with(||{
+                    let t=|key:&Pubkey|registry.get(*key).and_then(|p|p.tvl_usd).unwrap_or(0.0);
+                    t(b).total_cmp(&t(a))
+                }).then_with(||a.cmp(b))
+        });
+        for address in ordered {
+            if local.contains(&address){continue;}
+            local.push(address);
+            if local.len()>=number {return true;}
+        }
+        false
+    };
+    let mut cursor=BTreeMap::<(Pubkey,Pubkey),usize>::new();
+    // Each pass attempts one new complete topology per settlement/target pair.
+    loop {
+        let mut advanced=false;
+        for (key,ids) in &by_target {
+            let index=cursor.entry(*key).or_insert(0);
+            if *index>=ids.len(){continue;}
+            let g=&catalog.graph.groups[ids[*index]];*index+=1;
+            advanced=true;
+            let mut local=Vec::<Pubkey>::new();
+            let count=if g.bridge.is_none()&&g.conversion.is_none(){2}else{1};
+            if !choose(&g.direct_s,count,&picked,&mut local){continue;}
+            if g.bridge.is_some(){
+                let Some(middle)=g.intermediate else {continue;};
+                if !candidates.contains_key(&middle)||local.contains(&middle){continue;}
+                local.push(middle);
+                if !choose(&g.bridge_pools,local.len()+1,&picked,&mut local){continue;}
+            } else if g.conversion.is_some() {
+                if !choose(&g.direct_q,local.len()+1,&picked,&mut local){continue;}
+            }
+            if let Some(conv)=g.conversion {
+                if !candidates.contains_key(&conv)||local.contains(&conv){continue;}
+                local.push(conv);
+            }
+            let fresh:Vec<_>=local.into_iter().filter(|p|!picked.contains(p)).collect();
+            if fresh.is_empty()||picked.len()+fresh.len()>max_pools {continue;}
+            let cost:usize=fresh.iter().map(|p|watch_cost(candidates[p].venue)).sum();
+            if used_accounts+cost>account_budget {continue;}
+            for p in fresh {picked.insert(p);}
+            used_accounts+=cost;
+            if picked.len()==max_pools||used_accounts==account_budget {break;}
+        }
+        if !advanced||picked.len()==max_pools||used_accounts==account_budget {break;}
+    }
+    // Fill remaining budget with stable, structurally valuable alternatives.
+    let mut residual:Vec<_>=candidates.values().filter(|p|!picked.contains(&p.address)
+        && catalog.for_pool(p.address).is_some()).copied().collect();
+    residual.sort_by(|a,b|{
+        let score=|p:&PoolInput|{
+            let w=catalog.for_pool(p.address).expect("catalog filtered");
+            // Diverse context participation, not raw Cartesian route count.
+            (w.contexts.len(),w.group_ids.len(),w.pair_pool_count)
+        };
+        score(b).cmp(&score(a)).then_with(||old.contains(&b.address).cmp(&old.contains(&a.address)))
+            .then_with(||{
+                let tvl=|p:&PoolInput|registry.get(p.address).and_then(|s|s.tvl_usd).unwrap_or(0.0);
+                tvl(b).total_cmp(&tvl(a))
+            }).then_with(||a.address.cmp(&b.address))
+    });
+    for p in residual {
+        if picked.len()>=max_pools {break;}
+        let cost=watch_cost(p.venue);
+        if used_accounts+cost<=account_budget {picked.insert(p.address);used_accounts+=cost;}
+    }
+    let mut result=picked.into_iter().filter_map(|p|candidates.get(&p).copied()).collect::<Vec<_>>();
+    result.sort_unstable_by_key(|p|p.address);
+    result
 }
 fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
     let _=out.send(Arc::new(event));
@@ -853,7 +939,7 @@ fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
 // Preparation never publishes or borrows the running engine. Only the event loop
 // installs results, after checking that identities and resync revisions still match.
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
-    prices:bool,mint_cache:&MintDecimals,baseline_source:Option<&Engine>)->Result<(Engine,Vec<(PoolInput,String)>)> {
+    prices:bool,mints:&dyn MintReader,baseline_source:Option<&Engine>)->Result<(Engine,Vec<(PoolInput,String)>)> {
     let mut engine=Engine::empty(out.clone(),0);
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
     while let Some(batch)=pending.pop() {
@@ -867,7 +953,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
                 let mut part=source.subset(&selected);
                 part.refresh_baseline(rpc).await.map(|()|part)
             },
-            (None,Ok(cfg))=>Engine::hydrate(cfg,rpc,out.clone(),0,prices,mint_cache).await,
+            (None,Ok(cfg))=>Engine::hydrate(cfg,rpc,out.clone(),0,prices,mints).await,
             (None,Err(error))=>Err(error),
         };
         let result=result.and_then(|part| {
