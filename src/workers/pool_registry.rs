@@ -895,7 +895,7 @@ pub async fn run(
                     }
                     if batches == 1 || batches % 25 == 0 {
                         crate::log_event!(Debug,
-                            "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused} pools_in_ram={} updates_published={updates} ignored_mints={}",
+                            "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused}",
                             batch.source, stats.total, stats.ignored_mints,
                         );
                     }
@@ -962,7 +962,7 @@ pub async fn run(
         "completion_contracts min_native_tvl_usd={} mint_qualification=true admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
         MIN_NATIVE_TVL_USD);
     crate::log_event!(Info,
-        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",
+        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused}",
         snapshot.len(),
     );
     if require_completion {
