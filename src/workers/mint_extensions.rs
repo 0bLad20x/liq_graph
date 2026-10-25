@@ -154,6 +154,7 @@ pub async fn run(
     let mut jobs=JoinSet::new();let mut ticker=time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut scan=true;let mut decoded=0_u64;let mut failed=0_u64;
+    let mut qualified_open=true;let mut selected_open=true;
     loop {
         if *stop.borrow(){break;}
         if scan {
@@ -190,8 +191,12 @@ pub async fn run(
         }
         tokio::select! {
             _=ticker.tick()=>{scan=true;},
-            changed=qualified.changed()=>{if changed.is_ok(){scan=true;}},
-            changed=selected.changed()=>{if changed.is_ok(){scan=true;}},
+            changed=qualified.changed(),if qualified_open=>{
+                if changed.is_ok(){scan=true;}else{qualified_open=false;}
+            },
+            changed=selected.changed(),if selected_open=>{
+                if changed.is_ok(){scan=true;}else{selected_open=false;}
+            },
             changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){break;}},
             joined=jobs.join_next(),if !jobs.is_empty()=>{
                 if let Some(job)=joined {
