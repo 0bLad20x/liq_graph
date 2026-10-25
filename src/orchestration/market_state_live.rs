@@ -202,7 +202,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         let worker=Task(tokio::spawn(graph_signals::run(prices.subscribe(),catalog_rx.clone(),output.clone(),cfg)));
         (Some(output),Some(worker),Some(observer),execution)
     }else{(None,None,None,None)};
-    let mut consumer=Task(tokio::spawn(market_state::observe(price_rx,catalog_rx,settings.trace)));
+    let mut consumer=Task(tokio::spawn(market_state::observe(price_rx,catalog_rx.clone(),settings.trace)));
     // Keep resource roots alive until the producer result has been joined. Otherwise
     // an errored producer can close the consumer/RPC first and hide its actual error.
     let (account_control,account_events)=rpc.account_stream();
