@@ -332,6 +332,34 @@ impl PoolRegistry {
         self.entries.read().expect("pool registry lock poisoned")
             .values().filter(|p|p.tvl_usd.is_some()).count()
     }
+    /// Live accounting of the reference pair needed for Direct3/Triangle4.
+    /// Diagnostic only: the PoolRegistry remains the sole admission authority.
+    fn report_conversion_admission(&self) {
+        let references=reference_mints();
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let mut known=0_usize;
+        let mut admitted=0_usize;
+        let mut prepared=0_usize;
+        let mut prepared_admitted=0_usize;
+        let mut native_veto=0_usize;
+        let mut missing_qualification=0_usize;
+        for p in entries.values() {
+            let pair=matches!((p.mint_a,p.mint_b),
+                (Some(a),Some(b)) if a!=b && references.contains(&a) && references.contains(&b));
+            if !pair {continue;}
+            known+=1;
+            if p.completion_admission.is_admitted(){admitted+=1;}
+            if p.completion_state==CompletionState::Prepared{prepared+=1;}
+            if p.completion_admission.is_admitted() && p.completion_state==CompletionState::Prepared {
+                prepared_admitted+=1;
+            }
+            if p.completion_admission==CompletionAdmission::NativeTvlBelowMinimum {native_veto+=1;}
+            if p.completion_admission==CompletionAdmission::MintNotQualified {missing_qualification+=1;}
+        }
+        crate::log_event!(Info,
+            "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} native_tvl_veto={} mint_not_qualified={}",
+            known,admitted,prepared,prepared_admitted,native_veto,missing_qualification);
+    }
 
     /// Bootstrap complete, previously validated state before any producer starts.
     /// REST observations still own current TVL/freshness; persisted proof is historical.
@@ -863,6 +891,7 @@ pub async fn run(
                 }
             },
             _=freshness.tick()=>{
+                registry.report_conversion_admission();
                 let (invalidated,persist)=registry.refresh_tvl(now_unix_ms()?);
                 if !invalidated.is_empty() {
                     let count=invalidated.len();
