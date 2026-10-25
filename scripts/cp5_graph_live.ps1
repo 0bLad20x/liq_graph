@@ -102,8 +102,8 @@ try {
         consumer_delivery_loss=if($null -ne $consumer){$consumer.lost_events}else{$null}
         websocket_ready_anchors_by_kind=$ready
         ranges_by_kind=$ranges
-        direct3_ready=if($null -ne $ready){$ready.Direct3 -gt 0}else{$false}
-        triangle4_ready=if($null -ne $ready){$ready.Triangle4 -gt 0}else{$false}
+        direct3_ready=if($null -ne $ready){$ready.direct_3 -gt 0}else{$false}
+        triangle4_ready=if($null -ne $ready){$ready.triangle_4 -gt 0}else{$false}
         simulation_enabled=$false;transactions_sent=0
     }
     $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
