@@ -121,6 +121,7 @@ pub async fn run(
     mut onchain_updates:Option<mpsc::Receiver<Arc<MintOnchainBatch>>>,
     onchain_persist:Option<broadcast::Sender<Arc<MintOnchainBatch>>>,
     onchain_revision:Option<watch::Sender<u64>>,
+    mut stop:Option<watch::Receiver<bool>>,
 )->Result<()> {
     let mut known=HashSet::<Pubkey>::new();
     for pool in restored_pools {
@@ -138,7 +139,11 @@ pub async fn run(
     let mut jupiter_open=true;let mut revision=0_u64;
     loop {
         let onchain_open=onchain_updates.is_some();
+        let stop_open=stop.is_some();
         tokio::select! {
+            changed=async{stop.as_mut().expect("Mint stop").changed().await},if stop_open=>{
+                if changed.is_err() || stop.as_ref().is_some_and(|s|*s.borrow()) {break;}
+            },
             event=async {onchain_updates.as_mut().expect("Mint onchain receiver").recv().await},
                 if onchain_open=>match event {
                 Some(batch)=>{
