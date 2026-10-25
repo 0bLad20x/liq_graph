@@ -856,6 +856,18 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     let quality:HashMap<Pubkey,f64>=candidates.keys().map(|address|(*address,
         registry.get(*address).and_then(|p|p.tvl_usd).filter(|v|v.is_finite()&&*v>=0.0).unwrap_or(0.0)))
         .collect();
+    // Pre-sort each Mint pair once. Reusing the same sorted pool alternatives
+    // avoids re-sorting hundreds of pools per V10 group during graph updates.
+    let mut by_pair=HashMap::<(Pubkey,Pubkey),Vec<Pubkey>>::new();
+    for p in candidates.values() {
+        by_pair.entry((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b)))
+            .or_default().push(p.address);
+    }
+    for options in by_pair.values_mut() {
+        options.sort_by(|a,b|old.contains(b).cmp(&old.contains(a))
+            .then_with(||quality[b].total_cmp(&quality[a]))
+            .then_with(||a.cmp(b)));
+    }
     let mut picked=HashSet::<Pubkey>::new();
     let mut used_accounts=0_usize;
     let mut by_target=BTreeMap::<(Pubkey,Pubkey),Vec<usize>>::new();
@@ -874,21 +886,21 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     }
     let choose=|options:&[Pubkey],number:usize,picked:&HashSet<Pubkey>,
         local:&mut Vec<Pubkey>|->bool {
-        let mut ordered:Vec<Pubkey>=options.iter().copied()
-            .filter(|p|candidates.contains_key(p)).collect();
-        ordered.sort_by(|a,b|{
-            let sa=(picked.contains(a)||local.contains(a),old.contains(a));
-            let sb=(picked.contains(b)||local.contains(b),old.contains(b));
-            sb.cmp(&sa)
-                .then_with(||{
-                    let t=|key:&Pubkey|*quality.get(key).unwrap_or(&0.0);
-                    t(b).total_cmp(&t(a))
-                }).then_with(||a.cmp(b))
-        });
-        for address in ordered {
-            if local.contains(&address){continue;}
-            local.push(address);
-            if local.len()>=number {return true;}
+        let Some(first)=options.first() else{return false;};
+        let Some(w)=catalog.for_pool(*first) else{return false;};
+        let Some(ordered)=by_pair.get(&(w.mint_a,w.mint_b)) else{return false;};
+        // Already-covered legs have zero incremental subscription cost.
+        for &address in ordered {
+            if picked.contains(&address) && !local.contains(&address) {
+                local.push(address);
+                if local.len()>=number {return true;}
+            }
+        }
+        for &address in ordered {
+            if !local.contains(&address) {
+                local.push(address);
+                if local.len()>=number {return true;}
+            }
         }
         false
     };
