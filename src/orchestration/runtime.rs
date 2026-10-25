@@ -272,7 +272,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
         let (jupiter_out,jupiter_rx)=mint_stream.take().context("missing Jupiter stream")?;
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
             mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
-                jupiter_rx,qualified_tx,target_tx,None,None,None)));
+                jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
             source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
         critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
@@ -285,7 +285,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
         let (target_tx,_target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
             mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
-                jupiter_rx,qualified_tx,target_tx,None,None,None)));
+                jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
         let _keep_jupiter_sender=jupiter_out;
     }
     if configured.pumpswap.is_some() {
@@ -399,7 +399,7 @@ pub async fn cp1_live() -> Result<()> {
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let qualification=tokio::spawn(mint_qualification::run(
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx,
-        None,None,None));
+        None,None,None,None));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
     // This isolated checkpoint must not start an unbounded full backfill.
     let mut jupiter_settings=settings;
@@ -612,7 +612,7 @@ pub async fn run()->Result<()>{
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     critical(&mut tasks,"mint_registry",mint_qualification::run(
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
-        qualified_tx,target_tx,Some(onchain_rx),Some(onchain_persist),Some(mint_revision_tx)));
+        qualified_tx,target_tx,Some(onchain_rx),Some(onchain_persist),Some(mint_revision_tx),Some(stop_rx.clone())));
     if jupiter_settings()?.is_some() {
         let observer_sender=jupiter_out.clone();
         let mut first_jupiter_observer=Some(jupiter_observer_rx);
