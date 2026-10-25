@@ -44,6 +44,8 @@ pub enum RpcOperation {
     LatestBlockhash { min_context_slot: Option<u64> },
     /// Read-only execution. Signature verification is always enabled; never broadcasts.
     Simulate { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
+    /// Simulation-only: RPC replaces the blockhash and skips signature verification.
+    SimulateFast { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
 }
 
 impl RpcOperation {
@@ -56,7 +58,7 @@ impl RpcOperation {
             Self::Slot { .. } => "getSlot",
             Self::GenesisHash => "getGenesisHash",
             Self::LatestBlockhash { .. } => "getLatestBlockhash",
-            Self::Simulate { .. } => "simulateTransaction",
+            Self::Simulate { .. } | Self::SimulateFast { .. } => "simulateTransaction",
         }
     }
     fn bit(&self) -> u64 {
@@ -68,7 +70,7 @@ impl RpcOperation {
             Self::Slot { .. } => 16,
             Self::GenesisHash => 32,
             Self::LatestBlockhash { .. } => 64,
-            Self::Simulate { .. } => 128,
+            Self::Simulate { .. } | Self::SimulateFast { .. } => 128,
         }
     }
     fn params(&self, commitment: &str, account_limit: usize, v2_limit: usize) -> Result<Value> {
@@ -122,12 +124,14 @@ impl RpcOperation {
                 if let Some(slot)=min_context_slot {cfg["minContextSlot"]=json!(slot);}
                 json!([cfg])
             }
-            Self::Simulate { transaction, min_context_slot, accounts } => {
+            Self::Simulate { transaction, min_context_slot, accounts }
+            | Self::SimulateFast { transaction, min_context_slot, accounts } => {
                 ensure!(!transaction.is_empty() && transaction.len()<=4096,
                     "simulation transaction exceeds wire limit");
                 ensure!(accounts.len()<=64,"too many simulation account projections");
+                let fast=matches!(self,Self::SimulateFast{..});
                 let mut cfg=json!({"encoding":"base64","commitment":commitment,
-                    "sigVerify":true,"replaceRecentBlockhash":false,"innerInstructions":true,
+                    "sigVerify":!fast,"replaceRecentBlockhash":fast,"innerInstructions":true,
                     "accounts":{"encoding":"base64",
                         "addresses":accounts.iter().map(ToString::to_string).collect::<Vec<_>>()}});
                 if let Some(slot)=min_context_slot {cfg["minContextSlot"]=json!(slot);}
@@ -574,7 +578,7 @@ fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
                 last_valid_block_height:value.get("lastValidBlockHeight").and_then(Value::as_u64)
                     .context("blockhash expiry missing")?})
         }
-        RpcOperation::Simulate{min_context_slot,..}=>{
+        RpcOperation::Simulate{min_context_slot,..}|RpcOperation::SimulateFast{min_context_slot,..}=>{
             let slot=response_slot(&result)?;
             ensure!(min_context_slot.is_none_or(|min|slot>=min),"simulation context is older than requested");
             let value=result.get("value").filter(|v|v.is_object() && v.get("err").is_some())
