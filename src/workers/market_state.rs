@@ -70,7 +70,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
     let mut records=Vec::with_capacity(addresses.len());
     for wave in chunks.chunks(4) {
         let batches=join_all(wave.iter().map(|chunk|async move {
-            let expected=chunk.iter().map(|a|a.parse()).collect::<Result<Vec<Pubkey>>>()?;
+            let expected=chunk.iter().map(|a|a.parse::<Pubkey>()).collect::<std::result::Result<Vec<_>,_>>()?;
             let answer=rpc.call(RpcOperation::Multiple{addresses:expected,view:AccountView::Full,
                 min_context_slot:None}).await?;
             let received_us=answer.received_at_ms.saturating_mul(1000);
