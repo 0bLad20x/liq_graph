@@ -81,8 +81,16 @@ impl AdmissionIndex {
         }
     }
     fn admission(&self, pool: &PoolState) -> CompletionAdmission {
-        let mint_qualified=[pool.mint_a,pool.mint_b].into_iter().flatten()
-            .any(|mint| !reference_mints().contains(&mint) && self.qualified.contains(&mint));
+        // A WSOL/USDC conversion pool contains only settlement reference mints.
+        // It cannot satisfy the non-reference Jupiter qualification rule, yet it
+        // is required by V10 Direct3/Triangle4 routes. Admit ONLY this exact
+        // canonical reference pair; all other pools retain the Mint qualification
+        // and venue-native minimum-TVL policy.
+        let references=reference_mints();
+        let conversion_pair=matches!((pool.mint_a,pool.mint_b),
+            (Some(a),Some(b)) if a!=b && references.contains(&a) && references.contains(&b));
+        let mint_qualified=conversion_pair || [pool.mint_a,pool.mint_b].into_iter().flatten()
+            .any(|mint| !references.contains(&mint) && self.qualified.contains(&mint));
         let native_below_minimum=native_source(pool.venue).is_some()
             && self.native_tvl.get(&pool.address).is_some_and(|v|*v<MIN_NATIVE_TVL_USD);
         CompletionAdmission::from_qualification(
