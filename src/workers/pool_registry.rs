@@ -267,19 +267,33 @@ fn combine_metadata(
     let Some(new) = incoming.as_object() else { return incoming; };
     if old.get("source") != new.get("source") { return incoming; }
 
-    let mut merged = old.clone();
-    if new.get("fee.adaptive_available") == Some(&Value::Bool(false)) {
-        // Orca explicitly turned off / omitted the adaptive fee state.
-        merged.retain(|k,_| !k.starts_with("fee.adaptive.")
-            && !k.starts_with("fee.snapshot_adaptive_")
-            && k != "fee.snapshot_at_ms");
-    }
     let same_snapshot = new.iter()
         .filter(|(k,_)| k.starts_with("fee.snapshot_") && k.as_str() != "fee.snapshot_at_ms")
         .all(|(k,v)| old.get(k) == Some(v));
     let recent_snapshot = old.get("fee.snapshot_at_ms").and_then(Value::as_u64)
         .is_some_and(|old_ms| received_at_ms >= old_ms
             && received_at_ms - old_ms < TVL_PERSIST_INTERVAL_MS);
+    let clear_adaptive = new.get("fee.adaptive_available") == Some(&Value::Bool(false));
+    // The original merge removes these keys before inserting the incoming fields.
+    // Only reuse the old Arc when neither that removal nor any effective insert
+    // can alter the result (including the snapshot timestamp policy).
+    let removal_needed = clear_adaptive && old.keys().any(|k|
+        k.starts_with("fee.adaptive.") || k.starts_with("fee.snapshot_adaptive_")
+            || k == "fee.snapshot_at_ms");
+    if !removal_needed && new.iter().all(|(key,value)|
+        (key == "fee.snapshot_at_ms" && same_snapshot && recent_snapshot)
+            || old.get(key) == Some(value))
+    {
+        return Arc::clone(previous.expect("existing validated metadata"));
+    }
+
+    let mut merged = old.clone();
+    if clear_adaptive {
+        // Orca explicitly turned off / omitted the adaptive fee state.
+        merged.retain(|k,_| !k.starts_with("fee.adaptive.")
+            && !k.starts_with("fee.snapshot_adaptive_")
+            && k != "fee.snapshot_at_ms");
+    }
     for (key, value) in new {
         if key == "fee.snapshot_at_ms" && same_snapshot && recent_snapshot { continue; }
         merged.insert(key.clone(), value.clone());
@@ -463,9 +477,9 @@ impl PoolRegistry {
             }
 
             let observed_tvl = record.tvl_usd.filter(|v|v.is_finite() && *v>=0.0);
-            let metadata=pool_metadata(&record.payload,batch.source,*venue,batch.received_at_ms);
             match entries.get_mut(address) {
                 None => {
+                    let metadata=pool_metadata(&record.payload,batch.source,*venue,batch.received_at_ms);
                     admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
@@ -506,6 +520,7 @@ impl PoolRegistry {
                     // An older observation must not replace a newer one.
                     if batch.received_at_ms < current.last_seen_ms {
                         stats.stale += 1;
+                        stats.metadata_skipped += 1;
                         continue;
                     }
                     // Pool ownership and known mints are stable facts. Reject
@@ -515,9 +530,11 @@ impl PoolRegistry {
                         mint_b.as_ref().is_some_and(|mint| current.mint_b.is_some_and(|old| old != *mint))
                     {
                         stats.conflicts += 1;
+                        stats.metadata_skipped += 1;
                         crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
                         continue;
                     }
+                    let metadata=pool_metadata(&record.payload,batch.source,*venue,batch.received_at_ms);
                     admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
@@ -526,6 +543,9 @@ impl PoolRegistry {
                     let mut mint_identity_changed = false;
                     if let Some(config)=metadata {
                         let config=combine_metadata(current.pool_config.as_ref(),config,batch.received_at_ms);
+                        if current.pool_config.as_ref().is_some_and(|old|Arc::ptr_eq(old,&config)) {
+                            stats.metadata_reused += 1;
+                        }
                         if current.pool_config.as_deref()!=Some(config.as_ref()) {
                             current.pool_config=Some(config);
                             changed=true;
@@ -751,6 +771,8 @@ struct BatchStats {
     unchanged: usize,
     stale: usize,
     conflicts: usize,
+    metadata_skipped: usize,
+    metadata_reused: usize,
     ignored_mints: usize,
     total: usize,
     updates: Vec<PoolState>,
@@ -776,6 +798,8 @@ pub async fn run(
     let mut unchanged = 0_u64;
     let mut stale = 0_u64;
     let mut conflicts = 0_u64;
+    let mut metadata_skipped = 0_u64;
+    let mut metadata_reused = 0_u64;
     let mut lagged = 0_u64;
     let mut by_source = HashMap::<&'static str, u64>::new();
     let mut completion_received = 0_usize;
@@ -855,6 +879,8 @@ pub async fn run(
                     unchanged += stats.unchanged as u64;
                     stale += stats.stale as u64;
                     conflicts += stats.conflicts as u64;
+                    metadata_skipped += stats.metadata_skipped as u64;
+                    metadata_reused += stats.metadata_reused as u64;
                     let updates = stats.updates.len();
                     if updates > 0 {
                         if output.send(Arc::new(PoolUpdateBatch {
@@ -869,7 +895,7 @@ pub async fn run(
                     }
                     if batches == 1 || batches % 25 == 0 {
                         crate::log_event!(Debug,
-                            "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={}",
+                            "pool registry batches={batches} source={} input_records={input_records} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} pools_in_ram={} updates_published={updates} ignored_mints={} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused}",
                             batch.source, stats.total, stats.ignored_mints,
                         );
                     }
@@ -936,7 +962,7 @@ pub async fn run(
         "completion_contracts min_native_tvl_usd={} mint_qualification=true admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
         MIN_NATIVE_TVL_USD);
     crate::log_event!(Info,
-        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences}",
+        "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused}",
         snapshot.len(),
     );
     if require_completion {
