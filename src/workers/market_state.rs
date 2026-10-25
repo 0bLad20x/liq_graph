@@ -851,6 +851,7 @@ fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->(usize,u64){
 /// all structural facts are read from the existing WatchCatalog and Registry.
 fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput> {
+    let started=Instant::now();
     let max_pools=if limit==0 {usize::MAX}else{limit};
     let old:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
     let quality:HashMap<Pubkey,f64>=candidates.keys().map(|address|(*address,
@@ -891,13 +892,14 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
         let Some(ordered)=by_pair.get(&(w.mint_a,w.mint_b)) else{return false;};
         // Already-covered legs have zero incremental subscription cost.
         for &address in ordered {
-            if picked.contains(&address) && !local.contains(&address) {
+            if options.binary_search(&address).is_ok()
+                && picked.contains(&address) && !local.contains(&address) {
                 local.push(address);
                 if local.len()>=number {return true;}
             }
         }
         for &address in ordered {
-            if !local.contains(&address) {
+            if options.binary_search(&address).is_ok() && !local.contains(&address) {
                 local.push(address);
                 if local.len()>=number {return true;}
             }
@@ -969,9 +971,9 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     }
     let old_coverage=route_coverage(catalog,&legacy);
     crate::log_event!(Info,
-        "market state coverage selected={} graph_groups={} graph_routes={} alphabetical_groups={} alphabetical_routes={} ws_budget={} graph_accounts={}",
+        "market state coverage selected={} graph_groups={} graph_routes={} alphabetical_groups={} alphabetical_routes={} ws_budget={} graph_accounts={} selection_ms={}",
         picked.len(),new_coverage.0,new_coverage.1,old_coverage.0,old_coverage.1,
-        account_budget,used_accounts);
+        account_budget,used_accounts,started.elapsed().as_millis());
     let mut result=picked.into_iter().filter_map(|p|candidates.get(&p).copied()).collect::<Vec<_>>();
     result.sort_unstable_by_key(|p|p.address);
     result
