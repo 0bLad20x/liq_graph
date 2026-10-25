@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::{Arc,RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
-use futures_util::future::try_join_all;
+use futures_util::future::join_all;
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
     market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, rpc_transport::{RpcAnswer, RpcHandle, RpcOperation},
@@ -69,7 +69,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
     let chunks=addresses.chunks(rpc.account_batch_size()).collect::<Vec<_>>();
     let mut records=Vec::with_capacity(addresses.len());
     for wave in chunks.chunks(4) {
-        let batches=try_join_all(wave.iter().map(|chunk|async move {
+        let batches=join_all(wave.iter().map(|chunk|async move {
             let expected=chunk.iter().map(|a|a.parse()).collect::<Result<Vec<Pubkey>>>()?;
             let answer=rpc.call(RpcOperation::Multiple{addresses:expected,view:AccountView::Full,
                 min_context_slot:None}).await?;
@@ -84,8 +84,8 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
                 result.push(RpcAccount{owner:account.owner.to_string(),data:account.bytes,slot,received_us});
             }
             Ok::<Vec<RpcAccount>,anyhow::Error>(result)
-        })).await?;
-        for batch in batches {records.extend(batch);}
+        })).await;
+        for batch in batches {records.extend(batch?);}
     }
     Ok(records)
 }
