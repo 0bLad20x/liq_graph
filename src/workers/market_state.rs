@@ -1203,18 +1203,24 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let mut in_flight=HashSet::<Pubkey>::new();
      let concurrency:usize=env_parse("MARKET_STATE_HYDRATION_CONCURRENCY",8)?;
     let batch_pools:usize=env_parse("MARKET_STATE_HYDRATION_BATCH_POOLS",64)?;
+    let selection_interval_ms:u64=env_parse("MARKET_STATE_SELECTION_INTERVAL_MS",5000)?;
+    let account_budget:usize=env_parse("MARKET_STATE_WS_ACCOUNT_BUDGET",25000)?;
+    ensure!((1000..=300000).contains(&selection_interval_ms)
+        && account_budget>0,"invalid selection interval or WS account budget");
+    let selection_capacity=control.capacity().min(account_budget);
     ensure!((1..=32).contains(&concurrency) && (1..=256).contains(&batch_pools),
         "invalid market hydration concurrency/batch configuration");
     crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_source=central_registry baseline=dynamic_only graph_selection=true");
     let mut rebuild=true;let mut replan=false;let mut schedule=true;let mut input_open=true;let mut ticks=0;
+    let mut selector_job:Option<tokio::task::JoinHandle<(u64,Vec<PoolInput>)>>=None;
+    let mut selected_ready:Option<Vec<PoolInput>>=None;
+    let mut next_selection_at=time::Instant::now();
+    crate::log_event!(Info,"market state cp5 selector_async=true interval_ms={selection_interval_ms} pool_limit={} account_budget={} transport_capacity={}",
+        *limit.borrow(),selection_capacity,control.capacity());
     let mut tick=time::interval(Duration::from_secs(1));tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         if *stop.borrow(){break;}
-        if rebuild {
-            let next=if *enabled.borrow(){
-                let cat=catalog.borrow().clone();
-                select(&candidates,&cat,*limit.borrow(),control.capacity(),&selected,&registry)
-            }else{Vec::new()};
+        if let Some(next)=selected_ready.take() {
             if next!=selected {
                 let next_map:HashMap<_,_>=next.iter().map(|p|(p.address,*p)).collect();
                 let keep:HashSet<_>=selected.iter().filter(|p|next_map.get(&p.address)==Some(*p)).map(|p|p.address).collect();
@@ -1229,12 +1235,11 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 selected_mints.send_replace(Arc::from(mints_to_check));
                 crate::log_event!(Info,"market state graph selection selected_pools={} ws_upper_bound={} ws_capacity={} graph_groups={}",
                     selected.len(),selected.iter().map(|p|watch_cost(p.venue)).sum::<usize>(),
-                    control.capacity(),catalog.borrow().graph.groups.len());
+                    selection_capacity,catalog.borrow().graph.groups.len());
                 engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
                 crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
             }
-            rebuild=false;
         }
         if replan {
             let started=Instant::now();
@@ -1284,6 +1289,39 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             }
         }
         tokio::select! {
+            // Selection is read-only and potentially expensive; the WS loop
+            // keeps consuming account events while this blocking job runs.
+            _=time::sleep_until(next_selection_at),if rebuild && selector_job.is_none()=>{
+                let source=candidates.clone();
+                let view=catalog.borrow().clone();
+                let generation=view.generation;
+                let previous=selected.clone();
+                let owner=registry.clone();
+                let pool_cap=*limit.borrow();
+                let enabled_now=*enabled.borrow();
+                selector_job=Some(tokio::task::spawn_blocking(move||{
+                    let picked=if enabled_now {
+                        select(&source,&view,pool_cap,selection_capacity,&previous,&owner)
+                    }else{Vec::new()};
+                    (generation,picked)
+                }));
+                rebuild=false;
+                next_selection_at=time::Instant::now()+Duration::from_millis(selection_interval_ms);
+            },
+            computed=async{selector_job.as_mut().expect("selector task").await},
+                if selector_job.is_some()=>{
+                selector_job=None;
+                let (source_generation,mut next)=computed.context("market selection task panicked")?;
+                next.retain(|p|candidates.get(&p.address)==Some(p));
+                if !*enabled.borrow(){next.clear();}
+                if *limit.borrow()>0 {next.truncate(*limit.borrow());}
+                if source_generation!=catalog.borrow().generation {
+                    rebuild=true;
+                    crate::log_event!(Debug,"market state cp5 selection_generation_advanced old={} new={}",
+                        source_generation,catalog.borrow().generation);
+                }
+                selected_ready=Some(next);
+            },
             changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){break;}},
             changed=enabled.changed()=>{if changed.is_err(){break;}rebuild=true;},
             changed=limit.changed()=>{if changed.is_err(){break;}rebuild=true;},
