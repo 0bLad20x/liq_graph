@@ -850,7 +850,7 @@ fn route_options_selected(g:&super::graph_liquidity::Group,selected:&HashSet<Pub
     route_options_added(g,selected,&[])
 }
 fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->([usize;4],[u64;4]){
-    let mut groups=[0;4];let mut options=[0;4];
+    let mut groups=[0_usize;4];let mut options=[0_u64;4];
     for g in catalog.graph.groups.iter() {
         let routes=route_options_selected(g,selected);
         if routes>0 {
