@@ -801,7 +801,7 @@ impl Engine{
 pub struct Settings {pub pool_limit:usize,pub trace:bool}
 impl Settings {
     pub fn from_env()->Result<Self> {Ok(Self{
-        pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",5000)?,
+        pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",15000)?,
         trace:env_parse::<u8>("MARKET_STATE_TRACE",0)?!=0,
     })}
 }
@@ -829,155 +829,215 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 fn watch_cost(v:CoreVenue)->usize {
     match v {CoreVenue::PumpSwap|CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
 }
-/// Count complete observable route groups and directed gross route alternatives.
-fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->(usize,u64){
-    let mut groups=0_usize;let mut routes=0_u64;
-    for g in catalog.graph.groups.iter(){
-        let ns=g.direct_s.iter().filter(|p|selected.contains(p)).count() as u64;
-        let options=if g.bridge.is_none() && g.conversion.is_none() {
-            ns.saturating_mul(ns.saturating_sub(1))
-        } else {
-            let other=if g.bridge.is_some(){&g.bridge_pools}else{&g.direct_q};
-            let no=other.iter().filter(|p|selected.contains(p)).count() as u64;
-            let fixed=g.intermediate.is_none_or(|p|selected.contains(&p))
-                && g.conversion.is_none_or(|p|selected.contains(&p));
-            if fixed {2_u64.saturating_mul(ns).saturating_mul(no)} else {0}
-        };
-        if options>0 {groups+=1;routes=routes.saturating_add(options);}
+fn route_kind(g:&super::graph_liquidity::Group)->usize {
+    match (g.bridge.is_some(),g.conversion.is_some()) {
+        (false,false)=>0,(false,true)=>1,(true,false)=>2,(true,true)=>3,
     }
-    (groups,routes)
 }
-/// Select complete V10 routes before extra alternatives. No new Pool/Mint state;
-/// all structural facts are read from the existing WatchCatalog and Registry.
+fn route_options_selected(g:&super::graph_liquidity::Group,selected:&HashSet<Pubkey>)->u64 {
+    let n=g.direct_s.iter().filter(|p|selected.contains(p)).count() as u64;
+    if g.bridge.is_none() && g.conversion.is_none() {
+        return n.saturating_mul(n.saturating_sub(1));
+    }
+    let other=if g.bridge.is_some(){&g.bridge_pools}else{&g.direct_q};
+    let m=other.iter().filter(|p|selected.contains(p)).count() as u64;
+    if g.intermediate.is_some_and(|p|!selected.contains(&p))
+        ||g.conversion.is_some_and(|p|!selected.contains(&p)){return 0;}
+    n.saturating_mul(m).saturating_mul(2)
+}
+fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->([usize;4],[u64;4]){
+    let mut groups=[0;4];let mut options=[0;4];
+    for g in catalog.graph.groups.iter() {
+        let routes=route_options_selected(g,selected);
+        if routes>0 {
+            let kind=route_kind(g);groups[kind]+=1;
+            options[kind]=options[kind].saturating_add(routes);
+        }
+    }
+    (groups,options)
+}
+struct RoutePackage {kind:usize,additional:Vec<Pubkey>,account_cost:usize,score:f64}
+/// Read-only topological pool selection. Executed on a blocking worker thread,
+/// never on the market WS event loop. No independent pool or mint registry.
 fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
-    limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput> {
+    limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput>{
     let started=Instant::now();
     let max_pools=if limit==0 {usize::MAX}else{limit};
-    let old:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
+    let existing:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
     let quality:HashMap<Pubkey,f64>=candidates.keys().map(|address|(*address,
-        registry.get(*address).and_then(|p|p.tvl_usd).filter(|v|v.is_finite()&&*v>=0.0).unwrap_or(0.0)))
-        .collect();
-    // Pre-sort each Mint pair once. Reusing the same sorted pool alternatives
-    // avoids re-sorting hundreds of pools per V10 group during graph updates.
-    let mut by_pair=HashMap::<(Pubkey,Pubkey),Vec<Pubkey>>::new();
-    for p in candidates.values() {
-        by_pair.entry((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b)))
+        registry.get(*address).and_then(|p|p.tvl_usd)
+            .filter(|v|v.is_finite()&&*v>=0.0).unwrap_or(0.0))).collect();
+    let mut pairs=HashMap::<(Pubkey,Pubkey),Vec<Pubkey>>::new();
+    for p in candidates.values(){
+        pairs.entry((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b)))
             .or_default().push(p.address);
     }
-    for options in by_pair.values_mut() {
-        options.sort_by(|a,b|old.contains(b).cmp(&old.contains(a))
-            .then_with(||quality[b].total_cmp(&quality[a]))
-            .then_with(||a.cmp(b)));
+    for list in pairs.values_mut(){
+        list.sort_by(|a,b|existing.contains(b).cmp(&existing.contains(a))
+            .then_with(||quality[b].total_cmp(&quality[a])).then_with(||a.cmp(b)));
     }
     let mut picked=HashSet::<Pubkey>::new();
-    let mut used_accounts=0_usize;
-    let mut by_target=BTreeMap::<(Pubkey,Pubkey),Vec<usize>>::new();
-    for (id,g) in catalog.graph.groups.iter().enumerate() {
-        by_target.entry((g.settlement,g.target)).or_default().push(id);
+    let mut used=0_usize;
+    // A small diversified conversion backbone is shared by Direct3/Triangle4.
+    // Its legs are candidates from the SAME WatchCatalog, not independently discovered.
+    let mut conversions=catalog.graph.groups.iter().filter_map(|g|g.conversion)
+        .filter(|p|candidates.contains_key(p)).collect::<Vec<_>>();
+    conversions.sort_unstable();conversions.dedup();
+    conversions.sort_by(|a,b|quality[b].total_cmp(&quality[a]).then_with(||a.cmp(b)));
+    let mut venues=Vec::<CoreVenue>::new();
+    let mut backbone=Vec::new();
+    for &address in &conversions {
+        let p=candidates[&address];
+        if venues.contains(&p.venue){continue;}
+        let cost=watch_cost(p.venue);
+        if picked.len()<max_pools && used+cost<=account_budget {
+            picked.insert(address);used+=cost;backbone.push(address);venues.push(p.venue);
+        }
+        if backbone.len()>=8 {break;}
     }
-    // Rotate through settlement/target pairs rather than letting one prolific
-    // pair monopolize the 5000-pool budget.
-    for group_ids in by_target.values_mut() {
-        group_ids.sort_by_key(|&id|{
-            let g=&catalog.graph.groups[id];
-            let legs=if g.bridge.is_some(){if g.conversion.is_some(){4}else{3}}
-                else if g.conversion.is_some(){3}else{2};
-            (legs,std::cmp::Reverse(g.route_options),id)
-        });
+    // Do not pin eight accounts from one venue merely because they have high TVL.
+    // Each (settlement,target) gets independent queues for all four route types.
+    let mut groups=BTreeMap::<(Pubkey,Pubkey),[Vec<usize>;4]>::new();
+    for (id,g) in catalog.graph.groups.iter().enumerate(){
+        groups.entry((g.settlement,g.target)).or_insert_with(||std::array::from_fn(|_|Vec::new()))[route_kind(g)].push(id);
     }
-    let choose=|options:&[Pubkey],number:usize,picked:&HashSet<Pubkey>,
+    for lists in groups.values_mut(){
+        for ids in lists {
+            ids.sort_by_key(|&id|(std::cmp::Reverse(catalog.graph.groups[id].route_options),id));
+        }
+    }
+    let mut cursors=BTreeMap::<(Pubkey,Pubkey),[usize;4]>::new();
+    let mut coverage=[0_usize;4];
+    let mut selected_per_target=HashMap::<(Pubkey,Pubkey),usize>::new();
+    // Candidate leg order: already covered, retained, then TVL, then stable pubkey.
+    let choose=|options:&[Pubkey],count:usize,picked:&HashSet<Pubkey>,
         local:&mut Vec<Pubkey>|->bool {
         let Some(first)=options.first() else{return false;};
         let Some(w)=catalog.for_pool(*first) else{return false;};
-        let Some(ordered)=by_pair.get(&(w.mint_a,w.mint_b)) else{return false;};
-        // Already-covered legs have zero incremental subscription cost.
-        for &address in ordered {
-            if options.binary_search(&address).is_ok()
-                && picked.contains(&address) && !local.contains(&address) {
-                local.push(address);
-                if local.len()>=number {return true;}
-            }
-        }
-        for &address in ordered {
-            if options.binary_search(&address).is_ok() && !local.contains(&address) {
-                local.push(address);
-                if local.len()>=number {return true;}
+        let Some(ordered)=pairs.get(&(w.mint_a,w.mint_b)) else{return false;};
+        for desired in 0..3 {
+            for &address in ordered {
+                if options.binary_search(&address).is_err() || local.contains(&address){continue;}
+                let tier=if picked.contains(&address){0}
+                    else if existing.contains(&address){1}else{2};
+                if tier==desired {
+                    local.push(address);
+                    if local.len()>=count{return true;}
+                }
             }
         }
         false
     };
-    let mut cursor=BTreeMap::<(Pubkey,Pubkey),usize>::new();
-    // Each pass attempts one new complete topology per settlement/target pair.
+    // One useful package per target per sweep. Compare four route kinds on their
+    // incremental route benefit, completeness, diversity and actual account cost.
     loop {
-        let mut advanced=false;
-        for (key,ids) in &by_target {
-            let index=cursor.entry(*key).or_insert(0);
-            if *index>=ids.len(){continue;}
-            let g=&catalog.graph.groups[ids[*index]];*index+=1;
-            advanced=true;
-            let mut local=Vec::<Pubkey>::new();
-            let count=if g.bridge.is_none()&&g.conversion.is_none(){2}else{1};
-            if !choose(&g.direct_s,count,&picked,&mut local){continue;}
-            if g.bridge.is_some(){
-                let Some(middle)=g.intermediate else {continue;};
-                if !candidates.contains_key(&middle)||local.contains(&middle){continue;}
-                local.push(middle);
-                if !choose(&g.bridge_pools,local.len()+1,&picked,&mut local){continue;}
-            } else if g.conversion.is_some() {
-                if !choose(&g.direct_q,local.len()+1,&picked,&mut local){continue;}
+        let mut progressed=false;
+        for (target,lists) in &groups {
+            let cursors_for=cursors.entry(*target).or_insert([0;4]);
+            let mut best:Option<RoutePackage>=None;
+            for kind in [1_usize,3,0,2] {
+                let ids=&lists[kind];
+                while cursors_for[kind]<ids.len() {
+                    let g=&catalog.graph.groups[ids[cursors_for[kind]]];
+                    let before=route_options_selected(g,&picked);
+                    let mut local=Vec::<Pubkey>::new();
+                    let direct_needed=if kind==0 {2}else{1};
+                    let mut valid=choose(&g.direct_s,direct_needed,&picked,&mut local);
+                    if valid && g.bridge.is_some(){
+                        if let Some(middle)=g.intermediate {
+                            valid=candidates.contains_key(&middle);
+                            if valid && !local.contains(&middle){local.push(middle);}
+                            if valid {valid=choose(&g.bridge_pools,local.len()+1,&picked,&mut local);}
+                        }else{valid=false;}
+                    }else if valid && kind==1 {
+                        valid=choose(&g.direct_q,local.len()+1,&picked,&mut local);
+                    }
+                    if valid {
+                        if let Some(conv)=g.conversion {
+                            valid=candidates.contains_key(&conv);
+                            if valid && !local.contains(&conv){local.push(conv);}
+                        }
+                    }
+                    if !valid {cursors_for[kind]+=1;continue;}
+                    let additional:Vec<_>=local.iter().copied()
+                        .filter(|p|!picked.contains(p)).collect();
+                    let cost=additional.iter().map(|p|watch_cost(candidates[p].venue)).sum::<usize>();
+                    if cost==0 || picked.len()+additional.len()>max_pools
+                        ||used+cost>account_budget {
+                        cursors_for[kind]+=1;continue;
+                    }
+                    let mut hypothetical=picked.clone();
+                    hypothetical.extend(additional.iter().copied());
+                    let new_routes=route_options_selected(g,&hypothetical);
+                    let gain=new_routes.saturating_sub(before);
+                    if gain==0 {cursors_for[kind]+=1;continue;}
+                    let underrepresented=1.0/(1.0+coverage[kind] as f64/100.0);
+                    let target_damping=1.0/(1.0+*selected_per_target.get(target).unwrap_or(&0) as f64/12.0);
+                    let avg_quality=additional.iter().map(|p|quality[p].ln_1p())
+                        .sum::<f64>()/(additional.len() as f64);
+                    // Saturating log prevents large parallel-pool arrays from
+                    // overwhelming topology breadth. Exact weights are a testable heuristic.
+                    let score=(10.0*underrepresented+gain as f64 .ln_1p()
+                        +0.12*avg_quality)*target_damping/(cost as f64);
+                    if best.as_ref().is_none_or(|b|score>b.score) {
+                        best=Some(RoutePackage{kind,additional,account_cost:cost,score});
+                    }
+                    break;
+                }
             }
-            if let Some(conv)=g.conversion {
-                if !candidates.contains_key(&conv)||local.contains(&conv){continue;}
-                local.push(conv);
-            }
-            let fresh:Vec<_>=local.into_iter().filter(|p|!picked.contains(p)).collect();
-            if fresh.is_empty()||picked.len()+fresh.len()>max_pools {continue;}
-            let cost:usize=fresh.iter().map(|p|watch_cost(candidates[p].venue)).sum();
-            if used_accounts+cost>account_budget {continue;}
-            for p in fresh {picked.insert(p);}
-            used_accounts+=cost;
-            if picked.len()==max_pools||used_accounts==account_budget {break;}
+            let Some(best)=best else{continue;};
+            cursors_for[best.kind]+=1;
+            for address in best.additional {picked.insert(address);}
+            used+=best.account_cost;coverage[best.kind]+=1;
+            *selected_per_target.entry(*target).or_default()+=1;
+            progressed=true;
+            if picked.len()>=max_pools || used>=account_budget {break;}
         }
-        if !advanced||picked.len()==max_pools||used_accounts==account_budget {break;}
+        if !progressed || picked.len()>=max_pools || used>=account_budget {break;}
     }
-    // Fill remaining budget with stable, structurally valuable alternatives.
-    let mut residual:Vec<_>=candidates.values().filter(|p|!picked.contains(&p.address)
-        && catalog.for_pool(p.address).is_some()).copied().collect();
-    residual.sort_by(|a,b|{
-        let score=|p:&PoolInput|{
-            let w=catalog.for_pool(p.address).expect("catalog filtered");
-            // Diverse context participation, not raw Cartesian route count.
-            (w.contexts.len(),w.group_ids.len(),w.pair_pool_count)
+    // Remaining capacity: diversify parallel venues/pairs without building full
+    // copies of Pools. Prefer already monitored pools for subscription stability.
+    let mut occupied=HashSet::<(Pubkey,Pubkey,CoreVenue)>::new();
+    for address in &picked {
+        let p=candidates[address];
+        occupied.insert((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.venue));
+    }
+    let mut remaining=candidates.values().copied().filter(|p|
+        !picked.contains(&p.address) && catalog.for_pool(p.address).is_some()).collect::<Vec<_>>();
+    remaining.sort_by(|a,b|{
+        let rank=|p:&PoolInput|{
+            let c=catalog.for_pool(p.address).expect("catalog indexed");
+            (usize::from(!occupied.contains(&(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.venue))),
+                c.contexts.len(),c.pair_pool_count.min(16))
         };
-        score(b).cmp(&score(a)).then_with(||old.contains(&b.address).cmp(&old.contains(&a.address)))
-            .then_with(||{
-                let tvl=|p:&PoolInput|*quality.get(&p.address).unwrap_or(&0.0);
-                tvl(b).total_cmp(&tvl(a))
-            }).then_with(||a.address.cmp(&b.address))
+        rank(b).cmp(&rank(a)).then_with(||existing.contains(&b.address).cmp(&existing.contains(&a.address)))
+            .then_with(||quality[&b.address].total_cmp(&quality[&a.address]))
+            .then_with(||a.address.cmp(&b.address))
     });
-    for p in residual {
+    for p in remaining {
         if picked.len()>=max_pools {break;}
         let cost=watch_cost(p.venue);
-        if used_accounts+cost<=account_budget {picked.insert(p.address);used_accounts+=cost;}
+        if used+cost<=account_budget {picked.insert(p.address);used+=cost;}
     }
-    let new_coverage=route_coverage(catalog,&picked);
-    let mut alphabetical=candidates.values().copied().collect::<Vec<_>>();
-    alphabetical.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
-    let mut legacy=HashSet::new();let mut old_budget=0_usize;
-    for p in alphabetical {
-        if legacy.len()>=max_pools {break;}
+    let actual=route_coverage(catalog,&picked);
+    let mut alpha=candidates.values().copied().collect::<Vec<_>>();
+    alpha.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
+    let mut legacy=HashSet::new();let mut legacy_cost=0;
+    for p in alpha {
         let cost=watch_cost(p.venue);
-        if old_budget+cost<=account_budget {legacy.insert(p.address);old_budget+=cost;}
+        if legacy.len()>=max_pools {break;}
+        if legacy_cost+cost<=account_budget {legacy.insert(p.address);legacy_cost+=cost;}
     }
-    let old_coverage=route_coverage(catalog,&legacy);
+    let baseline=route_coverage(catalog,&legacy);
     crate::log_event!(Info,
-        "market state coverage selected={} graph_groups={} graph_routes={} alphabetical_groups={} alphabetical_routes={} ws_budget={} graph_accounts={} selection_ms={}",
-        picked.len(),new_coverage.0,new_coverage.1,old_coverage.0,old_coverage.1,
-        account_budget,used_accounts,started.elapsed().as_millis());
+        "market state cp5 coverage selected={} account_upper_bound={} ws_budget={} groups_by_kind={:?} alternatives_by_kind={:?} alphabetical_groups_by_kind={:?} alphabetical_alternatives_by_kind={:?} conversion_backbone={} selection_ms={}",
+        picked.len(),used,account_budget,actual.0,actual.1,baseline.0,baseline.1,
+        backbone.len(),started.elapsed().as_millis());
     let mut result=picked.into_iter().filter_map(|p|candidates.get(&p).copied()).collect::<Vec<_>>();
     result.sort_unstable_by_key(|p|p.address);
     result
 }
+
 fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
     let _=out.send(Arc::new(event));
 }
