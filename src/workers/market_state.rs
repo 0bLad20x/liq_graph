@@ -1323,8 +1323,14 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 selected_ready=Some(next);
             },
             changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){break;}},
-            changed=enabled.changed()=>{if changed.is_err(){break;}rebuild=true;},
-            changed=limit.changed()=>{if changed.is_err(){break;}rebuild=true;},
+            changed=enabled.changed()=>{
+                if changed.is_err(){break;}
+                if !*enabled.borrow(){selected_ready=Some(Vec::new());}
+                rebuild=true;next_selection_at=time::Instant::now();
+            },
+            changed=limit.changed()=>{
+                if changed.is_err(){break;}rebuild=true;next_selection_at=time::Instant::now();
+            },
             changed=catalog.changed()=>{if changed.is_err(){break;}rebuild=true;},
             changed=mint_revision.changed()=>{if changed.is_err(){break;}schedule=true;},
             update=input.recv(),if input_open=>match update {
