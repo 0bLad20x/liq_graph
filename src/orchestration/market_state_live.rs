@@ -5,7 +5,7 @@ use tokio::{sync::{broadcast,mpsc,watch},task::JoinHandle};
 use crate::{core::{self,CompletionState,DataBatch,PoolUpdateBatch,PoolUpdateKind,
     execution::{ExecutionOutcome,ExecutionReport},signals::SignalStream},workers::{
     execution_candidates,execution_v10,
-    graph_liquidity,graph_watch_catalog,graph_signals,market_state,mint_qualification,persistence,pool_registry,
+    graph_liquidity,graph_watch_catalog,graph_signals,market_state,mint_extensions,mint_qualification,persistence,pool_registry,
     rpc_transport,source_dexscreener,source_jupiter_mint}};
 
 // Do not leave background RPC or graph tasks alive after an early orchestration error.
@@ -159,7 +159,6 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let persisted_prepared=prepared.len();
     let registry=pool_registry::PoolRegistry::default();
     let count=registry.restore(restored)?;
-    drop(database);
     let rpc_settings=rpc_transport::settings_from_env()?;
     let websocket_plan=rpc_settings.websocket_plan()?;
     evidence["websocket_plan"]=serde_json::to_value(&websocket_plan)?;
@@ -176,9 +175,21 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let jupiter_rx=jupiter_out.subscribe();
     let (graphs,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
     let (catalogs,catalog_rx)=watch::channel(Arc::new(graph_watch_catalog::WatchCatalog::empty()));
+    // CP4: same authoritative MintRegistry, onchain producer and sole PostgreSQL writer
+    // as the full runtime. This isolated live path must not invent its own Mint state.
+    let mint_reader:Arc<dyn core::MintReader>=Arc::new(mint_registry.clone());
+    let (onchain_tx,onchain_rx)=mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
+    let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
+    let (mint_revision_tx,mint_revision_rx)=watch::channel(0_u64);
+    let (selected_mints_tx,selected_mints_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let mut writer=Task(tokio::spawn(database.run_with_mints(
+        updates.subscribe(),Some(jupiter_out.subscribe()),Some(onchain_persist.subscribe()))));
     let mut graph=Task(tokio::spawn(graph_liquidity::run(updates.subscribe(),graphs,graph_liquidity::Settings::from_env()?)));
     let mut catalog=Task(tokio::spawn(graph_watch_catalog::run(graph_rx,catalogs,None)));
     let (stop,stop_rx)=watch::channel(false);
+    let mut mint_worker=Task(tokio::spawn(mint_extensions::run(
+        qualified_rx.clone(),selected_mints_rx,mint_reader.clone(),rpc.clone(),
+        onchain_tx,stop_rx.clone())));
     let (control,enabled)=watch::channel(true);
     let (prices,price_rx)=broadcast::channel(16384);
     let (signal_output,mut signal_worker,mut signal_consumer,mut execution)=if let Some(cfg)=signal_settings {
@@ -196,12 +207,14 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     // an errored producer can close the consumer/RPC first and hide its actual error.
     let (account_control,account_events)=rpc.account_stream();
     let mut worker=Task(tokio::spawn(market_state::run(registry.clone(),updates.subscribe(),rpc.clone(),
-        account_control,account_events,prices.clone(),settings,stop_rx,enabled)));
+        account_control,account_events,prices.clone(),settings,
+        catalog_rx.clone(),mint_reader,mint_revision_rx,selected_mints_tx,stop_rx.clone(),enabled)));
     updates.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,source:"market_live_restore",
         received_at_ms:0,pools:prepared,persist_identity:Vec::new()}))?;
     let mut registry_task=Task(tokio::spawn(pool_registry::run(source_rx,None,registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone()))));
     let mut qualification=Task(tokio::spawn(mint_qualification::run(
-        registry.snapshot(),mint_registry,qualification_rx,jupiter_rx,qualified_tx,target_tx)));
+        registry.snapshot(),mint_registry,qualification_rx,jupiter_rx,qualified_tx,target_tx,
+        Some(onchain_rx),Some(onchain_persist),Some(mint_revision_tx),Some(stop_rx.clone()))));
     let mut jupiter=Task(tokio::spawn(source_jupiter_mint::run_targeted(
         http,jupiter_settings,target_rx,jupiter_out.clone())));
     let mut dex=Task(tokio::spawn(source_dexscreener::run_live(qualified_rx,registry.clone(),source.clone())));
@@ -265,6 +278,10 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
             .unwrap_or_else(||anyhow::anyhow!("market Registry ended before live duration"))),
         result=&mut qualification.0=>Some(result.context("market mint qualification panicked").and_then(|r|r).err()
             .unwrap_or_else(||anyhow::anyhow!("market mint qualification ended before live duration"))),
+        result=&mut mint_worker.0=>Some(result.context("market Mint onchain worker panicked").and_then(|r|r).err()
+            .unwrap_or_else(||anyhow::anyhow!("market Mint onchain worker ended before live duration"))),
+        result=&mut writer.0=>Some(result.context("market Persistence panicked").and_then(|r|r).err()
+            .unwrap_or_else(||anyhow::anyhow!("market Persistence ended before live duration"))),
         result=&mut jupiter.0=>Some(result.context("market Jupiter panicked").and_then(|r|r).err()
             .unwrap_or_else(||anyhow::anyhow!("market Jupiter ended before live duration"))),
         result=&mut dex.0=>Some(result.context("market DexScreener panicked").and_then(|r|r).err()
@@ -301,8 +318,12 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
         return Err(error);
     }
     // Cancel external producers, then let the sole Registry writer drain their inputs.
-    dex.0.abort();jupiter.0.abort();qualification.0.abort();
-    let _=tokio::join!(&mut dex.0,&mut jupiter.0,&mut qualification.0);
+    dex.0.abort();jupiter.0.abort();
+    let _=tokio::join!(&mut dex.0,&mut jupiter.0);
+    tokio::time::timeout(Duration::from_secs(20),&mut mint_worker.0).await
+        .context("market Mint onchain shutdown timeout")???;
+    tokio::time::timeout(Duration::from_secs(20),&mut qualification.0).await
+        .context("market Mint registry shutdown timeout")???;
     drop(source);drop(jupiter_out);
     tokio::time::timeout(Duration::from_secs(10),&mut worker.0).await.context("market producer shutdown timeout")???;
     drop(prices);
@@ -321,6 +342,8 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     evidence["report"]=serde_json::to_value(&report)?;
     tokio::time::timeout(Duration::from_secs(30),&mut registry_task.0).await.context("market Registry shutdown timeout")???;
     drop(updates);
+    tokio::time::timeout(Duration::from_secs(30),&mut writer.0).await
+        .context("market Persistence shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(30),&mut graph.0).await.context("market graph shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(10),&mut catalog.0).await.context("market catalog shutdown timeout")???;
     tokio::time::timeout(Duration::from_secs(10),&mut rpc_task.0).await.context("market RPC shutdown timeout")???;
