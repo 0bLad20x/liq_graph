@@ -1,9 +1,10 @@
 //! Indicative market state: Prepared pool inputs -> account watches -> typed prices.
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::{Arc,RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
+use futures_util::future::try_join_all;
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
     market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, rpc_transport::{RpcAnswer, RpcHandle, RpcOperation},
@@ -63,22 +64,32 @@ where T::Err:std::fmt::Display {
     env::var(key).map_or(Ok(default),|s|s.parse().map_err(|e|anyhow::anyhow!("invalid {key}: {e}")))
 }
 #[derive(Clone)]struct RpcAccount{owner:String,data:Vec<u8>,slot:u64,received_us:u64}
+// Bounded parallel RPC chunks; the transport continues to enforce provider RPS.
 async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>> {
+    let chunks=addresses.chunks(rpc.account_batch_size()).collect::<Vec<_>>();
     let mut records=Vec::with_capacity(addresses.len());
-    for chunk in addresses.chunks(rpc.account_batch_size()) {
-        let addresses=chunk.iter().map(|a|a.parse()).collect::<Result<Vec<Pubkey>,_>>()?;
-        let answer=rpc.call(RpcOperation::Multiple{addresses,view:AccountView::Full,min_context_slot:None}).await?;
-        let received_us=answer.received_at_ms.saturating_mul(1000);
-        let RpcAnswer::Multiple{slot,accounts}=answer.answer else {bail!("market state expected account batch");};
-        ensure!(accounts.len()==chunk.len(),"market state account batch length mismatch");
-        for (address,account) in chunk.iter().zip(accounts) {
-            let account=account.with_context(||format!("market account missing {address}"))?;
-            ensure!(account.address.to_string()==*address && account.view==AccountView::Full,"market account identity/view mismatch");
-            records.push(RpcAccount{owner:account.owner.to_string(),data:account.bytes,slot,received_us});
-        }
+    for wave in chunks.chunks(4) {
+        let batches=try_join_all(wave.iter().map(|chunk|async move {
+            let expected=chunk.iter().map(|a|a.parse()).collect::<Result<Vec<Pubkey>>>()?;
+            let answer=rpc.call(RpcOperation::Multiple{addresses:expected,view:AccountView::Full,
+                min_context_slot:None}).await?;
+            let received_us=answer.received_at_ms.saturating_mul(1000);
+            let RpcAnswer::Multiple{slot,accounts}=answer.answer else {bail!("market state expected account batch");};
+            ensure!(accounts.len()==chunk.len(),"market state account batch length mismatch");
+            let mut result=Vec::with_capacity(chunk.len());
+            for (address,account) in chunk.iter().zip(accounts) {
+                let account=account.with_context(||format!("market account missing {address}"))?;
+                ensure!(account.address.to_string()==**address && account.view==AccountView::Full,
+                    "market account identity/view mismatch");
+                result.push(RpcAccount{owner:account.owner.to_string(),data:account.bytes,slot,received_us});
+            }
+            Ok::<Vec<RpcAccount>,anyhow::Error>(result)
+        })).await?;
+        for batch in batches {records.extend(batch);}
     }
     Ok(records)
 }
+type MintDecimals=Arc<RwLock<HashMap<String,u8>>>;
 #[derive(Clone)]struct Watch {address:String,venue:Venue}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
@@ -246,7 +257,7 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
         base_vault:String,quote_vault:String,
         pool_slot:u64,base_slot:u64,quote_slot:u64},
 }
-struct Pool{
+#[derive(Clone)]struct Pool{
     key:Pubkey,ready:bool,id:String,venue:Venue,a:String,b:String,da:u8,db:u8,
     canon_base:String,canon_quote:String,state:State,
     price:f64,available:bool,slot:u64,received_us:u64,updates:u64,
@@ -325,7 +336,7 @@ impl Field{
         Self::ManifestBook=>(0,0) // full variable-length market account; no dataSlice
     }}
 }
-struct Subscription{pool:usize,field:Field,address:String,key:Pubkey,owner:Pubkey,
+#[derive(Clone)]struct Subscription{pool:usize,field:Field,address:String,key:Pubkey,owner:Pubkey,
     slot:u64,received_us:u64,floor:Option<u64>,valid:bool}
 // Fixed-size counters/histograms; no per-update logging or sample serialization.
 #[derive(Default)]
@@ -347,6 +358,7 @@ struct Metrics {
     baseline_skipped:u64,stale:u64,bindings:u64,deleted:u64,gaps:u64,lost:u64,rejections:u64,
     baseline_prices:u64,websocket_prices:u64,no_receiver:u64,max_queue_depth:usize,
     selection_changes:u64,hydration_jobs:u64,discarded_results:u64,hydration_failures:u64,
+    max_hydration_in_flight:usize,initial_hydration:Latency,baseline_hydration:Latency,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,venues:[VenueTiming;10],
 }
 impl Metrics {
@@ -362,6 +374,8 @@ impl Metrics {
             "baseline_prices":self.baseline_prices,"websocket_prices":self.websocket_prices,"no_receiver":self.no_receiver,
             "max_queue_depth":self.max_queue_depth,"selection_changes":self.selection_changes,"hydration_jobs":self.hydration_jobs,
             "discarded_preparation_pools":self.discarded_results,"hydration_failures":self.hydration_failures,
+            "max_hydration_in_flight":self.max_hydration_in_flight,
+            "initial_hydration":self.initial_hydration.report(),"baseline_hydration":self.baseline_hydration.report(),
             "account_processing":self.processing.report(),"transport_to_market":self.queue.report(),
             "preparation_install":self.install.report(),"watch_reconcile":self.watch_plan.report(),"by_venue":venues})
     }
@@ -396,6 +410,50 @@ impl Engine{
         self.subs.retain_mut(|s|match remap[s.pool]{Some(pi)=>{s.pool=pi;true},None=>false});
         self.index();
     }
+    // Copy only selected Prepared pools and their existing static account descriptors.
+    // The baseline phase must not re-read mint metadata or re-decode pool identities.
+    fn subset(&self,selected:&HashSet<Pubkey>)->Engine {
+        let mut part=Engine::empty(self.events.clone(),0);
+        let mut remap=HashMap::<usize,usize>::new();
+        for (i,p) in self.pools.iter().enumerate() {
+            if selected.contains(&p.key) {
+                remap.insert(i,part.pools.len());part.pools.push(p.clone());
+            }
+        }
+        for sub in &self.subs {
+            if let Some(&pi)=remap.get(&sub.pool) {
+                let mut next=sub.clone();next.pool=pi;part.subs.push(next);
+            }
+        }
+        part.index();part
+    }
+    // Read only dynamic subscribed account values, after every subscription is active.
+    // Keep all updates private to the staged batch until one coherent baseline is ready.
+    async fn refresh_baseline(&mut self,rpc:&RpcHandle)->Result<()> {
+        let mut addresses=Vec::new();let mut seen=HashSet::new();
+        for sub in &self.subs {
+            if seen.insert(sub.address.clone()){addresses.push(sub.address.clone());}
+        }
+        let accounts=fetch_batch(rpc,&addresses).await?;
+        let dict:HashMap<_,_>=addresses.into_iter().zip(accounts).collect();
+        for i in 0..self.subs.len() {
+            let sub=&self.subs[i];
+            let acc=dict.get(&sub.address).context("baseline account missing")?;
+            let owner:Pubkey=acc.owner.parse()?;
+            let (offset,length)=sub.field.slice();
+            let data=if sub.field==Field::ManifestBook {acc.data.as_slice()}
+                else if sub.field==Field::VirtualQuote && acc.data.len()<offset+length {&[]}
+                else {bytes(&acc.data,offset,length)?};
+            self.subs[i].slot=acc.slot;
+            self.subs[i].received_us=acc.received_us;
+            self.subs[i].floor=Some(acc.slot);
+            let timing=PricePipelineTiming{frame_received_at_us:acc.received_us,
+                transport_decoded_at_us:acc.received_us,market_received_at_us:acc.received_us,
+                price_published_at_us:0,market_decode_ns:0,market_compute_ns:0,initialization_replay:false};
+            self.update(i,acc.slot,owner,data,acc.received_us,timing,false)?;
+        }
+        Ok(())
+    }
     fn install(&mut self,mut part:Engine) {
         let replaced:HashSet<_>=part.pools.iter().map(|p|p.key).collect();
         let keep=self.pools.iter().filter(|p|!replaced.contains(&p.key)).map(|p|p.key).collect();
@@ -403,7 +461,7 @@ impl Engine{
         let offset=self.pools.len();for sub in &mut part.subs{sub.pool+=offset;}
         self.pools.extend(part.pools);self.subs.extend(part.subs);self.index();
     }
-    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool)->Result<Self>{
+    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool,mint_cache:&MintDecimals)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
         let pool_records=fetch_batch(rpc,&pool_addrs).await?;
         let mut raw_pools=Vec::new();let mut details=Vec::<String>::new();
@@ -499,14 +557,36 @@ impl Engine{
             details.push(a.clone());details.push(b.clone());
             raw_pools.push((a,b,state,acc.slot));
         }
+        // Mint decimals were already on-chain verified in earlier batches.
+        // The price worker owns this immutable mint cache; vaults are never cached.
+        let cached=mint_cache.read().expect("market mint cache poisoned").clone();
+        let mint_addresses:HashSet<String>=raw_pools.iter().flat_map(|(a,b,_,_)|
+            [a.clone(),b.clone()]).collect();
         let mut unique=Vec::new();let mut seen=HashSet::new();
-        for address in details{if seen.insert(address.clone()){unique.push(address);}}
+        for address in details {
+            if seen.insert(address.clone()) &&
+                (!mint_addresses.contains(&address) || !cached.contains_key(&address)) {
+                unique.push(address);
+            }
+        }
         let records=fetch_batch(rpc,&unique).await?;
         let dict:HashMap<String,RpcAccount>=unique.into_iter().zip(records).collect();
+        let mut verified=cached;
+        for mint in mint_addresses {
+            if !verified.contains_key(&mint) {
+                if let Some(account)=dict.get(&mint) {
+                    verified.insert(mint,mint_dec(account)?);
+                }
+            }
+        }
+        {
+            let mut cache=mint_cache.write().expect("market mint cache poisoned");
+            for (mint,decimals) in &verified {cache.entry(mint.clone()).or_insert(*decimals);}
+        }
         let mut pools=Vec::new();let mut subs=Vec::new();
         for (idx,(watch,(a,b,mut state,pool_slot))) in cfg.watches.iter().zip(raw_pools).enumerate(){
-            let da=mint_dec(dict.get(&a).context("token A mint missing")?)?;
-            let db=mint_dec(dict.get(&b).context("token B mint missing")?)?;
+            let da=*verified.get(&a).context("token A mint decimals missing")?;
+            let db=*verified.get(&b).context("token B mint decimals missing")?;
             if matches!(&state,State::Manifest{..}) {
                 let acc=&pool_records[idx].data;
                 ensure!(bytes(acc,9,1)?[0]==da && bytes(acc,10,1)?[0]==db,
@@ -627,7 +707,7 @@ impl Engine{
             received_at_us:recv_us,sequence,reason,
         }));
     }
-    fn update(&mut self,index:usize,slot:u64,owner:Pubkey,data:&[u8],recv_us:u64,pipeline:PricePipelineTiming)->Result<()> {
+    fn update(&mut self,index:usize,slot:u64,owner:Pubkey,data:&[u8],recv_us:u64,pipeline:PricePipelineTiming,emit:bool)->Result<()> {
         let decode_started=Instant::now();
         let mut pipeline=pipeline;
         let (pi,field,expected_owner,expected_len)={let s=&self.subs[index];
@@ -700,7 +780,7 @@ impl Engine{
         if let Some(reason)=unavailable_reason {
             self.metrics.venues[pool.venue as usize].unavailable+=1;
             pool.available=false;
-            self.publish_unavailable(pi,slot,recv_us,reason);
+            if emit {self.publish_unavailable(pi,slot,recv_us,reason);}
             return Ok(());
         }
         let compute_started=Instant::now();
@@ -710,7 +790,7 @@ impl Engine{
                 self.metrics.venues[pool.venue as usize].compute.add(nanos(compute_started));
                 self.metrics.venues[pool.venue as usize].unavailable+=1;
                 pool.available=false;
-                self.publish_unavailable(pi,slot,recv_us,error.to_string());
+                if emit {self.publish_unavailable(pi,slot,recv_us,error.to_string());}
                 return Ok(());
             }
         };
@@ -721,7 +801,7 @@ impl Engine{
         // After any unavailable state, the next valid observation has no
         // adjacent previous price. This applies to every venue, not just Manifest.
         let previous=if was_available{Some(old)}else{None};
-        self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field),Some(pipeline));
+        if emit {self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field),Some(pipeline));}
         Ok(())
     }
 
@@ -769,7 +849,7 @@ fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
 // Preparation never publishes or borrows the running engine. Only the event loop
 // installs results, after checking that identities and resync revisions still match.
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
-    prices:bool)->Result<(Engine,Vec<(PoolInput,String)>)> {
+    prices:bool,mint_cache:&MintDecimals,baseline_source:Option<&Engine>)->Result<(Engine,Vec<(PoolInput,String)>)> {
     let mut engine=Engine::empty(out.clone(),0);
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
     while let Some(batch)=pending.pop() {
@@ -777,7 +857,15 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
             Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?}))
             .collect::<Result<Vec<_>>>()?})})();
-        let result=match config {Ok(cfg)=>Engine::hydrate(cfg,rpc,out.clone(),0,prices).await,Err(e)=>Err(e)};
+        let result=match (baseline_source,config) {
+            (Some(source),_)=>{
+                let selected=batch.iter().map(|p|p.address).collect();
+                let mut part=source.subset(&selected);
+                part.refresh_baseline(rpc).await.map(|()|part)
+            },
+            (None,Ok(cfg))=>Engine::hydrate(cfg,rpc,out.clone(),0,prices,mint_cache).await,
+            (None,Err(error))=>Err(error),
+        };
         let result=result.and_then(|part| {
             for (actual,expected) in part.pools.iter().zip(&batch) {
                 ensure!(actual.a==expected.mint_a.to_string()
@@ -880,7 +968,7 @@ impl Engine {
             let pipeline=PricePipelineTiming{frame_received_at_us:*frame_received_at_us,transport_decoded_at_us:*decoded_at_us,
                 market_received_at_us:market_us,price_published_at_us:0,market_decode_ns:0,market_compute_ns:0,initialization_replay:replay};
             let updated=match decoded {
-                Ok((owner,data))=>self.update(index,*slot,owner,data,*frame_received_at_us,pipeline),Err(e)=>Err(e),
+                Ok((owner,data))=>self.update(index,*slot,owner,data,*frame_received_at_us,pipeline,true),Err(e)=>Err(e),
             };
             if let Err(error)=updated {
                 self.metrics.venues[self.pools[pi].venue as usize].decode_errors+=1;
@@ -908,6 +996,13 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let mut retry=HashMap::<Pubkey,time::Instant>::new();
     let mut cached=HashMap::<Pubkey,(WsEvent,u64)>::new();
     let mut jobs=tokio::task::JoinSet::new();
+    let mut in_flight=HashSet::<Pubkey>::new();
+    let mint_cache:MintDecimals=Arc::new(RwLock::new(HashMap::new()));
+    let concurrency:usize=env_parse("MARKET_STATE_HYDRATION_CONCURRENCY",8)?;
+    let batch_pools:usize=env_parse("MARKET_STATE_HYDRATION_BATCH_POOLS",64)?;
+    ensure!((1..=32).contains(&concurrency) && (1..=256).contains(&batch_pools),
+        "invalid market hydration concurrency/batch configuration");
+    crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_cache=true baseline=dynamic_only");
     let mut rebuild=true;let mut replan=false;let mut schedule=true;let mut input_open=true;let mut ticks=0;
     let mut tick=time::interval(Duration::from_secs(1));tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
@@ -943,19 +1038,35 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             }
             engine.metrics.watch_plan.add(nanos(started));replan=false;schedule=true;
         }
-        if schedule && jobs.is_empty() {
+        if schedule {
             schedule=false;
-            let now=time::Instant::now();
-            let present:HashMap<_,_>=engine.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
-            let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address).is_some_and(|&pi|
-                !engine.pools[pi].ready && complete(&engine,pi,&active)) && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
-            let baseline=!targets.is_empty();
-            if !baseline {targets=selected.iter().filter(|p|!present.contains_key(&p.address)&&retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();}
-            targets.truncate(64);
-            if !targets.is_empty() {
+            while jobs.len()<concurrency {
+                let now=time::Instant::now();
+                let present:HashSet<_>=engine.pools.iter().map(|p|p.key).collect();
+                let mut targets:Vec<_>=selected.iter().filter(|p|present.contains(&p.address)
+                    && !engine.pools.iter().find(|state|state.key==p.address).is_some_and(|state|state.ready)
+                    && !in_flight.contains(&p.address)
+                    && complete(&engine,engine.pools.iter().position(|state|state.key==p.address).expect("known baseline pool"),&active)
+                    && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
+                let baseline=!targets.is_empty();
+                if !baseline {
+                    targets=selected.iter().filter(|p|!present.contains(&p.address)
+                        && !in_flight.contains(&p.address)
+                        && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
+                }
+                targets.truncate(batch_pools);
+                if targets.is_empty(){break;}
+                let source=baseline.then(||engine.subset(&targets.iter().map(|p|p.address).collect()));
                 let tickets:Vec<_>=targets.iter().map(|p|(*p,versions[&p.address])).collect();
-                let rpc=rpc.clone();let output=out.clone();engine.metrics.hydration_jobs+=1;
-                jobs.spawn(async move {let result=hydrate(&targets,&rpc,&output,baseline).await;(tickets,baseline,result)});
+                for p in &targets {in_flight.insert(p.address);}
+                let rpc=rpc.clone();let output=out.clone();let cache=mint_cache.clone();
+                engine.metrics.hydration_jobs+=1;
+                jobs.spawn(async move {
+                    let started=Instant::now();
+                    let result=hydrate(&targets,&rpc,&output,baseline,&cache,source.as_ref()).await;
+                    (tickets,baseline,result,started.elapsed())
+                });
+                engine.metrics.max_hydration_in_flight=engine.metrics.max_hydration_in_flight.max(jobs.len());
             }
         }
         tokio::select! {
@@ -974,7 +1085,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             },
             joined=jobs.join_next(),if !jobs.is_empty()=>{
                 let started=Instant::now();
-                let (tickets,baseline,result)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
+                let (tickets,baseline,result,elapsed)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
+                for (pool,_) in &tickets {in_flight.remove(&pool.address);}
+                if baseline {engine.metrics.baseline_hydration.add(elapsed.as_nanos() as u64);}
+                else {engine.metrics.initial_hydration.add(elapsed.as_nanos() as u64);}
                 let (mut part,failures)=result?;schedule=true;
                 let valid:HashSet<_>=tickets.iter().filter(|(p,version)|current.get(&p.address)==Some(p)&&versions.get(&p.address)==Some(version))
                     .map(|(p,_)|p.address).collect();
