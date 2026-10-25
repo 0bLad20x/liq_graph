@@ -171,7 +171,7 @@ pub struct RpcHandle {
 impl RpcHandle {
     pub async fn call(&self, operation: RpcOperation) -> Result<RpcResponse> {
         let (reply, receive)=oneshot::channel();
-        self.requests.send(Call{operation,reply}).await.context("RPC worker stopped")?;
+        self.requests.send(Call{operation,reply,queued_at:Instant::now()}).await.context("RPC worker stopped")?;
         receive.await.context("RPC worker dropped response")?
     }
 
@@ -184,7 +184,7 @@ impl RpcHandle {
     }
 }
 
-struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcResponse>>}
+struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcResponse>>,queued_at:Instant}
 
 #[derive(Clone, Debug)]
 struct HttpSettings {
@@ -607,6 +607,25 @@ struct RpcCallStats {
 }
 
 type RpcStats = Arc<StdMutex<HashMap<(String, &'static str), RpcCallStats>>>;
+#[derive(Default)]
+struct RpcDispatchWait { calls:u64,total_us:u128,max_us:u128 }
+type RpcDispatchStats=Arc<StdMutex<HashMap<&'static str,RpcDispatchWait>>>;
+fn record_dispatch(stats:&RpcDispatchStats,method:&'static str,queued_at:Instant) {
+    let elapsed=queued_at.elapsed().as_micros();
+    let mut locked=stats.lock().expect("RPC dispatch metrics poisoned");
+    let entry=locked.entry(method).or_default();
+    entry.calls+=1;entry.total_us+=elapsed;entry.max_us=entry.max_us.max(elapsed);
+}
+fn report_dispatch(stats:&RpcDispatchStats) {
+    let guard=stats.lock().expect("RPC dispatch metrics poisoned");
+    let mut rows=guard.iter().collect::<Vec<_>>();
+    rows.sort_unstable_by_key(|(method,_)|*method);
+    for (method,v) in rows {
+        crate::log_event!(Info,"rpc dispatch method={} calls={} mean_queue_us={} max_queue_us={}",
+            method,v.calls,v.total_us/u128::from(v.calls),v.max_us);
+    }
+}
+
 
 fn record_rpc(stats:&RpcStats, provider:&str, method:&'static str,
     elapsed:Duration, failure:Option<&str>) {
@@ -690,9 +709,11 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     let mut tasks=tokio::task::JoinSet::new();
     let next=Arc::new(AtomicUsize::new(0));
     let stats:RpcStats=Arc::new(StdMutex::new(HashMap::new()));
+    let dispatch:RpcDispatchStats=Arc::new(StdMutex::new(HashMap::new()));
     let stats_interval:u64=var("RPC_STATS_INTERVAL_SECONDS",30)?;
     ensure!((1..=3600).contains(&stats_interval), "RPC_STATS_INTERVAL_SECONDS must be 1..=3600");
     let report_stats=stats.clone();
+    let report_dispatch_stats=dispatch.clone();
     let report_providers=providers.clone();
     let reporter=tokio::spawn(async move {
         let mut ticker=tokio::time::interval(Duration::from_secs(stats_interval));
@@ -700,6 +721,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
         loop {
             ticker.tick().await;
             report_rpc(&report_stats);
+            report_dispatch(&report_dispatch_stats);
             for p in &report_providers {
                 crate::log_event!(Info,
                     "rpc provider_load provider={} assigned={} multiple_http_ema_ms={} other_http_ema_ms={} rps={} max_in_flight={} multiple_enabled={} multiple_wait_ema_ms={} other_wait_ema_ms={}",
@@ -712,7 +734,8 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
             }
         }
     });
-    while let Some(Call{operation,reply})=rx.recv().await {
+    while let Some(Call{operation,reply,queued_at})=rx.recv().await {
+        record_dispatch(&dispatch,operation.method(),queued_at);
         let bit=operation.bit();
         let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(bit))
             .cloned().collect();
@@ -783,6 +806,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     }
     reporter.abort();
     report_rpc(&stats);
+    report_dispatch(&dispatch);
     crate::log_event!(Info,"rpc transport shutdown complete=true abandoned_calls={abandoned}");
     Ok(())
 }
