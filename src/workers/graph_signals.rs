@@ -18,7 +18,10 @@ const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const EXECUTION_LAYOUT: &str = "factorized_roles_v1";
 const OUTPUT_LAYOUT: &str = "versioned_state_ranges_v1";
-pub const OUTPUT_CAPACITY: usize = 256;
+// Bursty full-graph topology rebuilds can emit thousands of range blocks before
+// the consumer catches up. 256 slots lost 24,209 events in the CP5 900s audit.
+// Preserve full state/range/evaluated sequences without changing event semantics.
+pub const OUTPUT_CAPACITY: usize = 16384;
 
 #[derive(Clone, Copy)]
 pub struct Settings { pub threshold_bps: f64, pub sample_limit: usize, pub trace: bool, pub profile: bool }
