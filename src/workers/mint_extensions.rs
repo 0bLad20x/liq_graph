@@ -154,7 +154,7 @@ pub async fn run(
     let mut jobs=JoinSet::new();let mut ticker=time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut scan=true;let mut decoded=0_u64;let mut failed=0_u64;
-    let mut qualified_open=true;let mut selected_open=true;
+    let mut qualified_open=true;let mut selected_open=true;let mut last_coverage_log=0_u64;
     loop {
         if *stop.borrow(){break;}
         if scan {
@@ -162,9 +162,11 @@ pub async fn run(
             let now=now_unix_ms()?;
             let priority=selected.borrow().to_vec();let qualified_list=qualified.borrow().to_vec();
             let mut seen=HashSet::<Pubkey>::new();let mut needed=Vec::new();
+            let mut verified=0_usize;
             for address in priority.iter().chain(qualified_list.iter()).copied() {
                 if !seen.insert(address)||in_flight.contains(&address){continue;}
                 let record=reader.mint(address);
+                if record.as_ref().and_then(|s|s.onchain.as_ref()).is_some(){verified+=1;}
                 let ttl=record.as_ref().and_then(|s|s.onchain.as_ref()).map(|state|{
                     let fee_changeable=state.transfer_fee_config.get("config_authority")
                         .is_some_and(|v|!v.is_null());
@@ -173,9 +175,9 @@ pub async fn run(
                     if fee_changeable||ambiguous {mutable_refresh_s} else {stable_refresh_s}
                 }).unwrap_or(0);
                 if record.as_ref().and_then(|s|s.onchain.as_ref())
-                    .is_some_and(|v|now.saturating_sub(v.verified_at_ms)<ttl*1000) {continue;}
+                    .is_some_and(|v|now.saturating_sub(v.verified_at_ms)<ttl.saturating_mul(1000)) {continue;}
                 if attempted.get(&address).is_some_and(|at|
-                    now.saturating_sub(*at)<retry_s*1000) {continue;}
+                    now.saturating_sub(*at)<retry_s.saturating_mul(1000)) {continue;}
                 needed.push(address);
             }
             for chunk in needed.chunks(size).take(parallel.saturating_sub(jobs.len())) {
@@ -183,6 +185,11 @@ pub async fn run(
                 for address in &addresses {in_flight.insert(*address);attempted.insert(*address,now);}
                 let rpc=rpc.clone();
                 jobs.spawn(async move {let answer=fetch(rpc,addresses.clone()).await;(addresses,answer)});
+            }
+            if now.saturating_sub(last_coverage_log)>=30_000 {
+                last_coverage_log=now;
+                crate::log_event!(Info,"mint extensions coverage target={} verified={} queued={} in_flight={} decoded={} failed={} prioritized={} batch_size={}",
+                    seen.len(),verified,needed.len(),in_flight.len(),decoded,failed,priority.len(),size);
             }
             if !needed.is_empty() && jobs.len()>0 {
                 crate::log_event!(Debug,"mint extensions scan qualified={} prioritized={} needed={} inflight={} batch_size={}",
