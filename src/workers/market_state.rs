@@ -834,16 +834,20 @@ fn route_kind(g:&super::graph_liquidity::Group)->usize {
         (false,false)=>0,(false,true)=>1,(true,false)=>2,(true,true)=>3,
     }
 }
-fn route_options_selected(g:&super::graph_liquidity::Group,selected:&HashSet<Pubkey>)->u64 {
-    let n=g.direct_s.iter().filter(|p|selected.contains(p)).count() as u64;
+fn route_options_added(g:&super::graph_liquidity::Group,selected:&HashSet<Pubkey>,additional:&[Pubkey])->u64 {
+    let included=|p:&Pubkey|selected.contains(p)||additional.contains(p);
+    let n=g.direct_s.iter().filter(|p|included(p)).count() as u64;
     if g.bridge.is_none() && g.conversion.is_none() {
         return n.saturating_mul(n.saturating_sub(1));
     }
     let other=if g.bridge.is_some(){&g.bridge_pools}else{&g.direct_q};
-    let m=other.iter().filter(|p|selected.contains(p)).count() as u64;
-    if g.intermediate.is_some_and(|p|!selected.contains(&p))
-        ||g.conversion.is_some_and(|p|!selected.contains(&p)){return 0;}
+    let m=other.iter().filter(|p|included(p)).count() as u64;
+    if g.intermediate.is_some_and(|p|!included(&p))
+        ||g.conversion.is_some_and(|p|!included(&p)){return 0;}
     n.saturating_mul(m).saturating_mul(2)
+}
+fn route_options_selected(g:&super::graph_liquidity::Group,selected:&HashSet<Pubkey>)->u64{
+    route_options_added(g,selected,&[])
 }
 fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->([usize;4],[u64;4]){
     let mut groups=[0;4];let mut options=[0;4];
@@ -966,9 +970,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
                         ||used+cost>account_budget {
                         cursors_for[kind]+=1;continue;
                     }
-                    let mut hypothetical=picked.clone();
-                    hypothetical.extend(additional.iter().copied());
-                    let new_routes=route_options_selected(g,&hypothetical);
+                    let new_routes=route_options_added(g,&picked,&additional);
                     let gain=new_routes.saturating_sub(before);
                     if gain==0 {cursors_for[kind]+=1;continue;}
                     let underrepresented=1.0/(1.0+coverage[kind] as f64/100.0);
@@ -977,7 +979,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
                         .sum::<f64>()/(additional.len() as f64);
                     // Saturating log prevents large parallel-pool arrays from
                     // overwhelming topology breadth. Exact weights are a testable heuristic.
-                    let score=(10.0*underrepresented+gain as f64 .ln_1p()
+                    let score=(10.0*underrepresented+(gain as f64).ln_1p()
                         +0.12*avg_quality)*target_damping/(cost as f64);
                     if best.as_ref().is_none_or(|b|score>b.score) {
                         best=Some(RoutePackage{kind,additional,account_cost:cost,score});
@@ -997,17 +999,19 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     }
     // Remaining capacity: diversify parallel venues/pairs without building full
     // copies of Pools. Prefer already monitored pools for subscription stability.
-    let mut occupied=HashSet::<(Pubkey,Pubkey,CoreVenue)>::new();
+    let mut occupied=HashSet::new();
     for address in &picked {
         let p=candidates[address];
-        occupied.insert((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.venue));
+        occupied.insert((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),
+            std::mem::discriminant(&p.venue)));
     }
     let mut remaining=candidates.values().copied().filter(|p|
         !picked.contains(&p.address) && catalog.for_pool(p.address).is_some()).collect::<Vec<_>>();
     remaining.sort_by(|a,b|{
         let rank=|p:&PoolInput|{
             let c=catalog.for_pool(p.address).expect("catalog indexed");
-            (usize::from(!occupied.contains(&(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.venue))),
+            (usize::from(!occupied.contains(&(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),
+                std::mem::discriminant(&p.venue)))),
                 c.contexts.len(),c.pair_pool_count.min(16))
         };
         rank(b).cmp(&rank(a)).then_with(||existing.contains(&b.address).cmp(&existing.contains(&a.address)))
