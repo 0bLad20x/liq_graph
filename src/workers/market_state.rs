@@ -829,6 +829,24 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 fn watch_cost(v:CoreVenue)->usize {
     match v {CoreVenue::PumpSwap|CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
 }
+/// Count complete observable route groups and directed gross route alternatives.
+fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->(usize,u64){
+    let mut groups=0_usize;let mut routes=0_u64;
+    for g in catalog.graph.groups.iter(){
+        let ns=g.direct_s.iter().filter(|p|selected.contains(p)).count() as u64;
+        let options=if g.bridge.is_none() && g.conversion.is_none() {
+            ns.saturating_mul(ns.saturating_sub(1))
+        } else {
+            let other=if g.bridge.is_some(){&g.bridge_pools}else{&g.direct_q};
+            let no=other.iter().filter(|p|selected.contains(p)).count() as u64;
+            let fixed=g.intermediate.is_none_or(|p|selected.contains(&p))
+                && g.conversion.is_none_or(|p|selected.contains(&p));
+            if fixed {2_u64.saturating_mul(ns).saturating_mul(no)} else {0}
+        };
+        if options>0 {groups+=1;routes=routes.saturating_add(options);}
+    }
+    (groups,routes)
+}
 /// Select complete V10 routes before extra alternatives. No new Pool/Mint state;
 /// all structural facts are read from the existing WatchCatalog and Registry.
 fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
@@ -928,6 +946,20 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
         let cost=watch_cost(p.venue);
         if used_accounts+cost<=account_budget {picked.insert(p.address);used_accounts+=cost;}
     }
+    let new_coverage=route_coverage(catalog,&picked);
+    let mut alphabetical=candidates.values().copied().collect::<Vec<_>>();
+    alphabetical.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
+    let mut legacy=HashSet::new();let mut old_budget=0_usize;
+    for p in alphabetical {
+        if legacy.len()>=max_pools {break;}
+        let cost=watch_cost(p.venue);
+        if old_budget+cost<=account_budget {legacy.insert(p.address);old_budget+=cost;}
+    }
+    let old_coverage=route_coverage(catalog,&legacy);
+    crate::log_event!(Info,
+        "market state coverage selected={} graph_groups={} graph_routes={} alphabetical_groups={} alphabetical_routes={} ws_budget={} graph_accounts={}",
+        picked.len(),new_coverage.0,new_coverage.1,old_coverage.0,old_coverage.1,
+        account_budget,used_accounts);
     let mut result=picked.into_iter().filter_map(|p|candidates.get(&p).copied()).collect::<Vec<_>>();
     result.sort_unstable_by_key(|p|p.address);
     result
