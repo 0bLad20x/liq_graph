@@ -835,6 +835,9 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput> {
     let max_pools=if limit==0 {usize::MAX}else{limit};
     let old:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
+    let quality:HashMap<Pubkey,f64>=candidates.keys().map(|address|(*address,
+        registry.get(*address).and_then(|p|p.tvl_usd).filter(|v|v.is_finite()&&*v>=0.0).unwrap_or(0.0)))
+        .collect();
     let mut picked=HashSet::<Pubkey>::new();
     let mut used_accounts=0_usize;
     let mut by_target=BTreeMap::<(Pubkey,Pubkey),Vec<usize>>::new();
@@ -860,7 +863,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
             let sb=(picked.contains(b)||local.contains(b),old.contains(b));
             sb.cmp(&sa)
                 .then_with(||{
-                    let t=|key:&Pubkey|registry.get(*key).and_then(|p|p.tvl_usd).unwrap_or(0.0);
+                    let t=|key:&Pubkey|*quality.get(key).unwrap_or(&0.0);
                     t(b).total_cmp(&t(a))
                 }).then_with(||a.cmp(b))
         });
@@ -916,7 +919,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
         };
         score(b).cmp(&score(a)).then_with(||old.contains(&b.address).cmp(&old.contains(&a.address)))
             .then_with(||{
-                let tvl=|p:&PoolInput|registry.get(p.address).and_then(|s|s.tvl_usd).unwrap_or(0.0);
+                let tvl=|p:&PoolInput|*quality.get(&p.address).unwrap_or(&0.0);
                 tvl(b).total_cmp(&tvl(a))
             }).then_with(||a.address.cmp(&b.address))
     });
@@ -953,7 +956,10 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
             (None,Err(error))=>Err(error),
         };
         let result=result.and_then(|part| {
-            for (actual,expected) in part.pools.iter().zip(&batch) {
+            ensure!(part.pools.len()==batch.len(),"hydration pool count mismatch");
+            for actual in &part.pools {
+                let expected=batch.iter().find(|p|p.address==actual.key)
+                    .context("hydration returned an unexpected pool")?;
                 ensure!(actual.a==expected.mint_a.to_string()
                     && actual.b==expected.mint_b.to_string(),"Registry/pool mint identity mismatch");
             }
@@ -1250,6 +1256,8 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             _=tick.tick()=>{
                 ticks+=1;
                 if !retry.is_empty(){schedule=true;}
+                // TVL quality may change without changing PoolInput identity.
+                if ticks%60==0 {rebuild=true;}
                 if ticks%5==0 {
                     let hydrated=engine.pools.len();
                     let ready=engine.pools.iter().filter(|p|p.ready).count();
