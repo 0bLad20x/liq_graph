@@ -559,9 +559,13 @@ impl Engine{
         }
         // Mint decimals were already on-chain verified in earlier batches.
         // The price worker owns this immutable mint cache; vaults are never cached.
-        let cached=mint_cache.read().expect("market mint cache poisoned").clone();
         let mint_addresses:HashSet<String>=raw_pools.iter().flat_map(|(a,b,_,_)|
             [a.clone(),b.clone()]).collect();
+        let cached={
+            let cache=mint_cache.read().expect("market mint cache poisoned");
+            mint_addresses.iter().filter_map(|address|
+                cache.get(address).map(|decimals|(address.clone(),*decimals))).collect::<HashMap<_,_>>()
+        };
         let mut unique=Vec::new();let mut seen=HashSet::new();
         for address in details {
             if seen.insert(address.clone()) &&
@@ -1150,6 +1154,16 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 ticks+=1;
                 if !retry.is_empty(){schedule=true;}
                 if ticks%5==0 {
+                    let hydrated=engine.pools.len();
+                    let ready=engine.pools.iter().filter(|p|p.ready).count();
+                    let available=engine.pools.iter().filter(|p|p.ready && p.available).count();
+                    crate::log_event!(Info,
+                        "market state hydration progress selected={} hydrated={} ready={} priced={} in_flight={} init_jobs={} baseline_jobs={} initial_mean_ms={} baseline_mean_ms={} mint_cache={}",
+                        selected.len(),hydrated,ready,available,in_flight.len(),
+                        engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
+                        if engine.metrics.initial_hydration.count>0 {engine.metrics.initial_hydration.total/engine.metrics.initial_hydration.count as u128/1_000_000}else{0},
+                        if engine.metrics.baseline_hydration.count>0 {engine.metrics.baseline_hydration.total/engine.metrics.baseline_hydration.count as u128/1_000_000}else{0},
+                        mint_cache.read().expect("market mint cache poisoned").len());
                     for p in &selected {if !persisted{rebuild|=reconcile(&registry,&mut candidates,p.address);}}
                     let (ws_messages,ws_text_bytes)=control.stream_counts();engine.sequence+=1;
                     send(&out,MarketStateEvent::Stats{pools:selected.len(),ready:engine.pools.iter().filter(|p|p.ready).count(),
@@ -1161,6 +1175,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     // JoinSet drops/cancels the one preparation job. No detached HTTP initializer.
     drop(jobs);
     let report=engine.metrics.report();
+    crate::log_event!(Info,"market state hydration final selected={} prepared={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={}",
+        selected.len(),engine.pools.len(),engine.pools.iter().filter(|p|p.ready&&p.available).count(),
+        engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
+        engine.metrics.max_hydration_in_flight,engine.metrics.hydration_failures);
     for p in &selected {engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true");
     Ok(report)
