@@ -79,7 +79,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
             let mut result=Vec::with_capacity(chunk.len());
             for (address,account) in chunk.iter().zip(accounts) {
                 let account=account.with_context(||format!("market account missing {address}"))?;
-                ensure!(account.address.to_string()==**address && account.view==AccountView::Full,
+                ensure!(account.address.to_string()==address.as_str() && account.view==AccountView::Full,
                     "market account identity/view mismatch");
                 result.push(RpcAccount{owner:account.owner.to_string(),data:account.bytes,slot,received_us});
             }
@@ -1042,15 +1042,14 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             schedule=false;
             while jobs.len()<concurrency {
                 let now=time::Instant::now();
-                let present:HashSet<_>=engine.pools.iter().map(|p|p.key).collect();
-                let mut targets:Vec<_>=selected.iter().filter(|p|present.contains(&p.address)
-                    && !engine.pools.iter().find(|state|state.key==p.address).is_some_and(|state|state.ready)
+                let present:HashMap<_,_>=engine.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
+                let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address)
+                    .is_some_and(|&pi|!engine.pools[pi].ready && complete(&engine,pi,&active))
                     && !in_flight.contains(&p.address)
-                    && complete(&engine,engine.pools.iter().position(|state|state.key==p.address).expect("known baseline pool"),&active)
                     && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
                 let baseline=!targets.is_empty();
                 if !baseline {
-                    targets=selected.iter().filter(|p|!present.contains(&p.address)
+                    targets=selected.iter().filter(|p|!present.contains_key(&p.address)
                         && !in_flight.contains(&p.address)
                         && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
                 }
