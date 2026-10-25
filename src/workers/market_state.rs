@@ -109,10 +109,6 @@ impl Venue {
     }}
 }
 #[derive(Clone)]struct Config {watches:Vec<Watch>}
-fn mint_dec(a:&RpcAccount)->Result<u8>{
-    ensure!(a.owner==TOKEN_PROGRAM||a.owner==TOKEN_2022,"Invalid token mint program {}",a.owner);
-    Ok(bytes(&a.data,44,1)?[0])
-}
 fn vault_amount(a:&RpcAccount, mint:&str)->Result<u64>{
     ensure!(a.owner==TOKEN_PROGRAM||a.owner==TOKEN_2022,"Invalid token vault owner {}",a.owner);
     ensure!(key(&a.data,0)?==mint,"Vault's mint doesn't match pool mint");u64_le(&a.data,64)
@@ -1075,6 +1071,8 @@ impl Engine {
 /// Exactly one bounded preparation job may run while live events continue on this task.
 async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     rpc:RpcHandle,control:AccountStreamControl,mut events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,
+    mut catalog:watch::Receiver<Arc<WatchCatalog>>,mints:Arc<dyn MintReader>,
+    mut mint_revision:watch::Receiver<u64>,selected_mints:watch::Sender<Arc<[Pubkey]>>,
     mut stop:watch::Receiver<bool>,mut enabled:watch::Receiver<bool>,mut limit:watch::Receiver<usize>,persisted:bool)->Result<serde_json::Value> {
     ensure!(control.capacity()>0,"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
     let snapshot=|registry:&PoolRegistry|->HashMap<Pubkey,PoolInput>{registry.snapshot().iter()
@@ -1087,18 +1085,20 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let mut cached=HashMap::<Pubkey,(WsEvent,u64)>::new();
     let mut jobs=tokio::task::JoinSet::new();
     let mut in_flight=HashSet::<Pubkey>::new();
-    let mint_cache:MintDecimals=Arc::new(RwLock::new(HashMap::new()));
-    let concurrency:usize=env_parse("MARKET_STATE_HYDRATION_CONCURRENCY",8)?;
+     let concurrency:usize=env_parse("MARKET_STATE_HYDRATION_CONCURRENCY",8)?;
     let batch_pools:usize=env_parse("MARKET_STATE_HYDRATION_BATCH_POOLS",64)?;
     ensure!((1..=32).contains(&concurrency) && (1..=256).contains(&batch_pools),
         "invalid market hydration concurrency/batch configuration");
-    crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_cache=true baseline=dynamic_only");
+    crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_source=central_registry baseline=dynamic_only graph_selection=true");
     let mut rebuild=true;let mut replan=false;let mut schedule=true;let mut input_open=true;let mut ticks=0;
     let mut tick=time::interval(Duration::from_secs(1));tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         if *stop.borrow(){break;}
         if rebuild {
-            let next=if *enabled.borrow(){select(&candidates,*limit.borrow())}else{Vec::new()};
+            let next=if *enabled.borrow(){
+                let cat=catalog.borrow().clone();
+                select(&candidates,&cat,*limit.borrow(),control.capacity(),&selected,&registry)
+            }else{Vec::new()};
             if next!=selected {
                 let next_map:HashMap<_,_>=next.iter().map(|p|(p.address,*p)).collect();
                 let keep:HashSet<_>=selected.iter().filter(|p|next_map.get(&p.address)==Some(*p)).map(|p|p.address).collect();
@@ -1107,6 +1107,13 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 versions.retain(|key,_|keep.contains(key));retry.retain(|key,_|keep.contains(key));
                 for p in &next {if !keep.contains(&p.address){revision+=1;versions.insert(p.address,revision);}}
                 selected=next;current=next_map;replan=true;engine.metrics.selection_changes+=1;
+                let mut mints_to_check=selected.iter().flat_map(|p|[p.mint_a,p.mint_b])
+                    .collect::<Vec<_>>();
+                mints_to_check.sort_unstable();mints_to_check.dedup();
+                selected_mints.send_replace(Arc::from(mints_to_check));
+                crate::log_event!(Info,"market state graph selection selected_pools={} ws_upper_bound={} ws_capacity={} graph_groups={}",
+                    selected.len(),selected.iter().map(|p|watch_cost(p.venue)).sum::<usize>(),
+                    control.capacity(),catalog.borrow().graph.groups.len());
                 engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
                 crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
@@ -1141,18 +1148,20 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 if !baseline {
                     targets=selected.iter().filter(|p|!present.contains_key(&p.address)
                         && !in_flight.contains(&p.address)
-                        && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
+                        && retry.get(&p.address).is_none_or(|at|*at<=now)
+                        && [p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
+                            .and_then(|record|record.onchain).is_some())).copied().collect();
                 }
                 targets.truncate(batch_pools);
                 if targets.is_empty(){break;}
                 let source=baseline.then(||engine.subset(&targets.iter().map(|p|p.address).collect()));
                 let tickets:Vec<_>=targets.iter().map(|p|(*p,versions[&p.address])).collect();
                 for p in &targets {in_flight.insert(p.address);}
-                let rpc=rpc.clone();let output=out.clone();let cache=mint_cache.clone();
+                let rpc=rpc.clone();let output=out.clone();let reader=mints.clone();
                 engine.metrics.hydration_jobs+=1;
                 jobs.spawn(async move {
                     let started=Instant::now();
-                    let result=hydrate(&targets,&rpc,&output,baseline,&cache,source.as_ref()).await;
+                    let result=hydrate(&targets,&rpc,&output,baseline,reader.as_ref(),source.as_ref()).await;
                     (tickets,baseline,result,started.elapsed())
                 });
                 engine.metrics.max_hydration_in_flight=engine.metrics.max_hydration_in_flight.max(jobs.len());
@@ -1162,6 +1171,8 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){break;}},
             changed=enabled.changed()=>{if changed.is_err(){break;}rebuild=true;},
             changed=limit.changed()=>{if changed.is_err(){break;}rebuild=true;},
+            changed=catalog.changed()=>{if changed.is_err(){break;}rebuild=true;},
+            changed=mint_revision.changed()=>{if changed.is_err(){break;}schedule=true;},
             update=input.recv(),if input_open=>match update {
                 Ok(batch)=>{for p in &batch.pools {
                     if persisted {
@@ -1244,12 +1255,13 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     let ready=engine.pools.iter().filter(|p|p.ready).count();
                     let available=engine.pools.iter().filter(|p|p.ready && p.available).count();
                     crate::log_event!(Info,
-                        "market state hydration progress selected={} hydrated={} ready={} priced={} in_flight={} init_jobs={} baseline_jobs={} initial_mean_ms={} baseline_mean_ms={} mint_cache={}",
+                        "market state hydration progress selected={} hydrated={} ready={} priced={} in_flight={} init_jobs={} baseline_jobs={} initial_mean_ms={} baseline_mean_ms={} mint_verified_pools={}",
                         selected.len(),hydrated,ready,available,in_flight.len(),
                         engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
                         if engine.metrics.initial_hydration.count>0 {engine.metrics.initial_hydration.total/engine.metrics.initial_hydration.count as u128/1_000_000}else{0},
                         if engine.metrics.baseline_hydration.count>0 {engine.metrics.baseline_hydration.total/engine.metrics.baseline_hydration.count as u128/1_000_000}else{0},
-                        mint_cache.read().expect("market mint cache poisoned").len());
+                        selected.iter().filter(|p|[p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
+                            .and_then(|r|r.onchain).is_some())).count());
                     for p in &selected {if !persisted{rebuild|=reconcile(&registry,&mut candidates,p.address);}}
                     let (ws_messages,ws_text_bytes)=control.stream_counts();engine.sequence+=1;
                     send(&out,MarketStateEvent::Stats{pools:selected.len(),ready:engine.pools.iter().filter(|p|p.ready).count(),
@@ -1294,9 +1306,12 @@ impl ObservationReport {
 /// Cancels hydration as well as idle streaming, then releases the sole desired watch set.
 pub async fn run(registry:PoolRegistry,input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     rpc:RpcHandle,control:AccountStreamControl,events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
+    catalog:watch::Receiver<Arc<WatchCatalog>>,mints:Arc<dyn MintReader>,mint_revision:watch::Receiver<u64>,
+    selected_mints:watch::Sender<Arc<[Pubkey]>>,
     stop:watch::Receiver<bool>,enabled:watch::Receiver<bool>)->Result<()> {
     let (_limit_tx,limit)=watch::channel(settings.pool_limit);
-    let result=produce(registry,input,rpc,control.clone(),events,out,stop,enabled,limit,false).await;
+    let result=produce(registry,input,rpc,control.clone(),events,out,catalog,mints,
+        mint_revision,selected_mints,stop,enabled,limit,false).await;
     let cleanup=control.replace(Vec::new());
     crate::log_event!(Info,"market state released_watches=true");
     result.map(|_|()).and(cleanup)
