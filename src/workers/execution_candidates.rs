@@ -1,4 +1,4 @@
-//! Versioned indicative ranges + current Prepared proofs -> frozen V10 jobs.
+//! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 use std::{collections::HashSet, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
