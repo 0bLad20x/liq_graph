@@ -1,59 +1,53 @@
-//! Factorized route state: shared ordered roles, versioned deltas and complete ranges.
-//! No per-route score cache, best-pool pruning, reference engine or consumer waits.
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    env, ops::Bound::{Excluded, Included, Unbounded}, sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
-use anyhow::{Context, Result, bail, ensure};
+//! CP6A: factorized canonical topologies, directed-price ranking and one
+//! best executable witness per changed topology. Never enumerate route products.
+use std::{collections::{BTreeMap,BTreeSet,HashMap,HashSet},env,sync::Arc,
+    time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
+use anyhow::{Context,Result,bail,ensure};
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, task::JoinSet};
+use tokio::sync::{broadcast,watch};
 use crate::core::{
-    market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin, PricePipelineTiming},
-    signals::{SignalEvaluation, SignalEvent, SignalGroup, SignalLeg, SignalPlan, SignalPool,
-        SignalPoolPrice, SignalPriceChange, SignalRangeBlock, SignalRangeChange, SignalRole,
-        SignalRouteKind, SignalRouteRange, SignalSnapshot, SignalStateUpdate, SignalStream,
-        SignalTrigger, SignalWitness, SIGNAL_BLOCK_RANGES, SIGNAL_LOG_SCALE}};
-use super::{graph_liquidity::{GroupKind, GraphSnapshot}, graph_watch_catalog::WatchCatalog};
+    market_state::{MarketStateEvent,PoolPriceObservation,PriceEventStream,PriceOrigin,PricePipelineTiming},
+    signals::{SignalCandidate,SignalCandidateBatch,SignalEvaluation,SignalEvent,SignalLeg,
+        SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,SignalRangeBlock,
+        SignalRangeChange,SignalRouteKind,SignalSnapshot,SignalStateUpdate,SignalStream,
+        SignalTopology,SignalTrigger,SignalWitness,SIGNAL_BLOCK_RANGES,SIGNAL_LOG_SCALE}};
+use super::{graph_liquidity::{GraphSnapshot,RouteTopologyKind},graph_watch_catalog::WatchCatalog};
 
-const WSOL: &str = "So11111111111111111111111111111111111111112";
-const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const EXECUTION_LAYOUT: &str = "factorized_roles_v1";
-const OUTPUT_LAYOUT: &str = "versioned_state_ranges_v1";
-// Bursty full-graph topology rebuilds can emit thousands of range blocks before
-// the consumer catches up. 256 slots lost 24,209 events in the CP5 900s audit.
-// Preserve full state/range/evaluated sequences without changing event semantics.
-pub const OUTPUT_CAPACITY: usize = 16384;
+const EXECUTION_LAYOUT:&str="compact_topologies_cp6a";
+const OUTPUT_LAYOUT:&str="versioned_best_candidates_cp6a";
+pub const OUTPUT_CAPACITY:usize=16384;
 
-#[derive(Clone, Copy)]
-pub struct Settings { pub threshold_bps: f64, pub sample_limit: usize, pub trace: bool, pub profile: bool }
+#[derive(Clone,Copy)]
+pub struct Settings {pub threshold_bps:f64,pub sample_limit:usize,pub trace:bool,pub profile:bool}
 impl Settings {
-    pub fn from_env() -> Result<Self> {
-        let threshold_bps: f64 = env::var("GRAPH_SIGNALS_THRESHOLD_BPS")
-            .unwrap_or_else(|_| "0".into()).parse().context("invalid GRAPH_SIGNALS_THRESHOLD_BPS")?;
-        ensure!(threshold_bps.is_finite() && threshold_bps >= 0.0, "invalid signal threshold");
-        let sample_limit = env::var("GRAPH_SIGNALS_SAMPLE_LIMIT").unwrap_or_else(|_| "16".into())
+    pub fn from_env()->Result<Self>{
+        let threshold_bps:f64=env::var("GRAPH_SIGNALS_THRESHOLD_BPS")
+            .unwrap_or_else(|_|"0".into()).parse().context("invalid GRAPH_SIGNALS_THRESHOLD_BPS")?;
+        ensure!(threshold_bps.is_finite()&&threshold_bps>=0.0,"invalid signal threshold");
+        let sample_limit=env::var("GRAPH_SIGNALS_SAMPLE_LIMIT").unwrap_or_else(|_|"16".into())
             .parse().context("invalid GRAPH_SIGNALS_SAMPLE_LIMIT")?;
-        let flag = |name: &str| -> Result<bool> { match env::var(name).as_deref() {
-            Ok("1" | "true") => Ok(true), Ok("0" | "false") | Err(env::VarError::NotPresent) => Ok(false),
-            _ => bail!("{name} must be true or false"),
+        let flag=|name:&str|->Result<bool>{match env::var(name).as_deref(){
+            Ok("1"|"true")=>Ok(true),Ok("0"|"false")|Err(env::VarError::NotPresent)=>Ok(false),
+            _=>bail!("{name} must be true or false"),
         }};
-        Ok(Self { threshold_bps, sample_limit, trace: flag("GRAPH_SIGNALS_TRACE")?, profile: flag("GRAPH_SIGNALS_PROFILE")? })
+        Ok(Self{threshold_bps,sample_limit,trace:flag("GRAPH_SIGNALS_TRACE")?,
+            profile:flag("GRAPH_SIGNALS_PROFILE")?})
     }
 }
-fn now_us() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
-    .as_micros().min(u128::from(u64::MAX)) as u64 }
-fn nanos(start: Instant) -> u64 { start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64 }
-fn live(t: &SignalTrigger) -> bool { matches!(t, SignalTrigger::Price { origin: PriceOrigin::Websocket, .. }) }
-fn kind_id(k: SignalRouteKind) -> usize { match k {
-    SignalRouteKind::Direct2 => 0, SignalRouteKind::Direct3 => 1,
-    SignalRouteKind::Triangle3 => 2, SignalRouteKind::Triangle4 => 3,
+fn now_us()->u64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+    .as_micros().min(u128::from(u64::MAX)) as u64}
+fn nanos(start:Instant)->u64{start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
+fn live(t:&SignalTrigger)->bool{matches!(t,SignalTrigger::Price{origin:PriceOrigin::Websocket,..})}
+fn kind_id(k:SignalRouteKind)->usize{match k{
+    SignalRouteKind::Direct2=>0,SignalRouteKind::Direct3=>1,
+    SignalRouteKind::Triangle3=>2,SignalRouteKind::Triangle4=>3,
 }}
-fn change_id(c: SignalRangeChange) -> usize { match c {
-    SignalRangeChange::Entered => 0, SignalRangeChange::Updated => 1, SignalRangeChange::Exited => 2,
+fn change_id(c:SignalRangeChange)->usize{match c{
+    SignalRangeChange::Entered=>0,SignalRangeChange::Updated=>1,SignalRangeChange::Exited=>2,
 }}
-fn names(v: [u64; 4]) -> BTreeMap<&'static str, u64> {
-    ["direct_2", "direct_3", "triangle_3", "triangle_4"].into_iter().zip(v).collect()
+fn names(v:[u64;4])->BTreeMap<&'static str,u64>{
+    ["direct_2","direct_3","triangle_3","triangle_4"].into_iter().zip(v).collect()
 }
-
 struct Previous { pool: usize, price: Option<Arc<SignalPoolPrice>> }
 #[derive(Clone, Default)]
 struct Prices {
@@ -117,507 +111,372 @@ impl Prices {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Key { weight: i64, slot: usize }
 fn key(weight: i64, slot: usize) -> Key { Key { weight, slot } }
-struct OrderedRole { definition: SignalRole, ordered: BTreeSet<Key> }
-impl OrderedRole {
-    fn first(&self, lower: Option<i64>, upper: i64, exclude: Option<usize>) -> Option<Key> {
-        if lower.is_some_and(|l| l >= upper) { return None; }
-        let lower = lower.map_or(Unbounded, |w| Included(key(w, 0)));
-        self.ordered.range((lower, Excluded(key(upper, 0))))
-            .find(|k| Some(k.slot / 2) != exclude).copied()
-    }
-    fn has_partner(&self, exclude: Option<usize>) -> bool {
-        self.ordered.iter().take(2).any(|k| Some(k.slot / 2) != exclude)
-    }
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct Winner{slots:[usize;4],length:usize,total:i64}
+fn first_two(set:Option<&BTreeSet<Key>>)->[Option<Key>;2]{
+    let mut values=set.into_iter().flat_map(|v|v.iter());
+    [values.next().copied(),values.next().copied()]
 }
-#[derive(Clone, Copy)]
-enum Affected { Both(usize), Left(usize), Right(usize), Fixed }
-/// Price ordering is dynamic; static pool -> group references are owned by GraphSnapshot.
-struct ExecutionPlan {
-    graph: Arc<GraphSnapshot>,
-    data: Arc<SignalPlan>, roles: Vec<OrderedRole>, slot_roles: Vec<Option<usize>>,
+fn pair(a:Pubkey,b:Pubkey)->(Pubkey,Pubkey){(a.min(b),a.max(b))}
+#[derive(Default)]
+struct CompactIndex {
+    graph:Arc<GraphSnapshot>,
+    ranked:HashMap<(Pubkey,Pubkey),BTreeSet<Key>>,
+    qualifying:HashMap<(u32,bool),Winner>,
 }
-fn compile_role(prices: &Prices, pools: &Arc<[Pubkey]>, input: Pubkey, output: Pubkey,
-    cache: &mut HashMap<(Pubkey,Pubkey),usize>, roles: &mut Vec<OrderedRole>,
-    slot_roles: &mut [Option<usize>]) -> Result<usize> {
-    if let Some(&id) = cache.get(&(input,output)) {
-        ensure!(roles[id].definition.slots.len() == pools.len()
-            && roles[id].definition.slots.iter().zip(pools.iter()).all(|(&s,&p)| prices.pools[s/2].address == p),
-            "different alternatives for identical mint role");
-        return Ok(id);
-    }
-    ensure!(!pools.is_empty() && pools.windows(2).all(|p| p[0] < p[1]), "invalid graph alternatives");
-    let slots: Arc<[usize]> = pools.iter().map(|&p| prices.slot(p,input,output)).collect::<Result<Vec<_>>>()?.into();
-    let id = roles.len(); let mut ordered = BTreeSet::new();
-    for &slot in slots.iter() {
-        ensure!(slot_roles[slot].replace(id).is_none(), "directed slot belongs to multiple role indices");
-        if let Some(w) = prices.weight(slot,None) { ordered.insert(key(w,slot)); }
-    }
-    roles.push(OrderedRole { definition: SignalRole { slots }, ordered });
-    cache.insert((input,output),id);
-    Ok(id)
-}
-impl ExecutionPlan {
-    fn empty() -> Self {
-        Self { graph:Arc::new(GraphSnapshot::default()),
-            data:Arc::new(SignalPlan { graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
-                roles:Arc::from([]),groups:Arc::from([]),route_options:0 }),
-            roles:Vec::new(),slot_roles:Vec::new() }
-    }
-    /// Reconcile an asynchronously prepared topology with the latest observed prices.
-    /// Only unique directed role slots are traversed, never the group cross product.
-    fn rebase(&mut self, prices:&Prices) {
-        for role in &mut self.roles {
-            role.ordered.clear();
-            for &slot in role.definition.slots.iter() {
+impl CompactIndex {
+    fn install(&mut self,graph:Arc<GraphSnapshot>,prices:&Prices){
+        let mut ranked=HashMap::<(Pubkey,Pubkey),BTreeSet<Key>>::new();
+        for (id,identity) in prices.pools.iter().enumerate(){
+            if graph.pair_for_pool(identity.address)!=Some((identity.mint_a,identity.mint_b)){continue;}
+            for direction in 0..2 {
+                let slot=2*id+direction;
                 if let Some(weight)=prices.weight(slot,None) {
-                    role.ordered.insert(key(weight,slot));
+                    let role=if direction==0 {(identity.mint_a,identity.mint_b)}
+                        else {(identity.mint_b,identity.mint_a)};
+                    ranked.entry(role).or_default().insert(key(weight,slot));
                 }
             }
         }
+        self.graph=graph;
+        self.ranked=ranked;
+        // No candidate calculated against an older topology remains valid.
+        self.qualifying.clear();
     }
-    fn compile(catalog: Arc<WatchCatalog>, prices: &mut Prices) -> Result<Self> {
-        ensure!(catalog.generation == catalog.graph.generation, "mixed graph generation");
-        for p in catalog.pools.iter() { prices.bind(p.address,p.mint_a,p.mint_b)?; }
-        let mut roles = Vec::new(); let mut cache = HashMap::new();
-        let mut slot_roles = vec![None; 2*prices.pools.len()];
-        let mut groups = Vec::with_capacity(catalog.graph.groups.len());
-        let wsol: Pubkey = WSOL.parse()?; let usdc: Pubkey = USDC.parse()?;
-        for g in catalog.graph.groups.iter() {
-            let s=g.settlement; let t=g.target;
-            ensure!(s == wsol || s == usdc, "unsupported settlement");
-            let q=if s == wsol { usdc } else { wsol };
-            let mut pair = |pools: &Arc<[Pubkey]>, a, b| -> Result<[usize;2]> {
-                Ok([compile_role(prices,pools,a,b,&mut cache,&mut roles,&mut slot_roles)?,
-                    compile_role(prices,pools,b,a,&mut cache,&mut roles,&mut slot_roles)?])
-            };
-            let left=pair(&g.direct_s,s,t)?;
-            let mut fixed=[0;2];
-            let (kind,right,fixed_count,length,mints)=match (g.kind,g.conversion) {
-                (GroupKind::Direct,None) => {
-                    ensure!(g.bridge.is_none() && g.intermediate.is_none() && g.direct_q.is_empty()
-                        && g.bridge_pools.is_empty(), "invalid Direct2");
-                    (SignalRouteKind::Direct2,[left[1],left[0]],0,2,[s,t,s,s,s])
-                },
-                (GroupKind::Direct,Some(c)) => {
-                    ensure!(g.bridge.is_none() && g.intermediate.is_none() && g.bridge_pools.is_empty(), "invalid Direct3");
-                    let right=pair(&g.direct_q,t,q)?; fixed[0]=prices.slot(c,q,s)?;
-                    (SignalRouteKind::Direct3,right,1,3,[s,t,q,s,s])
-                },
-                (GroupKind::Bridge,c) => {
-                    ensure!(g.direct_q.is_empty(), "invalid triangle quote role");
-                    let b=g.bridge.context("missing bridge mint")?;
-                    fixed[0]=prices.slot(g.intermediate.context("missing intermediate")?,t,b)?;
-                    if let Some(c)=c {
-                        let right=pair(&g.bridge_pools,b,q)?; fixed[1]=prices.slot(c,q,s)?;
-                        (SignalRouteKind::Triangle4,right,2,4,[s,t,b,q,s])
-                    } else {
-                        let right=pair(&g.bridge_pools,b,s)?;
-                        (SignalRouteKind::Triangle3,right,1,3,[s,t,b,s,s])
-                    }
-                },
-            };
-            for i in 0..length { ensure!(!mints[..i].contains(&mints[i]), "repeated cycle mint"); }
-            let n=roles[left[0]].definition.slots.len() as u64;
-            let m=roles[right[0]].definition.slots.len() as u64;
-            let expected=if kind == SignalRouteKind::Direct2 {
-                ensure!(n>=2,"Direct2 requires distinct pools"); n.checked_mul(n-1)
-            } else { n.checked_mul(m).and_then(|x|x.checked_mul(2)) }.context("route count overflow")?;
-            ensure!(expected == g.route_options, "graph/signal route count differs");
-            groups.push(SignalGroup { kind,left,right,fixed,fixed_count,mints,route_options:expected });
-        }
-        let definitions=roles.iter().map(|r|r.definition.clone()).collect::<Vec<_>>().into();
-        let data=Arc::new(SignalPlan { graph_generation:catalog.generation,log_weight_scale:SIGNAL_LOG_SCALE,roles:definitions,
-            groups:groups.into(),route_options:catalog.graph.route_options });
-        Ok(Self { graph:catalog.graph.clone(),data,roles,slot_roles })
-    }
-    fn refresh(&mut self, prices: &Prices, old: &Previous) -> Result<()> {
-        for slot in [2*old.pool,2*old.pool+1] {
-            let Some(Some(role))=self.slot_roles.get(slot) else { continue };
-            let before=old.price.as_ref().and_then(|p|p.log_weight_units[slot%2]);
+    /// True only when a directed pair's best or runner-up has changed.
+    /// The second-best is required to preserve direct-2 same-pool exclusion.
+    fn refresh(&mut self,address:Pubkey,old:&Previous,prices:&Prices)->Result<bool>{
+        let Some((a,b))=self.graph.pair_for_pool(address) else{return Ok(false)};
+        let mut changed=false;
+        for (direction,role) in [(0,(a,b)),(1,(b,a))] {
+            let slot=2*old.pool+direction;
+            let before=old.price.as_ref().and_then(|p|p.log_weight_units[direction]);
             let after=prices.weight(slot,None);
-            if before==after {continue;}
+            if before==after{continue;}
+            let set=self.ranked.entry(role).or_default();
+            let old_top=first_two(Some(set));
             if let Some(w)=before {
-                ensure!(self.roles[*role].ordered.remove(&key(w,slot)), "missing prior ordered weight");
+                ensure!(set.remove(&key(w,slot)),"CP6A ordered price missing prior weight");
             }
             if let Some(w)=after {
-                ensure!(self.roles[*role].ordered.insert(key(w,slot)), "duplicate ordered weight");
+                ensure!(set.insert(key(w,slot)),"CP6A ordered price duplicated");
+            }
+            changed|=old_top!=first_two(Some(set));
+        }
+        Ok(changed)
+    }
+    fn first(&self,a:Pubkey,b:Pubkey,exclude:Option<usize>)->Option<Key>{
+        self.ranked.get(&(a,b))?.iter().find(|p|Some(p.slot/2)!=exclude).copied()
+    }
+    fn best(&self,top:&SignalTopology,reverse:bool)->Result<Option<Winner>>{
+        let mut slots=[0_usize;4];
+        if top.kind==SignalRouteKind::Direct2 {
+            if reverse{return Ok(None);}
+            let (s,t)=top.roles[0];
+            let left=self.first(s,t,None);
+            let right=self.first(t,s,None);
+            let first=left.and_then(|l|self.first(t,s,Some(l.slot/2))
+                .map(|r|[l.slot,r.slot]));
+            let second=right.and_then(|r|self.first(s,t,Some(r.slot/2))
+                .map(|l|[l.slot,r.slot]));
+            let result=[first,second].into_iter().flatten().filter_map(|choice|{
+                let w0=self.ranked.get(&(s,t))?.iter().find(|k|k.slot==choice[0])?;
+                let w1=self.ranked.get(&(t,s))?.iter().find(|k|k.slot==choice[1])?;
+                let total=i64::try_from(i128::from(w0.weight)+i128::from(w1.weight)).ok()?;
+                Some(Winner{slots:[choice[0],choice[1],0,0],length:2,total})
+            }).min_by_key(|p|(p.total,p.slots));
+            return Ok(result);
+        }
+        let mut total=0_i128;
+        for i in 0..top.length {
+            let j=if reverse{top.length-1-i}else{i};
+            let (input,output)=top.roles[j];
+            let chosen=if reverse{self.first(output,input,None)}else{self.first(input,output,None)};
+            let Some(chosen)=chosen else{return Ok(None)};
+            slots[i]=chosen.slot;
+            total+=i128::from(chosen.weight);
+        }
+        let total=i64::try_from(total).context("CP6A sum exceeds fixed log-weight representation")?;
+        Ok(Some(Winner{slots,length:top.length,total}))
+    }
+    fn witness(&self,top:&SignalTopology,winner:Winner,reverse:bool,prices:&Prices)->Result<SignalWitness>{
+        let mut legs=Vec::with_capacity(winner.length);
+        for i in 0..winner.length {
+            let j=if reverse{winner.length-1-i}else{i};
+            let (a,b)=top.roles[j];
+            let (input,output)=if reverse{(b,a)}else{(a,b)};
+            let slot=winner.slots[i];
+            let p=prices.pools.get(slot/2).context("candidate pool index invalid")?;
+            ensure!(pair(input,output)==(p.mint_a,p.mint_b),
+                "candidate mint role differs from priced pool");
+            let value=prices.values.get(slot/2).and_then(|p|p.as_ref())
+                .context("candidate price unavailable")?;
+            legs.push(SignalLeg{slot,input_mint:input,output_mint:output,
+                log_weight_units:value.log_weight_units[slot%2]
+                    .context("candidate directed price unavailable")?,
+                observation:value.observation.clone()});
+        }
+        ensure!(legs.windows(2).all(|w|w[0].output_mint==w[1].input_mint)
+            && legs.last().is_some_and(|last|last.output_mint==legs[0].input_mint),
+            "CP6A candidate route is not closed");
+        ensure!(legs.iter().map(|l|i128::from(l.log_weight_units)).sum::<i128>()
+            ==i128::from(winner.total),"CP6A candidate score mismatch");
+        let sum=winner.total as f64/SIGNAL_LOG_SCALE as f64;
+        let bps=(-sum).exp_m1()*10_000.0;
+        Ok(SignalWitness{legs,log_sum_units:winner.total,negative_log_sum:sum,
+            indicative_return_bps:bps.is_finite().then_some(bps)})
+    }
+    fn candidates(&mut self,address:Pubkey,prices:&Prices,threshold:i64,
+        stats:&mut SignalEvaluation)->Result<Vec<SignalCandidate>>{
+        let mut out=Vec::new();
+        for &id in self.graph.topologies_for_pool(address) {
+            let top=&self.graph.topologies[id as usize];
+            let kind=match top.kind {
+                RouteTopologyKind::Direct2=>SignalRouteKind::Direct2,
+                RouteTopologyKind::Direct3=>SignalRouteKind::Direct3,
+                RouteTopologyKind::Triangle3=>SignalRouteKind::Triangle3,
+                RouteTopologyKind::Triangle4=>SignalRouteKind::Triangle4,
+            };
+            let definition=SignalTopology{kind,settlement:top.settlement,target:top.target,
+                bridge:top.bridge,roles:top.roles,length:top.length};
+            stats.groups_visited+=1;
+            stats.logical_routes_affected=stats.logical_routes_affected
+                .saturating_add(top.route_options);
+            for reverse in [false,true] {
+                if kind==SignalRouteKind::Direct2 && reverse{continue;}
+                stats.range_queries+=1;
+                let best=self.best(&definition,reverse)?;
+                if best.is_some(){stats.ready_anchors[kind_id(kind)]+=1;}
+                let selected=best.filter(|b|b.total<threshold);
+                let key=(id,reverse);
+                let previous=self.qualifying.get(&key).copied();
+                if previous==selected{continue;}
+                let change=match(previous,selected){
+                    (None,Some(_))=>SignalRangeChange::Entered,
+                    (Some(_),None)=>SignalRangeChange::Exited,
+                    (Some(_),Some(_))=>SignalRangeChange::Updated,
+                    (None,None)=>continue,
+                };
+                let witness=selected.map(|w|self.witness(&definition,w,reverse,prices))
+                    .transpose()?;
+                if let Some(w)=selected{self.qualifying.insert(key,w);}
+                else{self.qualifying.remove(&key);}
+                stats.ranges[change_id(change)]+=1;
+                stats.ranges_by_kind[kind_id(kind)]+=1;
+                stats.anchors_visited+=1;
+                out.push(SignalCandidate{topology_id:id as usize,reverse,change,witness});
             }
         }
-        Ok(())
-    }
-    fn affected(&self, group_id: usize, pool_id: usize) -> Option<Affected> {
-        let group = self.data.groups.get(group_id)?;
-        // A pool's canonical slot (2*id) is not necessarily the forward
-        // trading direction for this topology. Recover the exact forward slot
-        // from the shared directed-role index, as the prior Binding table did.
-        let first=2*pool_id;
-        let forward=|role_id:usize| -> Option<usize> {
-            [first,first+1].into_iter()
-                .find(|&slot|self.slot_roles.get(slot)==Some(&Some(role_id)))
-        };
-        if let Some(slot)=forward(group.left[0]) {
-            return Some(if group.kind==SignalRouteKind::Direct2 {
-                Affected::Both(slot)
-            } else {
-                Affected::Left(slot)
-            });
-        }
-        if let Some(slot)=forward(group.right[0]) {
-            return Some(Affected::Right(slot));
-        }
-        if group.fixed[..group.fixed_count].iter().any(|&slot| slot / 2 == pool_id) {
-            return Some(Affected::Fixed);
-        }
-        None
+        Ok(out)
     }
 }
-enum Scope { All, Pool(usize), None }
 struct Work {
-    started: Instant, stats: SignalEvaluation, previous: Option<Previous>, pending: Vec<SignalRouteRange>,
+    started:Instant,stats:SignalEvaluation,
 }
 struct Engine {
-    prices: Prices, output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings,
-    sequence: u64, revision: u64, threshold: i64, production: ProductionReport,
-    scratch: Vec<SignalRouteRange>,
+    prices:Prices,plan:Arc<SignalPlan>,index:CompactIndex,
+    output:broadcast::Sender<Arc<SignalEvent>>,settings:Settings,
+    sequence:u64,revision:u64,threshold:i64,production:ProductionReport,
 }
 impl Engine {
-    fn emit(&mut self, event: SignalEvent) -> Result<()> {
+    fn next_sequence(&mut self)->u64{self.sequence+=1;self.sequence}
+    fn emit(&mut self,event:SignalEvent)->Result<()>{
         self.output.send(Arc::new(event)).map_err(|_|anyhow::anyhow!("signal output has no consumer"))?;
         self.production.max_output_queue_depth=self.production.max_output_queue_depth.max(self.output.len());
         Ok(())
     }
-    fn next_sequence(&mut self) -> u64 { self.sequence+=1; self.sequence }
-    fn begin(&mut self, plan: &ExecutionPlan, trigger: SignalTrigger, started: Instant,
-        received: u64, pipeline: Option<PricePipelineTiming>, queue: usize) -> Work {
+    fn begin(&mut self,trigger:SignalTrigger,started:Instant,received:u64,
+        pipeline:Option<PricePipelineTiming>,queue:usize)->Work{
         self.revision+=1;
-        Work { started, previous:None, pending:std::mem::take(&mut self.scratch),
-            stats:SignalEvaluation { sequence:0,revision:self.revision,graph_generation:plan.data.graph_generation,
-                trigger:Arc::new(trigger),price_pipeline:pipeline,worker_received_at_us:received,completed_at_us:0,
-                price_queue_depth:queue,groups_visited:0,logical_routes_affected:0,anchors_visited:0,
-                ready_anchors:[0;4],range_queries:0,ranges:[0;3],ranges_by_kind:[0;4],
-                logarithms_prepared:0,price_preparation_ns:0,index_update_ns:0,state_ready_ns:0,
-                plan_build_ns:0,query_ns:0,event_build_ns:0,publication_ns:0,
-                first_range_ns:None,last_range_ns:None,processing_ns:0 } }
+        Work{started,stats:SignalEvaluation{sequence:0,revision:self.revision,
+            graph_generation:self.plan.graph_generation,trigger:Arc::new(trigger),
+            price_pipeline:pipeline,worker_received_at_us:received,completed_at_us:0,
+            price_queue_depth:queue,groups_visited:0,logical_routes_affected:0,
+            anchors_visited:0,ready_anchors:[0;4],range_queries:0,ranges:[0;3],
+            ranges_by_kind:[0;4],logarithms_prepared:0,price_preparation_ns:0,
+            index_update_ns:0,state_ready_ns:0,plan_build_ns:0,query_ns:0,
+            event_build_ns:0,publication_ns:0,first_range_ns:None,
+            last_range_ns:None,processing_ns:0}}
     }
-    fn state(&mut self, plan: &ExecutionPlan, work: &mut Work, snapshot: bool,
-        clear: bool, changes: Vec<SignalPriceChange>) -> Result<()> {
+    fn state(&mut self,work:&mut Work,snapshot:bool,clear:bool,
+        changes:Vec<SignalPriceChange>)->Result<()>{
         work.stats.state_ready_ns=nanos(work.started);
         let ready_at_us=now_us();
         let started=Instant::now();
-        let snapshot=snapshot.then(||SignalSnapshot { plan:plan.data.clone(),
-            pools:self.prices.pools.clone(),prices:self.prices.values.clone() });
-        let update=SignalStateUpdate { sequence:self.next_sequence(),revision:self.revision,
-            graph_generation:plan.data.graph_generation,trigger:work.stats.trigger.clone(),ready_at_us,
-            price_pipeline:work.stats.price_pipeline,snapshot,clear,changes };
+        let snapshot=snapshot.then(||SignalSnapshot{plan:self.plan.clone(),
+            pools:self.prices.pools.clone(),prices:self.prices.values.clone()});
+        let update=SignalStateUpdate{sequence:self.next_sequence(),revision:self.revision,
+            graph_generation:self.plan.graph_generation,trigger:work.stats.trigger.clone(),
+            ready_at_us,price_pipeline:work.stats.price_pipeline,snapshot,clear,changes};
         work.stats.event_build_ns+=nanos(started);
-        let started=Instant::now();
         self.production.counts.state(&update);
+        let started=Instant::now();
         self.emit(SignalEvent::State(update))?;
         work.stats.publication_ns+=nanos(started);
         Ok(())
     }
-    fn flush(&mut self, work: &mut Work) -> Result<()> {
-        if work.pending.is_empty() { return Ok(()); }
+    fn candidates(&mut self,work:&mut Work,address:Pubkey)->Result<()>{
         let started=Instant::now();
-        let block=SignalRangeBlock { sequence:self.next_sequence(),revision:self.revision,
-            graph_generation:work.stats.graph_generation,trigger:work.stats.trigger.clone(),
-            threshold_bps:self.settings.threshold_bps,threshold_units:self.threshold,emitted_at_us:now_us(),
-            price_pipeline:work.stats.price_pipeline,
-            ranges:std::mem::replace(&mut work.pending,Vec::with_capacity(SIGNAL_BLOCK_RANGES)) };
-        work.stats.event_build_ns+=nanos(started);
+        let candidates=self.index.candidates(address,&self.prices,self.threshold,&mut work.stats)?;
+        work.stats.query_ns=nanos(started);
+        if candidates.is_empty(){return Ok(());}
+        let t=Instant::now();
+        let block=SignalCandidateBatch{sequence:self.next_sequence(),revision:self.revision,
+            graph_generation:self.plan.graph_generation,trigger:work.stats.trigger.clone(),
+            price_pipeline:work.stats.price_pipeline,threshold_units:self.threshold,candidates};
+        self.production.counts.candidate(&block);
+        work.stats.event_build_ns+=nanos(t);
         let started=Instant::now();
-        self.production.counts.block(&block);
-        self.emit(SignalEvent::Ranges(block))?;
+        self.emit(SignalEvent::Candidates(block))?;
         work.stats.publication_ns+=nanos(started);
-        let elapsed=nanos(work.started);
-        work.stats.first_range_ns.get_or_insert(elapsed); work.stats.last_range_ns=Some(elapsed);
+        let end=nanos(work.started);
+        work.stats.first_range_ns=Some(end);work.stats.last_range_ns=Some(end);
         Ok(())
     }
-    fn addend(&self, group: &SignalGroup, anchor: usize, reverse: bool,
-        previous: Option<&Previous>) -> Option<i64> {
-        let mut sum=self.prices.weight(anchor,previous)?;
-        for &slot in &group.fixed[..group.fixed_count] {
-            sum+=self.prices.weight(slot^usize::from(reverse),previous)?;
-        }
-        Some(sum)
-    }
-    fn witness(&self, group: &SignalGroup, anchor: usize, partner: usize,
-        anchor_left: bool, reverse: bool, change: SignalRangeChange,
-        addend: i64, work: &Work) -> Result<SignalWitness> {
-        let (a,b)=if anchor_left { (anchor,partner) } else { (partner,anchor) };
-        let mut slots=[0;4];
-        let count=match group.kind {
-            SignalRouteKind::Direct2 => { slots[..2].copy_from_slice(&[a,b]); 2 },
-            SignalRouteKind::Direct3 => { slots[..3].copy_from_slice(&[a,b,group.fixed[0]^usize::from(reverse)]); 3 },
-            SignalRouteKind::Triangle3 => { slots[..3].copy_from_slice(&[a,group.fixed[0]^usize::from(reverse),b]); 3 },
-            SignalRouteKind::Triangle4 => { slots.copy_from_slice(&[a,group.fixed[0]^usize::from(reverse),b,group.fixed[1]^usize::from(reverse)]); 4 },
-        };
-        if reverse { slots[..count].reverse(); }
-        let previous=if change == SignalRangeChange::Exited { work.previous.as_ref() } else { None };
-        let mut legs=Vec::with_capacity(count);
-        for (i,&slot) in slots[..count].iter().enumerate() {
-            let input=if reverse { count-i } else { i };
-            let output=if reverse { count-i-1 } else { i+1 };
-            let value=self.prices.price(slot/2,previous).context("missing witness price")?;
-            legs.push(SignalLeg { slot,input_mint:group.mints[input],output_mint:group.mints[output],
-                log_weight_units:value.log_weight_units[slot%2].context("invalid witness direction")?,
-                observation:value.observation.clone() });
-        }
-        let units=addend+self.prices.weight(partner,None).context("missing range partner")?;
-        let sum=units as f64 / SIGNAL_LOG_SCALE as f64;
-        let bps=(-sum).exp_m1()*10_000.0;
-        Ok(SignalWitness { legs,log_sum_units:units,negative_log_sum:sum,indicative_return_bps:bps.is_finite().then_some(bps) })
-    }
-    fn anchor(&mut self, plan: &ExecutionPlan, group_id: usize, anchor: usize,
-        anchor_left: bool, reverse: bool, work: &mut Work) -> Result<()> {
-        work.stats.anchors_visited+=1;
-        let g=&plan.data.groups[group_id]; let direction=usize::from(reverse);
-        let partner_role=if anchor_left { g.right[direction] } else { g.left[direction] };
-        let exclude=(g.kind == SignalRouteKind::Direct2).then_some(anchor/2);
-        let current=self.addend(g,anchor,reverse,None);
-        let previous=work.previous.as_ref().and_then(|p|self.addend(g,anchor,reverse,Some(p)));
-        if current.is_none() && previous.is_none() { return Ok(()); }
-        let role=&plan.roles[partner_role];
-        if !role.has_partner(exclude) { return Ok(()); }
-        work.stats.ready_anchors[kind_id(g.kind)]+=1;
-        let old=previous.map(|a|self.threshold-a); let new=current.map(|a|self.threshold-a);
-        let mut intervals=[(None,0,SignalRangeChange::Updated);2]; let count;
-        match (old,new) {
-            (None,Some(n)) => { intervals[0]=(None,n,SignalRangeChange::Entered); count=1; },
-            (Some(o),None) => { intervals[0]=(None,o,SignalRangeChange::Exited); count=1; },
-            (Some(o),Some(n)) => {
-                intervals[0]=(None,o.min(n),SignalRangeChange::Updated);
-                intervals[1]=(Some(o.min(n)),o.max(n),if n>o { SignalRangeChange::Entered } else { SignalRangeChange::Exited });
-                count=2;
-            },
-            _ => return Ok(()),
-        }
-        for &(lower,upper,change) in &intervals[..count] {
-            if lower.is_some_and(|l|l>=upper) { continue; }
-            work.stats.range_queries+=1;
-            let Some(partner)=role.first(lower,upper,exclude) else { continue };
-            let addend=if change == SignalRangeChange::Exited { previous } else { current }.context("missing range addend")?;
-            let witness=self.witness(g,anchor,partner.slot,anchor_left,reverse,change,addend,work)?;
-            work.pending.push(SignalRouteRange { group_id,reverse,anchor_is_left:anchor_left,
-                anchor_slot:anchor,partner_role,exclude_pool:exclude,lower_inclusive:lower,upper_exclusive:upper,
-                previous_addend:previous,current_addend:current,change,witness });
-            work.stats.ranges[change_id(change)]+=1; work.stats.ranges_by_kind[kind_id(g.kind)]+=1;
-            if work.stats.first_range_ns.is_none() || work.pending.len()==SIGNAL_BLOCK_RANGES { self.flush(work)?; }
-        }
-        Ok(())
-    }
-    fn group(&mut self, plan: &ExecutionPlan, id: usize, affected: Option<Affected>, work: &mut Work) -> Result<()> {
-        let g=&plan.data.groups[id]; work.stats.groups_visited+=1;
-        let n=plan.roles[g.left[0]].definition.slots.len() as u64;
-        let m=plan.roles[g.right[0]].definition.slots.len() as u64;
-        work.stats.logical_routes_affected+=match affected {
-            Some(Affected::Both(_)) => 2*(n-1), Some(Affected::Left(_)) => 2*m,
-            Some(Affected::Right(_)) => 2*n, _ => g.route_options,
-        };
-        match affected {
-            Some(Affected::Both(s)) => {
-                self.anchor(plan,id,s,true,false,work)?;
-                self.anchor(plan,id,s^1,false,false,work)?;
-            },
-            Some(Affected::Left(s)) | Some(Affected::Right(s)) => {
-                let left=matches!(affected,Some(Affected::Left(_)));
-                for reverse in [false,true] { self.anchor(plan,id,s^usize::from(reverse),left,reverse,work)?; }
-            },
-            None | Some(Affected::Fixed) => {
-                // Missing prices stay in the factorized state, not in the query walk.
-                let left=g.kind == SignalRouteKind::Direct2 || n<=m;
-                let directions=if g.kind==SignalRouteKind::Direct2 {1}else{2};
-                for direction in 0..directions {
-                    let role=if left {g.left[direction]}else{g.right[direction]};
-                    for entry in &plan.roles[role].ordered {
-                        self.anchor(plan,id,entry.slot,left,direction==1,work)?;
-                    }
-                }
-            },
-        }
-        Ok(())
-    }
-    fn evaluate(&mut self, plan: &ExecutionPlan, scope: Scope, mut work: Work) -> Result<()> {
-        let started=Instant::now(); let before=work.stats.event_build_ns+work.stats.publication_ns;
-        match scope {
-            Scope::All => for id in 0..plan.data.groups.len() { self.group(plan,id,None,&mut work)?; },
-            Scope::Pool(id) => {
-                let address=self.prices.pools[id].address;
-                for &group_id in plan.graph.for_pool(address) {
-                    let group_id=group_id as usize;
-                    let affected=plan.affected(group_id,id)
-                        .context("graph index contains a pool without an executable signal role")?;
-                    self.group(plan,group_id,Some(affected),&mut work)?;
-                }
-            },
-            Scope::None => {},
-        }
-        self.flush(&mut work)?;
-        work.stats.query_ns=nanos(started).saturating_sub(work.stats.event_build_ns+work.stats.publication_ns-before);
-        self.scratch=work.pending;
+    fn evaluate(&mut self,mut work:Work)->Result<()>{
         work.stats.sequence=self.next_sequence();
-        work.stats.processing_ns=nanos(work.started); work.stats.completed_at_us=now_us();
+        work.stats.processing_ns=nanos(work.started);
+        work.stats.completed_at_us=now_us();
         self.production.record(&work.stats);
         self.emit(SignalEvent::Evaluated(work.stats))
     }
-}
-
-/// Compile a topology on a blocking worker. The active price consumer continues
-/// against its previous immutable generation; no event buffering is introduced.
-fn schedule_compile(builds:&mut JoinSet<Result<(ExecutionPlan,u64)>>,
-    catalog:Arc<WatchCatalog>, engine:&mut Engine, active:&ExecutionPlan,
-    depth:usize) -> Result<()> {
-    let before=engine.prices.pools.len();
-    for p in catalog.pools.iter() { engine.prices.bind(p.address,p.mint_a,p.mint_b)?; }
-    if engine.prices.pools.len()!=before {
-        // Pool IDs are append-only and may already be used by live events. Publish
-        // the expanded identity map BEFORE any per-pool price delta references it.
-        let started=Instant::now();let received=now_us();
-        let mut work=engine.begin(active,SignalTrigger::Catalog {
-            generation:active.data.graph_generation },started,received,None,depth);
-        engine.state(active,&mut work,true,false,Vec::new())?;
-        engine.evaluate(active,Scope::None,work)?;
+    fn install(&mut self,graph:Arc<GraphSnapshot>)->Result<()>{
+        if graph.generation==self.plan.graph_generation{return Ok(());}
+        let compact=graph.topologies.iter().map(|t|SignalTopology{
+            kind:match t.kind{RouteTopologyKind::Direct2=>SignalRouteKind::Direct2,
+                RouteTopologyKind::Direct3=>SignalRouteKind::Direct3,
+                RouteTopologyKind::Triangle3=>SignalRouteKind::Triangle3,
+                RouteTopologyKind::Triangle4=>SignalRouteKind::Triangle4},
+            settlement:t.settlement,target:t.target,bridge:t.bridge,
+            roles:t.roles,length:t.length}).collect::<Vec<_>>();
+        self.index.install(graph.clone(),&self.prices);
+        let plan=Arc::new(SignalPlan{graph_generation:graph.generation,
+            log_weight_scale:SIGNAL_LOG_SCALE,roles:Arc::from([]),groups:Arc::from([]),
+            compact_topologies:compact.into(),route_options:graph.route_options});
+        let old=std::mem::replace(&mut self.plan,plan);
+        tokio::task::spawn_blocking(move||drop(old));
+        Ok(())
     }
-    let mut shadow=engine.prices.clone();
-    builds.spawn_blocking(move || {
-        let started=Instant::now();
-        let next=ExecutionPlan::compile(catalog,&mut shadow)?;
-        Ok((next,nanos(started)))
-    });
-    Ok(())
 }
-
-pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<WatchCatalog>>,
-    output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings) -> Result<ProductionReport> {
-    let mut e=Engine { prices:Prices::default(),output,settings,sequence:0,revision:0,
-        threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,production:ProductionReport::default(),
-        scratch:Vec::with_capacity(SIGNAL_BLOCK_RANGES) };
-    let outcome: Result<()> = async {
-        let started=Instant::now(); let received=now_us();
-        let mut plan=ExecutionPlan::empty();
-        let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:0 },started,received,None,input.len());
-        e.state(&plan,&mut work,true,false,Vec::new())?;
-        e.evaluate(&plan,Scope::None,work)?;
-        let mut builds=JoinSet::<Result<(ExecutionPlan,u64)>>::new();
-        let mut pending_catalog:Option<Arc<WatchCatalog>>=None;
+pub async fn run(mut input:PriceEventStream,mut catalogs:watch::Receiver<Arc<WatchCatalog>>,
+    output:broadcast::Sender<Arc<SignalEvent>>,settings:Settings)->Result<ProductionReport>{
+    let initial=Arc::new(SignalPlan{graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
+        roles:Arc::from([]),groups:Arc::from([]),compact_topologies:Arc::from([]),route_options:0});
+    let mut e=Engine{prices:Prices::default(),plan:initial,index:CompactIndex::default(),
+        output,settings,sequence:0,revision:0,
+        threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,
+        production:ProductionReport::default()};
+    let outcome:Result<()>=async{
+        let started=Instant::now();let received=now_us();
+        let mut work=e.begin(SignalTrigger::Catalog{generation:0},started,received,None,input.len());
+        e.state(&mut work,true,false,Vec::new())?;e.evaluate(work)?;
         let mut catalog_open=true;
-        let initial=catalogs.borrow_and_update().clone();
-        if initial.generation!=0 {
-            schedule_compile(&mut builds,initial,&mut e,&plan,input.len())?;
-        }
-        crate::log_event!(Info,"graph signals started=true execution_layout={} output_layout={} price_hotpath_independent_of_plan_build=true execution=false",EXECUTION_LAYOUT,OUTPUT_LAYOUT);
-        loop { tokio::select! {
-            change=catalogs.changed(), if catalog_open => {
-                if change.is_err() { catalog_open=false; continue; }
-                let next=catalogs.borrow_and_update().clone();
-                if next.generation==plan.data.graph_generation { continue; }
-                if builds.is_empty() {
-                    schedule_compile(&mut builds,next,&mut e,&plan,input.len())?;
-                } else {
-                    // Coalesce topology generations, never hold price events for them.
-                    pending_catalog=Some(next);
-                }
+        crate::log_event!(Info,"graph signals cp6a started=true output_layout={} compact=true",OUTPUT_LAYOUT);
+        loop{tokio::select!{
+            change=catalogs.changed(),if catalog_open=>{
+                if change.is_err(){catalog_open=false;continue;}
+                let c=catalogs.borrow_and_update().clone();
+                if c.generation==e.plan.graph_generation{continue;}
+                let started=Instant::now();let received=now_us();
+                for p in c.pools.iter(){e.prices.bind(p.address,p.mint_a,p.mint_b)?;}
+                e.install(c.graph.clone())?;
+                let mut work=e.begin(SignalTrigger::Catalog{generation:c.generation},
+                    started,received,None,input.len());
+                work.stats.plan_build_ns=nanos(started);
+                e.state(&mut work,true,false,Vec::new())?;
+                e.production.plan(&e.plan,&e.index,&e.prices,work.stats.plan_build_ns);
+                e.evaluate(work)?;
             },
-            result=builds.join_next(), if !builds.is_empty() => {
-                let (mut next,build_ns)=result.context("missing signal plan build")?
-                    .context("signal plan build task panicked")??;
-                // Always install the first completed real plan. With graph generations
-                // arriving faster than a compile, discarding stale completed plans
-                // would otherwise starve the signal engine indefinitely.
-                let upcoming=pending_catalog.take()
-                    .filter(|catalog|catalog.generation>next.data.graph_generation);
-                next.rebase(&e.prices);
-                let old=std::mem::replace(&mut plan,next);
-                // Do not drop millions of ordered role/group allocations on the price task.
-                tokio::task::spawn_blocking(move || drop(old));
-                let started=Instant::now(); let received=now_us();
-                let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:plan.data.graph_generation },started,received,None,input.len());
-                work.stats.plan_build_ns=build_ns;
-                e.state(&plan,&mut work,true,false,Vec::new())?;
-                e.production.plan(&plan,&e.prices,build_ns);
-                // Structural publication is not a price trigger. Price WS updates
-                // continue through the active plan during future compiles.
-                e.evaluate(&plan,Scope::None,work)?;
-                if let Some(newer)=upcoming {
-                    schedule_compile(&mut builds,newer,&mut e,&plan,input.len())?;
-                }
-            },
-            event=input.recv() => match event {
-                Ok(event) => match event.as_ref() {
-                    MarketStateEvent::Price(p) => {
-                        let started=Instant::now(); let received=now_us(); let preparing=Instant::now();
-                        let (pool,old)=e.prices.observe(p)?; let preparation_ns=nanos(preparing);
-                        let indexing=Instant::now(); plan.refresh(&e.prices,&old)?; let index_ns=nanos(indexing);
-                        let trigger=SignalTrigger::Price { pool,sequence:p.sequence,origin:p.origin,received_at_us:p.received_at_us };
-                        let mut work=e.begin(&plan,trigger,started,received,p.pipeline,input.len());
-                        work.stats.price_preparation_ns=preparation_ns; work.stats.index_update_ns=index_ns;
-                        work.stats.logarithms_prepared=1;
-                        let id=old.pool; work.previous=Some(old);
-                        let changes=vec![e.prices.change(id)]; e.state(&plan,&mut work,false,false,changes)?;
-                        e.evaluate(&plan,Scope::Pool(id),work)?;
+            event=input.recv()=>match event{
+                Ok(event)=>match event.as_ref(){
+                    MarketStateEvent::Price(p)=>{
+                        let started=Instant::now();let received=now_us();let preparing=Instant::now();
+                        let (address,old)=e.prices.observe(p)?;
+                        let preparation_ns=nanos(preparing);
+                        let index_start=Instant::now();
+                        let change=e.index.refresh(address,&old,&e.prices)?;
+                        let index_ns=nanos(index_start);
+                        let mut work=e.begin(SignalTrigger::Price{pool:address,
+                            sequence:p.sequence,origin:p.origin,received_at_us:p.received_at_us},
+                            started,received,p.pipeline,input.len());
+                        work.stats.price_preparation_ns=preparation_ns;
+                        work.stats.index_update_ns=index_ns;work.stats.logarithms_prepared=1;
+                        e.state(&mut work,false,false,vec![e.prices.change(old.pool)])?;
+                        if change{e.candidates(&mut work,address)?;}
+                        e.evaluate(work)?;
                     },
-                    MarketStateEvent::Unavailable { pool,sequence,.. } | MarketStateEvent::Removed { pool,sequence } => {
-                        let reason=match event.as_ref() { MarketStateEvent::Unavailable { reason,.. } => reason.clone(), _ => "pool removed".into() };
-                        let started=Instant::now(); let received=now_us();
-                        let id=e.prices.index.get(&pool.parse::<Pubkey>()?).copied();
-                        let mut old=None;
-                        if let Some(id)=id {
-                            let p=Previous { pool:id,price:e.prices.values[id].take() }; plan.refresh(&e.prices,&p)?; old=Some(p);
+                    MarketStateEvent::Unavailable{pool,sequence,..}|MarketStateEvent::Removed{pool,sequence}=>{
+                        let started=Instant::now();let received=now_us();
+                        let address:Pubkey=pool.parse().context("unavailable pool key")?;
+                        let id=e.prices.index.get(&address).copied();
+                        let mut changed=false;
+                        if let Some(id)=id{
+                            let old=Previous{pool:id,price:e.prices.values[id].take()};
+                            changed=e.index.refresh(address,&old,&e.prices)?;
                         }
-                        let mut work=e.begin(&plan,SignalTrigger::Coverage { sequence:*sequence,reason },started,received,None,input.len());
-                        work.stats.index_update_ns=nanos(started); work.previous=old;
+                        let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,
+                            reason:"pool unavailable or removed".into()},started,received,None,input.len());
                         let changes=id.map(|i|e.prices.change(i)).into_iter().collect();
-                        e.state(&plan,&mut work,false,false,changes)?;
-                        e.evaluate(&plan,id.map_or(Scope::None,Scope::Pool),work)?;
+                        e.state(&mut work,false,false,changes)?;
+                        if changed{e.candidates(&mut work,address)?;}
+                        e.evaluate(work)?;
                     },
-                    MarketStateEvent::Gap { sequence,.. } | MarketStateEvent::Selection { sequence,.. } => {
-                        let started=Instant::now(); let received=now_us(); let mut changes=Vec::new();
-                        let (clear,reason)=match event.as_ref() {
-                            MarketStateEvent::Gap { reason,.. } => {
-                                e.prices.values.fill(None); for role in &mut plan.roles { role.ordered.clear(); }
-                                (true,reason.clone())
-                            },
-                            MarketStateEvent::Selection { selected,.. } => {
-                                let selected=selected.iter().map(|p|p.parse::<Pubkey>()).collect::<Result<HashSet<_>,_>>()?;
-                                for id in 0..e.prices.pools.len() {
-                                    if e.prices.values[id].is_some() && !selected.contains(&e.prices.pools[id].address) {
-                                        let old=Previous { pool:id,price:e.prices.values[id].take() };
-                                        plan.refresh(&e.prices,&old)?; changes.push(e.prices.change(id));
-                                    }
-                                }
-                                (false,"observation selection reconciled".into())
-                            }, _ => unreachable!(),
-                        };
-                        let mut work=e.begin(&plan,SignalTrigger::Coverage { sequence:*sequence,reason },started,received,None,input.len());
-                        work.stats.index_update_ns=nanos(started);
-                        e.state(&plan,&mut work,false,clear,changes)?; e.evaluate(&plan,Scope::None,work)?;
+                    MarketStateEvent::Gap{sequence,reason}=>{
+                        let started=Instant::now();let received=now_us();
+                        e.prices.values.fill(None);
+                        e.index.install(e.index.graph.clone(),&e.prices);
+                        let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,reason:reason.clone()},
+                            started,received,None,input.len());
+                        e.state(&mut work,false,true,Vec::new())?;e.evaluate(work)?;
                     },
-                    MarketStateEvent::Stats { .. } => {},
+                    MarketStateEvent::Selection{sequence,selected,..}=>{
+                        let started=Instant::now();let received=now_us();
+                        let selected=selected.iter().map(|p|p.parse::<Pubkey>())
+                            .collect::<Result<HashSet<_>,_>>()?;
+                        let mut changes=Vec::new();
+                        let mut affected=HashSet::new();
+                        for id in 0..e.prices.pools.len(){
+                            let address=e.prices.pools[id].address;
+                            if e.prices.values[id].is_some()&&!selected.contains(&address){
+                                let old=Previous{pool:id,price:e.prices.values[id].take()};
+                                if e.index.refresh(address,&old,&e.prices)?{affected.insert(address);}
+                                changes.push(e.prices.change(id));
+                            }
+                        }
+                        let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,
+                            reason:"observation selection reconciled".into()},started,received,None,input.len());
+                        e.state(&mut work,false,false,changes)?;
+                        for address in affected{e.candidates(&mut work,address)?;}
+                        e.evaluate(work)?;
+                    },
+                    MarketStateEvent::Stats{..}=>{},
                 },
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let started=Instant::now(); let received=now_us();
-                    e.prices.values.fill(None); for role in &mut plan.roles {role.ordered.clear();}
-                    let mut work=e.begin(&plan,SignalTrigger::Coverage {sequence:0,
-                        reason:format!("price stream lost {n} inputs; state invalid")},started,received,None,input.len());
-                    e.state(&plan,&mut work,false,true,Vec::new())?;
-                    e.evaluate(&plan,Scope::None,work)?;
+                Err(broadcast::error::RecvError::Lagged(n))=>{
+                    e.prices.values.fill(None);
+                    e.index.install(e.index.graph.clone(),&e.prices);
+                    let started=Instant::now();let received=now_us();
+                    let mut work=e.begin(SignalTrigger::Coverage{sequence:0,
+                        reason:format!("price stream lost {n} inputs; state invalid")},
+                        started,received,None,input.len());
+                    e.state(&mut work,false,true,Vec::new())?;
+                    e.evaluate(work)?;
                     bail!("signal price stream lost {n} inputs; state invalid");
                 },
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed)=>break,
             },
         }}
         Ok(())
     }.await;
-    e.production.error=outcome.err().map(|x|format!("{x:#}"));
+    e.production.error=outcome.err().map(|e|format!("{e:#}"));
     e.production.final_price_pools=e.prices.values.iter().filter(|p|p.is_some()).count();
     e.production.final_available_directions=e.prices.values.iter().flatten()
         .map(|p|p.log_weight_units.iter().filter(|w|w.is_some()).count()).sum();
-    crate::log_event!(Info,"graph signals producer complete={} evaluations={} websocket={} ranges={} error={:?}",
-        e.production.error.is_none(),e.production.counts.evaluations,e.production.counts.websocket_evaluations,
-        e.production.counts.ranges,e.production.error);
+    crate::log_event!(Info,"graph signals cp6a complete={} websocket={} candidates={} error={:?}",
+        e.production.error.is_none(),e.production.counts.websocket_evaluations,
+        e.production.counts.candidates,e.production.error);
     Ok(e.production)
 }
-
 #[derive(Clone)]
 struct Histogram { bins: [u64; 64], count: u64, total: u128, min: u64, max: u64 }
 impl Default for Histogram {
