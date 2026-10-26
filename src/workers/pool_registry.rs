@@ -482,7 +482,7 @@ impl PoolRegistry {
                 let decision=admission.admission(pool);
                 if decision!=pool.completion_admission {
                     let previous=pool.completion_admission;
-                    crate::log_event!(Info,"pool admission_transition event={}",
+                    crate::log_event!(Debug,"pool admission_transition event={}",
                         json!({
                             "pool":address.to_string(),"venue":format!("{:?}",pool.venue),
                             "source":"mint_qualification","received_at_ms":now,
@@ -646,7 +646,7 @@ impl PoolRegistry {
                     current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
                         changed=true;
-                        crate::log_event!(Info,"pool admission_transition event={}",
+                        crate::log_event!(Debug,"pool admission_transition event={}",
                             json!({
                                 "pool":current.address.to_string(),
                                 "venue":format!("{:?}",current.venue),
