@@ -12,7 +12,7 @@ use crate::core::{
         SignalPoolPrice, SignalPriceChange, SignalRangeBlock, SignalRangeChange, SignalRole,
         SignalRouteKind, SignalRouteRange, SignalSnapshot, SignalStateUpdate, SignalStream,
         SignalTrigger, SignalWitness, SIGNAL_BLOCK_RANGES, SIGNAL_LOG_SCALE}};
-use super::{graph_liquidity::GroupKind, graph_watch_catalog::WatchCatalog};
+use super::{graph_liquidity::{GroupKind, GraphSnapshot}, graph_watch_catalog::WatchCatalog};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -131,11 +131,10 @@ impl OrderedRole {
 }
 #[derive(Clone, Copy)]
 enum Affected { Both(usize), Left(usize), Right(usize), Fixed }
-#[derive(Clone, Copy)]
-struct Binding { group: usize, affected: Affected }
+/// Price ordering is dynamic; static pool -> group references are owned by GraphSnapshot.
 struct ExecutionPlan {
+    graph: Arc<GraphSnapshot>,
     data: Arc<SignalPlan>, roles: Vec<OrderedRole>, slot_roles: Vec<Option<usize>>,
-    offsets: Vec<usize>, bindings: Vec<Binding>,
 }
 fn compile_role(prices: &Prices, pools: &Arc<[Pubkey]>, input: Pubkey, output: Pubkey,
     cache: &mut HashMap<(Pubkey,Pubkey),usize>, roles: &mut Vec<OrderedRole>,
@@ -164,7 +163,6 @@ impl ExecutionPlan {
         let mut roles = Vec::new(); let mut cache = HashMap::new();
         let mut slot_roles = vec![None; 2*prices.pools.len()];
         let mut groups = Vec::with_capacity(catalog.graph.groups.len());
-        let mut by_pool = vec![Vec::<Binding>::new(); prices.pools.len()];
         let wsol: Pubkey = WSOL.parse()?; let usdc: Pubkey = USDC.parse()?;
         for (id,g) in catalog.graph.groups.iter().enumerate() {
             let s=g.settlement; let t=g.target;
@@ -207,27 +205,12 @@ impl ExecutionPlan {
                 ensure!(n>=2,"Direct2 requires distinct pools"); n.checked_mul(n-1)
             } else { n.checked_mul(m).and_then(|x|x.checked_mul(2)) }.context("route count overflow")?;
             ensure!(expected == g.route_options, "graph/signal route count differs");
-            for &slot in roles[left[0]].definition.slots.iter() { by_pool[slot/2].push(Binding {
-                group:id, affected:if kind == SignalRouteKind::Direct2 { Affected::Both(slot) } else { Affected::Left(slot) },
-            }); }
-            if kind != SignalRouteKind::Direct2 {
-                for &slot in roles[right[0]].definition.slots.iter() {
-                    by_pool[slot/2].push(Binding { group:id, affected:Affected::Right(slot) });
-                }
-            }
-            for &slot in &fixed[..fixed_count] { by_pool[slot/2].push(Binding { group:id, affected:Affected::Fixed }); }
             groups.push(SignalGroup { kind,left,right,fixed,fixed_count,mints,route_options:expected });
-        }
-        let mut offsets=vec![0]; let mut bindings=Vec::new();
-        for (id,entries) in by_pool.into_iter().enumerate() {
-            ensure!(entries.iter().map(|b|b.group as u32).eq(catalog.graph.for_pool(prices.pools[id].address).iter().copied()),
-                "signal dependency index differs from graph");
-            bindings.extend(entries); offsets.push(bindings.len());
         }
         let definitions=roles.iter().map(|r|r.definition.clone()).collect::<Vec<_>>().into();
         let data=Arc::new(SignalPlan { graph_generation:catalog.generation,log_weight_scale:SIGNAL_LOG_SCALE,roles:definitions,
             groups:groups.into(),route_options:catalog.graph.route_options });
-        Ok(Self { data,roles,slot_roles,offsets,bindings })
+        Ok(Self { graph:catalog.graph.clone(),data,roles,slot_roles })
     }
     fn refresh(&mut self, prices: &Prices, old: &Previous) -> Result<()> {
         for slot in [2*old.pool,2*old.pool+1] {
@@ -244,10 +227,22 @@ impl ExecutionPlan {
         }
         Ok(())
     }
-    fn for_pool(&self, id: usize) -> &[Binding] {
-        match (self.offsets.get(id),self.offsets.get(id+1)) {
-            (Some(&a),Some(&b)) => &self.bindings[a..b], _ => &[],
+    fn affected(&self, group_id: usize, pool_id: usize) -> Option<Affected> {
+        let group = self.data.groups.get(group_id)?;
+        let role = self.slot_roles.get(2 * pool_id).copied().flatten();
+        if group.kind == SignalRouteKind::Direct2 && role.is_some_and(|id|group.left.contains(&id)) {
+            return Some(Affected::Both(2 * pool_id));
         }
+        if role.is_some_and(|id| group.left.contains(&id)) {
+            return Some(Affected::Left(2 * pool_id));
+        }
+        if role.is_some_and(|id| group.right.contains(&id)) {
+            return Some(Affected::Right(2 * pool_id));
+        }
+        if group.fixed[..group.fixed_count].iter().any(|&slot| slot / 2 == pool_id) {
+            return Some(Affected::Fixed);
+        }
+        None
     }
 }
 enum Scope { All, Pool(usize), None }
@@ -420,7 +415,15 @@ impl Engine {
         let started=Instant::now(); let before=work.stats.event_build_ns+work.stats.publication_ns;
         match scope {
             Scope::All => for id in 0..plan.data.groups.len() { self.group(plan,id,None,&mut work)?; },
-            Scope::Pool(id) => for b in plan.for_pool(id) { self.group(plan,b.group,Some(b.affected),&mut work)?; },
+            Scope::Pool(id) => {
+                let address=self.prices.pools[id].address;
+                for &group_id in plan.graph.for_pool(address) {
+                    let group_id=group_id as usize;
+                    let affected=plan.affected(group_id,id)
+                        .context("graph index contains a pool without an executable signal role")?;
+                    self.group(plan,group_id,Some(affected),&mut work)?;
+                }
+            },
             Scope::None => {},
         }
         self.flush(&mut work)?;
@@ -671,7 +674,8 @@ impl ProductionReport {
             "groups":p.data.groups.len(),"logical_routes":p.data.route_options,
             "role_slot_references":p.roles.iter().map(|r|r.definition.slots.len()).sum::<usize>(),
             "ordered_entries_at_install":p.roles.iter().map(|r|r.ordered.len()).sum::<usize>(),
-            "dependency_bindings":p.bindings.len(),"build_ns":ns,
+            "dependency_bindings":p.graph.pool_index.values().map(Vec::len).sum::<usize>(),
+            "dependency_index_shared":true,"build_ns":ns,
         }));
         crate::log_event!(Info,"graph signals plan={}",self.last_plan.as_ref().unwrap());
     }
