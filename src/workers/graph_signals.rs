@@ -247,15 +247,23 @@ impl ExecutionPlan {
     }
     fn affected(&self, group_id: usize, pool_id: usize) -> Option<Affected> {
         let group = self.data.groups.get(group_id)?;
-        let role = self.slot_roles.get(2 * pool_id).copied().flatten();
-        if group.kind == SignalRouteKind::Direct2 && role.is_some_and(|id|group.left.contains(&id)) {
-            return Some(Affected::Both(2 * pool_id));
+        // A pool's canonical slot (2*id) is not necessarily the forward
+        // trading direction for this topology. Recover the exact forward slot
+        // from the shared directed-role index, as the prior Binding table did.
+        let first=2*pool_id;
+        let forward=|role_id:usize| -> Option<usize> {
+            [first,first+1].into_iter()
+                .find(|&slot|self.slot_roles.get(slot)==Some(&Some(role_id)))
+        };
+        if let Some(slot)=forward(group.left[0]) {
+            return Some(if group.kind==SignalRouteKind::Direct2 {
+                Affected::Both(slot)
+            } else {
+                Affected::Left(slot)
+            });
         }
-        if role.is_some_and(|id| group.left.contains(&id)) {
-            return Some(Affected::Left(2 * pool_id));
-        }
-        if role.is_some_and(|id| group.right.contains(&id)) {
-            return Some(Affected::Right(2 * pool_id));
+        if let Some(slot)=forward(group.right[0]) {
+            return Some(Affected::Right(slot));
         }
         if group.fixed[..group.fixed_count].iter().any(|&slot| slot / 2 == pool_id) {
             return Some(Affected::Fixed);
