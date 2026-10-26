@@ -70,6 +70,8 @@ def run(args):
     per_pool = collections.defaultdict(list)
     observed_count = 0
     published_count = 0
+    cancelled_count = 0
+    no_op_windows = 0
     csv_fields = list(event_record({}).keys())
     with (out/"pool_transitions.csv").open("w", newline="", encoding="utf-8") as target, \
          (out/"published_transitions.csv").open("w", newline="", encoding="utf-8") as published_target:
@@ -86,19 +88,25 @@ def run(args):
                     raise RuntimeError(f"Invalid graph JSONL line {lineno}: {exc}") from exc
                 action=event.get("event")
                 audit_seen[action]+=1
+                if action=="audit_no_op_complete":
+                    no_op_windows+=1
+                    continue
                 if action=="audit_generation_complete":
                     ident=as_int(event.get("generation"))
                     if ident in audit_by_gen:
                         raise RuntimeError(f"Duplicate audit completion for generation {ident}")
                     audit_by_gen[ident]=event
                     continue
-                if action not in ("observed","published"):
+                if action not in ("observed","published","cancelled"):
                     raise RuntimeError(f"Unknown audit event {action!r} on line {lineno}")
                 record=event_record(event)
                 p=record["pool"]
                 timestamp=as_int(record.get("observed_at_ms"))
                 minute_id=max(0,(timestamp-started)//60000) if started else 0
                 minute[minute_id][action]+=1
+                if action=="cancelled":
+                    cancelled_count+=1
+                    continue
                 if action=="observed":
                     observed_csv.writerow(record)
                     observed_count+=1
@@ -141,6 +149,7 @@ def run(args):
     graph_rows={}
     graph_summaries={}
     graph_impacts={}
+    verified={}
     gaps=[]
     websocket_providers=collections.defaultdict(collections.Counter)
     http_stats={}
@@ -167,6 +176,9 @@ def run(args):
             gen=as_int(values.get("generation"))
             graph_summaries[gen]={k:values.get(k) for k in (
                 "observed","effective","no_effect","distinct","bootstrap","batches")}
+        if "graph reference_verified generation=" in line:
+            gen=as_int(values.get("generation"))
+            verified[gen]=values
         if "graph impact generation=" in line:
             gen=as_int(values.get("generation"))
             graph_impacts[gen]={k:values.get(k) for k in (
@@ -205,6 +217,8 @@ def run(args):
     rows=[]
     for gen in all_gen:
         row={"generation":gen,**graph_rows.get(gen,{}),**{
+            "reference_verified":gen in verified,
+            "reference_us":verified.get(gen,{}).get("reference_us"),
             "transition_"+k:v for k,v in graph_summaries.get(gen,{}).items()},
             **graph_impacts.get(gen,{})}
         check=audit_by_gen.get(gen)
@@ -225,7 +239,7 @@ def run(args):
         ["generation",*FIELDS,*["transition_"+k for k in
          ("observed","effective","no_effect","distinct","bootstrap","batches")],
          "conversion_pair_changed","recomputed_pct","registry_queue_depth",
-         "audit_observed","audit_published"]))
+         "audit_observed","audit_published","reference_verified","reference_us"]))
     csv_write(out/"graph_generations.csv",columns,rows)
     csv_write(out/"websocket_gap_events.csv",
               ["timestamp_ms","provider","source","reason"],gaps)
@@ -266,9 +280,12 @@ def run(args):
         "audited_generations":complete_count,
         "transition_observed":observed_count,
         "transition_published":published_count,
+        "transition_cancelled_before_build":cancelled_count,
+        "graph_no_op_windows":no_op_windows,
         "unique_changed_pools":len(per_pool),
         "zero_effect_generations":zero_effect,
-        "no_effect_dirty_total":sum(as_int(s.get("no_effect")) for s in graph_summaries.values()),
+        "no_effect_dirty_total":sum(as_int(s.get("no_effect")) for s in graph_summaries.values()), 
+        "reference_verified_generations":sum(bool(row.get("reference_verified")) for row in rows),
         "flapping_pools":sum(bool(p["remove_then_add"]) for p in flap_records),
         "top_flapping":flap_records[:20],
         "source_counts":dict(changed_by_source),
