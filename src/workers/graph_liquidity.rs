@@ -4,13 +4,15 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
+    fs::File,
+    io::{BufWriter, Write},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
+use tokio::{sync::{broadcast, watch, mpsc}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
 
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
 
@@ -146,6 +148,51 @@ fn transition_json(t:&ObservedTransition,generation:u64,event:&str,
         "before":evidence_json(t.before_evidence.as_ref()),
         "after":evidence_json(Some(&t.after_evidence)),
     })
+}
+
+/// Private graph telemetry. One bounded generation queue, one blocking buffered
+/// writer. The Registry/Graph Tokio task never serializes JSON or writes to
+/// stdout for individual pool transitions. A full queue fails explicitly:
+/// evidence is never silently sampled/dropped.
+struct AuditBatch {
+    generation:u64,
+    bootstrap:bool,
+    traces:Vec<ObservedTransition>,
+    before_pairs:HashMap<Pubkey,Option<Pair>>,
+    after_pairs:HashMap<Pubkey,Option<Pair>>,
+}
+fn write_audit_batch(writer:&mut BufWriter<File>, batch:AuditBatch)->Result<()>{
+    let AuditBatch{generation,bootstrap,traces,before_pairs,after_pairs}=batch;
+    let get_after=|address:&Pubkey|after_pairs.get(address).copied().flatten();
+    let mut observed=0_u64;
+    let mut published=0_u64;
+    for t in &traces {
+        let prior=before_pairs.get(&t.address).copied().flatten();
+        let after=get_after(&t.address);
+        serde_json::to_writer(&mut *writer,
+            &transition_json(t,generation,"observed",prior,after,prior!=after))?;
+        writer.write_all(b"\n")?;
+        observed+=1;
+    }
+    for (&address,&before) in &before_pairs {
+        let after=get_after(&address);
+        if before==after{continue;}
+        if let Some(t)=traces.iter().rev().find(|t|t.address==address){
+            serde_json::to_writer(&mut *writer,
+                &transition_json(t,generation,"published",before,after,true))?;
+            writer.write_all(b"\n")?;
+            published+=1;
+        }
+    }
+    serde_json::to_writer(&mut *writer,&serde_json::json!({
+        "event":"audit_generation_complete","generation":generation,
+        "bootstrap":bootstrap,"observed":observed,"published":published,
+        "distinct_pools":before_pairs.len(),
+        "no_effect":before_pairs.len().saturating_sub(published as usize)
+    }))?;
+    writer.write_all(b"\n")?;
+    writer.flush().context("flush graph audit generation")?;
+    Ok(())
 }
 
 fn pair(a: Pubkey, b: Pubkey) -> Pair {
@@ -451,6 +498,21 @@ pub async fn run(
     let mut last_source="persistence_restore";
     let mut next_rebuild=TokioInstant::now();
     let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str,Vec<ObservedTransition>,HashMap<Pubkey,Option<Pair>>,bool)>>::new();
+    let (audit_tx, audit_writer)=match std::env::var("GRAPH_DIAGNOSTIC_JSONL_PATH") {
+        Ok(path) if !path.trim().is_empty()=>{
+            let file=File::create(&path).with_context(||format!("create graph audit {path}"))?;
+            let (tx,mut rx)=mpsc::channel::<AuditBatch>(32);
+            let join=tokio::task::spawn_blocking(move||->Result<()>{
+                let mut writer=BufWriter::with_capacity(1024*1024,file);
+                while let Some(batch)=rx.blocking_recv(){write_audit_batch(&mut writer,batch)?;}
+                writer.flush().context("flush graph audit shutdown")?;
+                Ok(())
+            });
+            crate::log_event!(Info,"graph audit enabled=true output={} buffered_async=true queue_generations=32",path);
+            (Some(tx),Some(join))
+        },
+        _=>(None,None)
+    };
     loop {
         if !source_open&&dirty.is_empty()&&builds.is_empty(){break;}
         tokio::select!{
@@ -510,26 +572,13 @@ pub async fn run(
                     "graph transition_summary generation={} bootstrap={} observed={} distinct={} effective={} no_effect={} batches={} source_counts={}",
                     graph.generation,bootstrap,traces.len(),before_pairs.len(),
                     effective,no_effect,batches,serde_json::json!(source_counts));
-                if !bootstrap {
-                    for t in &traces {
-                        let prior=before_pairs.get(&t.address).copied().flatten();
-                        let after=graph.pair_for_pool(t.address);
-                        let published_effective=prior!=after;
-                        crate::log_event!(Info,"graph pool_transition event={}",
-                            transition_json(t,graph.generation,"observed",
-                                prior,after,published_effective));
-                    }
-                    // One published transition per actual changed identity. The
-                    // observed stream above can include multiple flips for one pool.
-                    for (&pool,&before) in &before_pairs {
-                        let after=graph.pair_for_pool(pool);
-                        if before==after {continue;}
-                        if let Some(t)=traces.iter().rev().find(|t|t.address==pool) {
-                            crate::log_event!(Info,"graph pool_transition event={}",
-                                transition_json(t,graph.generation,"published",
-                                    before,after,true));
-                        }
-                    }
+                if let Some(ref sink)=audit_tx {
+                    let after_pairs=before_pairs.keys()
+                        .map(|pool|(*pool,graph.pair_for_pool(*pool)))
+                        .collect::<HashMap<_,_>>();
+                    sink.try_send(AuditBatch{
+                        generation:graph.generation,bootstrap,traces,before_pairs,after_pairs,
+                    }).map_err(|e|anyhow::anyhow!("graph audit queue full/closed: {e}"))?;
                 }
                 let total=graph.topologies.len();
                 crate::log_event!(Info,
@@ -538,6 +587,16 @@ pub async fn run(
                     graph.recomputed_targets,graph.regenerated_topologies,graph.reused_topologies,
                     batches,graph.qualified_pools,graph.mint_pairs,total,graph.role_pool_refs,
                     graph.route_options,graph.role_pool_refs,graph.approx_index_bytes,micros);
+                crate::log_event!(Info,
+                    "graph impact generation={} conversion_pair_changed={} recomputed_pct={:.2} reused_topologies={} pool_delta={} registry_queue_depth={}",
+                    graph.generation,
+                    graph.changed_pairs.iter().any(|&(a,b)|{
+                        (a==WSOL.parse::<Pubkey>().expect("wsol")&&b==USDC.parse::<Pubkey>().expect("usdc"))
+                        ||(b==WSOL.parse::<Pubkey>().expect("wsol")&&a==USDC.parse::<Pubkey>().expect("usdc"))
+                    }),
+                    100.0*graph.regenerated_topologies as f64
+                        /graph.topologies.len().max(1) as f64,
+                    graph.reused_topologies,effective,input.len());
                 let old=output.send_replace(Arc::new(graph));
                 tokio::task::spawn_blocking(move||drop(old));
             },
@@ -561,6 +620,10 @@ pub async fn run(
                 });
             },
         }
+    }
+    drop(audit_tx);
+    if let Some(writer)=audit_writer {
+        writer.await.context("graph audit writer join")??;
     }
     let graph=output.borrow().clone();
     crate::log_event!(Info,"graph complete generation={} prepared={} compact_topologies={} legacy_groups=0",
