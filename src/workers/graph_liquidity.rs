@@ -460,7 +460,16 @@ pub async fn run(
                     for pool in &batch.pools {
                         let next=eligible(pool);
                         let before=prepared.get(&pool.address).copied();
-                        if before==next {continue;}
+                        if before==next {
+                            // Track the latest Registry evidence for previously
+                            // admitted pools even when the graph identity is stable.
+                            // Otherwise "before" could be an old TVL/Completion
+                            // snapshot unrelated to the eventual withdrawal.
+                            if previous_evidence.contains_key(&pool.address){
+                                previous_evidence.insert(pool.address,evidence(pool));
+                            }
+                            continue;
+                        }
                         let at=now_ms();
                         let duration=previous_transition_at.insert(pool.address,at)
                             .map(|last|at.saturating_sub(last));
