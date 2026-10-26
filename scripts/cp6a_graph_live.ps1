@@ -85,7 +85,7 @@ try {
     Write-Host "Starting real $DurationSeconds-second CP6A run, no V10 execution"
     & $binary --run 2>&1 | Tee-Object -FilePath $log
     $exitCode=$LASTEXITCODE
-    $selection=@(Select-String -LiteralPath $log -Pattern 'market state cp6a coverage selected='|Select-Object -Last 1)
+    $selection=@(Select-String -LiteralPath $log -Pattern 'market state cp5 coverage selected='|Select-Object -Last 1)
     $progress=@(Select-String -LiteralPath $log -Pattern 'market state hydration progress selected='|Select-Object -Last 1)
     $production=if(Test-Path -LiteralPath $productionPath){Get-Content $productionPath -Raw | ConvertFrom-Json}else{$null}
     $consumer=if(Test-Path -LiteralPath $consumerPath){Get-Content $consumerPath -Raw | ConvertFrom-Json}else{$null}
