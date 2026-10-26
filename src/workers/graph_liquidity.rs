@@ -174,10 +174,13 @@ fn write_audit_batch(writer:&mut BufWriter<File>, batch:AuditBatch)->Result<()>{
         writer.write_all(b"\n")?;
         observed+=1;
     }
+    let mut latest=HashMap::new();
+    for (i,t) in traces.iter().enumerate(){latest.insert(t.address,i);}
     for (&address,&before) in &before_pairs {
         let after=get_after(&address);
         if before==after{continue;}
-        if let Some(t)=traces.iter().rev().find(|t|t.address==address){
+        if let Some(&index)=latest.get(&address){
+            let t=&traces[index];
             serde_json::to_writer(&mut *writer,
                 &transition_json(t,generation,"published",before,after,true))?;
             writer.write_all(b"\n")?;
@@ -590,10 +593,9 @@ pub async fn run(
                 crate::log_event!(Info,
                     "graph impact generation={} conversion_pair_changed={} recomputed_pct={:.2} reused_topologies={} pool_delta={} registry_queue_depth={}",
                     graph.generation,
-                    graph.changed_pairs.iter().any(|&(a,b)|{
+                    graph.changed_pairs.iter().any(|&(a,b)|
                         (a==WSOL.parse::<Pubkey>().expect("wsol")&&b==USDC.parse::<Pubkey>().expect("usdc"))
-                        ||(b==WSOL.parse::<Pubkey>().expect("wsol")&&a==USDC.parse::<Pubkey>().expect("usdc"))
-                    }),
+                        ||(b==WSOL.parse::<Pubkey>().expect("wsol")&&a==USDC.parse::<Pubkey>().expect("usdc"))),
                     100.0*graph.regenerated_topologies as f64
                         /graph.topologies.len().max(1) as f64,
                     graph.reused_topologies,effective,input.len());
