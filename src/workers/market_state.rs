@@ -829,32 +829,31 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 fn watch_cost(v:CoreVenue)->usize {
     match v {CoreVenue::PumpSwap|CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
 }
-fn route_kind(g:&super::graph_liquidity::Group)->usize {
-    match (g.bridge.is_some(),g.conversion.is_some()) {
-        (false,false)=>0,(false,true)=>1,(true,false)=>2,(true,true)=>3,
-    }
+fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
+    use super::graph_liquidity::RouteTopologyKind as K;
+    match t.kind{K::Direct2=>0,K::Direct3=>1,K::Triangle3=>2,K::Triangle4=>3}
 }
-fn route_options_added(g:&super::graph_liquidity::Group,selected:&HashSet<Pubkey>,additional:&[Pubkey])->u64 {
+fn route_options_added(t:&super::graph_liquidity::RouteTopology,
+    graph:&super::graph_liquidity::GraphSnapshot,
+    selected:&HashSet<Pubkey>,additional:&[Pubkey])->u64{
     let included=|p:&Pubkey|selected.contains(p)||additional.contains(p);
-    let n=g.direct_s.iter().filter(|p|included(p)).count() as u64;
-    if g.bridge.is_none() && g.conversion.is_none() {
-        return n.saturating_mul(n.saturating_sub(1));
+    let mut counts=[0_u64;4];
+    for (i,&(a,b)) in t.directed_roles().iter().enumerate(){
+        counts[i]=graph.pools_for_pair(a,b).iter().filter(|p|included(p)).count() as u64;
     }
-    let other=if g.bridge.is_some(){&g.bridge_pools}else{&g.direct_q};
-    let m=other.iter().filter(|p|included(p)).count() as u64;
-    if g.intermediate.is_some_and(|p|!included(&p))
-        ||g.conversion.is_some_and(|p|!included(&p)){return 0;}
-    n.saturating_mul(m).saturating_mul(2)
+    if route_kind(t)==0{return counts[0].saturating_mul(counts[0].saturating_sub(1));}
+    (0..t.length).fold(2_u64,|n,i|n.saturating_mul(counts[i]))
 }
-fn route_options_selected(g:&super::graph_liquidity::Group,selected:&HashSet<Pubkey>)->u64{
-    route_options_added(g,selected,&[])
+fn route_options_selected(t:&super::graph_liquidity::RouteTopology,
+    graph:&super::graph_liquidity::GraphSnapshot,selected:&HashSet<Pubkey>)->u64{
+    route_options_added(t,graph,selected,&[])
 }
 fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->([usize;4],[u64;4]){
     let mut groups=[0_usize;4];let mut options=[0_u64;4];
-    for g in catalog.graph.groups.iter() {
-        let routes=route_options_selected(g,selected);
-        if routes>0 {
-            let kind=route_kind(g);groups[kind]+=1;
+    for t in catalog.graph.topologies.iter(){
+        let routes=route_options_selected(t,&catalog.graph,selected);
+        if routes>0{
+            let kind=route_kind(t);groups[kind]+=1;
             options[kind]=options[kind].saturating_add(routes);
         }
     }
@@ -884,7 +883,9 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     let mut used=0_usize;
     // A small diversified conversion backbone is shared by Direct3/Triangle4.
     // Its legs are candidates from the SAME WatchCatalog, not independently discovered.
-    let mut conversions=catalog.graph.groups.iter().filter_map(|g|g.conversion)
+    let wsol:Pubkey="So11111111111111111111111111111111111111112".parse().expect("WSOL");
+    let usdc:Pubkey="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().expect("USDC");
+    let mut conversions=catalog.graph.pools_for_pair(wsol,usdc).iter().copied()
         .filter(|p|candidates.contains_key(p)).collect::<Vec<_>>();
     conversions.sort_unstable();conversions.dedup();
     conversions.sort_by(|a,b|quality[b].total_cmp(&quality[a]).then_with(||a.cmp(b)));
@@ -902,12 +903,12 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     // Do not pin eight accounts from one venue merely because they have high TVL.
     // Each (settlement,target) gets independent queues for all four route types.
     let mut groups=BTreeMap::<(Pubkey,Pubkey),[Vec<usize>;4]>::new();
-    for (id,g) in catalog.graph.groups.iter().enumerate(){
-        groups.entry((g.settlement,g.target)).or_insert_with(||std::array::from_fn(|_|Vec::new()))[route_kind(g)].push(id);
+    for (id,t) in catalog.graph.topologies.iter().enumerate(){
+        groups.entry((t.settlement,t.target)).or_insert_with(||std::array::from_fn(|_|Vec::new()))[route_kind(t)].push(id);
     }
     for lists in groups.values_mut(){
         for ids in lists {
-            ids.sort_by_key(|&id|(std::cmp::Reverse(catalog.graph.groups[id].route_options),id));
+            ids.sort_by_key(|&id|(std::cmp::Reverse(catalog.graph.topologies[id].route_options),id));
         }
     }
     let mut cursors=BTreeMap::<(Pubkey,Pubkey),[usize;4]>::new();
@@ -942,24 +943,20 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
             for kind in [1_usize,3,0,2] {
                 let ids=&lists[kind];
                 while cursors_for[kind]<ids.len() {
-                    let g=&catalog.graph.groups[ids[cursors_for[kind]]];
-                    let before=route_options_selected(g,&picked);
+                    let t=&catalog.graph.topologies[ids[cursors_for[kind]]];
+                    let before=route_options_selected(t,&catalog.graph,&picked);
                     let mut local=Vec::<Pubkey>::new();
-                    let direct_needed=if kind==0 {2}else{1};
-                    let mut valid=choose(&g.direct_s,direct_needed,&picked,&mut local);
-                    if valid && g.bridge.is_some(){
-                        if let Some(middle)=g.intermediate {
-                            valid=candidates.contains_key(&middle);
-                            if valid && !local.contains(&middle){local.push(middle);}
-                            if valid {valid=choose(&g.bridge_pools,local.len()+1,&picked,&mut local);}
-                        }else{valid=false;}
-                    }else if valid && kind==1 {
-                        valid=choose(&g.direct_q,local.len()+1,&picked,&mut local);
-                    }
-                    if valid {
-                        if let Some(conv)=g.conversion {
-                            valid=candidates.contains_key(&conv);
-                            if valid && !local.contains(&conv){local.push(conv);}
+                    let mut valid=true;
+                    // One pool per leg, except Direct2's two distinct alternatives
+                    // on the same pair. Intermediate/Conversion remain fully variable.
+                    for (i,&(a,b)) in t.directed_roles().iter().enumerate(){
+                        let count=local.len()+1;
+                        let options=catalog.graph.pools_for_pair(a,b);
+                        valid=choose(options,count,&picked,&mut local);
+                        if !valid {break;}
+                        if kind==0 && i==0 {
+                            valid=choose(options,local.len()+1,&picked,&mut local);
+                            break;
                         }
                     }
                     if !valid {cursors_for[kind]+=1;continue;}
@@ -970,7 +967,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
                         ||used+cost>account_budget {
                         cursors_for[kind]+=1;continue;
                     }
-                    let new_routes=route_options_added(g,&picked,&additional);
+                    let new_routes=route_options_added(t,&catalog.graph,&picked,&additional);
                     let gain=new_routes.saturating_sub(before);
                     if gain==0 {cursors_for[kind]+=1;continue;}
                     let underrepresented=1.0/(1.0+coverage[kind] as f64/100.0);
@@ -1233,9 +1230,9 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     .collect::<Vec<_>>();
                 mints_to_check.sort_unstable();mints_to_check.dedup();
                 selected_mints.send_replace(Arc::from(mints_to_check));
-                crate::log_event!(Info,"market state graph selection selected_pools={} ws_upper_bound={} ws_capacity={} graph_groups={}",
+                crate::log_event!(Info,"market state graph selection selected_pools={} ws_upper_bound={} ws_capacity={} graph_topologies={}",
                     selected.len(),selected.iter().map(|p|watch_cost(p.venue)).sum::<usize>(),
-                    selection_capacity,catalog.borrow().graph.groups.len());
+                    selection_capacity,catalog.borrow().graph.topologies.len());
                 engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
                 crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
