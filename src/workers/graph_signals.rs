@@ -98,12 +98,6 @@ impl Prices {
     fn weight(&self, slot: usize, previous: Option<&Previous>) -> Option<i64> {
         self.price(slot / 2, previous)?.log_weight_units[slot % 2]
     }
-    fn slot(&self, pool: Pubkey, input: Pubkey, output: Pubkey) -> Result<usize> {
-        let id = *self.index.get(&pool).context("pool absent from signal identities")?;
-        let p = &self.pools[id];
-        ensure!((p.mint_a,p.mint_b) == (input.min(output),input.max(output)), "invalid graph pool role");
-        Ok(2 * id + usize::from(input != p.mint_a))
-    }
     fn change(&self, id: usize) -> SignalPriceChange { SignalPriceChange {
         pool_id: id, identity: self.pools[id].clone(), price: self.values[id].clone(),
     }}
@@ -129,7 +123,9 @@ impl CompactIndex {
     fn install(&mut self,graph:Arc<GraphSnapshot>,prices:&Prices){
         let mut ranked=HashMap::<(Pubkey,Pubkey),BTreeSet<Key>>::new();
         for (id,identity) in prices.pools.iter().enumerate(){
-            if graph.pair_for_pool(identity.address)!=Some((identity.mint_a,identity.mint_b)){continue;}
+            if graph.pair_for_pool(identity.address)!=Some((identity.mint_a,identity.mint_b))
+                || graph.pools_for_pair(identity.mint_a,identity.mint_b)
+                    .binary_search(&identity.address).is_err(){continue;}
             for direction in 0..2 {
                 let slot=2*id+direction;
                 if let Some(weight)=prices.weight(slot,None) {
@@ -177,14 +173,12 @@ impl CompactIndex {
             let left=self.first(s,t,None);
             let right=self.first(t,s,None);
             let first=left.and_then(|l|self.first(t,s,Some(l.slot/2))
-                .map(|r|[l.slot,r.slot]));
+                .map(|r|(l,r)));
             let second=right.and_then(|r|self.first(s,t,Some(r.slot/2))
-                .map(|l|[l.slot,r.slot]));
-            let result=[first,second].into_iter().flatten().filter_map(|choice|{
-                let w0=self.ranked.get(&(s,t))?.iter().find(|k|k.slot==choice[0])?;
-                let w1=self.ranked.get(&(t,s))?.iter().find(|k|k.slot==choice[1])?;
-                let total=i64::try_from(i128::from(w0.weight)+i128::from(w1.weight)).ok()?;
-                Some(Winner{slots:[choice[0],choice[1],0,0],length:2,total})
+                .map(|l|(l,r)));
+            let result=[first,second].into_iter().flatten().filter_map(|(l,r)|{
+                let total=i64::try_from(i128::from(l.weight)+i128::from(r.weight)).ok()?;
+                Some(Winner{slots:[l.slot,r.slot,0,0],length:2,total})
             }).min_by_key(|p|(p.total,p.slots));
             return Ok(result);
         }
@@ -276,7 +270,7 @@ struct Work {
 }
 struct Engine {
     prices:Prices,plan:Arc<SignalPlan>,index:CompactIndex,
-    output:broadcast::Sender<Arc<SignalEvent>>,settings:Settings,
+    output:broadcast::Sender<Arc<SignalEvent>>,
     sequence:u64,revision:u64,threshold:i64,production:ProductionReport,
 }
 impl Engine {
@@ -364,7 +358,7 @@ pub async fn run(mut input:PriceEventStream,mut catalogs:watch::Receiver<Arc<Wat
     let initial=Arc::new(SignalPlan{graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
         roles:Arc::from([]),groups:Arc::from([]),compact_topologies:Arc::from([]),route_options:0});
     let mut e=Engine{prices:Prices::default(),plan:initial,index:CompactIndex::default(),
-        output,settings,sequence:0,revision:0,
+        output,sequence:0,revision:0,
         threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,
         production:ProductionReport::default()};
     let outcome:Result<()>=async{
