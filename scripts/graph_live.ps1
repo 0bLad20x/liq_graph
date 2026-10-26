@@ -77,7 +77,7 @@ try {
         ws_account_budget=$AccountBudget;transactions_sent=0;simulation_enabled=$false
     }
     $checkout|ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
-    Write-Host "CP6B checkout: $branch $head"
+    Write-Host "Graph checkout: $branch $head"
     Write-Host "Output: $folder"
     & cargo build --locked --release
     if ($LASTEXITCODE -ne 0){throw 'cargo build --locked --release failed; live run not started.'}
