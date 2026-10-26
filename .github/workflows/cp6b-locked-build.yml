@@ -11,4 +11,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.98.1'
-      - run: cargo build --locked
+      - name: Verify checkout and locked build
+        run: |
+          echo "Branch: $(git branch --show-current)"
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          git status --short
+          git diff --exit-code -- Cargo.lock
+          cargo build --locked
+          git diff --exit-code -- Cargo.lock
+          git status --short
