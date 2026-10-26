@@ -5,7 +5,7 @@ use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
-use tokio::sync::{broadcast, watch};
+use tokio::{sync::{broadcast, watch}, task::JoinSet};
 use crate::core::{
     market_state::{MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceOrigin, PricePipelineTiming},
     signals::{SignalEvaluation, SignalEvent, SignalGroup, SignalLeg, SignalPlan, SignalPool,
@@ -55,7 +55,7 @@ fn names(v: [u64; 4]) -> BTreeMap<&'static str, u64> {
 }
 
 struct Previous { pool: usize, price: Option<Arc<SignalPoolPrice>> }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Prices {
     index: HashMap<Pubkey, usize>, pools: Vec<SignalPool>,
     mint_text: Vec<[String; 2]>, values: Vec<Option<Arc<SignalPoolPrice>>>,
@@ -157,6 +157,24 @@ fn compile_role(prices: &Prices, pools: &Arc<[Pubkey]>, input: Pubkey, output: P
     Ok(id)
 }
 impl ExecutionPlan {
+    fn empty() -> Self {
+        Self { graph:Arc::new(GraphSnapshot::default()),
+            data:Arc::new(SignalPlan { graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
+                roles:Arc::from([]),groups:Arc::from([]),route_options:0 }),
+            roles:Vec::new(),slot_roles:Vec::new() }
+    }
+    /// Reconcile an asynchronously prepared topology with the latest observed prices.
+    /// Only unique directed role slots are traversed, never the group cross product.
+    fn rebase(&mut self, prices:&Prices) {
+        for role in &mut self.roles {
+            role.ordered.clear();
+            for &slot in role.definition.slots.iter() {
+                if let Some(weight)=prices.weight(slot,None) {
+                    role.ordered.insert(key(weight,slot));
+                }
+            }
+        }
+    }
     fn compile(catalog: Arc<WatchCatalog>, prices: &mut Prices) -> Result<Self> {
         ensure!(catalog.generation == catalog.graph.generation, "mixed graph generation");
         for p in catalog.pools.iter() { prices.bind(p.address,p.mint_a,p.mint_b)?; }
@@ -436,6 +454,20 @@ impl Engine {
     }
 }
 
+/// Compile a topology on a blocking worker. The active price consumer continues
+/// against its previous immutable generation; no event buffering is introduced.
+fn schedule_compile(builds:&mut JoinSet<Result<(ExecutionPlan,u64)>>,
+    catalog:Arc<WatchCatalog>, prices:&mut Prices) -> Result<()> {
+    for p in catalog.pools.iter() { prices.bind(p.address,p.mint_a,p.mint_b)?; }
+    let mut shadow=prices.clone();
+    builds.spawn_blocking(move || {
+        let started=Instant::now();
+        let next=ExecutionPlan::compile(catalog,&mut shadow)?;
+        Ok((next,nanos(started)))
+    });
+    Ok(())
+}
+
 pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<WatchCatalog>>,
     output: broadcast::Sender<Arc<SignalEvent>>, settings: Settings) -> Result<ProductionReport> {
     let mut e=Engine { prices:Prices::default(),output,settings,sequence:0,revision:0,
@@ -443,23 +475,49 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
         scratch:Vec::with_capacity(SIGNAL_BLOCK_RANGES) };
     let outcome: Result<()> = async {
         let started=Instant::now(); let received=now_us();
-        let mut plan=ExecutionPlan::compile(catalogs.borrow_and_update().clone(),&mut e.prices)?;
-        let build_ns=nanos(started);
-        let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:plan.data.graph_generation },started,received,None,input.len());
-        work.stats.plan_build_ns=build_ns; e.state(&plan,&mut work,true,false,Vec::new())?;
-        e.production.plan(&plan,&e.prices,build_ns); e.evaluate(&plan,Scope::All,work)?;
+        let mut plan=ExecutionPlan::empty();
+        let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:0 },started,received,None,input.len());
+        e.state(&plan,&mut work,true,false,Vec::new())?;
+        e.evaluate(&plan,Scope::None,work)?;
+        let mut builds=JoinSet::<Result<(ExecutionPlan,u64)>>::new();
+        let mut pending_catalog:Option<Arc<WatchCatalog>>=None;
         let mut catalog_open=true;
-        crate::log_event!(Info,"graph signals started=true execution_layout={} output_layout={} reference_comparison=false execution=false",EXECUTION_LAYOUT,OUTPUT_LAYOUT);
+        let initial=catalogs.borrow_and_update().clone();
+        if initial.generation!=0 {
+            schedule_compile(&mut builds,initial,&mut e.prices)?;
+        }
+        crate::log_event!(Info,"graph signals started=true execution_layout={} output_layout={} price_hotpath_independent_of_plan_build=true execution=false",EXECUTION_LAYOUT,OUTPUT_LAYOUT);
         loop { tokio::select! {
             change=catalogs.changed(), if catalog_open => {
                 if change.is_err() { catalog_open=false; continue; }
                 let next=catalogs.borrow_and_update().clone();
                 if next.generation==plan.data.graph_generation { continue; }
+                if builds.is_empty() {
+                    schedule_compile(&mut builds,next,&mut e.prices)?;
+                } else {
+                    // Coalesce topology generations, never hold price events for them.
+                    pending_catalog=Some(next);
+                }
+            },
+            result=builds.join_next(), if !builds.is_empty() => {
+                let (mut next,build_ns)=result.context("missing signal plan build")?
+                    .context("signal plan build task panicked")??;
+                if let Some(newer)=pending_catalog.take() {
+                    if newer.generation>next.data.graph_generation {
+                        schedule_compile(&mut builds,newer,&mut e.prices)?;
+                        continue;
+                    }
+                }
+                next.rebase(&e.prices);
+                plan=next;
                 let started=Instant::now(); let received=now_us();
-                plan=ExecutionPlan::compile(next,&mut e.prices)?; let build_ns=nanos(started);
                 let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:plan.data.graph_generation },started,received,None,input.len());
-                work.stats.plan_build_ns=build_ns; e.state(&plan,&mut work,true,false,Vec::new())?;
-                e.production.plan(&plan,&e.prices,build_ns); e.evaluate(&plan,Scope::All,work)?;
+                work.stats.plan_build_ns=build_ns;
+                e.state(&plan,&mut work,true,false,Vec::new())?;
+                e.production.plan(&plan,&e.prices,build_ns);
+                // Structural publication is not a price trigger. Price WS updates
+                // continue through the active plan during future compiles.
+                e.evaluate(&plan,Scope::None,work)?;
             },
             event=input.recv() => match event {
                 Ok(event) => match event.as_ref() {
