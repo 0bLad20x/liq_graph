@@ -3,7 +3,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    hint::black_box,
     mem::size_of,
     sync::Arc,
     time::{Duration, Instant},
@@ -33,45 +32,6 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum GroupKind { Direct, Bridge }
-
-/// V10-compatible role template, NOT a packed instruction. Pools in each role are
-/// alternatives and can exceed the 16-declaration instruction cap. The eventual
-/// execution adapter must pack a valid subset, maximum four groups / 16 declarations.
-#[derive(Clone, Debug)]
-pub struct Group {
-    pub settlement: Pubkey,
-    pub target: Pubkey,
-    pub bridge: Option<Pubkey>,
-    pub intermediate: Option<Pubkey>,
-    pub conversion: Option<Pubkey>,
-    pub direct_s: Arc<[Pubkey]>,
-    /// Only applicable to direct-only groups using Q/S conversion.
-    pub direct_q: Arc<[Pubkey]>,
-    /// B/S without conversion, B/Q when conversion is present.
-    pub bridge_pools: Arc<[Pubkey]>,
-    pub kind: GroupKind,
-    /// Directed paths specific to this template; excludes direct roundtrips
-    /// that are already counted by the standalone Direct group.
-    pub route_options: u64,
-}
-
-impl Group {
-    fn declarations(&self) -> usize {
-        self.direct_s.len() + self.direct_q.len() + self.bridge_pools.len()
-            + usize::from(self.intermediate.is_some())
-            + usize::from(self.conversion.is_some())
-    }
-
-    /// Pool order is not group identity: only typed roles and their mint context
-    /// distinguish V10 group templates. Alternatives are kept in sorted role lists.
-    fn identity(&self) -> (Pubkey, Pubkey, GroupKind, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>) {
-        (self.settlement, self.target, self.kind,
-            self.bridge, self.intermediate, self.conversion)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PreparedPool {
     address: Pubkey,
@@ -98,82 +58,7 @@ fn pair(a: Pubkey, b: Pubkey) -> Pair {
     if a < b { (a, b) } else { (b, a) }
 }
 
-fn pools_for(pairs: &HashMap<Pair, Arc<[Pubkey]>>, a: Pubkey, b: Pubkey) -> Arc<[Pubkey]> {
-    pairs.get(&pair(a, b)).cloned().unwrap_or_else(|| Arc::from([]))
-}
-
-fn route_count(direct: usize, bridge: usize) -> u64 {
-    2_u64.saturating_mul(direct as u64).saturating_mul(bridge as u64)
-}
-
-/// Validate every published template against the mint roles required by the public
-/// V10 instruction contract. This validates topology, NOT a packed instruction:
-/// a template may retain more than 16 pool alternatives for later selection.
-fn validate_v10_group(group: &Group, pairs: &HashMap<Pair, Arc<[Pubkey]>>,
-    wsol: Pubkey, usdc: Pubkey) -> Result<()> {
-    let s = group.settlement;
-    ensure!(s == wsol || s == usdc, "V10 group has unsupported settlement {s}");
-    let q = if s == wsol { usdc } else { wsol };
-    let t = group.target;
-    ensure!(t != s && t != Pubkey::default(), "V10 group target equals settlement or zero");
-    ensure!(!group.direct_s.is_empty()
-        && group.direct_s.as_ref() == pools_for(pairs, t, s).as_ref(),
-        "V10 group missing or incorrect settlement-quoted direct pools");
-    for list in [&group.direct_s, &group.direct_q, &group.bridge_pools] {
-        ensure!(list.windows(2).all(|p| p[0] < p[1]),
-            "V10 group pool alternatives are not canonical and distinct");
-    }
-    if let Some(conversion) = group.conversion {
-        ensure!(conversion != Pubkey::default()
-            && pools_for(pairs, q, s).binary_search(&conversion).is_ok(),
-            "V10 group conversion does not pair WSOL and USDC");
-        ensure!(t != q, "V10 group target equals conversion quote");
-    }
-    match group.kind {
-        GroupKind::Direct => {
-            ensure!(group.bridge.is_none() && group.intermediate.is_none()
-                && group.bridge_pools.is_empty(),
-                "V10 direct template contains a triangle role");
-            let direct_q = if group.conversion.is_some() {
-                pools_for(pairs, t, q)
-            } else { Arc::from([]) };
-            ensure!(group.direct_q.as_ref() == direct_q.as_ref()
-                && group.direct_s.len() + group.direct_q.len() >= 2,
-                "V10 direct template requires at least two correctly quoted pools");
-            let expected_routes = if group.conversion.is_some() {
-                route_count(group.direct_s.len(), group.direct_q.len())
-            } else {
-                let n = group.direct_s.len() as u64;
-                n.saturating_mul(n - 1)
-            };
-            ensure!(expected_routes > 0 && group.route_options == expected_routes,
-                "V10 direct template has no valid 2/3-swap choices");
-        }
-        GroupKind::Bridge => {
-            let b = group.bridge.context("V10 triangle missing bridge mint")?;
-            let middle = group.intermediate.context("V10 triangle missing intermediate pool")?;
-            ensure!(b != s && b != t && b != Pubkey::default()
-                && group.direct_q.is_empty() && !group.bridge_pools.is_empty(),
-                "V10 triangle has invalid bridge mint or pool roles");
-            if group.conversion.is_some() {
-                ensure!(b != q, "V10 triangle bridge equals conversion quote");
-            }
-            ensure!(pools_for(pairs, t, b).binary_search(&middle).is_ok(),
-                "V10 triangle intermediate does not pair target and bridge");
-            let bridge_quote = if group.conversion.is_some() { q } else { s };
-            ensure!(group.bridge_pools.as_ref()
-                == pools_for(pairs, b, bridge_quote).as_ref(),
-                "V10 triangle bridge pools do not pair bridge and quote");
-            let expected_routes = route_count(group.direct_s.len(), group.bridge_pools.len());
-            ensure!(expected_routes > 0 && group.route_options == expected_routes,
-                "V10 triangle requires an intermediate, a direct and a bridge choice");
-        }
-    }
-    Ok(())
-}
-
-
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash,PartialOrd,Ord)]
 pub enum RouteTopologyKind { Direct2, Direct3, Triangle3, Triangle4 }
 
 /// One mathematical route shape, never one particular choice of pools.
@@ -197,7 +82,7 @@ impl RouteTopology {
 fn build_topologies(
     pairs:&HashMap<Pair,Arc<[Pubkey]>>,
     adjacency:&HashMap<Pubkey,HashSet<Pubkey>>,
-    wsol:Pubkey, usdc:Pubkey,
+    wsol:Pubkey, usdc:Pubkey, target_filter:Option<&HashSet<(Pubkey,Pubkey)>>,
 ) -> Result<(Arc<[RouteTopology]>,HashMap<Pair,Vec<u32>>)> {
     let mut result=Vec::<RouteTopology>::new();
     let mut index=HashMap::<Pair,Vec<u32>>::new();
@@ -219,7 +104,7 @@ fn build_topologies(
     let count=|a,b| -> u64 { pairs.get(&pair(a,b)).map_or(0,|v|v.len() as u64) };
     for (s,q) in [(wsol,usdc),(usdc,wsol)] {
         for &t in adjacency.get(&s).into_iter().flatten() {
-            if t==s { continue; }
+            if t==s || target_filter.is_some_and(|f|!f.contains(&(s,t))) { continue; }
             let direct=count(s,t);
             if direct>=2 {
                 push(RouteTopologyKind::Direct2,s,t,None,&[(s,t),(t,s)],
@@ -274,375 +159,230 @@ fn build_topologies(
     Ok((result.into(),index))
 }
 
-/// A generation owns every index; IDs must never cross generation boundaries.
-#[derive(Debug, Default)]
+/// An immutable generation shares unchanged pair-alternative arcs with its parent.
+/// Route topology identities are independent of alternative-pool combinations.
+#[derive(Debug,Default)]
 pub struct GraphSnapshot {
-    pub generation: u64,
-    pub qualified_pools: usize,
-    pub mint_pairs: usize,
-    /// Canonical source of truth for pair alternatives. Never reconstruct it in a consumer.
-    pub pair_pools: HashMap<Pair, Arc<[Pubkey]>>,
-    /// Pool identity mapped directly to a canonical pair (no traversal or DB lookup).
-    pub pool_pairs: HashMap<Pubkey, Pair>,
-    /// Factorized mathematical topology: not one record per intermediate/converter pool.
-    pub topologies: Arc<[RouteTopology]>,
-    pub pair_topologies: HashMap<Pair,Vec<u32>>,
-    pub groups: Vec<Group>,
-    pub token_index: HashMap<Pubkey, Vec<u32>>,
-    pub pool_index: HashMap<Pubkey, Vec<u32>>,
-    pub route_options: u64,
-    pub role_pool_refs: usize,
-    pub approx_index_bytes: usize,
+    pub generation:u64,
+    pub qualified_pools:usize,
+    pub mint_pairs:usize,
+    pub pair_pools:HashMap<Pair,Arc<[Pubkey]>>,
+    pub pool_pairs:HashMap<Pubkey,Pair>,
+    pub adjacency:HashMap<Pubkey,HashSet<Pubkey>>,
+    pub topologies:Arc<[RouteTopology]>,
+    pub pair_topologies:HashMap<Pair,Vec<u32>>,
+    pub token_index:HashMap<Pubkey,Vec<u32>>,
+    pub route_options:u64,
+    pub role_pool_refs:usize,
+    pub approx_index_bytes:usize,
+    pub changed_pairs:Arc<[Pair]>,
 }
-
 impl GraphSnapshot {
-    pub fn topologies_for_pair(&self, a: Pubkey, b: Pubkey) -> &[u32] {
+    pub fn topologies_for_pair(&self,a:Pubkey,b:Pubkey)->&[u32]{
         self.pair_topologies.get(&pair(a,b)).map_or(&[],Vec::as_slice)
     }
-    pub fn topologies_for_pool(&self, pool: Pubkey) -> &[u32] {
+    pub fn topologies_for_pool(&self,pool:Pubkey)->&[u32]{
         self.pool_pairs.get(&pool).map_or(&[],|(a,b)|self.topologies_for_pair(*a,*b))
     }
-    pub fn pools_for_pair(&self, a: Pubkey, b: Pubkey) -> &[Pubkey] {
-        self.pair_pools.get(&pair(a,b)).map_or(&[], |p| p.as_ref())
+    pub fn pools_for_pair(&self,a:Pubkey,b:Pubkey)->&[Pubkey]{
+        self.pair_pools.get(&pair(a,b)).map_or(&[],|x|x.as_ref())
     }
-    pub fn pair_for_pool(&self, pool: Pubkey) -> Option<Pair> {
+    pub fn pair_for_pool(&self,pool:Pubkey)->Option<Pair>{
         self.pool_pairs.get(&pool).copied()
     }
-    pub fn for_token(&self, mint: Pubkey) -> &[u32] {
-        self.token_index.get(&mint).map_or(&[], Vec::as_slice)
-    }
-    pub fn for_pool(&self, pool: Pubkey) -> &[u32] {
-        self.pool_index.get(&pool).map_or(&[], Vec::as_slice)
-    }
-    pub fn group(&self, id: u32) -> Option<&Group> {
-        self.groups.get(id as usize)
+    pub fn for_token(&self,mint:Pubkey)->&[u32]{
+        self.token_index.get(&mint).map_or(&[],Vec::as_slice)
     }
 }
-
-fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<GraphSnapshot> {
-    let mut edge_count = 0_usize;
-    let mut pairs: HashMap<Pair, Vec<Pubkey>> = HashMap::new();
-    let mut known_pools = HashSet::new();
-    let mut pool_pairs = HashMap::new();
-    for p in pools {
-        ensure!(known_pools.insert(p.address),
-            "V10 graph received duplicate Prepared pool address {}", p.address);
-        let key = pair(p.a,p.b);
-        pairs.entry(key).or_default().push(p.address);
-        pool_pairs.insert(p.address,key);
-        edge_count += 1;
+fn create(
+    old:Arc<GraphSnapshot>, updates:HashMap<Pubkey,Option<PreparedPool>>,generation:u64,
+)->Result<GraphSnapshot>{
+    let mut pool_pairs=old.pool_pairs.clone();
+    let mut changed_pairs=HashSet::<Pair>::new();
+    let mut changes=HashMap::<Pair,(HashSet<Pubkey>,Vec<Pubkey>)>::new();
+    for (address,new) in updates {
+        let prev=pool_pairs.get(&address).copied();
+        let next=new.map(|p|pair(p.a,p.b));
+        if prev==next {continue;}
+        if let Some(prev)=prev{
+            changes.entry(prev).or_default().0.insert(address);
+            changed_pairs.insert(prev);
+        }
+        if let Some(next)=next{
+            changes.entry(next).or_default().1.push(address);
+            pool_pairs.insert(address,next);
+            changed_pairs.insert(next);
+        } else {pool_pairs.remove(&address);}
     }
-    let mut adjacency: HashMap<Pubkey, HashSet<Pubkey>> = HashMap::new();
-    let pair_map: HashMap<Pair, Arc<[Pubkey]>> = pairs.into_iter().map(|((a,b),mut list)| {
-        list.sort_unstable();
+    let mut pairs=old.pair_pools.clone();
+    for (key,(removed,added)) in changes {
+        let mut list=pairs.get(&key).map_or_else(Vec::new,|v|v.to_vec());
+        list.retain(|p|!removed.contains(p));
+        list.extend(added);
+        list.sort_unstable();list.dedup();
+        if list.is_empty(){pairs.remove(&key);}
+        else{pairs.insert(key,Arc::from(list));}
+    }
+    // The compact mint adjacency is at most tens of thousands of entries.
+    // Recreating it is cheap and never multiplies the pool-alternative products.
+    let mut adjacency=HashMap::<Pubkey,HashSet<Pubkey>>::new();
+    for &(a,b) in pairs.keys(){
         adjacency.entry(a).or_default().insert(b);
         adjacency.entry(b).or_default().insert(a);
-        ((a,b), Arc::from(list))
-    }).collect();
-
-    let wsol: Pubkey = WSOL.parse()?;
-    let usdc: Pubkey = USDC.parse()?;
-    let settlements = [(wsol, usdc), (usdc, wsol)];
-    let mut groups: Vec<Group> = Vec::new();
-
-    for (s, q) in settlements {
-        let mut targets: Vec<_> = adjacency.get(&s).into_iter()
-            .flat_map(|neighbors| neighbors.iter().copied()).collect();
-        targets.sort_unstable();
-        for t in targets {
-            if t == s { continue; }
-            let direct_s = pools_for(&pair_map, t, s);
-            if direct_s.len() >= 2 {
-                let n = direct_s.len() as u64;
-                groups.push(Group {
-                    settlement:s, target:t, bridge:None, intermediate:None, conversion:None,
-                    direct_s:direct_s.clone(), direct_q:Arc::from([]),
-                    bridge_pools:Arc::from([]), kind:GroupKind::Direct,
-                    route_options:n.saturating_mul(n-1),
-                });
+    }
+    let wsol:Pubkey=WSOL.parse()?;
+    let usdc:Pubkey=USDC.parse()?;
+    // Rebuild only (settlement,target) shapes touching a changed pair. A changed
+    // conversion pair legitimately touches every topology using conversion.
+    let mut affected=HashSet::<(Pubkey,Pubkey)>::new();
+    for &(a,b) in &changed_pairs {
+        for &s in &[wsol,usdc]{
+            let mut targets=HashSet::from([a,b]);
+            targets.extend(adjacency.get(&a).into_iter().flatten().copied());
+            targets.extend(adjacency.get(&b).into_iter().flatten().copied());
+            if pair(a,b)==pair(wsol,usdc){
+                targets.extend(adjacency.get(&s).into_iter().flatten().copied());
             }
-
-            // Direct-only with Q/S conversion: one or more T/S and T/Q candidates.
-            // Distinct pool pairs guarantee no same pool reused on any trade path.
-            if t != q {
-                let direct_q = pools_for(&pair_map, t, q);
-                if !direct_s.is_empty() && !direct_q.is_empty() {
-                    let conversions = pools_for(&pair_map, q, s);
-                    for conversion in conversions.iter().copied() {
-                        groups.push(Group {
-                            settlement:s, target:t, bridge:None, intermediate:None,
-                            conversion:Some(conversion), direct_s:direct_s.clone(),
-                            direct_q:direct_q.clone(), bridge_pools:Arc::from([]),
-                            kind:GroupKind::Direct,
-                            route_options:route_count(direct_s.len(), direct_q.len()),
-                        });
-                    }
-                }
-            }
-
-            // Bridge groups have exactly one T/B intermediate pool per group.
-            let mut bridges: Vec<_> = adjacency.get(&t).into_iter()
-                .flat_map(|neighbors| neighbors.iter().copied())
-                .filter(|b| *b != s && *b != t).collect();
-            bridges.sort_unstable();
-            for b in bridges {
-                let intermediate = pools_for(&pair_map, t, b);
-                let return_s = pools_for(&pair_map, b, s);
-                if !direct_s.is_empty() && !return_s.is_empty() {
-                    for middle in intermediate.iter().copied() {
-                        groups.push(Group {
-                            settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
-                            conversion:None, direct_s:direct_s.clone(), direct_q:Arc::from([]),
-                            bridge_pools:return_s.clone(), kind:GroupKind::Bridge,
-                            route_options:route_count(direct_s.len(), return_s.len()),
-                        });
-                    }
-                }
-                // With Q/S conversion, both T and B must differ from Q.
-                if t != q && b != q && !direct_s.is_empty() {
-                    let return_q = pools_for(&pair_map, b, q);
-                    if return_q.is_empty() { continue; }
-                    let conversions = pools_for(&pair_map, q, s);
-                    for middle in intermediate.iter().copied() {
-                        for conversion in conversions.iter().copied() {
-                            groups.push(Group {
-                                settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
-                                conversion:Some(conversion), direct_s:direct_s.clone(),
-                                direct_q:Arc::from([]), bridge_pools:return_q.clone(),
-                                kind:GroupKind::Bridge,
-                                route_options:route_count(direct_s.len(), return_q.len()),
-                            });
-                        }
-                    }
+            for t in targets {
+                if t!=s && (adjacency.get(&s).is_some_and(|n|n.contains(&t))
+                    ||old.topologies.iter().any(|top|top.settlement==s&&top.target==t)){
+                    affected.insert((s,t));
                 }
             }
         }
-    }
-    // Canonical identity is independent of alternative-pool input order.
-    // The sorted role lists were built from each unique mint-pair set.
-    groups.sort_unstable_by_key(Group::identity);
-    let before_dedup = groups.len();
-    groups.dedup_by(|a, b| {
-        a.identity() == b.identity()
-            && a.direct_s == b.direct_s
-            && a.direct_q == b.direct_q
-            && a.bridge_pools == b.bridge_pools
-    });
-    ensure!(groups.windows(2).all(|w| w[0].identity() != w[1].identity()),
-        "V10 group identity collision with different pool alternatives");
-    ensure!(groups.len() <= u32::MAX as usize, "V10 group count exceeds u32 index capacity");
-
-    let mut direct_2 = 0_usize;
-    let mut direct_3 = 0_usize;
-    let mut triangle_3 = 0_usize;
-    let mut triangle_4 = 0_usize;
-    for g in &groups {
-        validate_v10_group(g, &pair_map, wsol, usdc)?;
-        match (g.kind, g.conversion.is_some()) {
-            (GroupKind::Direct, false) => direct_2 += 1,
-            (GroupKind::Direct, true) => direct_3 += 1,
-            (GroupKind::Bridge, false) => triangle_3 += 1,
-            (GroupKind::Bridge, true) => triangle_4 += 1,
+        // Removed pairs may be absent in the new adjacency: discover their old paths.
+        for &id in old.topologies_for_pair(a,b){
+            let top=&old.topologies[id as usize];
+            affected.insert((top.settlement,top.target));
         }
     }
-    crate::log_event!(Debug,"validated generation={} groups={} direct_2={} direct_3={} triangle_3={} triangle_4={} canonical_duplicates_removed={} invalid_groups=0",
-        generation, groups.len(), direct_2, direct_3, triangle_3, triangle_4,
-        before_dedup - groups.len());
-
-    let mut token_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
-    let mut pool_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
-    let mut routes = 0_u64;
-    let mut refs = 0_usize;
-    for (index, g) in groups.iter().enumerate() {
-        let id = index as u32;
-        let mut tokens = vec![g.settlement, g.target];
-        if let Some(b) = g.bridge { tokens.push(b); }
-        if g.conversion.is_some() { tokens.push(if g.settlement == wsol { usdc } else { wsol }); }
-        tokens.sort_unstable();
-        tokens.dedup();
-        for mint in tokens { token_index.entry(mint).or_default().push(id); }
-        for address in g.direct_s.iter().chain(g.direct_q.iter())
-            .chain(g.bridge_pools.iter()).copied()
-            .chain(g.intermediate).chain(g.conversion) {
-            pool_index.entry(address).or_default().push(id);
-            refs += 1;
-        }
-        routes = routes.saturating_add(g.route_options);
+    let mut topologies=old.topologies.iter()
+        .filter(|t|!affected.contains(&(t.settlement,t.target)))
+        .cloned().collect::<Vec<_>>();
+    if !affected.is_empty(){
+        let (regenerated,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&affected))?;
+        topologies.extend(regenerated.iter().cloned());
     }
-    // Each role list contains unique pools, and repeated role group references are intentional.
-    let index_items: usize = token_index.values().map(Vec::len).sum::<usize>()
-        + pool_index.values().map(Vec::len).sum::<usize>();
-    let (topologies,pair_topologies)=build_topologies(&pair_map,&adjacency,wsol,usdc)?;
-    let compact_routes=topologies.iter().fold(0_u64,|acc,t|acc.saturating_add(t.route_options));
-    ensure!(compact_routes==routes,
-        "factorized V10 route coverage differs from legacy groups: compact={compact_routes} legacy={routes}");
-    let topology_refs=pair_topologies.values().map(Vec::len).sum::<usize>();
-    let approx = topologies.len()*size_of::<RouteTopology>()+topology_refs*size_of::<u32>()
-        +edge_count * size_of::<PreparedPool>()
-        + groups.len() * size_of::<Group>()
-        + refs * size_of::<Pubkey>()
-        + index_items * size_of::<u32>();
-    Ok(GraphSnapshot { generation, qualified_pools:edge_count,
-        mint_pairs:pair_map.len(), pair_pools:pair_map, pool_pairs,
-        topologies,pair_topologies,
-        groups, token_index, pool_index,
-        route_options:routes, role_pool_refs:refs, approx_index_bytes:approx })
+    topologies.sort_unstable_by_key(|t| (t.settlement,t.target,t.bridge,t.kind));
+    ensure!(topologies.windows(2).all(|w|
+        (w[0].settlement,w[0].target,w[0].bridge,w[0].kind)
+        !=(w[1].settlement,w[1].target,w[1].bridge,w[1].kind)),
+        "duplicate compact route identity");
+    ensure!(topologies.len()<u32::MAX as usize,"compact graph topology ID overflow");
+    let mut pair_topologies=HashMap::<Pair,Vec<u32>>::new();
+    let mut token_index=HashMap::<Pubkey,Vec<u32>>::new();
+    let mut options=0_u64;
+    for (i,t) in topologies.iter().enumerate(){
+        let id=i as u32;
+        options=options.checked_add(t.route_options).context("route options overflow")?;
+        let mut seen_pairs=HashSet::new();
+        let mut seen_tokens=HashSet::new();
+        for &(a,b) in t.directed_roles(){
+            let p=pair(a,b);
+            ensure!(pairs.contains_key(&p),"topology role references unavailable pair");
+            if seen_pairs.insert(p){pair_topologies.entry(p).or_default().push(id);}
+            if seen_tokens.insert(a){token_index.entry(a).or_default().push(id);}
+            if seen_tokens.insert(b){token_index.entry(b).or_default().push(id);}
+        }
+    }
+    ensure!(pool_pairs.len()==pairs.values().map(|v|v.len()).sum::<usize>(),
+        "graph pool/pair identity accounting mismatch");
+    let refs=pair_topologies.values().map(Vec::len).sum::<usize>();
+    let approx=pool_pairs.len()*size_of::<PreparedPool>()
+        +pairs.values().map(|v|v.len()*size_of::<Pubkey>()).sum::<usize>()
+        +topologies.len()*size_of::<RouteTopology>()
+        +(refs+token_index.values().map(Vec::len).sum::<usize>())*size_of::<u32>();
+    let mut changed=changed_pairs.into_iter().collect::<Vec<_>>();
+    changed.sort_unstable();
+    Ok(GraphSnapshot{generation,qualified_pools:pool_pairs.len(),
+        mint_pairs:pairs.len(),pair_pools:pairs,pool_pairs,adjacency,
+        topologies:topologies.into(),pair_topologies,token_index,
+        route_options:options,role_pool_refs:refs,approx_index_bytes:approx,
+        changed_pairs:changed.into()})
 }
-
-fn probe(snapshot: &GraphSnapshot) {
-    let mut samples: Vec<(bool,Pubkey)> = snapshot.token_index.keys()
-        .copied().take(32).map(|k|(true,k)).collect();
-    samples.extend(snapshot.pool_index.keys().copied().take(32).map(|k|(false,k)));
-    if samples.is_empty() {
-        crate::log_event!(Debug,"liquidity graph lookup skipped=no_qualified_v10_groups");
-        return;
-    }
-    let mut lookup_ns = Vec::with_capacity(4096);
-    let mut resolve_ns = Vec::with_capacity(4096);
-    let mut matched = 0_usize;
-    // Real indexed addresses, including fetching up to four referenced templates.
-    // This is NOT the future 16-pool V10 instruction-packing benchmark.
-    for i in 0..4096 {
-        let (token,key) = samples[i % samples.len()];
-        let started = Instant::now();
-        let ids = if token { snapshot.for_token(key) } else { snapshot.for_pool(key) };
-        let looked_up = started.elapsed();
-        let resolved = ids.iter().take(4)
-            .filter_map(|id| snapshot.group(*id))
-            .map(|group| group.declarations())
-            .sum::<usize>();
-        matched += black_box(resolved);
-        lookup_ns.push(looked_up.as_nanos() as u64);
-        resolve_ns.push(started.elapsed().as_nanos() as u64);
-    }
-    lookup_ns.sort_unstable();
-    resolve_ns.sort_unstable();
-    let percentile = |samples: &[u64], numer:usize| samples[((samples.len()-1)*numer)/100];
-    crate::log_event!(Debug,"liquidity graph lookup generation={} samples={} resolved_pool_refs={} lookup_p50_ns={} lookup_p95_ns={} lookup_p99_ns={} lookup_max_ns={} resolve4_p50_ns={} resolve4_p95_ns={} resolve4_p99_ns={} resolve4_max_ns={}",
-        snapshot.generation,lookup_ns.len(),matched,
-        percentile(&lookup_ns,50),percentile(&lookup_ns,95),
-        percentile(&lookup_ns,99),lookup_ns[lookup_ns.len()-1],
-        percentile(&resolve_ns,50),percentile(&resolve_ns,95),
-        percentile(&resolve_ns,99),resolve_ns[resolve_ns.len()-1]);
-}
-
-/// A single owner consumes Registry changes. Publishing an Arc replaces the
-/// complete immutable generation atomically; no signal can read a partial catalog.
-const REBUILD_SPACING: Duration = Duration::from_secs(3);
-
-/// A single owner consumes every Registry update without waiting for a rebuild.
-/// At most one full rebuild runs at once; changed edges are coalesced for the
-/// next generation. An in-flight generation is immutable and can be superseded
-/// by a later one after another three-second interval.
+const REBUILD_SPACING:Duration=Duration::from_secs(3);
+/// Registry is the sole writer; every immutable generation publishes atomically.
+/// Incoming deltas are coalesced even while the previous graph is being updated.
 pub async fn run(
-    mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    output: watch::Sender<Arc<GraphSnapshot>>,
-    _settings: Settings,
-) -> Result<()> {
-    let mut prepared: HashMap<Pubkey, PreparedPool> = HashMap::new();
-    let mut changed_batches = 0_u64;
-    let mut observed = 0_usize;
-    let mut generation = 0_u64;
-    let mut dirty = false;
-    let mut pending_changes = 0_usize;
-    let mut pending_batches = 0_usize;
-    let mut last_source = "persistence_restore";
-    let mut next_rebuild = TokioInstant::now();
-    let mut builds=JoinSet::<Result<(GraphSnapshot, u128, usize, usize, &'static str)>>::new();
-    let mut source_open = true;
+    mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
+    output:watch::Sender<Arc<GraphSnapshot>>,
+    _settings:Settings,
+)->Result<()>{
+    let mut prepared=HashMap::<Pubkey,PreparedPool>::new();
+    let mut dirty=HashMap::<Pubkey,Option<PreparedPool>>::new();
+    let mut generation=0_u64;
+    let mut source_open=true;
+    let mut pending_batches=0_usize;
+    let mut last_source="persistence_restore";
+    let mut next_rebuild=TokioInstant::now();
+    let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str)>>::new();
     loop {
-        if !source_open && !dirty && builds.is_empty() { break; }
-        tokio::select! {
-            event = input.recv(), if source_open => match event {
-                Ok(batch) => {
-                    observed += batch.pools.len();
-                    let mut changes = 0_usize;
+        if !source_open&&dirty.is_empty()&&builds.is_empty(){break;}
+        tokio::select!{
+            event=input.recv(),if source_open=>match event {
+                Ok(batch)=>{
+                    let mut changes=0;
                     for pool in &batch.pools {
-                        let candidate = eligible(pool);
-                        match candidate {
-                            Some(p) => {
-                                // TVL and slot changes in an existing edge do not
-                                // require a new topology generation.
-                                let same_edge = prepared.get(&p.address)
-                                    .is_some_and(|old| old.a == p.a && old.b == p.b);
-                                prepared.insert(p.address, p);
-                                if !same_edge { changes += 1; }
-                            }
-                            None => {
-                                if prepared.remove(&pool.address).is_some() { changes += 1; }
-                            }
-                        }
+                        let next=eligible(pool);
+                        let same=prepared.get(&pool.address).copied()==next;
+                        if same {continue;}
+                        if let Some(p)=next {prepared.insert(pool.address,p);}
+                        else{prepared.remove(&pool.address);}
+                        dirty.insert(pool.address,next);
+                        changes+=1;
                     }
-                    if changes > 0 {
-                        dirty = true;
-                        pending_changes += changes;
-                        pending_batches += 1;
-                        last_source = batch.source;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) =>
-                    anyhow::bail!("liquidity graph lost {skipped} Registry update batches"),
-                Err(broadcast::error::RecvError::Closed) => source_open = false,
+                    if changes>0 {pending_batches+=1;last_source=batch.source;}
+                },
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    anyhow::bail!("liquidity graph lost {n} Registry update batches"),
+                Err(broadcast::error::RecvError::Closed)=>source_open=false,
             },
-            result = builds.join_next(), if !builds.is_empty() => {
-                let (graph, elapsed_us, changes, batches, source) =
-                    result.context("missing liquidity graph build")?
-                        .context("liquidity graph build task panicked")??;
-                let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
-                let bridge = graph.groups.len()-direct;
-                let oversized = graph.groups.iter()
-                    .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
+            result=builds.join_next(),if !builds.is_empty()=>{
+                let (graph,micros,changes,batches,source)=result
+                    .context("missing graph delta build")?
+                    .context("graph delta task panicked")??;
+                let total=graph.topologies.len();
                 crate::log_event!(Info,
-                    "rebuild generation={} source={} changed_pools={} coalesced_batches={} prepared={} pairs={} groups={} compact_topologies={} compact_pair_index_refs={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
-                    graph.generation, source, changes, batches, graph.qualified_pools, graph.mint_pairs,
-                    graph.groups.len(), graph.topologies.len(),graph.pair_topologies.values().map(Vec::len).sum::<usize>(), direct, bridge, graph.route_options, graph.role_pool_refs,
-                    oversized, graph.approx_index_bytes, elapsed_us);
+                    "graph incremental generation={} source={} changed_pools={} changed_pairs={} coalesced_batches={} prepared={} pairs={} compact_topologies={} compact_pair_index_refs={} legacy_groups=0 trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
+                    graph.generation,source,changes,graph.changed_pairs.len(),batches,
+                    graph.qualified_pools,graph.mint_pairs,total,graph.role_pool_refs,
+                    graph.route_options,graph.role_pool_refs,graph.approx_index_bytes,micros);
                 let old=output.send_replace(Arc::new(graph));
-                // Reclaim multi-million-group generations outside the Tokio hotpath.
-                tokio::task::spawn_blocking(move || drop(old));
-                changed_batches += 1;
+                tokio::task::spawn_blocking(move||drop(old));
             },
-            _ = sleep_until(next_rebuild), if dirty && builds.is_empty() => {
-                generation = generation.checked_add(1).context("graph generation overflow")?;
-                let snapshot: Vec<PreparedPool> = prepared.values().copied().collect();
-                let changed = std::mem::take(&mut pending_changes);
-                let batches = std::mem::take(&mut pending_batches);
-                let source = last_source;
-                dirty = false;
-                next_rebuild = TokioInstant::now() + REBUILD_SPACING;
-                builds.spawn_blocking(move || {
-                    let started = Instant::now();
-                    let graph = build(snapshot.into_iter(), generation)?;
-                    Ok((graph, started.elapsed().as_micros(), changed, batches, source))
+            _=sleep_until(next_rebuild),if !dirty.is_empty()&&builds.is_empty()=>{
+                generation=generation.checked_add(1).context("graph generation overflow")?;
+                let diff=std::mem::take(&mut dirty);
+                let count=diff.len();
+                let batches=std::mem::take(&mut pending_batches);
+                let source=last_source;
+                let old=output.borrow().clone();
+                next_rebuild=TokioInstant::now()+REBUILD_SPACING;
+                builds.spawn_blocking(move||{
+                    let started=Instant::now();
+                    let next=create(old,diff,generation)?;
+                    Ok((next,started.elapsed().as_micros(),count,batches,source))
                 });
             },
         }
     }
-    let final_graph = output.borrow().clone();
-    crate::log_event!(Info,
-        "complete observed_pool_updates={} changed_batches={} generation={} prepared={} groups={}",
-        observed,changed_batches,final_graph.generation,
-        final_graph.qualified_pools,final_graph.groups.len());
-
+    let graph=output.borrow().clone();
+    crate::log_event!(Info,"graph complete generation={} prepared={} compact_topologies={} legacy_groups=0",
+        graph.generation,graph.qualified_pools,graph.topologies.len());
     Ok(())
 }
-
-/// Live consumer proves that the immutable RAM generation reaches a real reader.
-pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<()> {
-    let mut observed = 0_u64;
-    while input.changed().await.is_ok() {
-        let snapshot = input.borrow_and_update().clone();
-        observed += 1;
-        probe(&snapshot);
-        if let Some(group) = snapshot.groups.first() {
-            crate::log_event!(Debug,"liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={} direct_pool_samples={:?} bridge_pool_samples={:?}",
-                snapshot.generation,snapshot.groups.len(),group.kind,group.settlement,group.target,
-                group.bridge,group.intermediate,group.conversion,group.direct_s.len(),
-                group.direct_q.len(),group.bridge_pools.len(),group.route_options,
-                group.direct_s.iter().take(3).collect::<Vec<_>>(),
-                group.bridge_pools.iter().take(3).collect::<Vec<_>>());
+/// Live observer reads the same immutable generation as every consumer.
+pub async fn observe(mut input:watch::Receiver<Arc<GraphSnapshot>>)->Result<()>{
+    let mut generations=0;
+    while input.changed().await.is_ok(){
+        let graph=input.borrow_and_update().clone();
+        generations+=1;
+        if let Some(t)=graph.topologies.first(){
+            crate::log_event!(Info,"graph observer generation={} topologies={} changed_pairs={} first={:?} settlement={} target={} paths={}",
+                graph.generation,graph.topologies.len(),graph.changed_pairs.len(),
+                t.kind,t.settlement,t.target,t.route_options);
         }
     }
-    crate::log_event!(Info,"liquidity graph consumer complete generations={observed}");
+    crate::log_event!(Info,"graph observer complete generations={generations}");
     Ok(())
 }
