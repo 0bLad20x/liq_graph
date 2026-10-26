@@ -147,8 +147,27 @@ impl CompactIndex {
                 else{self.ranked.insert((input,output),ordered);}
             }
         }
+        // Topology IDs are generation-local. Preserve winners only when the
+        // topology identity and every referenced pair alternative is unchanged.
+        // This avoids falsely emitting "Entered" for stable routes after a
+        // generation insertion shifted the sorted topology IDs.
+        let mut old_ids=HashMap::new();
+        for (id,t) in self.graph.topologies.iter().enumerate(){
+            old_ids.insert((t.kind,t.settlement,t.target,t.bridge),id as u32);
+        }
+        let previous=std::mem::take(&mut self.qualifying);
+        for (id,t) in graph.topologies.iter().enumerate(){
+            if t.directed_roles().iter().any(|&(a,b)|dirty.contains(&pair(a,b))){continue;}
+            let Some(&old)=old_ids.get(&(t.kind,t.settlement,t.target,t.bridge)) else {continue;};
+            let prior=&self.graph.topologies[old as usize];
+            if prior.directed_roles()!=t.directed_roles(){continue;}
+            for reverse in [false,true]{
+                if let Some(w)=previous.get(&(old,reverse)){
+                    self.qualifying.insert((id as u32,reverse),*w);
+                }
+            }
+        }
         self.graph=graph;
-        self.qualifying.clear();
         dirty.len()
     }
     fn clear_prices(&mut self){
