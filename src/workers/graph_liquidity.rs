@@ -493,7 +493,7 @@ pub async fn run(
                     .context("missing graph delta build")?
                     .context("graph delta task panicked")??;
                 let effective=before_pairs.iter().filter(|(pool,prior)|
-                    **prior!=graph.pair_for_pool(**pool)).count();
+                    *prior!=&graph.pair_for_pool(**pool)).count();
                 let no_effect=before_pairs.len().saturating_sub(effective);
                 let mut source_counts=HashMap::<&str,usize>::new();
                 for t in &traces {*source_counts.entry(t.source).or_default()+=1;}
