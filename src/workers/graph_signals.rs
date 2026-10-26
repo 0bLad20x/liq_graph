@@ -8,9 +8,9 @@ use tokio::sync::{broadcast,watch};
 use crate::core::{
     market_state::{MarketStateEvent,PoolPriceObservation,PriceEventStream,PriceOrigin,PricePipelineTiming},
     signals::{SignalCandidate,SignalCandidateBatch,SignalEvaluation,SignalEvent,SignalLeg,
-        SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,SignalRangeBlock,
-        SignalRangeChange,SignalRouteKind,SignalRouteRange,SignalSnapshot,SignalStateUpdate,SignalStream,
-        SignalTopology,SignalTrigger,SignalWitness,SIGNAL_BLOCK_RANGES,SIGNAL_LOG_SCALE}};
+        SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,
+        SignalRangeChange,SignalRouteKind,SignalSnapshot,SignalStateUpdate,SignalStream,
+        SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE}};
 use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
 const EXECUTION_LAYOUT:&str="compact_topologies_cp6a";
@@ -382,7 +382,7 @@ impl Engine {
         crate::log_event!(Info,"graph signals cp6b rankings generation={} changed_pairs={} directed_roles={} old_groups_compiled=0",
             graph.generation,changed_pair_rankings,self.index.ranked.len());
         let plan=Arc::new(SignalPlan{graph_generation:graph.generation,
-            log_weight_scale:SIGNAL_LOG_SCALE,roles:Arc::from([]),groups:Arc::from([]),
+            log_weight_scale:SIGNAL_LOG_SCALE,
             compact_topologies:compact.into(),route_options:graph.route_options});
         let old=std::mem::replace(&mut self.plan,plan);
         tokio::task::spawn_blocking(move||drop(old));
@@ -392,7 +392,7 @@ impl Engine {
 pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<GraphSnapshot>>,
     output:broadcast::Sender<Arc<SignalEvent>>,settings:Settings)->Result<ProductionReport>{
     let initial=Arc::new(SignalPlan{graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
-        roles:Arc::from([]),groups:Arc::from([]),compact_topologies:Arc::from([]),route_options:0});
+        compact_topologies:Arc::from([]),route_options:0});
     let mut e=Engine{prices:Prices::default(),plan:initial,index:CompactIndex::default(),
         output,sequence:0,revision:0,
         threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,
@@ -588,20 +588,6 @@ impl Counts {
             }
         }
     }
-    fn block(&mut self, b: &SignalRangeBlock) {
-        self.events+=1; self.range_blocks+=1; self.ranges+=b.ranges.len() as u64;
-        for r in &b.ranges {
-            match r.change {
-                SignalRangeChange::Entered => self.entered_ranges+=1,
-                SignalRangeChange::Updated => self.updated_ranges+=1,
-                SignalRangeChange::Exited => self.exited_ranges+=1,
-            }
-            if live(&b.trigger) {
-                self.websocket_ranges+=1;
-                self.websocket_candidate_ranges+=u64::from(r.change != SignalRangeChange::Exited);
-            }
-        }
-    }
     fn evaluation(&mut self, e: &SignalEvaluation) {
         self.events+=1; self.evaluations+=1;
         match e.trigger.as_ref() {
@@ -702,15 +688,11 @@ impl ProductionReport {
         Ok(())
     }
 }
-#[derive(Clone, serde::Serialize)]
-struct Example {
-    graph_generation: u64, revision: u64, trigger: Arc<SignalTrigger>, range: SignalRouteRange,
-}
 #[derive(Default, serde::Serialize)]
 pub struct ObservationReport {
     pub error: Option<String>, counts: Counts,
     execution_layout: &'static str, output_layout: &'static str,
-    output_capacity: usize, max_ranges_per_block: usize, reference_comparison_performed: bool,
+    output_capacity: usize, reference_comparison_performed: bool,
     lost_events: u64, max_queue_depth: usize, last_sequence: u64, last_revision: u64,
     lag_incidents: u64, first_loss_at_us: Option<u64>, last_loss_at_us: Option<u64>,
     resynchronizations: u64, awaiting_snapshot: bool, unverified_events: u64, unverified_ranges: u64,
@@ -719,7 +701,7 @@ pub struct ObservationReport {
     completion_to_consumer_us: Histogram, websocket_frame_to_completion_consumer_us: Histogram,
     ranges_by_kind: BTreeMap<&'static str,u64>, ready_anchors_by_kind: BTreeMap<&'static str,u64>,
     websocket_ready_anchors_by_kind: BTreeMap<&'static str,u64>,
-    examples: Vec<Example>, candidate_examples:Vec<SignalCandidate>, consumer_processing_ns: Histogram,
+    candidate_examples:Vec<SignalCandidate>, consumer_processing_ns: Histogram,
     consumer_logging_ns: u64,
 }
 impl ObservationReport {
@@ -749,7 +731,7 @@ impl ObservationReport {
 #[derive(Default)]
 struct Mirror {
     plan: Option<Arc<SignalPlan>>, pools: Vec<SignalPool>,
-    prices: Vec<Option<Arc<SignalPoolPrice>>>, slot_roles: Vec<Option<usize>>,
+    prices: Vec<Option<Arc<SignalPoolPrice>>>,
     revision: u64, generation: u64,
 }
 impl Mirror {
@@ -759,19 +741,12 @@ impl Mirror {
             ensure!(snapshot.plan.graph_generation==s.graph_generation
                 && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE && snapshot.pools.len()==snapshot.prices.len(),"invalid state snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
-            self.slot_roles=vec![None;2*self.pools.len()];
-            for (id,role) in snapshot.plan.roles.iter().enumerate() {
-                for &slot in role.slots.iter() {
-                    let entry=self.slot_roles.get_mut(slot).context("snapshot slot outside pool identities")?;
-                    ensure!(entry.replace(id).is_none(),"duplicate snapshot role slot");
-                }
-            }
             self.generation=s.graph_generation;
         } else { ensure!(self.plan.is_some() && s.graph_generation==self.generation,"state update without matching snapshot"); }
         if s.clear { self.prices.fill(None); }
         for c in &s.changes {
             if c.pool_id==self.pools.len() {
-                self.pools.push(c.identity.clone()); self.prices.push(None); self.slot_roles.extend([None;2]);
+                self.pools.push(c.identity.clone()); self.prices.push(None);
             }
             ensure!(self.pools.get(c.pool_id)==Some(&c.identity),"price delta identity mismatch");
             self.prices[c.pool_id]=c.price.clone();
@@ -815,48 +790,10 @@ impl Mirror {
             "candidate is not a profitable closed route");
         Ok(())
     }
-    fn range(&self, b: &SignalRangeBlock, r: &SignalRouteRange) -> Result<()> {
-        ensure!(b.revision==self.revision && b.graph_generation==self.generation,"range references another state revision");
-        let plan=self.plan.as_ref().context("range before state snapshot")?;
-        let g=plan.groups.get(r.group_id).context("range group missing")?;
-        let direction=usize::from(r.reverse);
-        let anchor_role=if r.anchor_is_left {g.left[direction]}else{g.right[direction]};
-        let partner_role=if r.anchor_is_left {g.right[direction]}else{g.left[direction]};
-        ensure!(partner_role==r.partner_role && self.slot_roles.get(r.anchor_slot)==Some(&Some(anchor_role)),
-            "range role mismatch");
-        ensure!(r.exclude_pool==(g.kind==SignalRouteKind::Direct2).then_some(r.anchor_slot/2),
-            "range same-pool exclusion mismatch");
-        let count=match g.kind { SignalRouteKind::Direct2=>2,SignalRouteKind::Triangle4=>4,_=>3 };
-        ensure!(r.witness.legs.len()==count 
-            && r.lower_inclusive.is_none_or(|l|l<r.upper_exclusive),"invalid range or witness");
-        let partner=r.witness.legs.iter().find(|leg|self.slot_roles.get(leg.slot)==Some(&Some(partner_role))
-            && leg.slot!=r.anchor_slot).context("witness partner missing")?;
-        let w=self.prices.get(partner.slot/2).and_then(|p|p.as_ref())
-            .and_then(|p|p.log_weight_units[partner.slot%2]).context("witness partner unavailable")?;
-        ensure!(Some(partner.slot/2)!=r.exclude_pool && r.lower_inclusive.is_none_or(|l|w>=l)
-            && w<r.upper_exclusive,"witness outside reported interval");
-        let threshold=b.threshold_units;
-        let before=r.previous_addend.is_some_and(|a|w<threshold-a);
-        let after=r.current_addend.is_some_and(|a|w<threshold-a);
-        ensure!(match r.change {
-            SignalRangeChange::Entered=>!before && after,
-            SignalRangeChange::Updated=>before && after,
-            SignalRangeChange::Exited=>before && !after,
-        },"witness status mismatch");
-        let addend=if r.change==SignalRangeChange::Exited {r.previous_addend}else{r.current_addend}.context("witness addend missing")?;
-        ensure!(r.witness.log_sum_units==addend+w && r.witness.negative_log_sum.is_finite(),"invalid witness score");
-        ensure!(r.witness.legs.iter().map(|l|l.log_weight_units).sum::<i64>()==r.witness.log_sum_units,
-            "witness legs do not match the reported score");
-        for i in 0..count {
-            let next=(i+1)%count;
-            ensure!(r.witness.legs[i].output_mint==r.witness.legs[next].input_mint,"witness is not a closed route");
-        }
-        Ok(())
-    }
 }
 pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
     let mut report=ObservationReport { execution_layout:EXECUTION_LAYOUT,output_layout:OUTPUT_LAYOUT,
-        output_capacity:OUTPUT_CAPACITY,max_ranges_per_block:SIGNAL_BLOCK_RANGES,..Default::default() };
+        output_capacity:OUTPUT_CAPACITY,..Default::default() };
     let mut mirror=Mirror::default(); let mut pending=false; let mut ranges=[0_u64;3];
     let mut sample_baseline=[0_usize;4]; let mut sample_ws=[0_usize;4];
     let mut ticker=tokio::time::interval(Duration::from_secs(5));
@@ -881,7 +818,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                     let started=Instant::now(); let at=now_us();
                     report.max_queue_depth=report.max_queue_depth.max(input.len());
                     let sequence=match event.as_ref() {
-                        SignalEvent::State(s)=>s.sequence, SignalEvent::Ranges(b)=>b.sequence,
+                        SignalEvent::State(s)=>s.sequence,
                         SignalEvent::Candidates(b)=>b.sequence,SignalEvent::Evaluated(e)=>e.sequence,
                     };
                     ensure!(report.awaiting_snapshot || sequence==report.last_sequence+1,"signal event sequence gap");
@@ -941,32 +878,6 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                     if let Some(us)=at.checked_sub(t.frame_received_at_us){
                                         report.websocket_frame_to_range_consumer_us.add(us);
                                     }
-                                }
-                            }
-                        },
-                        SignalEvent::Ranges(b) => {
-                            ensure!(!b.ranges.is_empty() && b.ranges.len()<=SIGNAL_BLOCK_RANGES,"invalid signal range block");
-                            if report.awaiting_snapshot {report.unverified_ranges+=b.ranges.len() as u64;}
-                            else {
-                                ensure!(pending,"range block without state");
-                                for r in &b.ranges {
-                                    mirror.range(b,r)?; ranges[change_id(r.change)]+=1;
-                                    let kind=kind_id(mirror.plan.as_ref().unwrap().groups[r.group_id].kind);
-                                    let samples=if live(&b.trigger) {&mut sample_ws}else{&mut sample_baseline};
-                                    if samples[kind]<settings.sample_limit {
-                                        samples[kind]+=1;
-                                        report.examples.push(Example { graph_generation:b.graph_generation,revision:b.revision,
-                                            trigger:b.trigger.clone(),range:r.clone() });
-                                    }
-                                    if settings.trace {
-                                        crate::log_event!(Info,"graph signals range={}",serde_json::to_string(r)?);
-                                    }
-                                }
-                            }
-                            report.counts.block(b);
-                            if live(&b.trigger) {
-                                if let Some(t)=b.price_pipeline {
-                                    if let Some(us)=at.checked_sub(t.frame_received_at_us) {report.websocket_frame_to_range_consumer_us.add(us);}
                                 }
                             }
                         },
