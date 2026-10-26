@@ -234,8 +234,12 @@ fn create(
     let usdc:Pubkey=USDC.parse()?;
     // Rebuild only (settlement,target) shapes touching a changed pair. A changed
     // conversion pair legitimately touches every topology using conversion.
+    let previous_targets=old.topologies.iter().map(|t|(t.settlement,t.target))
+        .collect::<HashSet<_>>();
+    let initial=old.generation==0;
     let mut affected=HashSet::<(Pubkey,Pubkey)>::new();
     for &(a,b) in &changed_pairs {
+        if initial {break;}
         for &s in &[wsol,usdc]{
             let mut targets=HashSet::from([a,b]);
             targets.extend(adjacency.get(&a).into_iter().flatten().copied());
@@ -245,7 +249,7 @@ fn create(
             }
             for t in targets {
                 if t!=s && (adjacency.get(&s).is_some_and(|n|n.contains(&t))
-                    ||old.topologies.iter().any(|top|top.settlement==s&&top.target==t)){
+                    ||previous_targets.contains(&(s,t))){
                     affected.insert((s,t));
                 }
             }
@@ -256,13 +260,18 @@ fn create(
             affected.insert((top.settlement,top.target));
         }
     }
-    let mut topologies=old.topologies.iter()
-        .filter(|t|!affected.contains(&(t.settlement,t.target)))
-        .cloned().collect::<Vec<_>>();
-    if !affected.is_empty(){
-        let (regenerated,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&affected))?;
-        topologies.extend(regenerated.iter().cloned());
-    }
+    let mut topologies=if initial {
+        build_topologies(&pairs,&adjacency,wsol,usdc,None)?.0.to_vec()
+    } else {
+        let mut retained=old.topologies.iter()
+            .filter(|t|!affected.contains(&(t.settlement,t.target)))
+            .cloned().collect::<Vec<_>>();
+        if !affected.is_empty() {
+            let (regenerated,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&affected))?;
+            retained.extend(regenerated.iter().cloned());
+        }
+        retained
+    };
     topologies.sort_unstable_by_key(|t| (t.settlement,t.target,t.bridge,t.kind));
     ensure!(topologies.windows(2).all(|w|
         (w[0].settlement,w[0].target,w[0].bridge,w[0].kind)
