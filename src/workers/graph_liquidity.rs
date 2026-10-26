@@ -318,7 +318,6 @@ pub struct GraphSnapshot {
     pub pool_pairs:HashMap<Pubkey,Pair>,
     pub topologies:Arc<[RouteTopology]>,
     pub pair_topologies:HashMap<Pair,Vec<u32>>,
-    pub token_index:HashMap<Pubkey,Vec<u32>>,
     pub route_options:u64,
     pub role_pool_refs:usize,
     pub approx_index_bytes:usize,
@@ -345,9 +344,6 @@ impl GraphSnapshot {
     }
     pub fn pair_for_pool(&self,pool:Pubkey)->Option<Pair>{
         self.pool_pairs.get(&pool).copied()
-    }
-    pub fn for_token(&self,mint:Pubkey)->&[u32]{
-        self.token_index.get(&mint).map_or(&[],Vec::as_slice)
     }
 }
 // CP6C invariant: a topology is defined only by its directed mint roles.
@@ -591,7 +587,6 @@ fn create(
         "duplicate compact route identity");
     ensure!(topologies.len()<u32::MAX as usize,"compact graph topology ID overflow");
     let mut pair_topologies=HashMap::<Pair,Vec<u32>>::new();
-    let mut token_index=HashMap::<Pubkey,Vec<u32>>::new();
     let mut options=0_u64;
     for (i,t) in topologies.iter().enumerate(){
         let id=i as u32;
@@ -619,13 +614,10 @@ fn create(
             "stale compact topology options after incremental update");
         options=options.checked_add(t.route_options).context("route options overflow")?;
         let mut seen_pairs=HashSet::new();
-        let mut seen_tokens=HashSet::new();
         for &(a,b) in t.directed_roles(){
             let p=pair(a,b);
             ensure!(pairs.contains_key(&p),"topology role references unavailable pair");
             if seen_pairs.insert(p){pair_topologies.entry(p).or_default().push(id);}
-            if seen_tokens.insert(a){token_index.entry(a).or_default().push(id);}
-            if seen_tokens.insert(b){token_index.entry(b).or_default().push(id);}
         }
     }
     ensure!(pool_pairs.len()==pairs.values().map(|v|v.len()).sum::<usize>(),
@@ -638,12 +630,12 @@ fn create(
     let approx=pool_pairs.len()*size_of::<PreparedPool>()
         +pairs.values().map(|v|v.len()*size_of::<Pubkey>()).sum::<usize>()
         +topologies.len()*size_of::<RouteTopology>()
-        +(refs+token_index.values().map(Vec::len).sum::<usize>())*size_of::<u32>();
+        +refs*size_of::<u32>();
     let mut changed=changed_pairs.into_iter().collect::<Vec<_>>();
     changed.sort_unstable();
     Ok(GraphSnapshot{generation,qualified_pools:pool_pairs.len(),
         mint_pairs:pairs.len(),pair_pools:pairs,pool_pairs,
-        topologies:topologies.into(),pair_topologies,token_index,
+        topologies:topologies.into(),pair_topologies,
         route_options:options,role_pool_refs:refs,approx_index_bytes:approx,
         changed_pairs:changed.into(),
         recomputed_targets:new_edges.len()+removed_edges,
