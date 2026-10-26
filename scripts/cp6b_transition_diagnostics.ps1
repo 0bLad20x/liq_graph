@@ -99,7 +99,7 @@ try {
             $payload=$match.Line.Substring($index+$marker.Length)
             $payload | ConvertFrom-Json -ErrorAction Stop
         })
-        return ,$records
+        return $records
     }
     $transitions=@(Read-EventRecords 'graph pool_transition event=')
     $observed=@($transitions | Where-Object {$_.event -eq 'observed'})
