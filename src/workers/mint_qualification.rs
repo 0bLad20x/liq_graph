@@ -182,10 +182,25 @@ pub async fn run(
                 Ok(batch)=>{
                     for mint in mints.apply(&batch){
                         if !known.contains(&mint){continue;}
-                        if mints.get(mint).as_ref().is_some_and(eligible){
-                            qualified.insert(mint);
-                        }else{
-                            qualified.remove(&mint);
+                        let was_qualified=qualified.contains(&mint);
+                        let current=mints.get(mint);
+                        let is_qualified=current.as_ref().is_some_and(eligible);
+                        if is_qualified {qualified.insert(mint);}
+                        else {qualified.remove(&mint);}
+                        if was_qualified!=is_qualified {
+                            crate::log_event!(Info,"mint qualification_transition event={}",
+                                serde_json::json!({
+                                    "mint":mint.to_string(),
+                                    "source":"jupiter",
+                                    "received_at_ms":batch.received_at_ms,
+                                    "was_qualified":was_qualified,
+                                    "is_qualified":is_qualified,
+                                    "liquidity_usd":current.as_ref().and_then(|v|v.liquidity_usd),
+                                    "market_cap_usd":current.as_ref().and_then(|v|v.market_cap_usd),
+                                    "min_liquidity_usd":MIN_LIQUIDITY_USD,
+                                    "min_market_cap_usd":MIN_MARKET_CAP_USD,
+                                })
+                            );
                         }
                         dirty=true;
                     }
