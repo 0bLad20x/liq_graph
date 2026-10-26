@@ -479,7 +479,9 @@ pub async fn run(
                     graph.generation, source, changes, batches, graph.qualified_pools, graph.mint_pairs,
                     graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
                     oversized, graph.approx_index_bytes, elapsed_us);
-                output.send_replace(Arc::new(graph));
+                let old=output.send_replace(Arc::new(graph));
+                // Reclaim multi-million-group generations outside the Tokio hotpath.
+                tokio::task::spawn_blocking(move || drop(old));
                 changed_batches += 1;
             },
             _ = sleep_until(next_rebuild), if dirty && builds.is_empty() => {
