@@ -1,0 +1,22 @@
+name: CP6C exact delta locked build
+on:
+  push:
+    branches: [cp6c-exact-graph-delta]
+  workflow_dispatch:
+jobs:
+  locked-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
+      - name: Verify checkout and build
+        run: |
+          git branch --show-current
+          git rev-parse --short HEAD
+          git status --short
+          git diff --exit-code -- Cargo.lock
+          cargo build --locked
+          git diff --exit-code -- Cargo.lock
+          git status --short
