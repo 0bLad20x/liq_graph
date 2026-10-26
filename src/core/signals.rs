@@ -1,4 +1,4 @@
-//! Versioned factorized route state and exact interval outputs. Data contracts only.
+//! Versioned compact route state and best-candidate outputs. Data contracts only.
 use std::sync::Arc;
 use solana_pubkey::Pubkey;
 use super::market_state::{PoolPriceObservation, PriceOrigin, PricePipelineTiming};
@@ -127,7 +127,7 @@ pub struct SignalEvaluation {
     pub price_queue_depth: usize,
     pub groups_visited: u64, pub logical_routes_affected: u64,
     pub anchors_visited: u64, pub ready_anchors: [u64; 4], pub range_queries: u64,
-    /// Counts intervals, not individual concrete routes.
+    /// Counts best-candidate transitions, not individual pool-combination routes.
     pub ranges: [u64; 3], pub ranges_by_kind: [u64; 4],
     pub logarithms_prepared: u64, pub price_preparation_ns: u64, pub index_update_ns: u64,
     /// Input acceptance to complete factorized state/index readiness, before output.
