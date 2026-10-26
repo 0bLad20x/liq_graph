@@ -51,11 +51,41 @@ pub struct SignalGroup {
 fn mint_array<S: serde::Serializer>(v: &[Pubkey; 5], s: S) -> Result<S::Ok, S::Error> {
     serde::Serialize::serialize(&v.map(|p| p.to_string()), s)
 }
+/// Immutable, factored V10 topology for signal and execution consumers.
+/// The ordered mint pairs describe the forward route; the reverse is implicit.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SignalTopology {
+    pub kind: SignalRouteKind,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub settlement: Pubkey,
+    #[serde(with = "super::execution::pubkey_json")]
+    pub target: Pubkey,
+    pub bridge: Option<Pubkey>,
+    pub roles: [(Pubkey, Pubkey);4],
+    pub length: usize,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SignalCandidate {
+    pub topology_id: usize,
+    pub reverse: bool,
+    pub change: SignalRangeChange,
+    /// Only present for entering/updating profitable candidates.
+    pub witness: Option<SignalWitness>,
+}
+#[derive(Debug, serde::Serialize)]
+pub struct SignalCandidateBatch {
+    pub sequence: u64, pub revision: u64, pub graph_generation: u64,
+    pub trigger: Arc<SignalTrigger>,
+    pub threshold_units: i64,
+    pub price_pipeline: Option<PricePipelineTiming>,
+    pub candidates: Vec<SignalCandidate>,
+}
 #[derive(Debug, serde::Serialize)]
 pub struct SignalPlan {
     pub graph_generation: u64,
     pub log_weight_scale: i64,
     pub roles: Arc<[SignalRole]>, pub groups: Arc<[SignalGroup]>,
+    pub compact_topologies: Arc<[SignalTopology]>,
     pub route_options: u64,
 }
 #[derive(Debug, serde::Serialize)]
@@ -139,6 +169,7 @@ pub struct SignalEvaluation {
 pub enum SignalEvent {
     State(SignalStateUpdate),
     Ranges(SignalRangeBlock),
+    Candidates(SignalCandidateBatch),
     Evaluated(SignalEvaluation),
 }
 pub type SignalStream = tokio::sync::broadcast::Receiver<Arc<SignalEvent>>;
