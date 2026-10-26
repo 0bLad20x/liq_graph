@@ -300,8 +300,7 @@ impl GraphSnapshot {
         self.pair_topologies.get(&pair(a,b)).map_or(&[],Vec::as_slice)
     }
     pub fn topologies_for_pool(&self, pool: Pubkey) -> &[u32] {
-        self.pool_pairs.get(&pool).and_then(|key|self.pair_topologies.get(key))
-            .map_or(&[],Vec::as_slice)
+        self.pool_pairs.get(&pool).map_or(&[],|(a,b)|self.topologies_for_pair(*a,*b))
     }
     pub fn pools_for_pair(&self, a: Pubkey, b: Pubkey) -> &[Pubkey] {
         self.pair_pools.get(&pair(a,b)).map_or(&[], |p| p.as_ref())
