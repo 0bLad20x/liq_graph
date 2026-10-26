@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::watch;
 
-use super::graph_liquidity::{GraphSnapshot, Group, GroupKind};
+use super::graph_liquidity::{GraphSnapshot, RouteTopology, RouteTopologyKind};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -27,12 +27,12 @@ pub enum RouteKind {
 }
 
 impl RouteKind {
-    fn of(group: &Group) -> Self {
-        match (group.kind, group.conversion.is_some()) {
-            (GroupKind::Direct, false) => Self::Direct2,
-            (GroupKind::Direct, true) => Self::Direct3,
-            (GroupKind::Bridge, false) => Self::Triangle3,
-            (GroupKind::Bridge, true) => Self::Triangle4,
+    fn of(topology: &RouteTopology) -> Self {
+        match topology.kind {
+            RouteTopologyKind::Direct2 => Self::Direct2,
+            RouteTopologyKind::Direct3 => Self::Direct3,
+            RouteTopologyKind::Triangle3 => Self::Triangle3,
+            RouteTopologyKind::Triangle4 => Self::Triangle4,
         }
     }
 }
@@ -193,48 +193,38 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
     let mut mint_state = BTreeMap::<Pubkey, MintAccumulator>::new();
     let mut pool_state = BTreeMap::<Pubkey, PoolAccumulator>::new();
 
-    for group in &graph.groups {
-        let kind = RouteKind::of(group);
-        let settlement = group.settlement;
-        ensure!(settlement == wsol || settlement == usdc,
-            "catalog has non-WSOL/USDC settlement");
-        let quote = if settlement == wsol { usdc } else { wsol };
-        let target = group.target;
-        mint_role(&mut mint_state, settlement, kind, MintRole::Settlement);
-        mint_role(&mut mint_state, target, kind, MintRole::Target);
-        if group.conversion.is_some() {
-            mint_role(&mut mint_state, quote, kind, MintRole::ConversionQuote);
+    for topology in graph.topologies.iter() {
+        let kind=RouteKind::of(topology);
+        let settlement=topology.settlement;
+        ensure!(settlement==wsol||settlement==usdc,"catalog invalid settlement");
+        let quote=if settlement==wsol{usdc}else{wsol};
+        let target=topology.target;
+        mint_role(&mut mint_state,settlement,kind,MintRole::Settlement);
+        mint_role(&mut mint_state,target,kind,MintRole::Target);
+        if kind==RouteKind::Direct3||kind==RouteKind::Triangle4 {
+            mint_role(&mut mint_state,quote,kind,MintRole::ConversionQuote);
         }
-
-        for &address in group.direct_s.iter() {
-            pool_role(&mut pool_state, address, target, settlement,
-                kind, PoolRole::DirectSettlement)?;
+        if let Some(bridge)=topology.bridge {
+            mint_role(&mut mint_state,bridge,kind,MintRole::Bridge);
         }
-        for &address in group.direct_q.iter() {
-            pool_role(&mut pool_state, address, target, quote,
-                kind, PoolRole::DirectQuote)?;
-        }
-        if let Some(bridge) = group.bridge {
-            mint_role(&mut mint_state, bridge, kind, MintRole::Bridge);
-            let middle = group.intermediate.context("bridge group without intermediate pool")?;
-            pool_role(&mut pool_state, middle, target, bridge,
-                kind, PoolRole::Intermediate)?;
-            let return_quote = if group.conversion.is_some() { quote } else { settlement };
-            for &address in group.bridge_pools.iter() {
-                pool_role(&mut pool_state, address, bridge, return_quote,
-                    kind, PoolRole::BridgeReturn)?;
+        for (i,&(a,b)) in topology.directed_roles().iter().enumerate() {
+            let role=match (kind,i) {
+                (RouteKind::Direct2,_) | (_,0)=>PoolRole::DirectSettlement,
+                (RouteKind::Direct3,1)=>PoolRole::DirectQuote,
+                (RouteKind::Direct3,2)|(RouteKind::Triangle4,3)=>PoolRole::Conversion,
+                (RouteKind::Triangle3,1)|(RouteKind::Triangle4,1)=>PoolRole::Intermediate,
+                (RouteKind::Triangle3,2)|(RouteKind::Triangle4,2)=>PoolRole::BridgeReturn,
+                _=>anyhow::bail!("unexpected compact topology role"),
+            };
+            for &address in graph.pools_for_pair(a,b) {
+                pool_role(&mut pool_state,address,a,b,kind,role)?;
             }
         }
-        if let Some(conversion) = group.conversion {
-            pool_role(&mut pool_state, conversion, settlement, quote,
-                kind, PoolRole::Conversion)?;
-        }
     }
-
-    ensure!(mint_state.len() == graph.token_index.len(),
-        "catalog mint set differs from graph token index");
-    ensure!(pool_state.len() == graph.pool_index.len(),
-        "catalog pool set differs from graph pool index");
+    ensure!(mint_state.len()==graph.token_index.len(),"catalog mint set differs from graph");
+    ensure!(pool_state.len()==graph.pair_topologies.keys().map(|p|
+        graph.pair_pools.get(p).map_or(0,|v|v.len())).sum::<usize>(),
+        "catalog pool set differs from compact topology coverage");
 
     let mut pair_state = BTreeMap::<MintPair, PairAccumulator>::new();
     for (&address, entry) in &pool_state {
@@ -255,7 +245,7 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         PoolWatch {
             address, mint_a, mint_b,
             contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
-            group_ids: Arc::from(graph.for_pool(address)),
+            group_ids: Arc::from(graph.topologies_for_pool(address)),
             pair_pool_count,
         }
     }).collect();
@@ -288,11 +278,15 @@ pub async fn run(
     while input.changed().await.is_ok() {
         let graph = input.borrow_and_update().clone();
         if last_generation == Some(graph.generation) { continue; }
-        let catalog = Arc::new(build(graph)?);
+        // The projection scans the complete graph. Never block Tokio's price/RPC tasks.
+        let catalog = Arc::new(tokio::task::spawn_blocking(move || build(graph)).await
+            .context("watch catalog build task panicked")??);
         let mint_addresses: Arc<[Pubkey]> =
             Arc::from(catalog.mints.iter().map(|m| m.address).collect::<Vec<_>>());
         last_generation = Some(catalog.generation);
-        output.send_replace(catalog.clone());
+        let old=output.send_replace(catalog.clone());
+        // Old catalog projections can own millions of references.
+        tokio::task::spawn_blocking(move || drop(old));
         if let Some(tx) = &jupiter_mints {
             // A topology generation change need not change the mint universe.
             if tx.borrow().as_ref() != mint_addresses.as_ref() {
@@ -300,66 +294,29 @@ pub async fn run(
             }
         }
         crate::log_event!(Info,"graph watch catalog published generation={} groups={} mints={} pools={} mint_pairs={}",
-            catalog.generation, catalog.graph.groups.len(),
+            catalog.generation, catalog.graph.topologies.len(),
             catalog.mints.len(), catalog.pools.len(), catalog.pairs.len());
     }
     Ok(())
 }
 
-/// Actual watch-channel consumer for the standalone Postgres restore/live mode.
-/// Reports each route category and the deduplicated triangle-4 intermediate set.
-pub async fn observe(mut input: watch::Receiver<Arc<WatchCatalog>>) -> Result<()> {
-    while input.changed().await.is_ok() {
-        let catalog = input.borrow_and_update().clone();
-        let mut categories = [0_usize; 4];
-        for group in &catalog.graph.groups {
-            let index = match RouteKind::of(group) {
-                RouteKind::Direct2 => 0,
-                RouteKind::Direct3 => 1,
-                RouteKind::Triangle3 => 2,
-                RouteKind::Triangle4 => 3,
-            };
-            categories[index] += 1;
+/// Live checks use the same compact topology ID generation as Signal Engine.
+pub async fn observe(mut input:watch::Receiver<Arc<WatchCatalog>>)->Result<()>{
+    let mut n=0_u64;
+    while input.changed().await.is_ok(){
+        let c=input.borrow_and_update().clone();
+        n+=1;
+        ensure!(c.generation==c.graph.generation,"watch catalog generation mismatch");
+        if let Some(p)=c.pools.first(){
+            ensure!(c.graph.pair_for_pool(p.address)==Some((p.mint_a,p.mint_b)),
+                "catalog pair differs from graph");
+            for &id in p.group_ids.iter().take(8){
+                ensure!(c.graph.topologies.get(id as usize).is_some(),"invalid compact topology ID");
+            }
         }
-        let bridge4_pools: Vec<_> = catalog.pools.iter().filter(|p|
-            p.contexts.contains(&PoolContext {
-                kind: RouteKind::Triangle4, role: PoolRole::Intermediate,
-            })
-        ).collect();
-        let bridge4_pairs: BTreeSet<_> = bridge4_pools.iter()
-            .map(|p| (p.mint_a, p.mint_b)).collect();
-        let bridge4_mints: BTreeSet<_> = bridge4_pairs.iter()
-            .flat_map(|&(a,b)| [a,b]).collect();
-        let parallel_pairs = catalog.pairs.iter().filter(|p| p.pools.len() >= 2).count();
-        crate::log_event!(Debug,"graph watch catalog consumer generation={} direct_2={} direct_3={} triangle_3={} triangle_4={} mints={} pools={} mint_pairs={} parallel_pairs={} triangle4_intermediate_pools={} triangle4_intermediate_pairs={} triangle4_intermediate_mints={}",
-            catalog.generation, categories[0], categories[1],
-            categories[2], categories[3], catalog.mints.len(),
-            catalog.pools.len(), catalog.pairs.len(), parallel_pairs,
-            bridge4_pools.len(), bridge4_pairs.len(), bridge4_mints.len());
-        // Prove an actual indexed lookup and a group-reference dereference.
-        if let Some(pool) = bridge4_pools.first() {
-            let selected = catalog.for_pool(pool.address)
-                .context("catalog consumer lookup missing published pool")?;
-            let group_id = *selected.group_ids.first()
-                .context("catalog consumer pool without group references")?;
-            let group = catalog.graph.group(group_id)
-                .context("catalog consumer group reference invalid")?;
-            let mint = catalog.for_mint(selected.mint_a)
-                .context("catalog consumer missing indexed mint")?;
-            let pair = catalog.for_pair(selected.mint_a, selected.mint_b)
-                .context("catalog consumer missing indexed mint pair")?;
-            ensure!(mint.group_ids.binary_search(&group_id).is_ok(),
-                "catalog indexed mint missing referencing group");
-            ensure!(pair.pools.binary_search(&selected.address).is_ok(),
-                "catalog indexed pair missing referencing pool");
-            ensure!(selected.contexts.iter().all(|ctx| pair.contexts.contains(ctx)),
-                "catalog pair missing a referenced pool context");
-            crate::log_event!(Debug,"graph watch catalog sample generation={} pool={} mint_a={} mint_b={} pair_pool_count={} group_refs={} group_settlement={} group_target={} mint_contexts={:?} mint_group_refs={} pair_contexts={:?} pair_pools={}",
-                catalog.generation, selected.address, selected.mint_a, selected.mint_b,
-                selected.pair_pool_count, selected.group_ids.len(),
-                group.settlement, group.target, mint.contexts,
-                mint.group_ids.len(), pair.contexts, pair.pools.len());
-        }
+        crate::log_event!(Info,"watch catalog consumer generation={} compact_topologies={} watched_pools={}",
+            c.generation,c.graph.topologies.len(),c.pools.len());
     }
+    crate::log_event!(Info,"watch catalog consumer complete generations={n}");
     Ok(())
 }

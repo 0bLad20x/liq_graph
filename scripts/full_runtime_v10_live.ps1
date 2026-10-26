@@ -3,7 +3,7 @@
 param(
     [ValidateRange(30,86400)][int]$DurationSeconds = 600,
     [ValidateRange(1,5000)][int]$SimulationLimit = 100,
-    [ValidateRange(0,2147483647)][int]$PoolLimit = 750,
+    [ValidateRange(0,2147483647)][int]$PoolLimit = 5000,
     [ValidateRange(0,1000000)][double]$ThresholdBps = 0,
     [string]$WalletPath = (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json'),
     [string]$ExpectedBranch = 'agent/full-runtime-v10-audit'
@@ -78,6 +78,8 @@ try {
             'liq_graph::workers::graph_liquidity=info',
             'liq_graph::workers::graph_watch_catalog=info',
             'liq_graph::workers::market_state=info',
+            'liq_graph::workers::mint_extensions=info',
+            'liq_graph::workers::mint_qualification=info',
             'liq_graph::workers::graph_signals=info',
             'liq_graph::workers::execution_candidates=info',
             'liq_graph::workers::execution_v10=info',

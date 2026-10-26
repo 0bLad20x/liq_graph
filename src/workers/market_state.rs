@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
-use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue,
+use futures_util::future::join_all;
+use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue, MintReader,
     market_state::{Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, rpc_transport::{RpcAnswer, RpcHandle, RpcOperation},
     graph_watch_catalog::{WatchCatalog,RouteKind}};
@@ -63,19 +64,28 @@ where T::Err:std::fmt::Display {
     env::var(key).map_or(Ok(default),|s|s.parse().map_err(|e|anyhow::anyhow!("invalid {key}: {e}")))
 }
 #[derive(Clone)]struct RpcAccount{owner:String,data:Vec<u8>,slot:u64,received_us:u64}
+// Bounded parallel RPC chunks; the transport continues to enforce provider RPS.
 async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>> {
+    let chunks=addresses.chunks(rpc.account_batch_size()).collect::<Vec<_>>();
     let mut records=Vec::with_capacity(addresses.len());
-    for chunk in addresses.chunks(rpc.account_batch_size()) {
-        let addresses=chunk.iter().map(|a|a.parse()).collect::<Result<Vec<Pubkey>,_>>()?;
-        let answer=rpc.call(RpcOperation::Multiple{addresses,view:AccountView::Full,min_context_slot:None}).await?;
-        let received_us=answer.received_at_ms.saturating_mul(1000);
-        let RpcAnswer::Multiple{slot,accounts}=answer.answer else {bail!("market state expected account batch");};
-        ensure!(accounts.len()==chunk.len(),"market state account batch length mismatch");
-        for (address,account) in chunk.iter().zip(accounts) {
-            let account=account.with_context(||format!("market account missing {address}"))?;
-            ensure!(account.address.to_string()==*address && account.view==AccountView::Full,"market account identity/view mismatch");
-            records.push(RpcAccount{owner:account.owner.to_string(),data:account.bytes,slot,received_us});
-        }
+    for wave in chunks.chunks(4) {
+        let batches=join_all(wave.iter().map(|chunk|async move {
+            let expected=chunk.iter().map(|a|a.parse::<Pubkey>()).collect::<std::result::Result<Vec<_>,_>>()?;
+            let answer=rpc.call(RpcOperation::Multiple{addresses:expected,view:AccountView::Full,
+                min_context_slot:None}).await?;
+            let received_us=answer.received_at_ms.saturating_mul(1000);
+            let RpcAnswer::Multiple{slot,accounts}=answer.answer else {bail!("market state expected account batch");};
+            ensure!(accounts.len()==chunk.len(),"market state account batch length mismatch");
+            let mut result=Vec::with_capacity(chunk.len());
+            for (address,account) in chunk.iter().zip(accounts) {
+                let account=account.with_context(||format!("market account missing {address}"))?;
+                ensure!(account.address.to_string()==address.as_str() && account.view==AccountView::Full,
+                    "market account identity/view mismatch");
+                result.push(RpcAccount{owner:account.owner.to_string(),data:account.bytes,slot,received_us});
+            }
+            Ok::<Vec<RpcAccount>,anyhow::Error>(result)
+        })).await;
+        for batch in batches {records.extend(batch?);}
     }
     Ok(records)
 }
@@ -99,10 +109,6 @@ impl Venue {
     }}
 }
 #[derive(Clone)]struct Config {watches:Vec<Watch>}
-fn mint_dec(a:&RpcAccount)->Result<u8>{
-    ensure!(a.owner==TOKEN_PROGRAM||a.owner==TOKEN_2022,"Invalid token mint program {}",a.owner);
-    Ok(bytes(&a.data,44,1)?[0])
-}
 fn vault_amount(a:&RpcAccount, mint:&str)->Result<u64>{
     ensure!(a.owner==TOKEN_PROGRAM||a.owner==TOKEN_2022,"Invalid token vault owner {}",a.owner);
     ensure!(key(&a.data,0)?==mint,"Vault's mint doesn't match pool mint");u64_le(&a.data,64)
@@ -246,7 +252,7 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
         base_vault:String,quote_vault:String,
         pool_slot:u64,base_slot:u64,quote_slot:u64},
 }
-struct Pool{
+#[derive(Clone)]struct Pool{
     key:Pubkey,ready:bool,id:String,venue:Venue,a:String,b:String,da:u8,db:u8,
     canon_base:String,canon_quote:String,state:State,
     price:f64,available:bool,slot:u64,received_us:u64,updates:u64,
@@ -325,7 +331,7 @@ impl Field{
         Self::ManifestBook=>(0,0) // full variable-length market account; no dataSlice
     }}
 }
-struct Subscription{pool:usize,field:Field,address:String,key:Pubkey,owner:Pubkey,
+#[derive(Clone)]struct Subscription{pool:usize,field:Field,address:String,key:Pubkey,owner:Pubkey,
     slot:u64,received_us:u64,floor:Option<u64>,valid:bool}
 // Fixed-size counters/histograms; no per-update logging or sample serialization.
 #[derive(Default)]
@@ -347,6 +353,7 @@ struct Metrics {
     baseline_skipped:u64,stale:u64,bindings:u64,deleted:u64,gaps:u64,lost:u64,rejections:u64,
     baseline_prices:u64,websocket_prices:u64,no_receiver:u64,max_queue_depth:usize,
     selection_changes:u64,hydration_jobs:u64,discarded_results:u64,hydration_failures:u64,
+    max_hydration_in_flight:usize,initial_hydration:Latency,baseline_hydration:Latency,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,venues:[VenueTiming;10],
 }
 impl Metrics {
@@ -362,6 +369,8 @@ impl Metrics {
             "baseline_prices":self.baseline_prices,"websocket_prices":self.websocket_prices,"no_receiver":self.no_receiver,
             "max_queue_depth":self.max_queue_depth,"selection_changes":self.selection_changes,"hydration_jobs":self.hydration_jobs,
             "discarded_preparation_pools":self.discarded_results,"hydration_failures":self.hydration_failures,
+            "max_hydration_in_flight":self.max_hydration_in_flight,
+            "initial_hydration":self.initial_hydration.report(),"baseline_hydration":self.baseline_hydration.report(),
             "account_processing":self.processing.report(),"transport_to_market":self.queue.report(),
             "preparation_install":self.install.report(),"watch_reconcile":self.watch_plan.report(),"by_venue":venues})
     }
@@ -396,6 +405,50 @@ impl Engine{
         self.subs.retain_mut(|s|match remap[s.pool]{Some(pi)=>{s.pool=pi;true},None=>false});
         self.index();
     }
+    // Copy only selected Prepared pools and their existing static account descriptors.
+    // The baseline phase must not re-read mint metadata or re-decode pool identities.
+    fn subset(&self,selected:&HashSet<Pubkey>)->Engine {
+        let mut part=Engine::empty(self.events.clone(),0);
+        let mut remap=HashMap::<usize,usize>::new();
+        for (i,p) in self.pools.iter().enumerate() {
+            if selected.contains(&p.key) {
+                remap.insert(i,part.pools.len());part.pools.push(p.clone());
+            }
+        }
+        for sub in &self.subs {
+            if let Some(&pi)=remap.get(&sub.pool) {
+                let mut next=sub.clone();next.pool=pi;part.subs.push(next);
+            }
+        }
+        part.index();part
+    }
+    // Read only dynamic subscribed account values, after every subscription is active.
+    // Keep all updates private to the staged batch until one coherent baseline is ready.
+    async fn refresh_baseline(&mut self,rpc:&RpcHandle)->Result<()> {
+        let mut addresses=Vec::new();let mut seen=HashSet::new();
+        for sub in &self.subs {
+            if seen.insert(sub.address.clone()){addresses.push(sub.address.clone());}
+        }
+        let accounts=fetch_batch(rpc,&addresses).await?;
+        let dict:HashMap<_,_>=addresses.into_iter().zip(accounts).collect();
+        for i in 0..self.subs.len() {
+            let sub=&self.subs[i];
+            let acc=dict.get(&sub.address).context("baseline account missing")?;
+            let owner:Pubkey=acc.owner.parse()?;
+            let (offset,length)=sub.field.slice();
+            let data=if sub.field==Field::ManifestBook {acc.data.as_slice()}
+                else if sub.field==Field::VirtualQuote && acc.data.len()<offset+length {&[]}
+                else {bytes(&acc.data,offset,length)?};
+            self.subs[i].slot=acc.slot;
+            self.subs[i].received_us=acc.received_us;
+            self.subs[i].floor=Some(acc.slot);
+            let timing=PricePipelineTiming{frame_received_at_us:acc.received_us,
+                transport_decoded_at_us:acc.received_us,market_received_at_us:acc.received_us,
+                price_published_at_us:0,market_decode_ns:0,market_compute_ns:0,initialization_replay:false};
+            self.update(i,acc.slot,owner,data,acc.received_us,timing,false)?;
+        }
+        Ok(())
+    }
     fn install(&mut self,mut part:Engine) {
         let replaced:HashSet<_>=part.pools.iter().map(|p|p.key).collect();
         let keep=self.pools.iter().filter(|p|!replaced.contains(&p.key)).map(|p|p.key).collect();
@@ -403,7 +456,7 @@ impl Engine{
         let offset=self.pools.len();for sub in &mut part.subs{sub.pool+=offset;}
         self.pools.extend(part.pools);self.subs.extend(part.subs);self.index();
     }
-    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool)->Result<Self>{
+    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool,mints:&dyn MintReader)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
         let pool_records=fetch_batch(rpc,&pool_addrs).await?;
         let mut raw_pools=Vec::new();let mut details=Vec::<String>::new();
@@ -499,14 +552,30 @@ impl Engine{
             details.push(a.clone());details.push(b.clone());
             raw_pools.push((a,b,state,acc.slot));
         }
+        // One authoritative Mint Registry. Only dynamic vault accounts are read here;
+        // onchain Mint verification and decimals are owned by the Mint-enrichment worker.
+        let mint_addresses:HashSet<String>=raw_pools.iter().flat_map(|(a,b,_,_)|
+            [a.clone(),b.clone()]).collect();
+        let mut verified=HashMap::new();
+        for address in mint_addresses {
+            let key:Pubkey=address.parse()?;
+            let state=mints.mint(key).and_then(|state|state.onchain)
+                .with_context(||format!("Mint onchain proof missing {address}"))?;
+            ensure!(state.address==key,"Mint proof identity mismatch");
+            verified.insert(address,state.decimals);
+        }
         let mut unique=Vec::new();let mut seen=HashSet::new();
-        for address in details{if seen.insert(address.clone()){unique.push(address);}}
+        for address in details {
+            if seen.insert(address.clone()) && !verified.contains_key(&address) {
+                unique.push(address);
+            }
+        }
         let records=fetch_batch(rpc,&unique).await?;
         let dict:HashMap<String,RpcAccount>=unique.into_iter().zip(records).collect();
         let mut pools=Vec::new();let mut subs=Vec::new();
         for (idx,(watch,(a,b,mut state,pool_slot))) in cfg.watches.iter().zip(raw_pools).enumerate(){
-            let da=mint_dec(dict.get(&a).context("token A mint missing")?)?;
-            let db=mint_dec(dict.get(&b).context("token B mint missing")?)?;
+            let da=*verified.get(&a).context("token A mint decimals missing")?;
+            let db=*verified.get(&b).context("token B mint decimals missing")?;
             if matches!(&state,State::Manifest{..}) {
                 let acc=&pool_records[idx].data;
                 ensure!(bytes(acc,9,1)?[0]==da && bytes(acc,10,1)?[0]==db,
@@ -627,7 +696,7 @@ impl Engine{
             received_at_us:recv_us,sequence,reason,
         }));
     }
-    fn update(&mut self,index:usize,slot:u64,owner:Pubkey,data:&[u8],recv_us:u64,pipeline:PricePipelineTiming)->Result<()> {
+    fn update(&mut self,index:usize,slot:u64,owner:Pubkey,data:&[u8],recv_us:u64,pipeline:PricePipelineTiming,emit:bool)->Result<()> {
         let decode_started=Instant::now();
         let mut pipeline=pipeline;
         let (pi,field,expected_owner,expected_len)={let s=&self.subs[index];
@@ -700,7 +769,7 @@ impl Engine{
         if let Some(reason)=unavailable_reason {
             self.metrics.venues[pool.venue as usize].unavailable+=1;
             pool.available=false;
-            self.publish_unavailable(pi,slot,recv_us,reason);
+            if emit {self.publish_unavailable(pi,slot,recv_us,reason);}
             return Ok(());
         }
         let compute_started=Instant::now();
@@ -710,7 +779,7 @@ impl Engine{
                 self.metrics.venues[pool.venue as usize].compute.add(nanos(compute_started));
                 self.metrics.venues[pool.venue as usize].unavailable+=1;
                 pool.available=false;
-                self.publish_unavailable(pi,slot,recv_us,error.to_string());
+                if emit {self.publish_unavailable(pi,slot,recv_us,error.to_string());}
                 return Ok(());
             }
         };
@@ -721,7 +790,7 @@ impl Engine{
         // After any unavailable state, the next valid observation has no
         // adjacent previous price. This applies to every venue, not just Manifest.
         let previous=if was_available{Some(old)}else{None};
-        self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field),Some(pipeline));
+        if emit {self.publish_price(pi,PriceOrigin::Websocket,previous,Some(field),Some(pipeline));}
         Ok(())
     }
 
@@ -732,7 +801,7 @@ impl Engine{
 pub struct Settings {pub pool_limit:usize,pub trace:bool}
 impl Settings {
     pub fn from_env()->Result<Self> {Ok(Self{
-        pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",1000)?,
+        pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",15000)?,
         trace:env_parse::<u8>("MARKET_STATE_TRACE",0)?!=0,
     })}
 }
@@ -757,19 +826,226 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
     if let Some(p)=current {candidates.insert(address,p);}else{candidates.remove(&address);}
     true
 }
-fn select(candidates:&HashMap<Pubkey,PoolInput>,limit:usize)->Vec<PoolInput> {
-    let mut pools:Vec<_>=candidates.values().copied().collect();
-    pools.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
-    if limit>0 {pools.truncate(limit);}
-    pools
+fn watch_cost(v:CoreVenue)->usize {
+    match v {CoreVenue::PumpSwap|CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
 }
+fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
+    use super::graph_liquidity::RouteTopologyKind as K;
+    match t.kind{K::Direct2=>0,K::Direct3=>1,K::Triangle3=>2,K::Triangle4=>3}
+}
+fn route_options_added(t:&super::graph_liquidity::RouteTopology,
+    graph:&super::graph_liquidity::GraphSnapshot,
+    selected:&HashSet<Pubkey>,additional:&[Pubkey])->u64{
+    let included=|p:&Pubkey|selected.contains(p)||additional.contains(p);
+    let mut counts=[0_u64;4];
+    for (i,&(a,b)) in t.directed_roles().iter().enumerate(){
+        counts[i]=graph.pools_for_pair(a,b).iter().filter(|p|included(p)).count() as u64;
+    }
+    if route_kind(t)==0{return counts[0].saturating_mul(counts[0].saturating_sub(1));}
+    (0..t.length).fold(2_u64,|n,i|n.saturating_mul(counts[i]))
+}
+fn route_options_selected(t:&super::graph_liquidity::RouteTopology,
+    graph:&super::graph_liquidity::GraphSnapshot,selected:&HashSet<Pubkey>)->u64{
+    route_options_added(t,graph,selected,&[])
+}
+fn route_coverage(catalog:&WatchCatalog,selected:&HashSet<Pubkey>)->([usize;4],[u64;4]){
+    let mut groups=[0_usize;4];let mut options=[0_u64;4];
+    for t in catalog.graph.topologies.iter(){
+        let routes=route_options_selected(t,&catalog.graph,selected);
+        if routes>0{
+            let kind=route_kind(t);groups[kind]+=1;
+            options[kind]=options[kind].saturating_add(routes);
+        }
+    }
+    (groups,options)
+}
+struct RoutePackage {kind:usize,additional:Vec<Pubkey>,account_cost:usize,score:f64}
+/// Read-only topological pool selection. Executed on a blocking worker thread,
+/// never on the market WS event loop. No independent pool or mint registry.
+fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
+    limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput>{
+    let started=Instant::now();
+    let max_pools=if limit==0 {usize::MAX}else{limit};
+    let existing:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
+    let quality:HashMap<Pubkey,f64>=candidates.keys().map(|address|(*address,
+        registry.get(*address).and_then(|p|p.tvl_usd)
+            .filter(|v|v.is_finite()&&*v>=0.0).unwrap_or(0.0))).collect();
+    let mut pairs=HashMap::<(Pubkey,Pubkey),Vec<Pubkey>>::new();
+    for p in candidates.values(){
+        pairs.entry((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b)))
+            .or_default().push(p.address);
+    }
+    for list in pairs.values_mut(){
+        list.sort_by(|a,b|existing.contains(b).cmp(&existing.contains(a))
+            .then_with(||quality[b].total_cmp(&quality[a])).then_with(||a.cmp(b)));
+    }
+    let mut picked=HashSet::<Pubkey>::new();
+    let mut used=0_usize;
+    // A small diversified conversion backbone is shared by Direct3/Triangle4.
+    // Its legs are candidates from the SAME WatchCatalog, not independently discovered.
+    let wsol:Pubkey="So11111111111111111111111111111111111111112".parse().expect("WSOL");
+    let usdc:Pubkey="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().expect("USDC");
+    let mut conversions=catalog.graph.pools_for_pair(wsol,usdc).iter().copied()
+        .filter(|p|candidates.contains_key(p)).collect::<Vec<_>>();
+    conversions.sort_unstable();conversions.dedup();
+    conversions.sort_by(|a,b|quality[b].total_cmp(&quality[a]).then_with(||a.cmp(b)));
+    let mut venues=Vec::<CoreVenue>::new();
+    let mut backbone=Vec::new();
+    for &address in &conversions {
+        let p=candidates[&address];
+        if venues.contains(&p.venue){continue;}
+        let cost=watch_cost(p.venue);
+        if picked.len()<max_pools && used+cost<=account_budget {
+            picked.insert(address);used+=cost;backbone.push(address);venues.push(p.venue);
+        }
+        if backbone.len()>=8 {break;}
+    }
+    // Do not pin eight accounts from one venue merely because they have high TVL.
+    // Each (settlement,target) gets independent queues for all four route types.
+    let mut groups=BTreeMap::<(Pubkey,Pubkey),[Vec<usize>;4]>::new();
+    for (id,t) in catalog.graph.topologies.iter().enumerate(){
+        groups.entry((t.settlement,t.target)).or_insert_with(||std::array::from_fn(|_|Vec::new()))[route_kind(t)].push(id);
+    }
+    for lists in groups.values_mut(){
+        for ids in lists {
+            ids.sort_by_key(|&id|(std::cmp::Reverse(catalog.graph.topologies[id].route_options),id));
+        }
+    }
+    let mut cursors=BTreeMap::<(Pubkey,Pubkey),[usize;4]>::new();
+    let mut coverage=[0_usize;4];
+    let mut selected_per_target=HashMap::<(Pubkey,Pubkey),usize>::new();
+    // Candidate leg order: already covered, retained, then TVL, then stable pubkey.
+    let choose=|options:&[Pubkey],count:usize,picked:&HashSet<Pubkey>,
+        local:&mut Vec<Pubkey>|->bool {
+        let Some(first)=options.first() else{return false;};
+        let Some(w)=catalog.for_pool(*first) else{return false;};
+        let Some(ordered)=pairs.get(&(w.mint_a,w.mint_b)) else{return false;};
+        for desired in 0..3 {
+            for &address in ordered {
+                if options.binary_search(&address).is_err() || local.contains(&address){continue;}
+                let tier=if picked.contains(&address){0}
+                    else if existing.contains(&address){1}else{2};
+                if tier==desired {
+                    local.push(address);
+                    if local.len()>=count{return true;}
+                }
+            }
+        }
+        false
+    };
+    // One useful package per target per sweep. Compare four route kinds on their
+    // incremental route benefit, completeness, diversity and actual account cost.
+    loop {
+        let mut progressed=false;
+        for (target,lists) in &groups {
+            let cursors_for=cursors.entry(*target).or_insert([0;4]);
+            let mut best:Option<RoutePackage>=None;
+            for kind in [1_usize,3,0,2] {
+                let ids=&lists[kind];
+                while cursors_for[kind]<ids.len() {
+                    let t=&catalog.graph.topologies[ids[cursors_for[kind]]];
+                    let before=route_options_selected(t,&catalog.graph,&picked);
+                    let mut local=Vec::<Pubkey>::new();
+                    let mut valid=true;
+                    // One pool per leg, except Direct2's two distinct alternatives
+                    // on the same pair. Intermediate/Conversion remain fully variable.
+                    for (i,&(a,b)) in t.directed_roles().iter().enumerate(){
+                        let count=local.len()+1;
+                        let options=catalog.graph.pools_for_pair(a,b);
+                        valid=choose(options,count,&picked,&mut local);
+                        if !valid {break;}
+                        if kind==0 && i==0 {
+                            valid=choose(options,local.len()+1,&picked,&mut local);
+                            break;
+                        }
+                    }
+                    if !valid {cursors_for[kind]+=1;continue;}
+                    let additional:Vec<_>=local.iter().copied()
+                        .filter(|p|!picked.contains(p)).collect();
+                    let cost=additional.iter().map(|p|watch_cost(candidates[p].venue)).sum::<usize>();
+                    if cost==0 || picked.len()+additional.len()>max_pools
+                        ||used+cost>account_budget {
+                        cursors_for[kind]+=1;continue;
+                    }
+                    let new_routes=route_options_added(t,&catalog.graph,&picked,&additional);
+                    let gain=new_routes.saturating_sub(before);
+                    if gain==0 {cursors_for[kind]+=1;continue;}
+                    let underrepresented=1.0/(1.0+coverage[kind] as f64/100.0);
+                    let target_damping=1.0/(1.0+*selected_per_target.get(target).unwrap_or(&0) as f64/12.0);
+                    let avg_quality=additional.iter().map(|p|quality[p].ln_1p())
+                        .sum::<f64>()/(additional.len() as f64);
+                    // Saturating log prevents large parallel-pool arrays from
+                    // overwhelming topology breadth. Exact weights are a testable heuristic.
+                    let score=(10.0*underrepresented+(gain as f64).ln_1p()
+                        +0.12*avg_quality)*target_damping/(cost as f64);
+                    if best.as_ref().is_none_or(|b|score>b.score) {
+                        best=Some(RoutePackage{kind,additional,account_cost:cost,score});
+                    }
+                    break;
+                }
+            }
+            let Some(best)=best else{continue;};
+            cursors_for[best.kind]+=1;
+            for address in best.additional {picked.insert(address);}
+            used+=best.account_cost;coverage[best.kind]+=1;
+            *selected_per_target.entry(*target).or_default()+=1;
+            progressed=true;
+            if picked.len()>=max_pools || used>=account_budget {break;}
+        }
+        if !progressed || picked.len()>=max_pools || used>=account_budget {break;}
+    }
+    // Remaining capacity: diversify parallel venues/pairs without building full
+    // copies of Pools. Prefer already monitored pools for subscription stability.
+    let mut occupied=HashSet::new();
+    for address in &picked {
+        let p=candidates[address];
+        occupied.insert((p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),
+            std::mem::discriminant(&p.venue)));
+    }
+    let mut remaining=candidates.values().copied().filter(|p|
+        !picked.contains(&p.address) && catalog.for_pool(p.address).is_some()).collect::<Vec<_>>();
+    remaining.sort_by(|a,b|{
+        let rank=|p:&PoolInput|{
+            let c=catalog.for_pool(p.address).expect("catalog indexed");
+            (usize::from(!occupied.contains(&(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),
+                std::mem::discriminant(&p.venue)))),
+                c.contexts.len(),c.pair_pool_count.min(16))
+        };
+        rank(b).cmp(&rank(a)).then_with(||existing.contains(&b.address).cmp(&existing.contains(&a.address)))
+            .then_with(||quality[&b.address].total_cmp(&quality[&a.address]))
+            .then_with(||a.address.cmp(&b.address))
+    });
+    for p in remaining {
+        if picked.len()>=max_pools {break;}
+        let cost=watch_cost(p.venue);
+        if used+cost<=account_budget {picked.insert(p.address);used+=cost;}
+    }
+    let actual=route_coverage(catalog,&picked);
+    let mut alpha=candidates.values().copied().collect::<Vec<_>>();
+    alpha.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
+    let mut legacy=HashSet::new();let mut legacy_cost=0;
+    for p in alpha {
+        let cost=watch_cost(p.venue);
+        if legacy.len()>=max_pools {break;}
+        if legacy_cost+cost<=account_budget {legacy.insert(p.address);legacy_cost+=cost;}
+    }
+    let baseline=route_coverage(catalog,&legacy);
+    crate::log_event!(Info,
+        "market state cp5 coverage selected={} account_upper_bound={} ws_budget={} groups_by_kind={:?} alternatives_by_kind={:?} alphabetical_groups_by_kind={:?} alphabetical_alternatives_by_kind={:?} conversion_backbone={} selection_ms={}",
+        picked.len(),used,account_budget,actual.0,actual.1,baseline.0,baseline.1,
+        backbone.len(),started.elapsed().as_millis());
+    let mut result=picked.into_iter().filter_map(|p|candidates.get(&p).copied()).collect::<Vec<_>>();
+    result.sort_unstable_by_key(|p|p.address);
+    result
+}
+
 fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
     let _=out.send(Arc::new(event));
 }
 // Preparation never publishes or borrows the running engine. Only the event loop
 // installs results, after checking that identities and resync revisions still match.
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
-    prices:bool)->Result<(Engine,Vec<(PoolInput,String)>)> {
+    prices:bool,mints:&dyn MintReader,baseline_source:Option<&Engine>)->Result<(Engine,Vec<(PoolInput,String)>)> {
     let mut engine=Engine::empty(out.clone(),0);
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
     while let Some(batch)=pending.pop() {
@@ -777,9 +1053,20 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
             Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?}))
             .collect::<Result<Vec<_>>>()?})})();
-        let result=match config {Ok(cfg)=>Engine::hydrate(cfg,rpc,out.clone(),0,prices).await,Err(e)=>Err(e)};
+        let result=match (baseline_source,config) {
+            (Some(source),_)=>{
+                let selected=batch.iter().map(|p|p.address).collect();
+                let mut part=source.subset(&selected);
+                part.refresh_baseline(rpc).await.map(|()|part)
+            },
+            (None,Ok(cfg))=>Engine::hydrate(cfg,rpc,out.clone(),0,prices,mints).await,
+            (None,Err(error))=>Err(error),
+        };
         let result=result.and_then(|part| {
-            for (actual,expected) in part.pools.iter().zip(&batch) {
+            ensure!(part.pools.len()==batch.len(),"hydration pool count mismatch");
+            for actual in &part.pools {
+                let expected=batch.iter().find(|p|p.address==actual.key)
+                    .context("hydration returned an unexpected pool")?;
                 ensure!(actual.a==expected.mint_a.to_string()
                     && actual.b==expected.mint_b.to_string(),"Registry/pool mint identity mismatch");
             }
@@ -880,7 +1167,7 @@ impl Engine {
             let pipeline=PricePipelineTiming{frame_received_at_us:*frame_received_at_us,transport_decoded_at_us:*decoded_at_us,
                 market_received_at_us:market_us,price_published_at_us:0,market_decode_ns:0,market_compute_ns:0,initialization_replay:replay};
             let updated=match decoded {
-                Ok((owner,data))=>self.update(index,*slot,owner,data,*frame_received_at_us,pipeline),Err(e)=>Err(e),
+                Ok((owner,data))=>self.update(index,*slot,owner,data,*frame_received_at_us,pipeline,true),Err(e)=>Err(e),
             };
             if let Err(error)=updated {
                 self.metrics.venues[self.pools[pi].venue as usize].decode_errors+=1;
@@ -897,6 +1184,8 @@ impl Engine {
 /// Exactly one bounded preparation job may run while live events continue on this task.
 async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     rpc:RpcHandle,control:AccountStreamControl,mut events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,
+    mut catalog:watch::Receiver<Arc<WatchCatalog>>,mints:Arc<dyn MintReader>,
+    mut mint_revision:watch::Receiver<u64>,selected_mints:watch::Sender<Arc<[Pubkey]>>,
     mut stop:watch::Receiver<bool>,mut enabled:watch::Receiver<bool>,mut limit:watch::Receiver<usize>,persisted:bool)->Result<serde_json::Value> {
     ensure!(control.capacity()>0,"market state requires enabled RPC_N_WS_ACCOUNT_SUBSCRIBE providers");
     let snapshot=|registry:&PoolRegistry|->HashMap<Pubkey,PoolInput>{registry.snapshot().iter()
@@ -908,12 +1197,27 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let mut retry=HashMap::<Pubkey,time::Instant>::new();
     let mut cached=HashMap::<Pubkey,(WsEvent,u64)>::new();
     let mut jobs=tokio::task::JoinSet::new();
+    let mut in_flight=HashSet::<Pubkey>::new();
+     let concurrency:usize=env_parse("MARKET_STATE_HYDRATION_CONCURRENCY",8)?;
+    let batch_pools:usize=env_parse("MARKET_STATE_HYDRATION_BATCH_POOLS",64)?;
+    let selection_interval_ms:u64=env_parse("MARKET_STATE_SELECTION_INTERVAL_MS",5000)?;
+    let account_budget:usize=env_parse("MARKET_STATE_WS_ACCOUNT_BUDGET",25000)?;
+    ensure!((1000..=300000).contains(&selection_interval_ms)
+        && account_budget>0,"invalid selection interval or WS account budget");
+    let selection_capacity=control.capacity().min(account_budget);
+    ensure!((1..=32).contains(&concurrency) && (1..=256).contains(&batch_pools),
+        "invalid market hydration concurrency/batch configuration");
+    crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_source=central_registry baseline=dynamic_only graph_selection=true");
     let mut rebuild=true;let mut replan=false;let mut schedule=true;let mut input_open=true;let mut ticks=0;
+    let mut selector_jobs=tokio::task::JoinSet::<(u64,Vec<PoolInput>)>::new();
+    let mut selected_ready:Option<Vec<PoolInput>>=None;
+    let mut next_selection_at=time::Instant::now();
+    crate::log_event!(Info,"market state cp5 selector_async=true interval_ms={selection_interval_ms} pool_limit={} account_budget={} transport_capacity={}",
+        *limit.borrow(),selection_capacity,control.capacity());
     let mut tick=time::interval(Duration::from_secs(1));tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         if *stop.borrow(){break;}
-        if rebuild {
-            let next=if *enabled.borrow(){select(&candidates,*limit.borrow())}else{Vec::new()};
+        if let Some(next)=selected_ready.take() {
             if next!=selected {
                 let next_map:HashMap<_,_>=next.iter().map(|p|(p.address,*p)).collect();
                 let keep:HashSet<_>=selected.iter().filter(|p|next_map.get(&p.address)==Some(*p)).map(|p|p.address).collect();
@@ -922,17 +1226,24 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 versions.retain(|key,_|keep.contains(key));retry.retain(|key,_|keep.contains(key));
                 for p in &next {if !keep.contains(&p.address){revision+=1;versions.insert(p.address,revision);}}
                 selected=next;current=next_map;replan=true;engine.metrics.selection_changes+=1;
+                let mut mints_to_check=selected.iter().flat_map(|p|[p.mint_a,p.mint_b])
+                    .collect::<Vec<_>>();
+                mints_to_check.sort_unstable();mints_to_check.dedup();
+                selected_mints.send_replace(Arc::from(mints_to_check));
+                crate::log_event!(Info,"market state graph selection selected_pools={} ws_upper_bound={} ws_capacity={} graph_topologies={}",
+                    selected.len(),selected.iter().map(|p|watch_cost(p.venue)).sum::<usize>(),
+                    selection_capacity,catalog.borrow().graph.topologies.len());
                 engine.sequence+=1;send(&out,MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
                 crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
             }
-            rebuild=false;
         }
         if replan {
             let started=Instant::now();
             let failed:Vec<_>=retry.keys().copied().filter(|key|!engine.pools.iter().any(|p|p.key==*key)).collect();
             let next=watches(&engine,&failed)?;
-            ensure!(next.len()<=control.capacity(),"market state selected {} pools require {} accounts; configured WS capacity={}",selected.len(),next.len(),control.capacity());
+            ensure!(next.len()<=selection_capacity,"market state selected {} pools require {} accounts; CP5 WS budget={} configured WS capacity={}",
+                selected.len(),next.len(),selection_capacity,control.capacity());
             if next!=wanted {
                 let old:HashMap<_,_>=wanted.iter().map(|w|(w.address,w.view)).collect();
                 let changed:HashSet<_>=next.iter().filter(|w|old.get(&w.address)!=Some(&w.view)).map(|w|w.address).collect();
@@ -943,25 +1254,82 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             }
             engine.metrics.watch_plan.add(nanos(started));replan=false;schedule=true;
         }
-        if schedule && jobs.is_empty() {
+        if schedule {
             schedule=false;
-            let now=time::Instant::now();
-            let present:HashMap<_,_>=engine.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
-            let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address).is_some_and(|&pi|
-                !engine.pools[pi].ready && complete(&engine,pi,&active)) && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
-            let baseline=!targets.is_empty();
-            if !baseline {targets=selected.iter().filter(|p|!present.contains_key(&p.address)&&retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();}
-            targets.truncate(64);
-            if !targets.is_empty() {
+            while jobs.len()<concurrency {
+                let now=time::Instant::now();
+                let present:HashMap<_,_>=engine.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
+                let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address)
+                    .is_some_and(|&pi|!engine.pools[pi].ready && complete(&engine,pi,&active))
+                    && !in_flight.contains(&p.address)
+                    && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
+                let baseline=!targets.is_empty();
+                if !baseline {
+                    targets=selected.iter().filter(|p|!present.contains_key(&p.address)
+                        && !in_flight.contains(&p.address)
+                        && retry.get(&p.address).is_none_or(|at|*at<=now)
+                        && [p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
+                            .and_then(|record|record.onchain).is_some())).copied().collect();
+                }
+                targets.truncate(batch_pools);
+                if targets.is_empty(){break;}
+                let source=baseline.then(||engine.subset(&targets.iter().map(|p|p.address).collect()));
                 let tickets:Vec<_>=targets.iter().map(|p|(*p,versions[&p.address])).collect();
-                let rpc=rpc.clone();let output=out.clone();engine.metrics.hydration_jobs+=1;
-                jobs.spawn(async move {let result=hydrate(&targets,&rpc,&output,baseline).await;(tickets,baseline,result)});
+                for p in &targets {in_flight.insert(p.address);}
+                let rpc=rpc.clone();let output=out.clone();let reader=mints.clone();
+                engine.metrics.hydration_jobs+=1;
+                jobs.spawn(async move {
+                    let started=Instant::now();
+                    let result=hydrate(&targets,&rpc,&output,baseline,reader.as_ref(),source.as_ref()).await;
+                    (tickets,baseline,result,started.elapsed())
+                });
+                engine.metrics.max_hydration_in_flight=engine.metrics.max_hydration_in_flight.max(jobs.len());
             }
         }
         tokio::select! {
+            // Selection is read-only and potentially expensive; the WS loop
+            // keeps consuming account events while this blocking job runs.
+            _=time::sleep_until(next_selection_at),if rebuild && selector_jobs.is_empty()=>{
+                let source=candidates.clone();
+                let view=catalog.borrow().clone();
+                let generation=view.generation;
+                let previous=selected.clone();
+                let owner=registry.clone();
+                let pool_cap=*limit.borrow();
+                let enabled_now=*enabled.borrow();
+                selector_jobs.spawn_blocking(move||{
+                    let picked=if enabled_now {
+                        select(&source,&view,pool_cap,selection_capacity,&previous,&owner)
+                    }else{Vec::new()};
+                    (generation,picked)
+                });
+                rebuild=false;
+                next_selection_at=time::Instant::now()+Duration::from_millis(selection_interval_ms);
+            },
+            computed=selector_jobs.join_next(),if !selector_jobs.is_empty()=>{
+                let (source_generation,mut next)=computed.context("market selection task disappeared")?
+                    .context("market selection task panicked")?;
+                next.retain(|p|candidates.get(&p.address)==Some(p));
+                if !*enabled.borrow(){next.clear();}
+                if *limit.borrow()>0 {next.truncate(*limit.borrow());}
+                if source_generation!=catalog.borrow().generation {
+                    rebuild=true;
+                    crate::log_event!(Debug,"market state cp5 selection_generation_advanced old={} new={}",
+                        source_generation,catalog.borrow().generation);
+                }
+                selected_ready=Some(next);
+            },
             changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){break;}},
-            changed=enabled.changed()=>{if changed.is_err(){break;}rebuild=true;},
-            changed=limit.changed()=>{if changed.is_err(){break;}rebuild=true;},
+            changed=enabled.changed()=>{
+                if changed.is_err(){break;}
+                if !*enabled.borrow(){selected_ready=Some(Vec::new());}
+                rebuild=true;next_selection_at=time::Instant::now();
+            },
+            changed=limit.changed()=>{
+                if changed.is_err(){break;}rebuild=true;next_selection_at=time::Instant::now();
+            },
+            changed=catalog.changed()=>{if changed.is_err(){break;}rebuild=true;},
+            changed=mint_revision.changed()=>{if changed.is_err(){break;}schedule=true;},
             update=input.recv(),if input_open=>match update {
                 Ok(batch)=>{for p in &batch.pools {
                     if persisted {
@@ -974,7 +1342,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             },
             joined=jobs.join_next(),if !jobs.is_empty()=>{
                 let started=Instant::now();
-                let (tickets,baseline,result)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
+                let (tickets,baseline,result,elapsed)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
+                for (pool,_) in &tickets {in_flight.remove(&pool.address);}
+                if baseline {engine.metrics.baseline_hydration.add(elapsed.as_nanos() as u64);}
+                else {engine.metrics.initial_hydration.add(elapsed.as_nanos() as u64);}
                 let (mut part,failures)=result?;schedule=true;
                 let valid:HashSet<_>=tickets.iter().filter(|(p,version)|current.get(&p.address)==Some(p)&&versions.get(&p.address)==Some(version))
                     .map(|(p,_)|p.address).collect();
@@ -1036,7 +1407,20 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             _=tick.tick()=>{
                 ticks+=1;
                 if !retry.is_empty(){schedule=true;}
+                // TVL quality may change without changing PoolInput identity.
+                if ticks%60==0 {rebuild=true;}
                 if ticks%5==0 {
+                    let hydrated=engine.pools.len();
+                    let ready=engine.pools.iter().filter(|p|p.ready).count();
+                    let available=engine.pools.iter().filter(|p|p.ready && p.available).count();
+                    crate::log_event!(Info,
+                        "market state hydration progress selected={} hydrated={} ready={} priced={} in_flight={} init_jobs={} baseline_jobs={} initial_mean_ms={} baseline_mean_ms={} mint_verified_pools={}",
+                        selected.len(),hydrated,ready,available,in_flight.len(),
+                        engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
+                        if engine.metrics.initial_hydration.count>0 {engine.metrics.initial_hydration.total/engine.metrics.initial_hydration.count as u128/1_000_000}else{0},
+                        if engine.metrics.baseline_hydration.count>0 {engine.metrics.baseline_hydration.total/engine.metrics.baseline_hydration.count as u128/1_000_000}else{0},
+                        selected.iter().filter(|p|[p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
+                            .and_then(|r|r.onchain).is_some())).count());
                     for p in &selected {if !persisted{rebuild|=reconcile(&registry,&mut candidates,p.address);}}
                     let (ws_messages,ws_text_bytes)=control.stream_counts();engine.sequence+=1;
                     send(&out,MarketStateEvent::Stats{pools:selected.len(),ready:engine.pools.iter().filter(|p|p.ready).count(),
@@ -1048,6 +1432,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     // JoinSet drops/cancels the one preparation job. No detached HTTP initializer.
     drop(jobs);
     let report=engine.metrics.report();
+    crate::log_event!(Info,"market state hydration final selected={} prepared={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={}",
+        selected.len(),engine.pools.len(),engine.pools.iter().filter(|p|p.ready&&p.available).count(),
+        engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
+        engine.metrics.max_hydration_in_flight,engine.metrics.hydration_failures);
     for p in &selected {engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true");
     Ok(report)
@@ -1077,9 +1465,12 @@ impl ObservationReport {
 /// Cancels hydration as well as idle streaming, then releases the sole desired watch set.
 pub async fn run(registry:PoolRegistry,input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     rpc:RpcHandle,control:AccountStreamControl,events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,settings:Settings,
+    catalog:watch::Receiver<Arc<WatchCatalog>>,mints:Arc<dyn MintReader>,mint_revision:watch::Receiver<u64>,
+    selected_mints:watch::Sender<Arc<[Pubkey]>>,
     stop:watch::Receiver<bool>,enabled:watch::Receiver<bool>)->Result<()> {
     let (_limit_tx,limit)=watch::channel(settings.pool_limit);
-    let result=produce(registry,input,rpc,control.clone(),events,out,stop,enabled,limit,false).await;
+    let result=produce(registry,input,rpc,control.clone(),events,out,catalog,mints,
+        mint_revision,selected_mints,stop,enabled,limit,false).await;
     let cleanup=control.replace(Vec::new());
     crate::log_event!(Info,"market state released_watches=true");
     result.map(|_|()).and(cleanup)

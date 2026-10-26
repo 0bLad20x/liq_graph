@@ -44,6 +44,8 @@ pub enum RpcOperation {
     LatestBlockhash { min_context_slot: Option<u64> },
     /// Read-only execution. Signature verification is always enabled; never broadcasts.
     Simulate { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
+    /// Simulation-only: RPC replaces the blockhash and skips signature verification.
+    SimulateFast { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
 }
 
 impl RpcOperation {
@@ -56,7 +58,7 @@ impl RpcOperation {
             Self::Slot { .. } => "getSlot",
             Self::GenesisHash => "getGenesisHash",
             Self::LatestBlockhash { .. } => "getLatestBlockhash",
-            Self::Simulate { .. } => "simulateTransaction",
+            Self::Simulate { .. } | Self::SimulateFast { .. } => "simulateTransaction",
         }
     }
     fn bit(&self) -> u64 {
@@ -68,7 +70,7 @@ impl RpcOperation {
             Self::Slot { .. } => 16,
             Self::GenesisHash => 32,
             Self::LatestBlockhash { .. } => 64,
-            Self::Simulate { .. } => 128,
+            Self::Simulate { .. } | Self::SimulateFast { .. } => 128,
         }
     }
     fn params(&self, commitment: &str, account_limit: usize, v2_limit: usize) -> Result<Value> {
@@ -122,12 +124,14 @@ impl RpcOperation {
                 if let Some(slot)=min_context_slot {cfg["minContextSlot"]=json!(slot);}
                 json!([cfg])
             }
-            Self::Simulate { transaction, min_context_slot, accounts } => {
+            Self::Simulate { transaction, min_context_slot, accounts }
+            | Self::SimulateFast { transaction, min_context_slot, accounts } => {
                 ensure!(!transaction.is_empty() && transaction.len()<=4096,
                     "simulation transaction exceeds wire limit");
                 ensure!(accounts.len()<=64,"too many simulation account projections");
+                let fast=matches!(self,Self::SimulateFast{..});
                 let mut cfg=json!({"encoding":"base64","commitment":commitment,
-                    "sigVerify":true,"replaceRecentBlockhash":false,"innerInstructions":true,
+                    "sigVerify":!fast,"replaceRecentBlockhash":fast,"innerInstructions":true,
                     "accounts":{"encoding":"base64",
                         "addresses":accounts.iter().map(ToString::to_string).collect::<Vec<_>>()}});
                 if let Some(slot)=min_context_slot {cfg["minContextSlot"]=json!(slot);}
@@ -167,7 +171,7 @@ pub struct RpcHandle {
 impl RpcHandle {
     pub async fn call(&self, operation: RpcOperation) -> Result<RpcResponse> {
         let (reply, receive)=oneshot::channel();
-        self.requests.send(Call{operation,reply}).await.context("RPC worker stopped")?;
+        self.requests.send(Call{operation,reply,queued_at:Instant::now()}).await.context("RPC worker stopped")?;
         receive.await.context("RPC worker dropped response")?
     }
 
@@ -180,7 +184,7 @@ impl RpcHandle {
     }
 }
 
-struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcResponse>>}
+struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcResponse>>,queued_at:Instant}
 
 #[derive(Clone, Debug)]
 struct HttpSettings {
@@ -373,6 +377,8 @@ struct HttpProvider {
     // Actual HTTP attempt duration, excluding transport scheduling and retries.
     multiple_latency_ms:AtomicU64,
     other_latency_ms:AtomicU64,
+    multiple_wait_ms:AtomicU64,
+    other_wait_ms:AtomicU64,
 }
 impl HttpProvider {
     fn new(cfg:HttpSettings)->Result<Self> {
@@ -383,6 +389,7 @@ impl HttpProvider {
             request_id:AtomicU64::new(1),disabled:AtomicU64::new(0),
             pending:AtomicUsize::new(0),
             multiple_latency_ms:AtomicU64::new(0),other_latency_ms:AtomicU64::new(0),
+            multiple_wait_ms:AtomicU64::new(0),other_wait_ms:AtomicU64::new(0),
             client,cfg})
     }
     fn eligible(&self,bit:u64)->bool {
@@ -394,6 +401,12 @@ impl HttpProvider {
     }
     fn latency_cell(&self,bit:u64)->&AtomicU64 {
         if bit==1 {&self.multiple_latency_ms} else {&self.other_latency_ms}
+    }
+    fn observe_gate(&self,bit:u64,duration:Duration) {
+        let ms=duration.as_millis().min(120_000) as u64;
+        let cell=if bit==1 {&self.multiple_wait_ms}else{&self.other_wait_ms};
+        let _=cell.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|old|
+            Some(if old==0 {ms}else{old.saturating_mul(7).saturating_add(ms)/8}));
     }
     fn observe_http(&self,bit:u64,duration:Duration) {
         let ms=duration.as_millis().clamp(1,120_000) as u64;
@@ -419,6 +432,7 @@ impl HttpProvider {
                 bail!("provider {} in HTTP 429 cooldown",self.cfg.name);
             }
             if attempt>0 {sleep(Duration::from_millis(200_u64.saturating_mul(1 << attempt.min(7)))).await;}
+            let wait_started=Instant::now();
             let _permit=self.concurrent.acquire().await?;
             // Reserve a distinct request start slot, releasing the gate mutex
             // before sleeping. The semaphore remains held so delayed slots
@@ -430,6 +444,7 @@ impl HttpProvider {
                 due
             };
             sleep_until(due).await;
+            self.observe_gate(operation.bit(),wait_started.elapsed());
             let id=self.request_id.fetch_add(1,Ordering::Relaxed);
             let sent=Instant::now();
             let outcome=self.client.post(&self.cfg.url)
@@ -574,7 +589,7 @@ fn interpret(operation:RpcOperation,result:Value)->Result<RpcAnswer> {
                 last_valid_block_height:value.get("lastValidBlockHeight").and_then(Value::as_u64)
                     .context("blockhash expiry missing")?})
         }
-        RpcOperation::Simulate{min_context_slot,..}=>{
+        RpcOperation::Simulate{min_context_slot,..}|RpcOperation::SimulateFast{min_context_slot,..}=>{
             let slot=response_slot(&result)?;
             ensure!(min_context_slot.is_none_or(|min|slot>=min),"simulation context is older than requested");
             let value=result.get("value").filter(|v|v.is_object() && v.get("err").is_some())
@@ -592,6 +607,25 @@ struct RpcCallStats {
 }
 
 type RpcStats = Arc<StdMutex<HashMap<(String, &'static str), RpcCallStats>>>;
+#[derive(Default)]
+struct RpcDispatchWait { calls:u64,total_us:u128,max_us:u128 }
+type RpcDispatchStats=Arc<StdMutex<HashMap<&'static str,RpcDispatchWait>>>;
+fn record_dispatch(stats:&RpcDispatchStats,method:&'static str,queued_at:Instant) {
+    let elapsed=queued_at.elapsed().as_micros();
+    let mut locked=stats.lock().expect("RPC dispatch metrics poisoned");
+    let entry=locked.entry(method).or_default();
+    entry.calls+=1;entry.total_us+=elapsed;entry.max_us=entry.max_us.max(elapsed);
+}
+fn report_dispatch(stats:&RpcDispatchStats) {
+    let guard=stats.lock().expect("RPC dispatch metrics poisoned");
+    let mut rows=guard.iter().collect::<Vec<_>>();
+    rows.sort_unstable_by_key(|(method,_)|*method);
+    for (method,v) in rows {
+        crate::log_event!(Info,"rpc dispatch method={} calls={} mean_queue_us={} max_queue_us={}",
+            method,v.calls,v.total_us/u128::from(v.calls),v.max_us);
+    }
+}
+
 
 fn record_rpc(stats:&RpcStats, provider:&str, method:&'static str,
     elapsed:Duration, failure:Option<&str>) {
@@ -675,9 +709,11 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     let mut tasks=tokio::task::JoinSet::new();
     let next=Arc::new(AtomicUsize::new(0));
     let stats:RpcStats=Arc::new(StdMutex::new(HashMap::new()));
+    let dispatch:RpcDispatchStats=Arc::new(StdMutex::new(HashMap::new()));
     let stats_interval:u64=var("RPC_STATS_INTERVAL_SECONDS",30)?;
     ensure!((1..=3600).contains(&stats_interval), "RPC_STATS_INTERVAL_SECONDS must be 1..=3600");
     let report_stats=stats.clone();
+    let report_dispatch_stats=dispatch.clone();
     let report_providers=providers.clone();
     let reporter=tokio::spawn(async move {
         let mut ticker=tokio::time::interval(Duration::from_secs(stats_interval));
@@ -685,17 +721,21 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
         loop {
             ticker.tick().await;
             report_rpc(&report_stats);
+            report_dispatch(&report_dispatch_stats);
             for p in &report_providers {
                 crate::log_event!(Info,
-                    "rpc provider_load provider={} assigned={} multiple_http_ema_ms={} other_http_ema_ms={} rps={} max_in_flight={} multiple_enabled={}",
+                    "rpc provider_load provider={} assigned={} multiple_http_ema_ms={} other_http_ema_ms={} rps={} max_in_flight={} multiple_enabled={} multiple_wait_ema_ms={} other_wait_ema_ms={}",
                     p.cfg.name,p.pending.load(Ordering::Relaxed),
                     p.multiple_latency_ms.load(Ordering::Relaxed),
                     p.other_latency_ms.load(Ordering::Relaxed),
-                    p.cfg.rps,p.cfg.max_in_flight,p.eligible(1));
+                    p.cfg.rps,p.cfg.max_in_flight,p.eligible(1),
+                    p.multiple_wait_ms.load(Ordering::Relaxed),
+                    p.other_wait_ms.load(Ordering::Relaxed));
             }
         }
     });
-    while let Some(Call{operation,reply})=rx.recv().await {
+    while let Some(Call{operation,reply,queued_at})=rx.recv().await {
+        record_dispatch(&dispatch,operation.method(),queued_at);
         let bit=operation.bit();
         let eligible:Vec<_>=providers.iter().filter(|provider|provider.eligible(bit))
             .cloned().collect();
@@ -766,6 +806,7 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
     }
     reporter.abort();
     report_rpc(&stats);
+    report_dispatch(&dispatch);
     crate::log_event!(Info,"rpc transport shutdown complete=true abandoned_calls={abandoned}");
     Ok(())
 }

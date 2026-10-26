@@ -255,7 +255,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
     let mut mint_stream=enrichment.as_ref().map(|_|broadcast::channel::<Arc<DataBatch>>(256));
     let mint_store_rx=mint_stream.as_ref().map(|(out,_)|out.subscribe());
     critical(&mut tasks,"persistence",database.run_with_mints(
-        updates.subscribe(),mint_store_rx));
+        updates.subscribe(),mint_store_rx,None));
     if selected=="all" {
         let (graph_out,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
         critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
@@ -272,7 +272,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
         let (jupiter_out,jupiter_rx)=mint_stream.take().context("missing Jupiter stream")?;
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
             mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
-                jupiter_rx,qualified_tx,target_tx)));
+                jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
             source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
         critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
@@ -285,7 +285,7 @@ pub async fn completion_lifecycle_live()->Result<()> {
         let (target_tx,_target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
         critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
             mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
-                jupiter_rx,qualified_tx,target_tx)));
+                jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
         let _keep_jupiter_sender=jupiter_out;
     }
     if configured.pumpswap.is_some() {
@@ -395,10 +395,11 @@ pub async fn cp1_live() -> Result<()> {
     let registry_task=tokio::spawn(pool_registry::run(
         source_rx,None,registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone())));
     let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
-    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe())));
+    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe()),None));
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let qualification=tokio::spawn(mint_qualification::run(
-        registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx));
+        registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx,
+        None,None,None,None));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
     // This isolated checkpoint must not start an unbounded full backfill.
     let mut jupiter_settings=settings;
@@ -515,10 +516,18 @@ pub async fn run()->Result<()>{
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
         registry.clone(),updates.clone(),source_done,true,Some(qualified_rx.clone())));
     let (jupiter_out,jupiter_observer_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (onchain_tx,onchain_rx)=tokio::sync::mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
+    let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
+    let (mint_revision_tx,mint_revision_rx)=watch::channel(0_u64);
+    let (selected_mints_tx,selected_mints_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let mint_reader:Arc<dyn core::MintReader>=Arc::new(mint_registry.clone());
     critical(&mut tasks,"persistence",database.run_with_mints(
-        updates.subscribe(),Some(jupiter_out.subscribe())));
+        updates.subscribe(),Some(jupiter_out.subscribe()),Some(onchain_persist.subscribe())));
     critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
         updates.subscribe(),graph_tx,graph_settings));
+    critical(&mut tasks,"mint_extensions",crate::workers::mint_extensions::run(
+        qualified_rx.clone(),selected_mints_rx,mint_reader.clone(),rpc.clone(),
+        onchain_tx,stop_rx.clone()));
     // Price observations are optional. The Registry and graph retain their own eligibility rules.
     let market_enabled=enabled("MARKET_STATE_ENABLED")?;
     let signals_enabled=enabled("GRAPH_SIGNALS_ENABLED")?;
@@ -558,7 +567,7 @@ pub async fn run()->Result<()>{
                     result
                 });
             }
-            let signal_input=prices.subscribe(); let signal_catalog=catalog_rx.clone();
+            let signal_input=prices.subscribe(); let signal_catalog=graph_rx.clone();
             critical(&mut tasks,"graph_signals",async move {
                 let report=crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?;
                 if let Ok(path)=env::var("GRAPH_RUNTIME_PRODUCTION_REPORT_PATH") {
@@ -581,7 +590,9 @@ pub async fn run()->Result<()>{
         }
         let (account_control,account_events)=rpc.account_stream();
         critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),
-            rpc.clone(),account_control,account_events,prices,settings,stop_rx.clone(),enabled_rx));
+            rpc.clone(),account_control,account_events,prices,settings,
+            catalog_rx.clone(),mint_reader,mint_revision_rx,selected_mints_tx,
+            stop_rx.clone(),enabled_rx));
         let market_catalog=catalog_rx.clone();
         critical(&mut tasks,"market_state.consumer",async move {
             market_state::observe(price_rx,market_catalog,settings.trace).await.map(|_|())
@@ -601,7 +612,7 @@ pub async fn run()->Result<()>{
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     critical(&mut tasks,"mint_registry",mint_qualification::run(
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
-        qualified_tx,target_tx));
+        qualified_tx,target_tx,Some(onchain_rx),Some(onchain_persist),Some(mint_revision_tx),Some(stop_rx.clone())));
     if jupiter_settings()?.is_some() {
         let observer_sender=jupiter_out.clone();
         let mut first_jupiter_observer=Some(jupiter_observer_rx);

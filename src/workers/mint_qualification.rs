@@ -5,8 +5,8 @@ use std::{collections::{HashMap,HashSet},sync::{Arc,RwLock},time::Duration};
 use anyhow::{Result,ensure};
 use solana_pubkey::Pubkey;
 use serde_json::Value;
-use tokio::sync::{broadcast,watch};
-use crate::core::{DataBatch,MintState,PoolState,PoolUpdateBatch,RecordIdentity};
+use tokio::sync::{broadcast,watch,mpsc};
+use crate::core::{DataBatch,MintState,MintOnchainBatch,MintReader,PoolState,PoolUpdateBatch,RecordIdentity};
 
 const MIN_LIQUIDITY_USD:f64=2000.0;
 const MIN_MARKET_CAP_USD:f64=10000.0;
@@ -31,6 +31,27 @@ impl MintRegistry {
     pub fn snapshot(&self)->Vec<MintState> {
         self.entries.read().expect("mint registry lock poisoned").values().cloned().collect()
     }
+    fn apply_onchain(&self,batch:&MintOnchainBatch)->MintOnchainBatch {
+        let mut entries=self.entries.write().expect("mint registry lock poisoned");
+        let mut states=Vec::new();
+        for verified in &batch.states {
+            let previous=entries.get(&verified.address);
+            if previous.and_then(|m|m.onchain.as_ref()).is_some_and(|m|
+                m.verified_slot>verified.verified_slot) {continue;}
+            let mut mint=previous.cloned().unwrap_or_else(||MintState{
+                address:verified.address,token_program:None,decimals:None,
+                created_at:None,updated_at:None,liquidity_usd:None,
+                market_cap_usd:None,holder_count:None,usd_price:None,
+                fetched_at_ms:0,onchain:None,
+            });
+            mint.token_program=Some(verified.owner);
+            mint.decimals=Some(verified.decimals);
+            mint.onchain=Some(Arc::new(verified.clone()));
+            entries.insert(verified.address,mint);
+            states.push(verified.clone());
+        }
+        MintOnchainBatch{states}
+    }
     fn apply(&self,batch:&DataBatch)->Vec<Pubkey> {
         fn amount(v:Option<&Value>)->Option<f64> {
             let v=v?;
@@ -53,11 +74,13 @@ impl MintRegistry {
             if previous.is_some_and(|v|v.fetched_at_ms>batch.received_at_ms){continue;}
             let state=MintState{
                 address:*address,
-                token_program:v.get("tokenProgram").and_then(Value::as_str)
-                    .and_then(|s|s.parse::<Pubkey>().ok())
+                token_program:previous.and_then(|v|v.onchain.as_ref()).map(|v|v.owner)
+                    .or_else(||v.get("tokenProgram").and_then(Value::as_str)
+                        .and_then(|s|s.parse::<Pubkey>().ok()))
                     .or_else(||previous.and_then(|v|v.token_program)),
-                decimals:v.get("decimals").and_then(Value::as_u64)
-                    .and_then(|n|u8::try_from(n).ok())
+                decimals:previous.and_then(|v|v.onchain.as_ref()).map(|v|v.decimals)
+                    .or_else(||v.get("decimals").and_then(Value::as_u64)
+                        .and_then(|n|u8::try_from(n).ok()))
                     .or_else(||previous.and_then(|v|v.decimals)),
                 created_at:date(v.get("createdAt"))
                     .or_else(||previous.and_then(|v|v.created_at.clone())),
@@ -69,12 +92,16 @@ impl MintRegistry {
                     v.as_u64().or_else(||v.as_str().and_then(|s|s.parse::<u64>().ok()))),
                 usd_price:amount(v.get("usdPrice")),
                 fetched_at_ms:batch.received_at_ms,
+                onchain:previous.and_then(|v|v.onchain.clone()),
             };
             entries.insert(*address,state);
             changed.push(*address);
         }
         changed
     }
+}
+impl MintReader for MintRegistry {
+    fn mint(&self,address:Pubkey)->Option<MintState>{self.get(address)}
 }
 fn eligible(v:&MintState)->bool {
     v.liquidity_usd.is_some_and(|n|n>=MIN_LIQUIDITY_USD)
@@ -91,6 +118,10 @@ pub async fn run(
     mut jupiter_updates:broadcast::Receiver<Arc<DataBatch>>,
     qualified_tx:watch::Sender<Arc<[Pubkey]>>,
     jupiter_targets:watch::Sender<Arc<[Pubkey]>>,
+    mut onchain_updates:Option<mpsc::Receiver<Arc<MintOnchainBatch>>>,
+    onchain_persist:Option<broadcast::Sender<Arc<MintOnchainBatch>>>,
+    onchain_revision:Option<watch::Sender<u64>>,
+    mut stop:Option<watch::Receiver<bool>>,
 )->Result<()> {
     let mut known=HashSet::<Pubkey>::new();
     for pool in restored_pools {
@@ -105,9 +136,31 @@ pub async fn run(
     let mut missing_cursor=0_usize;
     let mut dirty=true;
     let mut pool_open=true;
-    let mut jupiter_open=true;
+    let mut jupiter_open=true;let mut revision=0_u64;
     loop {
+        let onchain_open=onchain_updates.is_some();
+        let stop_open=stop.is_some();
         tokio::select! {
+            changed=async{stop.as_mut().expect("Mint stop").changed().await},if stop_open=>{
+                if changed.is_err() || stop.as_ref().is_some_and(|s|*s.borrow()) {break;}
+            },
+            event=async {onchain_updates.as_mut().expect("Mint onchain receiver").recv().await},
+                if onchain_open=>match event {
+                Some(batch)=>{
+                    let accepted=mints.apply_onchain(&batch);
+                    if !accepted.states.is_empty() {
+                        if let Some(tx)=&onchain_persist {
+                            tx.send(Arc::new(accepted.clone())).map_err(|_|anyhow::anyhow!(
+                                "Mint onchain Persistence consumer closed"))?;
+                        }
+                        revision+=1;
+                        if let Some(tx)=&onchain_revision {tx.send_replace(revision);}
+                        crate::log_event!(Debug,"mint registry onchain received={} accepted={} revision={revision}",
+                            batch.states.len(),accepted.states.len());
+                    }
+                },
+                None=>{onchain_updates=None;},
+            },
             event=pool_updates.recv(),if pool_open=>match event {
                 Ok(batch)=>{
                     for pool in &batch.pools {
@@ -129,10 +182,25 @@ pub async fn run(
                 Ok(batch)=>{
                     for mint in mints.apply(&batch){
                         if !known.contains(&mint){continue;}
-                        if mints.get(mint).as_ref().is_some_and(eligible){
-                            qualified.insert(mint);
-                        }else{
-                            qualified.remove(&mint);
+                        let was_qualified=qualified.contains(&mint);
+                        let current=mints.get(mint);
+                        let is_qualified=current.as_ref().is_some_and(eligible);
+                        if is_qualified {qualified.insert(mint);}
+                        else {qualified.remove(&mint);}
+                        if was_qualified!=is_qualified {
+                            crate::log_event!(Info,"mint qualification_transition event={}",
+                                serde_json::json!({
+                                    "mint":mint.to_string(),
+                                    "source":"jupiter",
+                                    "received_at_ms":batch.received_at_ms,
+                                    "was_qualified":was_qualified,
+                                    "is_qualified":is_qualified,
+                                    "liquidity_usd":current.as_ref().and_then(|v|v.liquidity_usd),
+                                    "market_cap_usd":current.as_ref().and_then(|v|v.market_cap_usd),
+                                    "min_liquidity_usd":MIN_LIQUIDITY_USD,
+                                    "min_market_cap_usd":MIN_MARKET_CAP_USD,
+                                })
+                            );
                         }
                         dirty=true;
                     }

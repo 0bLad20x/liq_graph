@@ -85,6 +85,21 @@ ON CONFLICT (mint_address) DO UPDATE SET
 WHERE old.fetched_at IS NULL OR EXCLUDED.fetched_at >= old.fetched_at
 "#;
 
+const UPSERT_ONCHAIN_MINT: &str = r#"
+INSERT INTO public.mints AS prior
+    (mint_address,token_program,decimals,token_extensions,transfer_fee_config)
+SELECT d.mint,d.owner,d.decimals,d.extensions::jsonb,d.fee::jsonb
+FROM UNNEST($1::text[],$2::text[],$3::smallint[],$4::text[],$5::text[])
+    AS d(mint,owner,decimals,extensions,fee)
+ON CONFLICT (mint_address) DO UPDATE SET
+    token_program=EXCLUDED.token_program,
+    decimals=EXCLUDED.decimals,
+    token_extensions=EXCLUDED.token_extensions,
+    transfer_fee_config=EXCLUDED.transfer_fee_config
+WHERE COALESCE((prior.token_extensions->>'verified_slot')::bigint,-1)
+    <= (EXCLUDED.token_extensions->>'verified_slot')::bigint
+"#;
+
 const UPSERT_IDENTITY: &str = r#"
 INSERT INTO public.pools AS existing
  (pool_address,venue,mint_a,mint_b,tvl_usd,tvl_source,tvl_observed_at,pool_config)
@@ -348,7 +363,9 @@ impl Persistence {
                         liquidity_usd::double precision AS liquidity,
                         market_cap_usd::double precision AS mcap,
                         holder_count,usd_price::double precision AS price,
-                        (extract(epoch FROM fetched_at)*1000)::bigint AS fetched
+                        (extract(epoch FROM fetched_at)*1000)::bigint AS fetched,
+                        token_extensions::text AS token_extensions,
+                        transfer_fee_config::text AS transfer_fee_config
                  FROM public.mints WHERE ($1::text IS NULL OR mint_address>$1)
                  ORDER BY mint_address LIMIT 8192",&[&after]).await
                 .context("restore mint catalog")?;
@@ -359,6 +376,27 @@ impl Persistence {
                 let decimal:Option<i16>=row.get("decimals");
                 let holders:Option<i64>=row.get("holder_count");
                 let fetched:Option<i64>=row.get("fetched");
+                let extensions:Option<String>=row.get("token_extensions");
+                let transfer_fee:Option<String>=row.get("transfer_fee_config");
+                let onchain=match (extensions,transfer_fee) {
+                    (Some(ext),Some(fee))=>{
+                        let ext:Value=serde_json::from_str(&ext).context("restore token_extensions")?;
+                        let fee:Value=serde_json::from_str(&fee).context("restore transfer_fee_config")?;
+                        let slot=ext.get("verified_slot").and_then(Value::as_u64)
+                            .context("persisted Mint onchain slot missing")?;
+                        let at=ext.get("verified_at_ms").and_then(Value::as_u64)
+                            .context("persisted Mint onchain timestamp missing")?;
+                        let decimals=u8::try_from(ext.get("decimals").and_then(Value::as_u64)
+                            .context("persisted Mint onchain decimals missing")?)?;
+                        let owner:Pubkey=ext.get("owner").and_then(Value::as_str)
+                            .context("persisted Mint onchain owner missing")?.parse()?;
+                        Some(Arc::new(crate::core::MintOnchainState{
+                            address:pubkey(&addr)?,owner,decimals,verified_slot:slot,
+                            verified_at_ms:at,token_extensions:ext,transfer_fee_config:fee,
+                        }))
+                    },
+                    _=>None,
+                };
                 result.push(MintState{
                     address:pubkey(&addr)?,
                     token_program:program.as_deref().map(pubkey).transpose()?,
@@ -370,12 +408,30 @@ impl Persistence {
                     holder_count:holders.map(u64::try_from).transpose()?,
                     usd_price:row.get("price"),
                     fetched_at_ms:fetched.map(u64::try_from).transpose()?.unwrap_or(0),
+                    onchain,
                 });
                 after=Some(addr);
             }
         }
         crate::log_event!(Info,"persistence restored_mints={} table=public.mints",result.len());
         Ok(result)
+    }
+
+    /// Only this worker writes onchain Mint columns, independently of Jupiter freshness.
+    pub async fn save_onchain_batch(&self,batch:&crate::core::MintOnchainBatch)->Result<u64>{
+        let mut addresses=Vec::new();let mut owners=Vec::new();let mut decimals=Vec::new();
+        let mut extensions=Vec::new();let mut fees=Vec::new();
+        for state in &batch.states {
+            addresses.push(state.address.to_string());
+            owners.push(state.owner.to_string());
+            decimals.push(i16::from(state.decimals));
+            extensions.push(serde_json::to_string(&state.token_extensions)?);
+            fees.push(serde_json::to_string(&state.transfer_fee_config)?);
+        }
+        if addresses.is_empty(){return Ok(0);}
+        self.client.execute(UPSERT_ONCHAIN_MINT,
+            &[&addresses,&owners,&decimals,&extensions,&fees]).await
+            .context("persist onchain Mint extension/fee batch")
     }
 
     /// Sole PostgreSQL writer for Jupiter batches; sources only publish typed DataBatch.
@@ -564,10 +620,11 @@ impl Persistence {
     }
 
     pub async fn run(self,rx:broadcast::Receiver<Arc<PoolUpdateBatch>>) -> Result<()> {
-        self.run_with_mints(rx,None).await
+        self.run_with_mints(rx,None,None).await
     }
     pub async fn run_with_mints(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-        mut mint_rx:Option<broadcast::Receiver<Arc<DataBatch>>>) -> Result<()> {
+        mut mint_rx:Option<broadcast::Receiver<Arc<DataBatch>>>,
+        mut onchain_rx:Option<broadcast::Receiver<Arc<crate::core::MintOnchainBatch>>>) -> Result<()> {
         use std::collections::HashSet;
         let mut pending_identity=HashMap::with_capacity(BATCH_SIZE);
         let mut pending_completion=HashMap::with_capacity(BATCH_SIZE);
@@ -578,9 +635,20 @@ impl Persistence {
         let mut ticker=interval(WRITE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut pool_open=true;
-        while pool_open || mint_rx.is_some() {
+        while pool_open || mint_rx.is_some() || onchain_rx.is_some() {
             let mint_open=mint_rx.is_some();
+            let onchain_open=onchain_rx.is_some();
             tokio::select! {
+                event=async{onchain_rx.as_mut().expect("onchain channel").recv().await},
+                    if onchain_open=>match event {
+                    Ok(batch)=>{
+                        let n=self.save_onchain_batch(&batch).await?;
+                        crate::log_event!(Debug,"persistence onchain mints={} updated={}",batch.states.len(),n);
+                    },
+                    Err(broadcast::error::RecvError::Lagged(n))=>
+                        bail!("persistence lost {n} Mint onchain batches"),
+                    Err(broadcast::error::RecvError::Closed)=>{onchain_rx=None;},
+                },
                 event=async {mint_rx.as_mut().expect("mint channel").recv().await},if mint_open=>match event {
                     Ok(batch)=>{self.save_mint_batch(&batch).await?;},
                     Err(broadcast::error::RecvError::Lagged(n))=>

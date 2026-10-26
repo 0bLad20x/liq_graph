@@ -6,7 +6,7 @@ use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc};
 use crate::core::{CompletionState, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionParameters, ExecutionPool, ExecutionReport, ExecutionRequest}, market_state::{PriceOrigin,PricePipelineTiming},
-    signals::{SignalEvent, SignalGroup, SignalPlan, SignalPool, SignalPoolPrice,
+    signals::{SignalCandidate, SignalEvent, SignalGroup, SignalPlan, SignalPool, SignalPoolPrice, SignalTopology,
         SignalRangeChange, SignalRouteKind, SignalRouteRange, SignalStateUpdate,
         SignalStream, SignalTrigger, SIGNAL_LOG_SCALE}};
 use super::pool_registry::PoolRegistry;
@@ -49,8 +49,8 @@ struct PoolEvidence {
 #[derive(serde::Serialize)]
 pub struct Selection {
     pub request: ExecutionRequest,
-    graph_generation: u64, revision: u64, group_id: usize, route_kind: SignalRouteKind,
-    reverse: bool, trigger: Arc<SignalTrigger>, seed: SignalRouteRange,
+    graph_generation: u64, revision: u64, group_id: Option<usize>, topology_id: Option<usize>, route_kind: SignalRouteKind,
+    reverse: bool, trigger: Arc<SignalTrigger>, seed: Option<SignalRouteRange>, candidate: Option<SignalCandidate>,
     threshold_units: i64, indicative_return_bps: Option<f64>,
     pools: Vec<PoolEvidence>, packing: ExecutionMetrics,
     signal_ready_at_us: u64, candidate_received_at_us: u64, request_ready_at_us: u64,
@@ -206,8 +206,8 @@ impl State {
         let alternative_pools_added=pools.len()-slots.len();
         let ready=now_us();
         let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
-        Ok(Selection {request,graph_generation:self.generation,revision:self.revision,group_id:seed.group_id,
-            route_kind:g.kind,reverse:seed.reverse,trigger,seed:seed.clone(),threshold_units:threshold,
+        Ok(Selection {request,graph_generation:self.generation,revision:self.revision,group_id:Some(seed.group_id),topology_id:None,
+            route_kind:g.kind,reverse:seed.reverse,trigger,seed:Some(seed.clone()),candidate:None,threshold_units:threshold,
             indicative_return_bps:seed.witness.indicative_return_bps,
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,signal_ready_at_us:self.ready_at_us,
             candidate_received_at_us:self.received_at_us,request_ready_at_us:ready,
@@ -217,6 +217,129 @@ impl State {
             alternatives_considered:considered,packing_rejections,unavailable_alternatives,
             last_alternative_rejection,alternative_pools_added})
     }
+
+    /// Pack an exact CP6A best-witness without rebuilding any route product.
+    /// Alternatives are drawn from currently priced slots with the same mint roles.
+    fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
+        registry:&PoolRegistry,cfg:&Settings,number:usize)->Result<Selection>{
+        let started=Instant::now();
+        let plan=self.plan.as_ref().context("compact candidate plan missing")?;
+        let top=plan.compact_topologies.get(c.topology_id)
+            .context("compact topology missing")?;
+        ensure!(c.change!=SignalRangeChange::Exited,"cannot pack exited candidate");
+        let witness=c.witness.as_ref().context("compact candidate witness missing")?;
+        ensure!(witness.legs.len()==top.length
+            &&witness.log_sum_units<threshold,"invalid compact candidate length/score");
+        let role=|index:usize|->&'static str{
+            match top.kind {
+                SignalRouteKind::Direct2=>if index==0{"direct"}else{"partner"},
+                SignalRouteKind::Direct3=>match index{0=>"direct",1=>"partner",_=>"conversion"},
+                SignalRouteKind::Triangle3=>match index{0=>"direct",1=>"intermediate",_=>"partner"},
+                SignalRouteKind::Triangle4=>match index{
+                    0=>"direct",1=>"intermediate",2=>"partner",_=>"conversion"},
+            }
+        };
+        let mut slots=Vec::<(usize,&'static str)>::new();
+        let mut used=HashSet::new();
+        for (i,leg) in witness.legs.iter().enumerate(){
+            let j=if c.reverse{top.length-1-i}else{i};
+            let (a,b)=top.roles[j];
+            let (input,output)=if c.reverse{(b,a)}else{(a,b)};
+            ensure!((leg.input_mint,leg.output_mint)==(input,output)
+                && used.insert(leg.slot/2),"compact witness has wrong or duplicate pools");
+            ensure!(self.weight(leg.slot)==Some(leg.log_weight_units),
+                "compact candidate is stale relative to price revision");
+            slots.push((leg.slot,role(j)));
+        }
+        ensure!(witness.legs.last().is_some_and(|l|l.output_mint==top.settlement)
+            &&witness.legs[0].input_mint==top.settlement,
+            "compact route does not settle");
+        let mut request=ExecutionRequest{id:format!("graph-{}-{}-{number}",self.generation,self.revision),
+            wallet:cfg.wallet,settlement:top.settlement,groups:Vec::new(),conversion:None,
+            parameters:cfg.parameters.clone()};
+        let mut pools=Vec::new();
+        for &(slot,r) in &slots{
+            pools.push(self.pool(slot,r,registry,cfg.wallet)?);
+        }
+        install_compact(&mut request,top,&pools);
+        let mut packing=(cfg.capacity)(&request).context("compact seed does not fit V10")?;
+        let mut options=Vec::new();
+        // Only direct/partner roles accept parallel alternatives in the current
+        // V10 group contract. Intermediate/conversion remain the best chosen pool.
+        for (i,&(selected,role_name)) in slots.iter().enumerate(){
+            if role_name!="direct"&&role_name!="partner"{continue;}
+            let target=self.pools.get(selected/2).context("candidate identity missing")?;
+            let (a,b)=(target.mint_a,target.mint_b);
+            let original=self.weight(selected).context("seed weight missing")?;
+            for (id,p) in self.pools.iter().enumerate(){
+                if p.mint_a!=a||p.mint_b!=b||used.contains(&id){continue;}
+                let slot=2*id+selected%2;
+                if let Some(w)=self.weight(slot){
+                    let new_sum=i128::from(witness.log_sum_units)-i128::from(original)+i128::from(w);
+                    if new_sum<i128::from(threshold){
+                        options.push((new_sum,slot,role_name,i));
+                    }
+                }
+            }
+        }
+        options.sort_unstable_by_key(|(score,slot,_,_)|(*score,*slot));
+        let mut considered=0;let mut rejected=0;let mut unavailable=0;
+        let mut last_rejection=None;
+        for (_,slot,role_name,_) in options{
+            if used.contains(&(slot/2)){continue;}
+            considered+=1;
+            let pool=match self.pool(slot,role_name,registry,cfg.wallet){
+                Ok(pool)=>pool,Err(error)=>{
+                    unavailable+=1;last_rejection=Some(format!("{error:#}"));continue;
+                }
+            };
+            pools.push(pool);
+            install_compact(&mut request,top,&pools);
+            match (cfg.capacity)(&request){
+                Ok(metrics)=>{packing=metrics;used.insert(slot/2);},
+                Err(error)=>{pools.pop();rejected+=1;last_rejection=Some(format!("{error:#}"));}
+            }
+        }
+        install_compact(&mut request,top,&pools);
+        let ready=now_us();
+        let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
+        let alternative_pools_added=pools.len()-slots.len();
+        Ok(Selection{request,graph_generation:self.generation,revision:self.revision,
+            group_id:None,topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
+            trigger,seed:None,candidate:Some(c.clone()),threshold_units:threshold,
+            indicative_return_bps:witness.indicative_return_bps,
+            pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
+            signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
+            request_ready_at_us:ready,price_pipeline:self.price_pipeline,
+            frame_to_request_us:frame.and_then(|at|ready.checked_sub(at)),
+            signal_to_request_us:ready.saturating_sub(self.ready_at_us),selection_ns:elapsed_ns(started),
+            alternatives_considered:considered,packing_rejections:rejected,
+            unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
+            alternative_pools_added})
+    }
+
+}
+
+
+fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
+    pools:&[(ExecutionPool,PoolEvidence)]){
+    let direct=pools.iter().filter(|(_,e)|e.role=="direct")
+        .map(|(p,_)|p.clone()).collect::<Vec<_>>();
+    let partners=pools.iter().filter(|(_,e)|e.role=="partner")
+        .map(|(p,_)|p.clone()).collect::<Vec<_>>();
+    request.conversion=pools.iter().find(|(_,e)|e.role=="conversion")
+        .map(|(p,_)|p.clone());
+    request.groups=vec![match top.kind{
+        SignalRouteKind::Direct2|SignalRouteKind::Direct3=>ExecutionGroup::Direct{
+            target:top.target,pools:direct.into_iter().chain(partners).collect(),
+        },
+        SignalRouteKind::Triangle3|SignalRouteKind::Triangle4=>ExecutionGroup::Bridge{
+            target:top.target,bridge:top.bridge.expect("triangle has bridge mint"),
+            intermediate:pools.iter().find(|(_,e)|e.role=="intermediate")
+                .expect("triangle has intermediate").0.clone(),
+            bridges:partners,direct,
+        },
+    }];
 }
 
 fn install(request:&mut ExecutionRequest, g:&SignalGroup, pools:&[(ExecutionPool,PoolEvidence)]) {
@@ -252,7 +375,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                 },
             };
             report.events+=1;
-            let next=match event.as_ref() {SignalEvent::State(s)=>s.sequence,SignalEvent::Ranges(b)=>b.sequence,SignalEvent::Evaluated(e)=>e.sequence};
+            let next=match event.as_ref() {SignalEvent::State(s)=>s.sequence,SignalEvent::Ranges(b)=>b.sequence,
+                SignalEvent::Candidates(b)=>b.sequence,SignalEvent::Evaluated(e)=>e.sequence};
             ensure!(report.awaiting_snapshot || next==sequence+1,"candidate event sequence gap"); sequence=next;
             if report.awaiting_snapshot && !matches!(event.as_ref(),SignalEvent::State(s) if s.snapshot.is_some()) {continue;}
             match event.as_ref() {
@@ -261,6 +385,26 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     state.apply(s,report.awaiting_snapshot)?;
                     if report.awaiting_snapshot {report.resynchronizations+=1;report.awaiting_snapshot=false;}
                     pending=true;ranked.clear();
+                },
+                SignalEvent::Candidates(b)=>{
+                    ensure!(pending&&b.revision==state.revision&&b.graph_generation==state.generation,
+                        "candidate batch references wrong state");
+                    if report.requests.len()>=cfg.limit
+                        ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket,..})
+                        ||!b.price_pipeline.is_some_and(|t|!t.initialization_replay){continue;}
+                    for (index,candidate) in b.candidates.iter().enumerate(){
+                        if candidate.change==SignalRangeChange::Exited{continue;}
+                        let top=state.plan.as_ref()
+                            .and_then(|p|p.compact_topologies.get(candidate.topology_id))
+                            .context("candidate references unknown topology")?;
+                        if cfg.kind.is_some_and(|kind|kind!=top.kind){continue;}
+                        if let Some(w)=candidate.witness.as_ref(){
+                            ensure!(w.log_sum_units<b.threshold_units,
+                                "best candidate does not satisfy threshold");
+                            report.qualifying_ranges+=1;
+                            ranked.push((w.log_sum_units,event.clone(),index));
+                        }
+                    }
                 },
                 SignalEvent::Ranges(b)=>{
                     ensure!(pending && b.revision==state.revision && b.graph_generation==state.generation,"candidate ranges reference wrong state");
@@ -293,8 +437,16 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     ranked.sort_unstable_by_key(|entry|entry.0);
                     let mut chosen=None;
                     for (_,event,index) in &ranked {
-                        let SignalEvent::Ranges(block)=event.as_ref() else {unreachable!("stored range event")};
-                        match state.build(&block.ranges[*index],block.threshold_units,block.trigger.clone(),&registry,&cfg,report.requests.len()+1) {
+                        let selected=match event.as_ref(){
+                            SignalEvent::Ranges(block)=>state.build(&block.ranges[*index],
+                                block.threshold_units,block.trigger.clone(),&registry,&cfg,
+                                report.requests.len()+1),
+                            SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
+                                block.threshold_units,block.trigger.clone(),&registry,&cfg,
+                                report.requests.len()+1),
+                            _=>bail!("ranked event is neither range nor compact candidate"),
+                        };
+                        match selected {
                             Ok(mut selection)=>{selection.selection_ns=elapsed_ns(started);chosen=Some(selection);break;},
                             Err(error)=>{report.skipped_invalid_seed+=1;report.last_rejection=Some(format!("{error:#}"));},
                         }

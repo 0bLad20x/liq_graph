@@ -132,6 +132,30 @@ pub struct MintState {
     pub holder_count: Option<u64>,
     pub usd_price: Option<f64>,
     pub fetched_at_ms: u64,
+    /// Authoritative on-chain extension/fee state, independently versioned from Jupiter.
+    pub onchain: Option<Arc<MintOnchainState>>,
+}
+
+/// Complete attested on-chain mint data, including raw TLV payloads for extensions
+/// whose application-specific execution cost cannot be determined from a Mint alone.
+#[derive(Clone, Debug)]
+pub struct MintOnchainState {
+    pub address: Pubkey,
+    pub owner: Pubkey,
+    pub decimals: u8,
+    pub verified_slot: u64,
+    pub verified_at_ms: u64,
+    pub token_extensions: Value,
+    pub transfer_fee_config: Value,
+}
+
+/// Source-independent changes; a single Mint Registry writer validates slot order.
+#[derive(Clone, Debug)]
+pub struct MintOnchainBatch { pub states: Vec<MintOnchainState> }
+
+/// Shared read-only contract. No worker accesses another worker's implementation.
+pub trait MintReader: Send + Sync {
+    fn mint(&self, address: Pubkey) -> Option<MintState>;
 }
 
 /// Generic HTTP client; no DEX or protocol logic.

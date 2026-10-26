@@ -81,8 +81,16 @@ impl AdmissionIndex {
         }
     }
     fn admission(&self, pool: &PoolState) -> CompletionAdmission {
-        let mint_qualified=[pool.mint_a,pool.mint_b].into_iter().flatten()
-            .any(|mint| !reference_mints().contains(&mint) && self.qualified.contains(&mint));
+        // A WSOL/USDC conversion pool contains only settlement reference mints.
+        // It cannot satisfy the non-reference Jupiter qualification rule, yet it
+        // is required by V10 Direct3/Triangle4 routes. Admit ONLY this exact
+        // canonical reference pair; all other pools retain the Mint qualification
+        // and venue-native minimum-TVL policy.
+        let references=reference_mints();
+        let conversion_pair=matches!((pool.mint_a,pool.mint_b),
+            (Some(a),Some(b)) if a!=b && references.contains(&a) && references.contains(&b));
+        let mint_qualified=conversion_pair || [pool.mint_a,pool.mint_b].into_iter().flatten()
+            .any(|mint| !references.contains(&mint) && self.qualified.contains(&mint));
         let native_below_minimum=native_source(pool.venue).is_some()
             && self.native_tvl.get(&pool.address).is_some_and(|v|*v<MIN_NATIVE_TVL_USD);
         CompletionAdmission::from_qualification(
@@ -324,6 +332,34 @@ impl PoolRegistry {
         self.entries.read().expect("pool registry lock poisoned")
             .values().filter(|p|p.tvl_usd.is_some()).count()
     }
+    /// Live accounting of the reference pair needed for Direct3/Triangle4.
+    /// Diagnostic only: the PoolRegistry remains the sole admission authority.
+    fn report_conversion_admission(&self) {
+        let references=reference_mints();
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let mut known=0_usize;
+        let mut admitted=0_usize;
+        let mut prepared=0_usize;
+        let mut prepared_admitted=0_usize;
+        let mut native_veto=0_usize;
+        let mut missing_qualification=0_usize;
+        for p in entries.values() {
+            let pair=matches!((p.mint_a,p.mint_b),
+                (Some(a),Some(b)) if a!=b && references.contains(&a) && references.contains(&b));
+            if !pair {continue;}
+            known+=1;
+            if p.completion_admission.is_admitted(){admitted+=1;}
+            if p.completion_state==CompletionState::Prepared{prepared+=1;}
+            if p.completion_admission.is_admitted() && p.completion_state==CompletionState::Prepared {
+                prepared_admitted+=1;
+            }
+            if p.completion_admission==CompletionAdmission::NativeTvlBelowMinimum {native_veto+=1;}
+            if p.completion_admission==CompletionAdmission::MintNotQualified {missing_qualification+=1;}
+        }
+        crate::log_event!(Info,
+            "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} native_tvl_veto={} mint_not_qualified={}",
+            known,admitted,prepared,prepared_admitted,native_veto,missing_qualification);
+    }
 
     /// Bootstrap complete, previously validated state before any producer starts.
     /// REST observations still own current TVL/freshness; persisted proof is historical.
@@ -445,6 +481,27 @@ impl PoolRegistry {
             if let Some(pool)=entries.get_mut(&address) {
                 let decision=admission.admission(pool);
                 if decision!=pool.completion_admission {
+                    let previous=pool.completion_admission;
+                    crate::log_event!(Debug,"pool admission_transition event={}",
+                        json!({
+                            "pool":address.to_string(),"venue":format!("{:?}",pool.venue),
+                            "source":"mint_qualification","received_at_ms":now,
+                            "before":format!("{previous:?}"),"after":format!("{decision:?}"),
+                            "native_tvl_usd":admission.native_tvl.get(&address).copied(),
+                            "canonical_tvl_usd":pool.tvl_usd,
+                            "completion":format!("{:?}",pool.completion_state),
+                            "completion_reason":pool.completion_reason_code.map(|r|format!("{r:?}")),
+                        }));
+                    if (previous.is_admitted()&&!decision.is_admitted())
+                        ||(previous==CompletionAdmission::NativeTvlBelowMinimum&&decision.is_admitted()){
+                        crate::log_event!(Info,"pool admission_membership_change event={}",
+                            json!({"pool":address.to_string(),
+                                "source":"mint_qualification","at_ms":now,
+                                "venue":format!("{:?}",pool.venue),
+                                "before":format!("{previous:?}"),"after":format!("{decision:?}"),
+                                "native_tvl_usd":admission.native_tvl.get(&address).copied(),
+                                "canonical_tvl_usd":pool.tvl_usd}));
+                    }
                     pool.completion_admission=decision;
                     pool.last_changed_ms=now;
                     updates.push(pool.clone());
@@ -599,9 +656,31 @@ impl PoolRegistry {
                     current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
                         changed=true;
-                        crate::log_event!(Debug,
-                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
-                            current.address,current.venue,current.completion_admission,current.tvl_usd,current.execution_manifest.is_some());
+                        if (previous_admission.is_admitted()&&!current.completion_admission.is_admitted())
+                            ||(previous_admission==CompletionAdmission::NativeTvlBelowMinimum
+                                &&current.completion_admission.is_admitted()){
+                            crate::log_event!(Info,"pool admission_membership_change event={}",
+                                json!({"pool":current.address.to_string(),
+                                    "source":batch.source,"at_ms":batch.received_at_ms,
+                                    "venue":format!("{:?}",current.venue),
+                                    "before":format!("{previous_admission:?}"),
+                                    "after":format!("{:?}",current.completion_admission),
+                                    "native_tvl_usd":admission.native_tvl.get(&current.address).copied(),
+                                    "canonical_tvl_usd":current.tvl_usd}));
+                        }
+                        crate::log_event!(Debug,"pool admission_transition event={}",
+                            json!({
+                                "pool":current.address.to_string(),
+                                "venue":format!("{:?}",current.venue),
+                                "source":batch.source,"received_at_ms":batch.received_at_ms,
+                                "before":format!("{previous_admission:?}"),
+                                "after":format!("{:?}",current.completion_admission),
+                                "native_tvl_usd":admission.native_tvl.get(&current.address).copied(),
+                                "canonical_tvl_usd":current.tvl_usd,
+                                "completion":format!("{:?}",current.completion_state),
+                                "completion_reason":current.completion_reason_code.map(|r|format!("{r:?}")),
+                                "manifest_retained":current.execution_manifest.is_some(),
+                            }));
                     }
                     if changed {
                         if identity_changed { stats.identity.push(*address); }
@@ -855,6 +934,7 @@ pub async fn run(
                 }
             },
             _=freshness.tick()=>{
+                registry.report_conversion_admission();
                 let (invalidated,persist)=registry.refresh_tvl(now_unix_ms()?);
                 if !invalidated.is_empty() {
                     let count=invalidated.len();

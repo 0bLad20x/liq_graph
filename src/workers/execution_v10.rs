@@ -1,6 +1,6 @@
 //! Complete typed execution job -> signed V10/Solana-v1 simulation -> typed report.
 //! No DB, Registry, graph lookup, pool selection, protocol decoding or broadcasting.
-use std::{collections::{HashMap, HashSet}, path::Path};
+use std::{collections::{HashMap, HashSet}, path::Path, time::Instant};
 use anyhow::{Context, Result, bail, ensure};
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde_json::Value;
@@ -25,7 +25,7 @@ fn ata(wallet: Pubkey, mint: Pubkey, program: Pubkey) -> Pubkey {
 }
 
 /// Signer is a startup resource, never part of an execution request or its logs.
-pub struct Settings { signer: Ed25519KeyPair }
+pub struct Settings { signer: Ed25519KeyPair, fast: bool }
 impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
         let mut encoded=std::fs::read(path).context("read V10 wallet keypair")?;
@@ -37,7 +37,11 @@ impl Settings {
                 .map_err(|_|anyhow::anyhow!("wallet seed/public key mismatch"))
         } else { Err(anyhow::anyhow!("wallet keypair must contain 64 bytes")) };
         bytes.fill(0);
-        Ok(Self { signer:result? })
+        let fast=match std::env::var("V10_SIMULATION_FAST").as_deref() {
+            Ok("false"|"0")=>false, Ok("true"|"1")|Err(_)=>true,
+            Ok(_)=>bail!("V10_SIMULATION_FAST must be true or false"),
+        };
+        Ok(Self { signer:result?, fast })
     }
     pub fn wallet(&self) -> Pubkey {
         Pubkey::new_from_array(self.signer.public_key().as_ref().try_into().expect("Ed25519 public key"))
@@ -311,33 +315,47 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
     // Check exact account/byte limits before performing any RPC or signing real blockhash data.
     let _=message(&mut ix,request,"11111111111111111111111111111111")?;
     report.metrics=Some(ix.metrics.clone());
-    report.phase="chain_preflight".into(); report.outcome=ExecutionOutcome::RpcFailure;
-    match rpc.call(RpcOperation::GenesisHash).await?.answer {
-        RpcAnswer::GenesisHash(hash)=>ensure!(hash==MAINNET,"V10 worker expects mainnet genesis"),
-        _=>bail!("unexpected genesis response"),
-    }
-    match rpc.call(RpcOperation::Account{address:key(EXECUTOR),view:AccountView::Slice{offset:0,length:0}}).await?.answer {
-        RpcAnswer::Account{account:Some(account),..}=>ensure!(account.executable,"V10 program is not executable"),
-        _=>bail!("V10 executor program account missing"),
-    }
     let min_slot=ix.metrics.pools.iter().map(|p|p.validated_slot).max().context("no manifest slots")?;
-    for attempt in 0..2 {
+    // In fast mode the RPC node substitutes its own valid blockhash. No serial
+    // genesis/program/blockhash HTTP lookup is allowed on this signal hotpath.
+    for attempt in 0..if settings.fast {1}else{2} {
         report.phase="latest_blockhash".into();
-        let (slot,blockhash,last_valid_block_height)=match rpc.call(
-            RpcOperation::LatestBlockhash{min_context_slot:Some(min_slot)}).await?.answer {
-            RpcAnswer::LatestBlockhash{slot,blockhash,last_valid_block_height}=>(slot,blockhash,last_valid_block_height),
-            _=>bail!("unexpected blockhash response"),
+        let (slot,blockhash,last_valid_block_height)=if settings.fast {
+            (min_slot,"11111111111111111111111111111111".to_owned(),None)
+        } else {
+            match rpc.call(RpcOperation::LatestBlockhash{min_context_slot:Some(min_slot)}).await?.answer {
+                RpcAnswer::LatestBlockhash{slot,blockhash,last_valid_block_height}=>
+                    (slot,blockhash,Some(last_valid_block_height)),
+                _=>bail!("unexpected blockhash response"),
+            }
         };
         report.phase="sign".into(); report.outcome=ExecutionOutcome::Rejected;
+        let build_started=Instant::now();
         let signed=compile(&mut ix,request,settings,&blockhash)?;
-        report.simulated_signature=Some(signed.signature.clone()); report.blockhash=Some(blockhash);
-        report.last_valid_block_height=Some(last_valid_block_height);
+        let build_us=build_started.elapsed().as_micros();
+        // A fast simulation uses a replaced blockhash: the local signature is
+        // not a signature of the executed message and must not be advertised.
+        if !settings.fast {
+            report.simulated_signature=Some(signed.signature.clone());
+            report.blockhash=Some(blockhash);
+            report.last_valid_block_height=last_valid_block_height;
+        }
         report.phase="simulate".into(); report.outcome=ExecutionOutcome::RpcFailure;
-        let response=rpc.call(RpcOperation::Simulate{transaction:signed.bytes,
-            min_context_slot:Some(min_slot.max(slot)),accounts:ix.projections.clone()}).await?;
+        let operation=if settings.fast {
+            RpcOperation::SimulateFast{transaction:signed.bytes,min_context_slot:Some(min_slot),
+                accounts:ix.projections.clone()}
+        } else {
+            RpcOperation::Simulate{transaction:signed.bytes,min_context_slot:Some(min_slot.max(slot)),
+                accounts:ix.projections.clone()}
+        };
+        let simulation_started=Instant::now();
+        let response=rpc.call(operation).await?;
+        let simulation_ms=simulation_started.elapsed().as_millis();
+        crate::log_event!(Info,"v10 timing request_id={:?} fast={} build_us={build_us} simulation_rpc_ms={simulation_ms} provider={}",
+            request.id,settings.fast,response.provider);
         let RpcAnswer::Simulation{slot,value}=response.answer else {bail!("unexpected simulation response")};
         report.context_slot=Some(slot); report.provider=Some(response.provider);
-        if attempt==0 && value.get("err").and_then(Value::as_str)==Some("BlockhashNotFound") {
+        if !settings.fast && attempt==0 && value.get("err").and_then(Value::as_str)==Some("BlockhashNotFound") {
             report.blockhash_retried=true; continue;
         }
         report.executor_invoked=value.get("logs").and_then(Value::as_array).is_some_and(|logs|
@@ -356,9 +374,22 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
 
 pub async fn run(settings: Settings, rpc: RpcHandle, mut input: mpsc::Receiver<ExecutionRequest>,
     output: mpsc::Sender<ExecutionReport>) -> Result<()> {
-    crate::log_event!(Info,"v10 started wallet={} mode=simulation broadcasts=false",settings.wallet());
+    // Check static chain/program identity once at worker startup only in signed mode.
+    if !settings.fast {
+        match rpc.call(RpcOperation::GenesisHash).await?.answer {
+            RpcAnswer::GenesisHash(hash)=>ensure!(hash==MAINNET,"V10 worker expects mainnet genesis"),
+            _=>bail!("unexpected genesis response"),
+        }
+        match rpc.call(RpcOperation::Account{address:key(EXECUTOR),view:AccountView::Slice{offset:0,length:0}}).await?.answer {
+            RpcAnswer::Account{account:Some(account),..}=>ensure!(account.executable,"V10 program is not executable"),
+            _=>bail!("V10 executor program account missing"),
+        }
+    }
+    crate::log_event!(Info,"v10 started wallet={} mode={} broadcasts=false",settings.wallet(),
+        if settings.fast {"simulation_fast"}else{"simulation_signed"});
     let mut count=0_u64;
     while let Some(request)=input.recv().await {
+        let started=Instant::now();
         let mut report=ExecutionReport{id:request.id.clone(),outcome:ExecutionOutcome::Rejected,
             phase:"validate".into(),error:None,metrics:None,simulated_signature:None,
             blockhash:None,last_valid_block_height:None,context_slot:None,provider:None,
@@ -366,8 +397,8 @@ pub async fn run(settings: Settings, rpc: RpcHandle, mut input: mpsc::Receiver<E
         if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
             report.error=Some(format!("{error:#}"));
         }
-        crate::log_event!(Info,"v10 result request_id={:?} outcome={:?} phase={} context_slot={:?} dex_calls={}",
-            report.id,report.outcome,report.phase,report.context_slot,report.dex_invocations.len());
+        crate::log_event!(Info,"v10 result request_id={:?} outcome={:?} phase={} context_slot={:?} dex_calls={} elapsed_ms={}",
+            report.id,report.outcome,report.phase,report.context_slot,report.dex_invocations.len(),started.elapsed().as_millis());
         output.send(report).await.context("V10 report consumer stopped")?;
         count+=1;
     }

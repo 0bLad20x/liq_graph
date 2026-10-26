@@ -3,23 +3,23 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    hint::black_box,
     mem::size_of,
+    fs::File,
+    io::{BufWriter, Write},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
+use tokio::{sync::{broadcast, watch, mpsc}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
 
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const V10_MAX_DECLARATIONS: usize = 16;
 
-type Pair = (Pubkey, Pubkey);
+pub type Pair = (Pubkey, Pubkey);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings;
@@ -30,45 +30,6 @@ impl Settings {
             crate::log_event!(Warn,"GRAPH_MIN_TVL_USD is ignored; Registry completion admission owns the common TVL gate");
         }
         Ok(Self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum GroupKind { Direct, Bridge }
-
-/// V10-compatible role template, NOT a packed instruction. Pools in each role are
-/// alternatives and can exceed the 16-declaration instruction cap. The eventual
-/// execution adapter must pack a valid subset, maximum four groups / 16 declarations.
-#[derive(Clone, Debug)]
-pub struct Group {
-    pub settlement: Pubkey,
-    pub target: Pubkey,
-    pub bridge: Option<Pubkey>,
-    pub intermediate: Option<Pubkey>,
-    pub conversion: Option<Pubkey>,
-    pub direct_s: Arc<[Pubkey]>,
-    /// Only applicable to direct-only groups using Q/S conversion.
-    pub direct_q: Arc<[Pubkey]>,
-    /// B/S without conversion, B/Q when conversion is present.
-    pub bridge_pools: Arc<[Pubkey]>,
-    pub kind: GroupKind,
-    /// Directed paths specific to this template; excludes direct roundtrips
-    /// that are already counted by the standalone Direct group.
-    pub route_options: u64,
-}
-
-impl Group {
-    fn declarations(&self) -> usize {
-        self.direct_s.len() + self.direct_q.len() + self.bridge_pools.len()
-            + usize::from(self.intermediate.is_some())
-            + usize::from(self.conversion.is_some())
-    }
-
-    /// Pool order is not group identity: only typed roles and their mint context
-    /// distinguish V10 group templates. Alternatives are kept in sorted role lists.
-    fn identity(&self) -> (Pubkey, Pubkey, GroupKind, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>) {
-        (self.settlement, self.target, self.kind,
-            self.bridge, self.intermediate, self.conversion)
     }
 }
 
@@ -94,421 +55,802 @@ fn eligible(pool: &PoolState) -> Option<PreparedPool> {
     Some(PreparedPool { address: pool.address, a, b })
 }
 
+/// CP6B observational evidence; never participates in admission or routing.
+#[derive(Clone)]
+struct TransitionEvidence {
+    venue:String,
+    admission:String,
+    completion:String,
+    reason_code:Option<String>,
+    rejection:&'static str,
+    canonical_tvl_usd:Option<f64>,
+    validated_slot:Option<u64>,
+    checked_at_ms:Option<u64>,
+    last_changed_ms:u64,
+}
+fn rejection(pool:&PoolState)->&'static str{
+    let (Some(a),Some(b))=(pool.mint_a,pool.mint_b) else{return "missing_mint_identity"};
+    if a==b||a==Pubkey::default()||b==Pubkey::default(){return "invalid_mint_identity";}
+    if !pool.completion_admission.is_admitted(){return "admission_withdrawn";}
+    if pool.completion_state!=CompletionState::Prepared{return "not_prepared";}
+    let Some(slot)=pool.completion_validated_slot else{return "missing_validated_slot"};
+    let Some(manifest)=pool.execution_manifest.as_ref() else{return "missing_manifest"};
+    if manifest.pool!=pool.address||manifest.mint_a!=a||manifest.mint_b!=b {
+        return "manifest_identity_mismatch";
+    }
+    if manifest.validated_slot!=slot{return "manifest_slot_mismatch";}
+    if manifest.base_a.is_empty()||manifest.base_b.is_empty(){return "manifest_basis_missing";}
+    "eligible"
+}
+fn evidence(pool:&PoolState)->TransitionEvidence{
+    TransitionEvidence {
+        venue:format!("{:?}",pool.venue),
+        admission:format!("{:?}",pool.completion_admission),
+        completion:format!("{:?}",pool.completion_state),
+        reason_code:pool.completion_reason_code.map(|v|format!("{v:?}")),
+        rejection:rejection(pool),
+        // This is the canonical observation, NOT necessarily venue-native TVL.
+        canonical_tvl_usd:pool.tvl_usd,
+        validated_slot:pool.completion_validated_slot,
+        checked_at_ms:pool.completion_checked_at_ms,
+        last_changed_ms:pool.last_changed_ms,
+    }
+}
+fn evidence_json(value:Option<&TransitionEvidence>)->serde_json::Value{
+    match value {
+        None=>serde_json::Value::Null,
+        Some(e)=>serde_json::json!({
+            "venue":e.venue,"admission":e.admission,"completion":e.completion,
+            "completion_reason":e.reason_code,"eligibility":e.rejection,
+            "canonical_tvl_usd":e.canonical_tvl_usd,"validated_slot":e.validated_slot,
+            "completion_checked_at_ms":e.checked_at_ms,"registry_last_changed_ms":e.last_changed_ms,
+        })
+    }
+}
+fn now_ms()->u64{
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_millis().min(u128::from(u64::MAX)) as u64
+}
+fn pair_json(value:Option<Pair>)->serde_json::Value{
+    match value{
+        None=>serde_json::Value::Null,
+        Some((a,b))=>serde_json::json!([a.to_string(),b.to_string()])
+    }
+}
+fn transition_kind(before:Option<PreparedPool>,after:Option<PreparedPool>)->&'static str{
+    match (before,after){
+        (None,Some(_))=>"ADDED",
+        (Some(_),None)=>"REMOVED",
+        (Some(a),Some(b)) if pair(a.a,a.b)!=pair(b.a,b.b)=>"PAIR_CHANGED",
+        (Some(_),Some(_))=>"PAIR_ORDER_ONLY",
+        (None,None)=>"UNCHANGED",
+    }
+}
+#[derive(Clone)]
+struct ObservedTransition {
+    address:Pubkey,source:&'static str,batch_at_ms:u64,observed_at_ms:u64,
+    previous_duration_ms:Option<u64>,
+    before:Option<PreparedPool>,after:Option<PreparedPool>,
+    before_evidence:Option<TransitionEvidence>,after_evidence:TransitionEvidence,
+}
+fn transition_json(t:&ObservedTransition,generation:u64,event:&str,
+    old_graph:Option<Pair>,new_graph:Option<Pair>,published_effective:bool)->serde_json::Value{
+    serde_json::json!({
+        "event":event,"generation":generation,"observed_at_ms":t.observed_at_ms,
+        "source_received_at_ms":t.batch_at_ms,"pool":t.address.to_string(),
+        "batch_source":t.source,"transition":transition_kind(t.before,t.after),
+        "before_pair":pair_json(t.before.map(|p|pair(p.a,p.b))),
+        "after_pair":pair_json(t.after.map(|p|pair(p.a,p.b))),
+        "published_before_pair":pair_json(old_graph),
+        "published_after_pair":pair_json(new_graph),
+        "published_effective":published_effective,
+        "previous_state_duration_ms":t.previous_duration_ms,
+        "before":evidence_json(t.before_evidence.as_ref()),
+        "after":evidence_json(Some(&t.after_evidence)),
+    })
+}
+
+/// Private graph telemetry. One bounded generation queue, one blocking buffered
+/// writer. The Registry/Graph Tokio task never serializes JSON or writes to
+/// stdout for individual pool transitions. A full queue fails explicitly:
+/// evidence is never silently sampled/dropped.
+struct AuditBatch {
+    generation:u64,
+    bootstrap:bool,
+    no_op:bool,
+    traces:Vec<ObservedTransition>,
+    before_pairs:HashMap<Pubkey,Option<Pair>>,
+    after_pairs:HashMap<Pubkey,Option<Pair>>,
+}
+fn write_audit_batch(writer:&mut BufWriter<File>, batch:AuditBatch)->Result<()>{
+    let AuditBatch{generation,bootstrap,no_op,traces,before_pairs,after_pairs}=batch;
+    let get_after=|address:&Pubkey|after_pairs.get(address).copied().flatten();
+    let mut observed=0_u64;
+    let mut published=0_u64;
+    for t in &traces {
+        let prior=before_pairs.get(&t.address).copied().flatten();
+        let after=get_after(&t.address);
+        serde_json::to_writer(&mut *writer,
+            &transition_json(t,generation,if no_op{"cancelled"}else{"observed"},
+                prior,after,prior!=after))?;
+        writer.write_all(b"\n")?;
+        observed+=1;
+    }
+    let mut latest=HashMap::new();
+    for (i,t) in traces.iter().enumerate(){latest.insert(t.address,i);}
+    for (&address,&before) in &before_pairs {
+        if no_op {continue;}
+        let after=get_after(&address);
+        if before==after{continue;}
+        if let Some(&index)=latest.get(&address){
+            let t=&traces[index];
+            serde_json::to_writer(&mut *writer,
+                &transition_json(t,generation,"published",before,after,true))?;
+            writer.write_all(b"\n")?;
+            published+=1;
+        }
+    }
+    serde_json::to_writer(&mut *writer,&serde_json::json!({
+        "event":if no_op{"audit_no_op_complete"}else{"audit_generation_complete"},
+        "generation":generation,
+        "bootstrap":bootstrap,"observed":observed,"published":published,
+        "distinct_pools":before_pairs.len(),
+        "no_effect":before_pairs.len().saturating_sub(published as usize)
+    }))?;
+    writer.write_all(b"\n")?;
+    writer.flush().context("flush graph audit generation")?;
+    Ok(())
+}
+
 fn pair(a: Pubkey, b: Pubkey) -> Pair {
     if a < b { (a, b) } else { (b, a) }
 }
 
-fn pools_for(pairs: &HashMap<Pair, Arc<[Pubkey]>>, a: Pubkey, b: Pubkey) -> Arc<[Pubkey]> {
-    pairs.get(&pair(a, b)).cloned().unwrap_or_else(|| Arc::from([]))
-}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash,PartialOrd,Ord)]
+pub enum RouteTopologyKind { Direct2, Direct3, Triangle3, Triangle4 }
 
-fn route_count(direct: usize, bridge: usize) -> u64 {
-    2_u64.saturating_mul(direct as u64).saturating_mul(bridge as u64)
-}
-
-/// Validate every published template against the mint roles required by the public
-/// V10 instruction contract. This validates topology, NOT a packed instruction:
-/// a template may retain more than 16 pool alternatives for later selection.
-fn validate_v10_group(group: &Group, pairs: &HashMap<Pair, Arc<[Pubkey]>>,
-    wsol: Pubkey, usdc: Pubkey) -> Result<()> {
-    let s = group.settlement;
-    ensure!(s == wsol || s == usdc, "V10 group has unsupported settlement {s}");
-    let q = if s == wsol { usdc } else { wsol };
-    let t = group.target;
-    ensure!(t != s && t != Pubkey::default(), "V10 group target equals settlement or zero");
-    ensure!(!group.direct_s.is_empty()
-        && group.direct_s.as_ref() == pools_for(pairs, t, s).as_ref(),
-        "V10 group missing or incorrect settlement-quoted direct pools");
-    for list in [&group.direct_s, &group.direct_q, &group.bridge_pools] {
-        ensure!(list.windows(2).all(|p| p[0] < p[1]),
-            "V10 group pool alternatives are not canonical and distinct");
-    }
-    if let Some(conversion) = group.conversion {
-        ensure!(conversion != Pubkey::default()
-            && pools_for(pairs, q, s).binary_search(&conversion).is_ok(),
-            "V10 group conversion does not pair WSOL and USDC");
-        ensure!(t != q, "V10 group target equals conversion quote");
-    }
-    match group.kind {
-        GroupKind::Direct => {
-            ensure!(group.bridge.is_none() && group.intermediate.is_none()
-                && group.bridge_pools.is_empty(),
-                "V10 direct template contains a triangle role");
-            let direct_q = if group.conversion.is_some() {
-                pools_for(pairs, t, q)
-            } else { Arc::from([]) };
-            ensure!(group.direct_q.as_ref() == direct_q.as_ref()
-                && group.direct_s.len() + group.direct_q.len() >= 2,
-                "V10 direct template requires at least two correctly quoted pools");
-            let expected_routes = if group.conversion.is_some() {
-                route_count(group.direct_s.len(), group.direct_q.len())
-            } else {
-                let n = group.direct_s.len() as u64;
-                n.saturating_mul(n - 1)
-            };
-            ensure!(expected_routes > 0 && group.route_options == expected_routes,
-                "V10 direct template has no valid 2/3-swap choices");
-        }
-        GroupKind::Bridge => {
-            let b = group.bridge.context("V10 triangle missing bridge mint")?;
-            let middle = group.intermediate.context("V10 triangle missing intermediate pool")?;
-            ensure!(b != s && b != t && b != Pubkey::default()
-                && group.direct_q.is_empty() && !group.bridge_pools.is_empty(),
-                "V10 triangle has invalid bridge mint or pool roles");
-            if group.conversion.is_some() {
-                ensure!(b != q, "V10 triangle bridge equals conversion quote");
-            }
-            ensure!(pools_for(pairs, t, b).binary_search(&middle).is_ok(),
-                "V10 triangle intermediate does not pair target and bridge");
-            let bridge_quote = if group.conversion.is_some() { q } else { s };
-            ensure!(group.bridge_pools.as_ref()
-                == pools_for(pairs, b, bridge_quote).as_ref(),
-                "V10 triangle bridge pools do not pair bridge and quote");
-            let expected_routes = route_count(group.direct_s.len(), group.bridge_pools.len());
-            ensure!(expected_routes > 0 && group.route_options == expected_routes,
-                "V10 triangle requires an intermediate, a direct and a bridge choice");
-        }
-    }
-    Ok(())
-}
-
-/// A generation owns every index; IDs must never cross generation boundaries.
-#[derive(Debug, Default)]
-pub struct GraphSnapshot {
-    pub generation: u64,
-    pub qualified_pools: usize,
-    pub mint_pairs: usize,
-    pub groups: Vec<Group>,
-    pub token_index: HashMap<Pubkey, Vec<u32>>,
-    pub pool_index: HashMap<Pubkey, Vec<u32>>,
+/// One mathematical route shape, never one particular choice of pools.
+/// Reverse direction is implicit; each role resolves through pair_pools.
+#[derive(Clone,Debug)]
+pub struct RouteTopology {
+    pub kind: RouteTopologyKind,
+    pub settlement: Pubkey,
+    pub target: Pubkey,
+    pub bridge: Option<Pubkey>,
+    pub roles: [(Pubkey, Pubkey); 4],
+    pub length: usize,
     pub route_options: u64,
-    pub role_pool_refs: usize,
-    pub approx_index_bytes: usize,
+}
+impl RouteTopology {
+    pub fn directed_roles(&self) -> &[(Pubkey,Pubkey)] { &self.roles[..self.length] }
 }
 
+/// Only distinct mint paths are enumerated. Pool alternatives stay factored by
+/// pair. The legacy Group projection is retained temporarily for CP5 consumers.
+fn build_topologies(
+    pairs:&HashMap<Pair,Arc<[Pubkey]>>,
+    adjacency:&HashMap<Pubkey,HashSet<Pubkey>>,
+    wsol:Pubkey, usdc:Pubkey, target_filter:Option<&HashSet<(Pubkey,Pubkey)>>,
+) -> Result<(Arc<[RouteTopology]>,HashMap<Pair,Vec<u32>>)> {
+    let mut result=Vec::<RouteTopology>::new();
+    let mut index=HashMap::<Pair,Vec<u32>>::new();
+    let mut push=|kind,settlement,target,bridge,roles:&[(Pubkey,Pubkey)],options:u64| -> Result<()> {
+        ensure!(options>0 && roles.len()>=2 && roles.len()<=4,"empty or invalid compact topology");
+        ensure!(result.len()<u32::MAX as usize,"too many compact topologies");
+        let id=result.len() as u32;
+        let mut storage=[(Pubkey::default(),Pubkey::default());4];
+        storage[..roles.len()].copy_from_slice(roles);
+        result.push(RouteTopology { kind,settlement,target,bridge,roles:storage,
+            length:roles.len(),route_options:options });
+        let mut seen=HashSet::new();
+        for &(a,b) in roles {
+            let p=pair(a,b);
+            if seen.insert(p) { index.entry(p).or_default().push(id); }
+        }
+        Ok(())
+    };
+    let count=|a,b| -> u64 { pairs.get(&pair(a,b)).map_or(0,|v|v.len() as u64) };
+    for (s,q) in [(wsol,usdc),(usdc,wsol)] {
+        for &t in adjacency.get(&s).into_iter().flatten() {
+            if t==s || target_filter.is_some_and(|f|!f.contains(&(s,t))) { continue; }
+            let direct=count(s,t);
+            if direct>=2 {
+                push(RouteTopologyKind::Direct2,s,t,None,&[(s,t),(t,s)],
+                    direct.saturating_mul(direct-1))?;
+            }
+            if t!=q && direct>0 {
+                let quoted=count(t,q);let conversions=count(q,s);
+                if quoted>0 && conversions>0 {
+                    let options=2_u64.saturating_mul(direct)
+                        .saturating_mul(quoted).saturating_mul(conversions);
+                    push(RouteTopologyKind::Direct3,s,t,None,&[(s,t),(t,q),(q,s)],options)?;
+                }
+            }
+            for &b in adjacency.get(&t).into_iter().flatten() {
+                if b==s || b==t { continue; }
+                let middle=count(t,b);
+                let back=count(b,s);
+                if direct>0 && middle>0 && back>0 {
+                    let options=2_u64.saturating_mul(direct)
+                        .saturating_mul(middle).saturating_mul(back);
+                    push(RouteTopologyKind::Triangle3,s,t,Some(b),&[(s,t),(t,b),(b,s)],options)?;
+                }
+                if t!=q && b!=q && direct>0 && middle>0 {
+                    let back_q=count(b,q);let conversions=count(q,s);
+                    if back_q>0 && conversions>0 {
+                        let options=2_u64.saturating_mul(direct)
+                            .saturating_mul(middle).saturating_mul(back_q).saturating_mul(conversions);
+                        push(RouteTopologyKind::Triangle4,s,t,Some(b),
+                            &[(s,t),(t,b),(b,q),(q,s)],options)?;
+                    }
+                }
+            }
+        }
+    }
+    // Stable IDs within one snapshot regardless of HashMap adjacency iteration order.
+    result.sort_unstable_by_key(|topology| {
+        (topology.settlement,topology.target,topology.bridge,match topology.kind {
+            RouteTopologyKind::Direct2=>0,
+            RouteTopologyKind::Direct3=>1,
+            RouteTopologyKind::Triangle3=>2,
+            RouteTopologyKind::Triangle4=>3,
+        })
+    });
+    index.clear();
+    for (id,topology) in result.iter().enumerate() {
+        let mut seen=HashSet::new();
+        for &(a,b) in topology.directed_roles() {
+            let key=pair(a,b);
+            if seen.insert(key) { index.entry(key).or_default().push(id as u32); }
+        }
+    }
+    Ok((result.into(),index))
+}
+
+/// An immutable generation shares unchanged pair-alternative arcs with its parent.
+/// Route topology identities are independent of alternative-pool combinations.
+#[derive(Debug,Default)]
+pub struct GraphSnapshot {
+    pub generation:u64,
+    pub qualified_pools:usize,
+    pub mint_pairs:usize,
+    pub pair_pools:HashMap<Pair,Arc<[Pubkey]>>,
+    pub pool_pairs:HashMap<Pubkey,Pair>,
+    pub topologies:Arc<[RouteTopology]>,
+    pub pair_topologies:HashMap<Pair,Vec<u32>>,
+    pub token_index:HashMap<Pubkey,Vec<u32>>,
+    pub route_options:u64,
+    pub role_pool_refs:usize,
+    pub approx_index_bytes:usize,
+    pub changed_pairs:Arc<[Pair]>,
+    pub recomputed_targets:usize,
+    pub regenerated_topologies:usize,
+    pub reused_topologies:usize,
+    pub added_mint_pairs:usize,
+    pub removed_mint_pairs:usize,
+    pub alternatives_only_pairs:usize,
+    pub discovered_topologies:usize,
+    pub recounted_topologies:usize,
+    pub removed_topologies:usize,
+}
 impl GraphSnapshot {
-    pub fn for_token(&self, mint: Pubkey) -> &[u32] {
-        self.token_index.get(&mint).map_or(&[], Vec::as_slice)
+    pub fn topologies_for_pair(&self,a:Pubkey,b:Pubkey)->&[u32]{
+        self.pair_topologies.get(&pair(a,b)).map_or(&[],Vec::as_slice)
     }
-    pub fn for_pool(&self, pool: Pubkey) -> &[u32] {
-        self.pool_index.get(&pool).map_or(&[], Vec::as_slice)
+    pub fn topologies_for_pool(&self,pool:Pubkey)->&[u32]{
+        self.pool_pairs.get(&pool).map_or(&[],|(a,b)|self.topologies_for_pair(*a,*b))
     }
-    pub fn group(&self, id: u32) -> Option<&Group> {
-        self.groups.get(id as usize)
+    pub fn pools_for_pair(&self,a:Pubkey,b:Pubkey)->&[Pubkey]{
+        self.pair_pools.get(&pair(a,b)).map_or(&[],|x|x.as_ref())
+    }
+    pub fn pair_for_pool(&self,pool:Pubkey)->Option<Pair>{
+        self.pool_pairs.get(&pool).copied()
+    }
+    pub fn for_token(&self,mint:Pubkey)->&[u32]{
+        self.token_index.get(&mint).map_or(&[],Vec::as_slice)
     }
 }
-
-fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<GraphSnapshot> {
-    let mut edge_count = 0_usize;
-    let mut pairs: HashMap<Pair, Vec<Pubkey>> = HashMap::new();
-    let mut known_pools = HashSet::new();
-    for p in pools {
-        ensure!(known_pools.insert(p.address),
-            "V10 graph received duplicate Prepared pool address {}", p.address);
-        pairs.entry(pair(p.a, p.b)).or_default().push(p.address);
-        edge_count += 1;
+// CP6C invariant: a topology is defined only by its directed mint roles.
+// Pools are alternative edges; their number changes route multiplicity,
+// never the mathematical directed cycle. Direct2 uniquely requires n >= 2.
+fn topology_identity(t:&RouteTopology)->(RouteTopologyKind,Pubkey,Pubkey,Option<Pubkey>){
+    (t.kind,t.settlement,t.target,t.bridge)
+}
+fn topology_options(t:&RouteTopology,pairs:&HashMap<Pair,Arc<[Pubkey]>>)->Result<Option<u64>>{
+    let count=|a,b|pairs.get(&pair(a,b)).map_or(0_u64,|v|v.len() as u64);
+    let roles=t.directed_roles();
+    if t.kind==RouteTopologyKind::Direct2{
+        let n=count(roles[0].0,roles[0].1);
+        if n<2{return Ok(None);}
+        return Ok(Some(n.checked_mul(n-1).context("Direct2 option count overflow")?));
     }
-    let mut adjacency: HashMap<Pubkey, HashSet<Pubkey>> = HashMap::new();
-    let pair_map: HashMap<Pair, Arc<[Pubkey]>> = pairs.into_iter().map(|((a,b),mut list)| {
-        list.sort_unstable();
+    let mut options=2_u64; // Exact existing convention: forward + reverse.
+    for &(a,b) in roles{
+        let n=count(a,b);
+        if n==0{return Ok(None);}
+        options=options.checked_mul(n).context("compact route option overflow")?;
+    }
+    Ok(Some(options))
+}
+fn direct2_shape(s:Pubkey,t:Pubkey,n:u64)->Result<RouteTopology>{
+    let options=n.checked_mul(n-1).context("Direct2 option count overflow")?;
+    let mut roles=[(Pubkey::default(),Pubkey::default());4];
+    roles[0]=(s,t);roles[1]=(t,s);
+    Ok(RouteTopology{kind:RouteTopologyKind::Direct2,settlement:s,target:t,
+        bridge:None,roles,length:2,route_options:options})
+}
+/// Every newly possible 2-, 3- or 4-leg mint cycle must contain at least
+/// one previously absent undirected pair. Enumerate candidate targets by
+/// placing that new pair into each of the four supported role positions.
+/// This is a conservative target superset; a final directed-role membership
+/// predicate below excludes all unaffected shapes.
+fn new_edge_targets(new_edges:&HashSet<Pair>,adj:&HashMap<Pubkey,HashSet<Pubkey>>,
+    wsol:Pubkey,usdc:Pubkey)->HashSet<(Pubkey,Pubkey)>{
+    let mut targets=HashSet::new();
+    for &(a,b) in new_edges {
+        for (s,q) in [(wsol,usdc),(usdc,wsol)] {
+            let ns=adj.get(&s);
+            let nq=adj.get(&q);
+            if pair(a,b)==pair(s,q) {
+                // The conversion edge can complete paths for all existing
+                // direct targets and bridges. Includes Triangle3 S-T-Q-S.
+                for &t in ns.into_iter().flatten(){
+                    if t!=s {targets.insert((s,t));}
+                }
+                continue;
+            }
+            if a==s || b==s {
+                let x=if a==s{b}else{a};
+                // First leg S->T, and Triangle3 return B->S where B=X.
+                targets.insert((s,x));
+                if let Some(nx)=adj.get(&x) {
+                    for &t in nx {
+                        if t!=s && t!=x && ns.is_some_and(|n|n.contains(&t)){
+                            targets.insert((s,t));
+                        }
+                    }
+                }
+                continue;
+            }
+            if a==q || b==q {
+                let x=if a==q{b}else{a};
+                // New quoted T->Q leg (Direct3), or B->Q (Triangle4).
+                // B need not be S-adjacent: find every S-T-X path.
+                if ns.is_some_and(|n|n.contains(&x)){targets.insert((s,x));}
+                if let Some(nx)=adj.get(&x){
+                    for &t in nx {
+                        if t!=s && ns.is_some_and(|n|n.contains(&t)){
+                            targets.insert((s,t));
+                        }
+                    }
+                }
+                // Triangle3 S->Q->X->S, when S-Q already exists.
+                if ns.is_some_and(|n|n.contains(&q))
+                    && ns.is_some_and(|n|n.contains(&x)){
+                    targets.insert((s,q));
+                }
+                continue;
+            }
+            // Interior leg T-B. Either orientation is possible.
+            // Triangle3 requires S-T and S-B. Triangle4 requires
+            // S-T, B-Q, and the independent conversion edge Q-S.
+            for (t,bridge) in [(a,b),(b,a)]{
+                if t==s||t==q {continue;}
+                if !ns.is_some_and(|n|n.contains(&t)){continue;}
+                if ns.is_some_and(|n|n.contains(&bridge))
+                    ||(nq.is_some_and(|n|n.contains(&bridge))
+                        &&ns.is_some_and(|n|n.contains(&q))){
+                    targets.insert((s,t));
+                }
+            }
+        }
+    }
+    targets
+}
+/// Live comparison against the *unchanged* original full route enumerator.
+/// It checks exact identity, directed roles, option multiplicities and
+/// the corresponding pair pools. No price or simulated input is involved.
+fn compare_reference(graph:&GraphSnapshot)->Result<u128>{
+    let started=Instant::now();
+    let mut adj=HashMap::<Pubkey,HashSet<Pubkey>>::new();
+    for &(a,b) in graph.pair_pools.keys(){
+        adj.entry(a).or_default().insert(b);
+        adj.entry(b).or_default().insert(a);
+    }
+    let wsol:Pubkey=WSOL.parse()?;
+    let usdc:Pubkey=USDC.parse()?;
+    let (full,reference_index)=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None)?;
+    ensure!(reference_index==graph.pair_topologies,
+        "CP6C reference mismatch generation={} pair-to-topology inverted index",
+        graph.generation);
+    ensure!(full.len()==graph.topologies.len(),
+        "CP6C reference mismatch generation={} cardinality delta={} full={}",
+        graph.generation,graph.topologies.len(),full.len());
+    for (i,(got,expected)) in graph.topologies.iter().zip(full.iter()).enumerate(){
+        ensure!(topology_identity(got)==topology_identity(expected)
+            &&got.directed_roles()==expected.directed_roles()
+            &&got.route_options==expected.route_options,
+            "CP6C reference mismatch generation={} topology_index={} kind={:?} settlement={} target={} bridge={:?} actual_options={} reference_options={}",
+            graph.generation,i,got.kind,got.settlement,got.target,got.bridge,
+            got.route_options,expected.route_options);
+    }
+    Ok(started.elapsed().as_micros())
+}
+
+fn create(
+    old:Arc<GraphSnapshot>, updates:HashMap<Pubkey,Option<PreparedPool>>,generation:u64,
+)->Result<GraphSnapshot>{
+    let mut pool_pairs=old.pool_pairs.clone();
+    let mut changed_pairs=HashSet::<Pair>::new();
+    let mut changes=HashMap::<Pair,(HashSet<Pubkey>,Vec<Pubkey>)>::new();
+    for (address,new) in updates {
+        let prev=pool_pairs.get(&address).copied();
+        let next=new.map(|p|pair(p.a,p.b));
+        if prev==next {continue;}
+        if let Some(prev)=prev{
+            changes.entry(prev).or_default().0.insert(address);
+            changed_pairs.insert(prev);
+        }
+        if let Some(next)=next{
+            changes.entry(next).or_default().1.push(address);
+            pool_pairs.insert(address,next);
+            changed_pairs.insert(next);
+        } else {pool_pairs.remove(&address);}
+    }
+    let mut pairs=old.pair_pools.clone();
+    for (key,(removed,added)) in changes {
+        let mut list=pairs.get(&key).map_or_else(Vec::new,|v|v.to_vec());
+        list.retain(|p|!removed.contains(p));
+        list.extend(added);
+        list.sort_unstable();list.dedup();
+        if list.is_empty(){pairs.remove(&key);}
+        else{pairs.insert(key,Arc::from(list));}
+    }
+    // The compact mint adjacency is at most tens of thousands of entries.
+    // Recreating it is cheap and never multiplies the pool-alternative products.
+    let mut adjacency=HashMap::<Pubkey,HashSet<Pubkey>>::new();
+    for &(a,b) in pairs.keys(){
         adjacency.entry(a).or_default().insert(b);
         adjacency.entry(b).or_default().insert(a);
-        ((a,b), Arc::from(list))
-    }).collect();
-
-    let wsol: Pubkey = WSOL.parse()?;
-    let usdc: Pubkey = USDC.parse()?;
-    let settlements = [(wsol, usdc), (usdc, wsol)];
-    let mut groups: Vec<Group> = Vec::new();
-
-    for (s, q) in settlements {
-        let mut targets: Vec<_> = adjacency.get(&s).into_iter()
-            .flat_map(|neighbors| neighbors.iter().copied()).collect();
-        targets.sort_unstable();
-        for t in targets {
-            if t == s { continue; }
-            let direct_s = pools_for(&pair_map, t, s);
-            if direct_s.len() >= 2 {
-                let n = direct_s.len() as u64;
-                groups.push(Group {
-                    settlement:s, target:t, bridge:None, intermediate:None, conversion:None,
-                    direct_s:direct_s.clone(), direct_q:Arc::from([]),
-                    bridge_pools:Arc::from([]), kind:GroupKind::Direct,
-                    route_options:n.saturating_mul(n-1),
-                });
+    }
+    let wsol:Pubkey=WSOL.parse()?;
+    let usdc:Pubkey=USDC.parse()?;
+    let initial=old.generation==0;
+    let new_edges=changed_pairs.iter().copied().filter(|p|
+        !old.pair_pools.contains_key(p)&&pairs.contains_key(p)).collect::<HashSet<_>>();
+    let removed_edges=changed_pairs.iter().copied().filter(|p|
+        old.pair_pools.contains_key(p)&&!pairs.contains_key(p)).count();
+    let alternatives_only_pairs=changed_pairs.len()-new_edges.len()-removed_edges;
+    let mut topologies=Vec::with_capacity(old.topologies.len()+new_edges.len()*4);
+    let mut reused_count=0_usize;
+    let mut recounted_count=0_usize;
+    let mut removed_count=0_usize;
+    if initial {
+        topologies=build_topologies(&pairs,&adjacency,wsol,usdc,None)?.0.to_vec();
+    } else {
+        // Fast path: existing cycle shapes survive pool alternative changes.
+        // Recompute multiplicities only for shapes that use a changed pair.
+        for t in old.topologies.iter(){
+            let affected=t.directed_roles().iter().any(|&(a,b)|changed_pairs.contains(&pair(a,b)));
+            if !affected{
+                topologies.push(t.clone());
+                reused_count+=1;
+                continue;
             }
-
-            // Direct-only with Q/S conversion: one or more T/S and T/Q candidates.
-            // Distinct pool pairs guarantee no same pool reused on any trade path.
-            if t != q {
-                let direct_q = pools_for(&pair_map, t, q);
-                if !direct_s.is_empty() && !direct_q.is_empty() {
-                    let conversions = pools_for(&pair_map, q, s);
-                    for conversion in conversions.iter().copied() {
-                        groups.push(Group {
-                            settlement:s, target:t, bridge:None, intermediate:None,
-                            conversion:Some(conversion), direct_s:direct_s.clone(),
-                            direct_q:direct_q.clone(), bridge_pools:Arc::from([]),
-                            kind:GroupKind::Direct,
-                            route_options:route_count(direct_s.len(), direct_q.len()),
-                        });
+            match topology_options(t,&pairs)? {
+                Some(options)=>{
+                    let mut updated=t.clone();
+                    updated.route_options=options;
+                    topologies.push(updated);
+                    recounted_count+=1;
+                },
+                None=>removed_count+=1,
+            }
+        }
+        let existing=old.topologies.iter().map(topology_identity).collect::<HashSet<_>>();
+        // Only new *mint connections* can introduce previously impossible
+        // Direct3/Triangle3/Triangle4 shapes. No global target traversal.
+        if !new_edges.is_empty(){
+            let targets=new_edge_targets(&new_edges,&adjacency,wsol,usdc);
+            if !targets.is_empty(){
+                let (discovered,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&targets))?;
+                for t in discovered.iter(){
+                    if t.kind==RouteTopologyKind::Direct2{continue;}
+                    if existing.contains(&topology_identity(t)){continue;}
+                    if !t.directed_roles().iter().any(|&(a,b)|new_edges.contains(&pair(a,b))){
+                        continue;
                     }
+                    topologies.push(t.clone());
                 }
             }
-
-            // Bridge groups have exactly one T/B intermediate pool per group.
-            let mut bridges: Vec<_> = adjacency.get(&t).into_iter()
-                .flat_map(|neighbors| neighbors.iter().copied())
-                .filter(|b| *b != s && *b != t).collect();
-            bridges.sort_unstable();
-            for b in bridges {
-                let intermediate = pools_for(&pair_map, t, b);
-                let return_s = pools_for(&pair_map, b, s);
-                if !direct_s.is_empty() && !return_s.is_empty() {
-                    for middle in intermediate.iter().copied() {
-                        groups.push(Group {
-                            settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
-                            conversion:None, direct_s:direct_s.clone(), direct_q:Arc::from([]),
-                            bridge_pools:return_s.clone(), kind:GroupKind::Bridge,
-                            route_options:route_count(direct_s.len(), return_s.len()),
-                        });
-                    }
+        }
+        // Direct2's unique topology birth is n:1->2, even when the
+        // undirected mint pair existed before this generation.
+        for &(a,b) in &changed_pairs{
+            let old_n=old.pair_pools.get(&pair(a,b)).map_or(0,|v|v.len());
+            let new_n=pairs.get(&pair(a,b)).map_or(0,|v|v.len());
+            if old_n>=2||new_n<2{continue;}
+            for &settlement in &[wsol,usdc]{
+                let target=if a==settlement{b}else if b==settlement{a}else{continue};
+                let candidate=direct2_shape(settlement,target,new_n as u64)?;
+                if !existing.contains(&topology_identity(&candidate)){
+                    topologies.push(candidate);
                 }
-                // With Q/S conversion, both T and B must differ from Q.
-                if t != q && b != q && !direct_s.is_empty() {
-                    let return_q = pools_for(&pair_map, b, q);
-                    if return_q.is_empty() { continue; }
-                    let conversions = pools_for(&pair_map, q, s);
-                    for middle in intermediate.iter().copied() {
-                        for conversion in conversions.iter().copied() {
-                            groups.push(Group {
-                                settlement:s, target:t, bridge:Some(b), intermediate:Some(middle),
-                                conversion:Some(conversion), direct_s:direct_s.clone(),
-                                direct_q:Arc::from([]), bridge_pools:return_q.clone(),
-                                kind:GroupKind::Bridge,
-                                route_options:route_count(direct_s.len(), return_q.len()),
+            }
+        }
+    }
+    let generated_count=if initial {topologies.len()}else{
+        topologies.len().saturating_sub(reused_count+recounted_count)
+    };
+    topologies.sort_unstable_by_key(|t| (t.settlement,t.target,t.bridge,t.kind));
+    ensure!(topologies.len()==reused_count+recounted_count+generated_count,
+        "CP6C delta topology accounting mismatch");
+    ensure!(topologies.windows(2).all(|w|
+        (w[0].settlement,w[0].target,w[0].bridge,w[0].kind)
+        !=(w[1].settlement,w[1].target,w[1].bridge,w[1].kind)),
+        "duplicate compact route identity");
+    ensure!(topologies.len()<u32::MAX as usize,"compact graph topology ID overflow");
+    let mut pair_topologies=HashMap::<Pair,Vec<u32>>::new();
+    let mut token_index=HashMap::<Pubkey,Vec<u32>>::new();
+    let mut options=0_u64;
+    for (i,t) in topologies.iter().enumerate(){
+        let id=i as u32;
+        let roles=t.directed_roles();
+        ensure!(roles.len()>=2 && roles.len()<=4,"invalid compact topology length");
+        ensure!(roles[0].0==t.settlement
+            &&roles[roles.len()-1].1==t.settlement
+            &&roles.windows(2).all(|r|r[0].1==r[1].0),
+            "V10 compact topology route is not a closed mint cycle");
+        let mut encountered=HashSet::new();
+        ensure!(roles.iter().all(|(a,b)|a!=b && encountered.insert(*a)),
+            "V10 compact topology repeats a mint before settlement");
+        let mut expected=if t.kind==RouteTopologyKind::Direct2 {1_u64}else{2_u64};
+        for (leg,&(a,b)) in roles.iter().enumerate(){
+            let count=pairs.get(&pair(a,b)).map_or(0,|p|p.len()) as u64;
+            if t.kind==RouteTopologyKind::Direct2 && leg==1 {continue;}
+            expected=expected.checked_mul(count).context("compact route total overflow")?;
+        }
+        if t.kind==RouteTopologyKind::Direct2 {
+            let count=pairs.get(&pair(roles[0].0,roles[0].1)).map_or(0,|p|p.len()) as u64;
+            expected=count.checked_mul(count.saturating_sub(1))
+                .context("direct2 total overflow")?;
+        }
+        ensure!(expected>0 && expected==t.route_options,
+            "stale compact topology options after incremental update");
+        options=options.checked_add(t.route_options).context("route options overflow")?;
+        let mut seen_pairs=HashSet::new();
+        let mut seen_tokens=HashSet::new();
+        for &(a,b) in t.directed_roles(){
+            let p=pair(a,b);
+            ensure!(pairs.contains_key(&p),"topology role references unavailable pair");
+            if seen_pairs.insert(p){pair_topologies.entry(p).or_default().push(id);}
+            if seen_tokens.insert(a){token_index.entry(a).or_default().push(id);}
+            if seen_tokens.insert(b){token_index.entry(b).or_default().push(id);}
+        }
+    }
+    ensure!(pool_pairs.len()==pairs.values().map(|v|v.len()).sum::<usize>(),
+        "graph pool/pair identity accounting mismatch");
+    ensure!(pairs.iter().all(|(mint_pair,addresses)|
+        addresses.windows(2).all(|v|v[0]<v[1])
+        && addresses.iter().all(|pool|pool_pairs.get(pool)==Some(mint_pair))),
+        "CP6C canonical pool alternatives and pair reverse index differ");
+    let refs=pair_topologies.values().map(Vec::len).sum::<usize>();
+    let approx=pool_pairs.len()*size_of::<PreparedPool>()
+        +pairs.values().map(|v|v.len()*size_of::<Pubkey>()).sum::<usize>()
+        +topologies.len()*size_of::<RouteTopology>()
+        +(refs+token_index.values().map(Vec::len).sum::<usize>())*size_of::<u32>();
+    let mut changed=changed_pairs.into_iter().collect::<Vec<_>>();
+    changed.sort_unstable();
+    Ok(GraphSnapshot{generation,qualified_pools:pool_pairs.len(),
+        mint_pairs:pairs.len(),pair_pools:pairs,pool_pairs,
+        topologies:topologies.into(),pair_topologies,token_index,
+        route_options:options,role_pool_refs:refs,approx_index_bytes:approx,
+        changed_pairs:changed.into(),
+        recomputed_targets:new_edges.len()+removed_edges,
+        regenerated_topologies:recounted_count+generated_count,
+        reused_topologies:reused_count,
+        added_mint_pairs:new_edges.len(),removed_mint_pairs:removed_edges,
+        alternatives_only_pairs,discovered_topologies:generated_count,
+        recounted_topologies:recounted_count,removed_topologies:removed_count})
+}
+const REBUILD_SPACING:Duration=Duration::from_secs(3);
+/// Registry is the sole writer; every immutable generation publishes atomically.
+/// Incoming deltas are coalesced even while the previous graph is being updated.
+pub async fn run(
+    mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
+    output:watch::Sender<Arc<GraphSnapshot>>,
+    _settings:Settings,
+)->Result<()>{
+    let mut prepared=HashMap::<Pubkey,PreparedPool>::new();
+    let mut dirty=HashMap::<Pubkey,Option<PreparedPool>>::new();
+    let mut pending_traces=Vec::<ObservedTransition>::new();
+    let mut previous_evidence=HashMap::<Pubkey,TransitionEvidence>::new();
+    let mut previous_transition_at=HashMap::<Pubkey,u64>::new();
+    let mut generation=0_u64;
+    let mut source_open=true;
+    let mut pending_batches=0_usize;
+    let mut skipped_no_op_windows=0_u64;
+    let reference_every=std::env::var("CP6C_REFERENCE_EVERY")
+        .ok().and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);
+    let mut last_source="persistence_restore";
+    let mut next_rebuild=TokioInstant::now();
+    let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str,Vec<ObservedTransition>,HashMap<Pubkey,Option<Pair>>,bool,Option<u128>)>>::new();
+    let (audit_tx, audit_writer)=match std::env::var("GRAPH_DIAGNOSTIC_JSONL_PATH") {
+        Ok(path) if !path.trim().is_empty()=>{
+            let file=File::create(&path).with_context(||format!("create graph audit {path}"))?;
+            let (tx,mut rx)=mpsc::channel::<AuditBatch>(32);
+            let join=tokio::task::spawn_blocking(move||->Result<()>{
+                let mut writer=BufWriter::with_capacity(1024*1024,file);
+                while let Some(batch)=rx.blocking_recv(){write_audit_batch(&mut writer,batch)?;}
+                writer.flush().context("flush graph audit shutdown")?;
+                Ok(())
+            });
+            crate::log_event!(Info,"graph audit enabled=true output={} buffered_async=true queue_generations=32",path);
+            (Some(tx),Some(join))
+        },
+        _=>(None,None)
+    };
+    loop {
+        if !source_open&&dirty.is_empty()&&builds.is_empty(){break;}
+        tokio::select!{
+            event=input.recv(),if source_open=>match event {
+                Ok(batch)=>{
+                    let mut changes=0;
+                    for pool in &batch.pools {
+                        let next=eligible(pool);
+                        let before=prepared.get(&pool.address).copied();
+                        if before==next {
+                            // Track the latest Registry evidence for previously
+                            // admitted pools even when the graph identity is stable.
+                            // Otherwise "before" could be an old TVL/Completion
+                            // snapshot unrelated to the eventual withdrawal.
+                            if previous_evidence.contains_key(&pool.address){
+                                previous_evidence.insert(pool.address,evidence(pool));
+                            }
+                            continue;
+                        }
+                        let at=now_ms();
+                        let duration=previous_transition_at.insert(pool.address,at)
+                            .map(|last|at.saturating_sub(last));
+                        let before_evidence=previous_evidence.insert(pool.address,evidence(pool));
+                        // Initial Registry restoration can add >20k pools. Its
+                        // generation is summarized separately, rather than emitting
+                        // tens of thousands of uninteresting bootstrap records.
+                        if generation>0 {
+                            pending_traces.push(ObservedTransition {
+                                address:pool.address,source:batch.source,
+                                batch_at_ms:batch.received_at_ms,observed_at_ms:at,
+                                previous_duration_ms:duration,before,after:next,
+                                before_evidence,
+                                after_evidence:evidence(pool),
                             });
                         }
+                        if let Some(p)=next {prepared.insert(pool.address,p);}
+                        else{prepared.remove(&pool.address);}
+                        dirty.insert(pool.address,next);
+                        changes+=1;
                     }
-                }
-            }
-        }
-    }
-    // Canonical identity is independent of alternative-pool input order.
-    // The sorted role lists were built from each unique mint-pair set.
-    groups.sort_unstable_by_key(Group::identity);
-    let before_dedup = groups.len();
-    groups.dedup_by(|a, b| {
-        a.identity() == b.identity()
-            && a.direct_s == b.direct_s
-            && a.direct_q == b.direct_q
-            && a.bridge_pools == b.bridge_pools
-    });
-    ensure!(groups.windows(2).all(|w| w[0].identity() != w[1].identity()),
-        "V10 group identity collision with different pool alternatives");
-    ensure!(groups.len() <= u32::MAX as usize, "V10 group count exceeds u32 index capacity");
-
-    let mut direct_2 = 0_usize;
-    let mut direct_3 = 0_usize;
-    let mut triangle_3 = 0_usize;
-    let mut triangle_4 = 0_usize;
-    for g in &groups {
-        validate_v10_group(g, &pair_map, wsol, usdc)?;
-        match (g.kind, g.conversion.is_some()) {
-            (GroupKind::Direct, false) => direct_2 += 1,
-            (GroupKind::Direct, true) => direct_3 += 1,
-            (GroupKind::Bridge, false) => triangle_3 += 1,
-            (GroupKind::Bridge, true) => triangle_4 += 1,
-        }
-    }
-    crate::log_event!(Debug,"validated generation={} groups={} direct_2={} direct_3={} triangle_3={} triangle_4={} canonical_duplicates_removed={} invalid_groups=0",
-        generation, groups.len(), direct_2, direct_3, triangle_3, triangle_4,
-        before_dedup - groups.len());
-
-    let mut token_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
-    let mut pool_index: HashMap<Pubkey, Vec<u32>> = HashMap::new();
-    let mut routes = 0_u64;
-    let mut refs = 0_usize;
-    for (index, g) in groups.iter().enumerate() {
-        let id = index as u32;
-        let mut tokens = vec![g.settlement, g.target];
-        if let Some(b) = g.bridge { tokens.push(b); }
-        if g.conversion.is_some() { tokens.push(if g.settlement == wsol { usdc } else { wsol }); }
-        tokens.sort_unstable();
-        tokens.dedup();
-        for mint in tokens { token_index.entry(mint).or_default().push(id); }
-        for address in g.direct_s.iter().chain(g.direct_q.iter())
-            .chain(g.bridge_pools.iter()).copied()
-            .chain(g.intermediate).chain(g.conversion) {
-            pool_index.entry(address).or_default().push(id);
-            refs += 1;
-        }
-        routes = routes.saturating_add(g.route_options);
-    }
-    // Each role list contains unique pools, and repeated role group references are intentional.
-    let index_items: usize = token_index.values().map(Vec::len).sum::<usize>()
-        + pool_index.values().map(Vec::len).sum::<usize>();
-    let approx = edge_count * size_of::<PreparedPool>()
-        + groups.len() * size_of::<Group>()
-        + refs * size_of::<Pubkey>()
-        + index_items * size_of::<u32>();
-    Ok(GraphSnapshot { generation, qualified_pools:edge_count,
-        mint_pairs:pair_map.len(), groups, token_index, pool_index,
-        route_options:routes, role_pool_refs:refs, approx_index_bytes:approx })
-}
-
-fn probe(snapshot: &GraphSnapshot) {
-    let mut samples: Vec<(bool,Pubkey)> = snapshot.token_index.keys()
-        .copied().take(32).map(|k|(true,k)).collect();
-    samples.extend(snapshot.pool_index.keys().copied().take(32).map(|k|(false,k)));
-    if samples.is_empty() {
-        crate::log_event!(Debug,"liquidity graph lookup skipped=no_qualified_v10_groups");
-        return;
-    }
-    let mut lookup_ns = Vec::with_capacity(4096);
-    let mut resolve_ns = Vec::with_capacity(4096);
-    let mut matched = 0_usize;
-    // Real indexed addresses, including fetching up to four referenced templates.
-    // This is NOT the future 16-pool V10 instruction-packing benchmark.
-    for i in 0..4096 {
-        let (token,key) = samples[i % samples.len()];
-        let started = Instant::now();
-        let ids = if token { snapshot.for_token(key) } else { snapshot.for_pool(key) };
-        let looked_up = started.elapsed();
-        let resolved = ids.iter().take(4)
-            .filter_map(|id| snapshot.group(*id))
-            .map(|group| group.declarations())
-            .sum::<usize>();
-        matched += black_box(resolved);
-        lookup_ns.push(looked_up.as_nanos() as u64);
-        resolve_ns.push(started.elapsed().as_nanos() as u64);
-    }
-    lookup_ns.sort_unstable();
-    resolve_ns.sort_unstable();
-    let percentile = |samples: &[u64], numer:usize| samples[((samples.len()-1)*numer)/100];
-    crate::log_event!(Debug,"liquidity graph lookup generation={} samples={} resolved_pool_refs={} lookup_p50_ns={} lookup_p95_ns={} lookup_p99_ns={} lookup_max_ns={} resolve4_p50_ns={} resolve4_p95_ns={} resolve4_p99_ns={} resolve4_max_ns={}",
-        snapshot.generation,lookup_ns.len(),matched,
-        percentile(&lookup_ns,50),percentile(&lookup_ns,95),
-        percentile(&lookup_ns,99),lookup_ns[lookup_ns.len()-1],
-        percentile(&resolve_ns,50),percentile(&resolve_ns,95),
-        percentile(&resolve_ns,99),resolve_ns[resolve_ns.len()-1]);
-}
-
-/// A single owner consumes Registry changes. Publishing an Arc replaces the
-/// complete immutable generation atomically; no signal can read a partial catalog.
-const REBUILD_SPACING: Duration = Duration::from_secs(3);
-
-/// A single owner consumes every Registry update without waiting for a rebuild.
-/// At most one full rebuild runs at once; changed edges are coalesced for the
-/// next generation. An in-flight generation is immutable and can be superseded
-/// by a later one after another three-second interval.
-pub async fn run(
-    mut input: broadcast::Receiver<Arc<PoolUpdateBatch>>,
-    output: watch::Sender<Arc<GraphSnapshot>>,
-    _settings: Settings,
-) -> Result<()> {
-    let mut prepared: HashMap<Pubkey, PreparedPool> = HashMap::new();
-    let mut changed_batches = 0_u64;
-    let mut observed = 0_usize;
-    let mut generation = 0_u64;
-    let mut dirty = false;
-    let mut pending_changes = 0_usize;
-    let mut pending_batches = 0_usize;
-    let mut last_source = "persistence_restore";
-    let mut next_rebuild = TokioInstant::now();
-    let mut builds=JoinSet::<Result<(GraphSnapshot, u128, usize, usize, &'static str)>>::new();
-    let mut source_open = true;
-    loop {
-        if !source_open && !dirty && builds.is_empty() { break; }
-        tokio::select! {
-            event = input.recv(), if source_open => match event {
-                Ok(batch) => {
-                    observed += batch.pools.len();
-                    let mut changes = 0_usize;
-                    for pool in &batch.pools {
-                        let candidate = eligible(pool);
-                        match candidate {
-                            Some(p) => {
-                                // TVL and slot changes in an existing edge do not
-                                // require a new topology generation.
-                                let same_edge = prepared.get(&p.address)
-                                    .is_some_and(|old| old.a == p.a && old.b == p.b);
-                                prepared.insert(p.address, p);
-                                if !same_edge { changes += 1; }
-                            }
-                            None => {
-                                if prepared.remove(&pool.address).is_some() { changes += 1; }
-                            }
-                        }
-                    }
-                    if changes > 0 {
-                        dirty = true;
-                        pending_changes += changes;
-                        pending_batches += 1;
-                        last_source = batch.source;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) =>
-                    anyhow::bail!("liquidity graph lost {skipped} Registry update batches"),
-                Err(broadcast::error::RecvError::Closed) => source_open = false,
+                    if changes>0 {pending_batches+=1;last_source=batch.source;}
+                },
+                Err(broadcast::error::RecvError::Lagged(n))=>
+                    anyhow::bail!("liquidity graph lost {n} Registry update batches"),
+                Err(broadcast::error::RecvError::Closed)=>source_open=false,
             },
-            result = builds.join_next(), if !builds.is_empty() => {
-                let (graph, elapsed_us, changes, batches, source) =
-                    result.context("missing liquidity graph build")?
-                        .context("liquidity graph build task panicked")??;
-                let direct = graph.groups.iter().filter(|g|g.kind==GroupKind::Direct).count();
-                let bridge = graph.groups.len()-direct;
-                let oversized = graph.groups.iter()
-                    .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
+            result=builds.join_next(),if !builds.is_empty()=>{
+                let (graph,micros,changes,batches,source,traces,before_pairs,bootstrap,reference_us)=result
+                    .context("missing graph delta build")?
+                    .context("graph delta task panicked")??;
+                let effective=before_pairs.iter().filter(|(pool,prior)|
+                    *prior!=&graph.pair_for_pool(**pool)).count();
+                let no_effect=before_pairs.len().saturating_sub(effective);
+                let mut source_counts=HashMap::<&str,usize>::new();
+                for t in &traces {*source_counts.entry(t.source).or_default()+=1;}
                 crate::log_event!(Info,
-                    "rebuild generation={} source={} changed_pools={} coalesced_batches={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
-                    graph.generation, source, changes, batches, graph.qualified_pools, graph.mint_pairs,
-                    graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
-                    oversized, graph.approx_index_bytes, elapsed_us);
-                output.send_replace(Arc::new(graph));
-                changed_batches += 1;
+                    "graph transition_summary generation={} bootstrap={} observed={} distinct={} effective={} no_effect={} batches={} source_counts={}",
+                    graph.generation,bootstrap,traces.len(),before_pairs.len(),
+                    effective,no_effect,batches,serde_json::json!(source_counts));
+                if let Some(ref sink)=audit_tx {
+                    let after_pairs=before_pairs.keys()
+                        .map(|pool|(*pool,graph.pair_for_pool(*pool)))
+                        .collect::<HashMap<_,_>>();
+                    sink.try_send(AuditBatch{
+                        generation:graph.generation,bootstrap,no_op:false,traces,before_pairs,after_pairs,
+                    }).map_err(|e|anyhow::anyhow!("graph audit queue full/closed: {e}"))?;
+                }
+                if let Some(us)=reference_us{
+                    crate::log_event!(Info,
+                        "graph reference_verified generation={} exact_identity=true directed_roles=true route_options=true checked_topologies={} reference_us={}",
+                        graph.generation,graph.topologies.len(),us);
+                }
+                let total=graph.topologies.len();
+                crate::log_event!(Info,
+                    "graph cp6c_delta generation={} added_mint_pairs={} removed_mint_pairs={} alternatives_only_pairs={} discovered_topologies={} recounted_topologies={} removed_topologies={} reused_topologies={} net_pool_changes={}",
+                    graph.generation,graph.added_mint_pairs,graph.removed_mint_pairs,
+                    graph.alternatives_only_pairs,graph.discovered_topologies,
+                    graph.recounted_topologies,graph.removed_topologies,
+                    graph.reused_topologies,effective);
+                crate::log_event!(Info,
+                    "graph incremental generation={} source={} changed_pools={} changed_pairs={} affected_targets={} regenerated_topologies={} reused_topologies={} coalesced_batches={} prepared={} pairs={} compact_topologies={} compact_pair_index_refs={} legacy_groups=0 trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
+                    graph.generation,source,changes,graph.changed_pairs.len(),
+                    graph.recomputed_targets,graph.regenerated_topologies,graph.reused_topologies,
+                    batches,graph.qualified_pools,graph.mint_pairs,total,graph.role_pool_refs,
+                    graph.route_options,graph.role_pool_refs,graph.approx_index_bytes,micros);
+                crate::log_event!(Info,
+                    "graph impact generation={} conversion_pair_changed={} recomputed_pct={:.2} reused_topologies={} pool_delta={} registry_queue_depth={}",
+                    graph.generation,
+                    graph.changed_pairs.iter().any(|&(a,b)|
+                        (a==WSOL.parse::<Pubkey>().expect("wsol")&&b==USDC.parse::<Pubkey>().expect("usdc"))
+                        ||(b==WSOL.parse::<Pubkey>().expect("wsol")&&a==USDC.parse::<Pubkey>().expect("usdc"))),
+                    100.0*graph.regenerated_topologies as f64
+                        /graph.topologies.len().max(1) as f64,
+                    graph.reused_topologies,effective,input.len());
+                let old=output.send_replace(Arc::new(graph));
+                tokio::task::spawn_blocking(move||drop(old));
             },
-            _ = sleep_until(next_rebuild), if dirty && builds.is_empty() => {
-                generation = generation.checked_add(1).context("graph generation overflow")?;
-                let snapshot: Vec<PreparedPool> = prepared.values().copied().collect();
-                let changed = std::mem::take(&mut pending_changes);
-                let batches = std::mem::take(&mut pending_batches);
-                let source = last_source;
-                dirty = false;
-                next_rebuild = TokioInstant::now() + REBUILD_SPACING;
-                builds.spawn_blocking(move || {
-                    let started = Instant::now();
-                    let graph = build(snapshot.into_iter(), generation)?;
-                    Ok((graph, started.elapsed().as_micros(), changed, batches, source))
+            _=sleep_until(next_rebuild),if !dirty.is_empty()&&builds.is_empty()=>{
+                let mut diff=std::mem::take(&mut dirty);
+                let traces=std::mem::take(&mut pending_traces);
+                let count=diff.len();
+                let batches=std::mem::take(&mut pending_batches);
+                let source=last_source;
+                let old=output.borrow().clone();
+                let before_pairs=diff.keys().map(|pool|(*pool,old.pair_for_pool(*pool)))
+                    .collect::<HashMap<_,_>>();
+                // Registry updates may cancel within the three-second window.
+                // Compare against the *published* immutable generation and
+                // never publish an identical pool identity graph.
+                diff.retain(|address,next|
+                    old.pair_for_pool(*address)!=next.map(|p|pair(p.a,p.b)));
+                next_rebuild=TokioInstant::now()+REBUILD_SPACING;
+                if diff.is_empty() {
+                    skipped_no_op_windows+=1;
+                    crate::log_event!(Info,
+                        "graph no_op_window published_generation={} observed={} distinct={} batches={} skipped_total={} registry_queue_depth={}",
+                        old.generation,traces.len(),count,batches,skipped_no_op_windows,input.len());
+                    if let Some(ref sink)=audit_tx {
+                        let after_pairs=before_pairs.clone();
+                        sink.try_send(AuditBatch {
+                            generation:old.generation,bootstrap:false,no_op:true,
+                            traces,before_pairs,after_pairs,
+                        }).map_err(|e|anyhow::anyhow!("graph audit no-op queue full/closed: {e}"))?;
+                    }
+                    continue;
+                }
+                generation=generation.checked_add(1).context("graph generation overflow")?;
+                let verify=reference_every>0 && (generation==1 || generation%reference_every==0);
+                builds.spawn_blocking(move||{
+                    let started=Instant::now();
+                    let bootstrap=old.generation==0;
+                    let next=create(old,diff,generation)?;
+                    let build_us=started.elapsed().as_micros();
+                    let comparison=if verify {Some(compare_reference(&next)?)}else{None};
+                    Ok((next,build_us,count,batches,source,
+                        traces,before_pairs,bootstrap,comparison))
                 });
             },
         }
     }
-    let final_graph = output.borrow().clone();
-    crate::log_event!(Info,
-        "complete observed_pool_updates={} changed_batches={} generation={} prepared={} groups={}",
-        observed,changed_batches,final_graph.generation,
-        final_graph.qualified_pools,final_graph.groups.len());
-
+    drop(audit_tx);
+    if let Some(writer)=audit_writer {
+        writer.await.context("graph audit writer join")??;
+    }
+    let graph=output.borrow().clone();
+    crate::log_event!(Info,"graph complete generation={} prepared={} compact_topologies={} legacy_groups=0",
+        graph.generation,graph.qualified_pools,graph.topologies.len());
     Ok(())
 }
-
-/// Live consumer proves that the immutable RAM generation reaches a real reader.
-pub async fn observe(mut input: watch::Receiver<Arc<GraphSnapshot>>) -> Result<()> {
-    let mut observed = 0_u64;
-    while input.changed().await.is_ok() {
-        let snapshot = input.borrow_and_update().clone();
-        observed += 1;
-        probe(&snapshot);
-        if let Some(group) = snapshot.groups.first() {
-            crate::log_event!(Debug,"liquidity graph consumer generation={} groups={} sample_kind={:?} settlement={} target={} bridge={:?} intermediate={:?} conversion={:?} direct_s={} direct_q={} bridge_pools={} route_options={} direct_pool_samples={:?} bridge_pool_samples={:?}",
-                snapshot.generation,snapshot.groups.len(),group.kind,group.settlement,group.target,
-                group.bridge,group.intermediate,group.conversion,group.direct_s.len(),
-                group.direct_q.len(),group.bridge_pools.len(),group.route_options,
-                group.direct_s.iter().take(3).collect::<Vec<_>>(),
-                group.bridge_pools.iter().take(3).collect::<Vec<_>>());
+/// Live observer reads the same immutable generation as every consumer.
+pub async fn observe(mut input:watch::Receiver<Arc<GraphSnapshot>>)->Result<()>{
+    let mut generations=0;
+    while input.changed().await.is_ok(){
+        let graph=input.borrow_and_update().clone();
+        generations+=1;
+        if let Some(t)=graph.topologies.first(){
+            crate::log_event!(Info,"graph observer generation={} topologies={} changed_pairs={} first={:?} settlement={} target={} paths={}",
+                graph.generation,graph.topologies.len(),graph.changed_pairs.len(),
+                t.kind,t.settlement,t.target,t.route_options);
         }
     }
-    crate::log_event!(Info,"liquidity graph consumer complete generations={observed}");
+    crate::log_event!(Info,"graph observer complete generations={generations}");
     Ok(())
 }
