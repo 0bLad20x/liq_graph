@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -51,6 +51,101 @@ fn eligible(pool: &PoolState) -> Option<PreparedPool> {
         return None;
     }
     Some(PreparedPool { address: pool.address, a, b })
+}
+
+/// CP6B observational evidence; never participates in admission or routing.
+#[derive(Clone)]
+struct TransitionEvidence {
+    venue:String,
+    admission:String,
+    completion:String,
+    reason_code:Option<String>,
+    rejection:&'static str,
+    canonical_tvl_usd:Option<f64>,
+    validated_slot:Option<u64>,
+    checked_at_ms:Option<u64>,
+    last_changed_ms:u64,
+}
+fn rejection(pool:&PoolState)->&'static str{
+    let (Some(a),Some(b))=(pool.mint_a,pool.mint_b) else{return "missing_mint_identity"};
+    if a==b||a==Pubkey::default()||b==Pubkey::default(){return "invalid_mint_identity";}
+    if !pool.completion_admission.is_admitted(){return "admission_withdrawn";}
+    if pool.completion_state!=CompletionState::Prepared{return "not_prepared";}
+    let Some(slot)=pool.completion_validated_slot else{return "missing_validated_slot"};
+    let Some(manifest)=pool.execution_manifest.as_ref() else{return "missing_manifest"};
+    if manifest.pool!=pool.address||manifest.mint_a!=a||manifest.mint_b!=b {
+        return "manifest_identity_mismatch";
+    }
+    if manifest.validated_slot!=slot{return "manifest_slot_mismatch";}
+    if manifest.base_a.is_empty()||manifest.base_b.is_empty(){return "manifest_basis_missing";}
+    "eligible"
+}
+fn evidence(pool:&PoolState)->TransitionEvidence{
+    TransitionEvidence {
+        venue:format!("{:?}",pool.venue),
+        admission:format!("{:?}",pool.completion_admission),
+        completion:format!("{:?}",pool.completion_state),
+        reason_code:pool.completion_reason_code.map(|v|format!("{v:?}")),
+        rejection:rejection(pool),
+        // This is the canonical observation, NOT necessarily venue-native TVL.
+        canonical_tvl_usd:pool.tvl_usd,
+        validated_slot:pool.completion_validated_slot,
+        checked_at_ms:pool.completion_checked_at_ms,
+        last_changed_ms:pool.last_changed_ms,
+    }
+}
+fn evidence_json(value:Option<&TransitionEvidence>)->serde_json::Value{
+    match value {
+        None=>serde_json::Value::Null,
+        Some(e)=>serde_json::json!({
+            "venue":e.venue,"admission":e.admission,"completion":e.completion,
+            "completion_reason":e.reason_code,"eligibility":e.rejection,
+            "canonical_tvl_usd":e.canonical_tvl_usd,"validated_slot":e.validated_slot,
+            "completion_checked_at_ms":e.checked_at_ms,"registry_last_changed_ms":e.last_changed_ms,
+        })
+    }
+}
+fn now_ms()->u64{
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_millis().min(u128::from(u64::MAX)) as u64
+}
+fn pair_json(value:Option<Pair>)->serde_json::Value{
+    match value{
+        None=>serde_json::Value::Null,
+        Some((a,b))=>serde_json::json!([a.to_string(),b.to_string()])
+    }
+}
+fn transition_kind(before:Option<PreparedPool>,after:Option<PreparedPool>)->&'static str{
+    match (before,after){
+        (None,Some(_))=>"ADDED",
+        (Some(_),None)=>"REMOVED",
+        (Some(a),Some(b)) if pair(a.a,a.b)!=pair(b.a,b.b)=>"PAIR_CHANGED",
+        (Some(_),Some(_))=>"PAIR_ORDER_ONLY",
+        (None,None)=>"UNCHANGED",
+    }
+}
+#[derive(Clone)]
+struct ObservedTransition {
+    address:Pubkey,source:&'static str,batch_at_ms:u64,observed_at_ms:u64,
+    previous_duration_ms:Option<u64>,
+    before:Option<PreparedPool>,after:Option<PreparedPool>,
+    before_evidence:Option<TransitionEvidence>,after_evidence:TransitionEvidence,
+}
+fn transition_json(t:&ObservedTransition,generation:u64,event:&str,
+    old_graph:Option<Pair>,new_graph:Option<Pair>,published_effective:bool)->serde_json::Value{
+    serde_json::json!({
+        "event":event,"generation":generation,"observed_at_ms":t.observed_at_ms,
+        "source_received_at_ms":t.batch_at_ms,"pool":t.address.to_string(),
+        "batch_source":t.source,"transition":transition_kind(t.before,t.after),
+        "before_pair":pair_json(t.before.map(|p|pair(p.a,p.b))),
+        "after_pair":pair_json(t.after.map(|p|pair(p.a,p.b))),
+        "published_before_pair":pair_json(old_graph),
+        "published_after_pair":pair_json(new_graph),
+        "published_effective":published_effective,
+        "previous_state_duration_ms":t.previous_duration_ms,
+        "before":evidence_json(t.before_evidence.as_ref()),
+        "after":evidence_json(Some(&t.after_evidence)),
+    })
 }
 
 fn pair(a: Pubkey, b: Pubkey) -> Pair {
@@ -347,12 +442,15 @@ pub async fn run(
 )->Result<()>{
     let mut prepared=HashMap::<Pubkey,PreparedPool>::new();
     let mut dirty=HashMap::<Pubkey,Option<PreparedPool>>::new();
+    let mut pending_traces=Vec::<ObservedTransition>::new();
+    let mut previous_evidence=HashMap::<Pubkey,TransitionEvidence>::new();
+    let mut previous_transition_at=HashMap::<Pubkey,u64>::new();
     let mut generation=0_u64;
     let mut source_open=true;
     let mut pending_batches=0_usize;
     let mut last_source="persistence_restore";
     let mut next_rebuild=TokioInstant::now();
-    let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str)>>::new();
+    let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str,Vec<ObservedTransition>,HashMap<Pubkey,Option<Pair>>,bool)>>::new();
     loop {
         if !source_open&&dirty.is_empty()&&builds.is_empty(){break;}
         tokio::select!{
@@ -361,8 +459,24 @@ pub async fn run(
                     let mut changes=0;
                     for pool in &batch.pools {
                         let next=eligible(pool);
-                        let same=prepared.get(&pool.address).copied()==next;
-                        if same {continue;}
+                        let before=prepared.get(&pool.address).copied();
+                        if before==next {continue;}
+                        let at=now_ms();
+                        let duration=previous_transition_at.insert(pool.address,at)
+                            .map(|last|at.saturating_sub(last));
+                        let before_evidence=previous_evidence.insert(pool.address,evidence(pool));
+                        // Initial Registry restoration can add >20k pools. Its
+                        // generation is summarized separately, rather than emitting
+                        // tens of thousands of uninteresting bootstrap records.
+                        if generation>0 {
+                            pending_traces.push(ObservedTransition {
+                                address:pool.address,source:batch.source,
+                                batch_at_ms:batch.received_at_ms,observed_at_ms:at,
+                                previous_duration_ms:duration,before,after:next,
+                                before_evidence,
+                                after_evidence:evidence(pool),
+                            });
+                        }
                         if let Some(p)=next {prepared.insert(pool.address,p);}
                         else{prepared.remove(&pool.address);}
                         dirty.insert(pool.address,next);
@@ -375,9 +489,39 @@ pub async fn run(
                 Err(broadcast::error::RecvError::Closed)=>source_open=false,
             },
             result=builds.join_next(),if !builds.is_empty()=>{
-                let (graph,micros,changes,batches,source)=result
+                let (graph,micros,changes,batches,source,traces,before_pairs,bootstrap)=result
                     .context("missing graph delta build")?
                     .context("graph delta task panicked")??;
+                let effective=before_pairs.iter().filter(|(pool,prior)|
+                    **prior!=graph.pair_for_pool(**pool)).count();
+                let no_effect=before_pairs.len().saturating_sub(effective);
+                let mut source_counts=HashMap::<&str,usize>::new();
+                for t in &traces {*source_counts.entry(t.source).or_default()+=1;}
+                crate::log_event!(Info,
+                    "graph transition_summary generation={} bootstrap={} observed={} distinct={} effective={} no_effect={} batches={} source_counts={}",
+                    graph.generation,bootstrap,traces.len(),before_pairs.len(),
+                    effective,no_effect,batches,serde_json::json!(source_counts));
+                if !bootstrap {
+                    for t in &traces {
+                        let prior=before_pairs.get(&t.address).copied().flatten();
+                        let after=graph.pair_for_pool(t.address);
+                        let published_effective=prior!=after;
+                        crate::log_event!(Info,"graph pool_transition event={}",
+                            transition_json(t,graph.generation,"observed",
+                                prior,after,published_effective));
+                    }
+                    // One published transition per actual changed identity. The
+                    // observed stream above can include multiple flips for one pool.
+                    for (&pool,&before) in &before_pairs {
+                        let after=graph.pair_for_pool(pool);
+                        if before==after {continue;}
+                        if let Some(t)=traces.iter().rev().find(|t|t.address==pool) {
+                            crate::log_event!(Info,"graph pool_transition event={}",
+                                transition_json(t,graph.generation,"published",
+                                    before,after,true));
+                        }
+                    }
+                }
                 let total=graph.topologies.len();
                 crate::log_event!(Info,
                     "graph incremental generation={} source={} changed_pools={} changed_pairs={} affected_targets={} regenerated_topologies={} reused_topologies={} coalesced_batches={} prepared={} pairs={} compact_topologies={} compact_pair_index_refs={} legacy_groups=0 trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
@@ -391,6 +535,7 @@ pub async fn run(
             _=sleep_until(next_rebuild),if !dirty.is_empty()&&builds.is_empty()=>{
                 generation=generation.checked_add(1).context("graph generation overflow")?;
                 let diff=std::mem::take(&mut dirty);
+                let traces=std::mem::take(&mut pending_traces);
                 let count=diff.len();
                 let batches=std::mem::take(&mut pending_batches);
                 let source=last_source;
@@ -398,8 +543,12 @@ pub async fn run(
                 next_rebuild=TokioInstant::now()+REBUILD_SPACING;
                 builds.spawn_blocking(move||{
                     let started=Instant::now();
+                    let bootstrap=old.generation==0;
+                    let before_pairs=diff.keys().map(|pool|(*pool,old.pair_for_pool(*pool)))
+                        .collect::<HashMap<_,_>>();
                     let next=create(old,diff,generation)?;
-                    Ok((next,started.elapsed().as_micros(),count,batches,source))
+                    Ok((next,started.elapsed().as_micros(),count,batches,source,
+                        traces,before_pairs,bootstrap))
                 });
             },
         }
