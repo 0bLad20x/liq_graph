@@ -185,7 +185,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
     let mut writer=Task(tokio::spawn(database.run_with_mints(
         updates.subscribe(),Some(jupiter_out.subscribe()),Some(onchain_persist.subscribe()))));
     let mut graph=Task(tokio::spawn(graph_liquidity::run(updates.subscribe(),graphs,graph_liquidity::Settings::from_env()?)));
-    let mut catalog=Task(tokio::spawn(graph_watch_catalog::run(graph_rx,catalogs,None)));
+    let mut catalog=Task(tokio::spawn(graph_watch_catalog::run(graph_rx.clone(),catalogs,None)));
     let (stop,stop_rx)=watch::channel(false);
     let mut mint_worker=Task(tokio::spawn(mint_extensions::run(
         qualified_rx.clone(),selected_mints_rx,mint_reader.clone(),rpc.clone(),
