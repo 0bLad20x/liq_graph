@@ -19,7 +19,7 @@ const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const V10_MAX_DECLARATIONS: usize = 16;
 
-type Pair = (Pubkey, Pubkey);
+pub type Pair = (Pubkey, Pubkey);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings;
@@ -172,6 +172,108 @@ fn validate_v10_group(group: &Group, pairs: &HashMap<Pair, Arc<[Pubkey]>>,
     Ok(())
 }
 
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum RouteTopologyKind { Direct2, Direct3, Triangle3, Triangle4 }
+
+/// One mathematical route shape, never one particular choice of pools.
+/// Reverse direction is implicit; each role resolves through pair_pools.
+#[derive(Clone,Debug)]
+pub struct RouteTopology {
+    pub kind: RouteTopologyKind,
+    pub settlement: Pubkey,
+    pub target: Pubkey,
+    pub bridge: Option<Pubkey>,
+    pub roles: [(Pubkey, Pubkey); 4],
+    pub length: usize,
+    pub route_options: u64,
+}
+impl RouteTopology {
+    pub fn directed_roles(&self) -> &[(Pubkey,Pubkey)] { &self.roles[..self.length] }
+}
+
+/// Only distinct mint paths are enumerated. Pool alternatives stay factored by
+/// pair. The legacy Group projection is retained temporarily for CP5 consumers.
+fn build_topologies(
+    pairs:&HashMap<Pair,Arc<[Pubkey]>>,
+    adjacency:&HashMap<Pubkey,HashSet<Pubkey>>,
+    wsol:Pubkey, usdc:Pubkey,
+) -> Result<(Arc<[RouteTopology]>,HashMap<Pair,Vec<u32>>)> {
+    let mut result=Vec::<RouteTopology>::new();
+    let mut index=HashMap::<Pair,Vec<u32>>::new();
+    let mut push=|kind,settlement,target,bridge,roles:&[(Pubkey,Pubkey)],options:u64| -> Result<()> {
+        ensure!(options>0 && roles.len()>=2 && roles.len()<=4,"empty or invalid compact topology");
+        ensure!(result.len()<u32::MAX as usize,"too many compact topologies");
+        let id=result.len() as u32;
+        let mut storage=[(Pubkey::default(),Pubkey::default());4];
+        storage[..roles.len()].copy_from_slice(roles);
+        result.push(RouteTopology { kind,settlement,target,bridge,roles:storage,
+            length:roles.len(),route_options:options });
+        let mut seen=HashSet::new();
+        for &(a,b) in roles {
+            let p=pair(a,b);
+            if seen.insert(p) { index.entry(p).or_default().push(id); }
+        }
+        Ok(())
+    };
+    let count=|a,b| -> u64 { pairs.get(&pair(a,b)).map_or(0,|v|v.len() as u64) };
+    for (s,q) in [(wsol,usdc),(usdc,wsol)] {
+        for &t in adjacency.get(&s).into_iter().flatten() {
+            if t==s { continue; }
+            let direct=count(s,t);
+            if direct>=2 {
+                push(RouteTopologyKind::Direct2,s,t,None,&[(s,t),(t,s)],
+                    direct.saturating_mul(direct-1))?;
+            }
+            if t!=q && direct>0 {
+                let quoted=count(t,q);let conversions=count(q,s);
+                if quoted>0 && conversions>0 {
+                    let options=2_u64.saturating_mul(direct)
+                        .saturating_mul(quoted).saturating_mul(conversions);
+                    push(RouteTopologyKind::Direct3,s,t,None,&[(s,t),(t,q),(q,s)],options)?;
+                }
+            }
+            for &b in adjacency.get(&t).into_iter().flatten() {
+                if b==s || b==t { continue; }
+                let middle=count(t,b);
+                let back=count(b,s);
+                if direct>0 && middle>0 && back>0 {
+                    let options=2_u64.saturating_mul(direct)
+                        .saturating_mul(middle).saturating_mul(back);
+                    push(RouteTopologyKind::Triangle3,s,t,Some(b),&[(s,t),(t,b),(b,s)],options)?;
+                }
+                if t!=q && b!=q && direct>0 && middle>0 {
+                    let back_q=count(b,q);let conversions=count(q,s);
+                    if back_q>0 && conversions>0 {
+                        let options=2_u64.saturating_mul(direct)
+                            .saturating_mul(middle).saturating_mul(back_q).saturating_mul(conversions);
+                        push(RouteTopologyKind::Triangle4,s,t,Some(b),
+                            &[(s,t),(t,b),(b,q),(q,s)],options)?;
+                    }
+                }
+            }
+        }
+    }
+    // Stable IDs within one snapshot regardless of HashMap adjacency iteration order.
+    result.sort_unstable_by_key(|topology| {
+        (topology.settlement,topology.target,topology.bridge,match topology.kind {
+            RouteTopologyKind::Direct2=>0,
+            RouteTopologyKind::Direct3=>1,
+            RouteTopologyKind::Triangle3=>2,
+            RouteTopologyKind::Triangle4=>3,
+        })
+    });
+    index.clear();
+    for (id,topology) in result.iter().enumerate() {
+        let mut seen=HashSet::new();
+        for &(a,b) in topology.directed_roles() {
+            let key=pair(a,b);
+            if seen.insert(key) { index.entry(key).or_default().push(id as u32); }
+        }
+    }
+    Ok((result.into(),index))
+}
+
 /// A generation owns every index; IDs must never cross generation boundaries.
 #[derive(Debug, Default)]
 pub struct GraphSnapshot {
@@ -182,6 +284,9 @@ pub struct GraphSnapshot {
     pub pair_pools: HashMap<Pair, Arc<[Pubkey]>>,
     /// Pool identity mapped directly to a canonical pair (no traversal or DB lookup).
     pub pool_pairs: HashMap<Pubkey, Pair>,
+    /// Factorized mathematical topology: not one record per intermediate/converter pool.
+    pub topologies: Arc<[RouteTopology]>,
+    pub pair_topologies: HashMap<Pair,Vec<u32>>,
     pub groups: Vec<Group>,
     pub token_index: HashMap<Pubkey, Vec<u32>>,
     pub pool_index: HashMap<Pubkey, Vec<u32>>,
@@ -191,6 +296,13 @@ pub struct GraphSnapshot {
 }
 
 impl GraphSnapshot {
+    pub fn topologies_for_pair(&self, a: Pubkey, b: Pubkey) -> &[u32] {
+        self.pair_topologies.get(&pair(a,b)).map_or(&[],Vec::as_slice)
+    }
+    pub fn topologies_for_pool(&self, pool: Pubkey) -> &[u32] {
+        self.pool_pairs.get(&pool).and_then(|key|self.pair_topologies.get(key))
+            .map_or(&[],Vec::as_slice)
+    }
     pub fn pools_for_pair(&self, a: Pubkey, b: Pubkey) -> &[Pubkey] {
         self.pair_pools.get(&pair(a,b)).map_or(&[], |p| p.as_ref())
     }
@@ -361,12 +473,19 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
     // Each role list contains unique pools, and repeated role group references are intentional.
     let index_items: usize = token_index.values().map(Vec::len).sum::<usize>()
         + pool_index.values().map(Vec::len).sum::<usize>();
-    let approx = edge_count * size_of::<PreparedPool>()
+    let (topologies,pair_topologies)=build_topologies(&pair_map,&adjacency,wsol,usdc)?;
+    let compact_routes=topologies.iter().fold(0_u64,|acc,t|acc.saturating_add(t.route_options));
+    ensure!(compact_routes==routes,
+        "factorized V10 route coverage differs from legacy groups: compact={compact_routes} legacy={routes}");
+    let topology_refs=pair_topologies.values().map(Vec::len).sum::<usize>();
+    let approx = topologies.len()*size_of::<RouteTopology>()+topology_refs*size_of::<u32>()
+        +edge_count * size_of::<PreparedPool>()
         + groups.len() * size_of::<Group>()
         + refs * size_of::<Pubkey>()
         + index_items * size_of::<u32>();
     Ok(GraphSnapshot { generation, qualified_pools:edge_count,
         mint_pairs:pair_map.len(), pair_pools:pair_map, pool_pairs,
+        topologies,pair_topologies,
         groups, token_index, pool_index,
         route_options:routes, role_pool_refs:refs, approx_index_bytes:approx })
 }
@@ -475,9 +594,9 @@ pub async fn run(
                 let oversized = graph.groups.iter()
                     .filter(|g|g.declarations()>V10_MAX_DECLARATIONS).count();
                 crate::log_event!(Info,
-                    "rebuild generation={} source={} changed_pools={} coalesced_batches={} prepared={} pairs={} groups={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
+                    "rebuild generation={} source={} changed_pools={} coalesced_batches={} prepared={} pairs={} groups={} compact_topologies={} compact_pair_index_refs={} direct={} bridge={} trade_paths={} role_refs={} over_16_declarations={} approx_index_bytes={} build_us={}",
                     graph.generation, source, changes, batches, graph.qualified_pools, graph.mint_pairs,
-                    graph.groups.len(), direct, bridge, graph.route_options, graph.role_pool_refs,
+                    graph.groups.len(), graph.topologies.len(),graph.pair_topologies.values().map(Vec::len).sum::<usize>(), direct, bridge, graph.route_options, graph.role_pool_refs,
                     oversized, graph.approx_index_bytes, elapsed_us);
                 let old=output.send_replace(Arc::new(graph));
                 // Reclaim multi-million-group generations outside the Tokio hotpath.
