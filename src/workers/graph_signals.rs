@@ -120,24 +120,39 @@ struct CompactIndex {
     qualifying:HashMap<(u32,bool),Winner>,
 }
 impl CompactIndex {
-    fn install(&mut self,graph:Arc<GraphSnapshot>,prices:&Prices){
-        let mut ranked=HashMap::<(Pubkey,Pubkey),BTreeSet<Key>>::new();
-        for (id,identity) in prices.pools.iter().enumerate(){
-            if graph.pair_for_pool(identity.address)!=Some((identity.mint_a,identity.mint_b))
-                || graph.pools_for_pair(identity.mint_a,identity.mint_b)
-                    .binary_search(&identity.address).is_err(){continue;}
-            for direction in 0..2 {
-                let slot=2*id+direction;
-                if let Some(weight)=prices.weight(slot,None) {
-                    let role=if direction==0 {(identity.mint_a,identity.mint_b)}
-                        else {(identity.mint_b,identity.mint_a)};
-                    ranked.entry(role).or_default().insert(key(weight,slot));
+    /// Re-index only changed pair-alternative lists. Compare complete generations
+    /// because watch channels can skip intermediate publications.
+    fn install(&mut self,graph:Arc<GraphSnapshot>,prices:&Prices)->usize {
+        let mut dirty=HashSet::new();
+        for (pair,pools) in &graph.pair_pools {
+            let unchanged=self.graph.pair_pools.get(pair)
+                .is_some_and(|old|Arc::ptr_eq(old,pools)||old==pools);
+            if !unchanged {dirty.insert(*pair);}
+        }
+        for pair in self.graph.pair_pools.keys(){
+            if !graph.pair_pools.contains_key(pair){dirty.insert(*pair);}
+        }
+        for &(a,b) in &dirty {
+            for (input,output) in [(a,b),(b,a)] {
+                let mut ordered=BTreeSet::new();
+                for &address in graph.pools_for_pair(a,b){
+                    if let Some(&id)=prices.index.get(&address){
+                        let slot=2*id+usize::from(input!=a);
+                        if let Some(weight)=prices.weight(slot,None){
+                            ordered.insert(key(weight,slot));
+                        }
+                    }
                 }
+                if ordered.is_empty(){self.ranked.remove(&(input,output));}
+                else{self.ranked.insert((input,output),ordered);}
             }
         }
         self.graph=graph;
-        self.ranked=ranked;
-        // No candidate calculated against an older topology remains valid.
+        self.qualifying.clear();
+        dirty.len()
+    }
+    fn clear_prices(&mut self){
+        self.ranked.clear();
         self.qualifying.clear();
     }
     /// True only when a directed pair's best or runner-up has changed.
@@ -344,7 +359,9 @@ impl Engine {
                 RouteTopologyKind::Triangle4=>SignalRouteKind::Triangle4},
             settlement:t.settlement,target:t.target,bridge:t.bridge,
             roles:t.roles,length:t.length}).collect::<Vec<_>>();
-        self.index.install(graph.clone(),&self.prices);
+        let changed_pair_rankings=self.index.install(graph.clone(),&self.prices);
+        crate::log_event!(Info,"graph signals cp6b rankings generation={} changed_pairs={} directed_roles={} old_groups_compiled=0",
+            graph.generation,changed_pair_rankings,self.index.ranked.len());
         let plan=Arc::new(SignalPlan{graph_generation:graph.generation,
             log_weight_scale:SIGNAL_LOG_SCALE,roles:Arc::from([]),groups:Arc::from([]),
             compact_topologies:compact.into(),route_options:graph.route_options});
@@ -419,7 +436,7 @@ pub async fn run(mut input:PriceEventStream,mut catalogs:watch::Receiver<Arc<Wat
                     MarketStateEvent::Gap{sequence,reason}=>{
                         let started=Instant::now();let received=now_us();
                         e.prices.values.fill(None);
-                        e.index.install(e.index.graph.clone(),&e.prices);
+                        e.index.clear_prices();
                         let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,reason:reason.clone()},
                             started,received,None,input.len());
                         e.state(&mut work,false,true,Vec::new())?;e.evaluate(work)?;
@@ -448,7 +465,7 @@ pub async fn run(mut input:PriceEventStream,mut catalogs:watch::Receiver<Arc<Wat
                 },
                 Err(broadcast::error::RecvError::Lagged(n))=>{
                     e.prices.values.fill(None);
-                    e.index.install(e.index.graph.clone(),&e.prices);
+                    e.index.clear_prices();
                     let started=Instant::now();let received=now_us();
                     let mut work=e.begin(SignalTrigger::Coverage{sequence:0,
                         reason:format!("price stream lost {n} inputs; state invalid")},
