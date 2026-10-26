@@ -148,8 +148,16 @@ def run(args):
     admission_crossings=[]
     errors=collections.Counter()
     completed=False
+    runtime_start_ms=None
+    runtime_end_ms=None
     for line in pathlib.Path(args.runtime).open(encoding="utf-8",errors="replace"):
-        completed|="runtime shutdown complete=true" in line
+        if "runtime running=true" in line and runtime_start_ms is None:
+            found=TS.search(line)
+            if found:runtime_start_ms=int(found.group(1))
+        if "runtime shutdown complete=true" in line:
+            completed=True
+            found=TS.search(line)
+            if found:runtime_end_ms=int(found.group(1))
         values={k:v for k,v in KEY.findall(line)}
         if "graph incremental generation=" in line:
             gen=as_int(values.get("generation"))
@@ -251,6 +259,9 @@ def run(args):
         "branch":checkout.get("branch"),"head":checkout.get("head"),
         "requested_duration_seconds":checkout.get("duration_seconds"),
         "exit_code":args.exit_code,"runtime_completed":completed,
+        "runtime_measured_seconds":(
+            (runtime_end_ms-runtime_start_ms)/1000 if
+            runtime_end_ms is not None and runtime_start_ms is not None else None),
         "graph_generations":len(graph_rows),
         "audited_generations":complete_count,
         "transition_observed":observed_count,
@@ -290,6 +301,17 @@ def run(args):
         raise SystemExit("Producer/consumer candidate count differs.")
     if len(graph_rows)<2 or not observed_count or not published_count:
         raise SystemExit("Insufficient real graph transition evidence.")
+    if stats["runtime_measured_seconds"] is None or stats["runtime_measured_seconds"]<args.min_duration:
+        raise SystemExit("Real runtime duration was shorter than the requested 30-minute observation.")
+    if not (stats["signal_websocket_evaluations"] or 0)>0 or not (stats["signal_producer_candidates"] or 0)>0:
+        raise SystemExit("No real WebSocket price evaluation and compact candidate evidence.")
+    ready=consumer.get("websocket_ready_anchors_by_kind") or {}
+    if any((ready.get(k) or 0)<=0 for k in
+           ("direct_2","direct_3","triangle_3","triangle_4")):
+        raise SystemExit("No WebSocket-ready signals for one or more topology kinds.")
+    last_plan=prod.get("last_plan") or {}
+    if (last_plan.get("legacy_groups_compiled") or 0)!=0 or (last_plan.get("compact_topologies") or 0)<=0:
+        raise SystemExit("Compact topology plan missing or legacy signal groups compiled.")
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser()
@@ -297,4 +319,5 @@ if __name__=="__main__":
     parser.add_argument("--runtime",required=True)
     parser.add_argument("--output",required=True)
     parser.add_argument("--exit-code",type=int,required=True)
+    parser.add_argument("--min-duration",type=int,default=1790)
     run(parser.parse_args())
