@@ -288,7 +288,9 @@ pub async fn run(
     while input.changed().await.is_ok() {
         let graph = input.borrow_and_update().clone();
         if last_generation == Some(graph.generation) { continue; }
-        let catalog = Arc::new(build(graph)?);
+        // The projection scans the complete graph. Never block Tokio's price/RPC tasks.
+        let catalog = Arc::new(tokio::task::spawn_blocking(move || build(graph)).await
+            .context("watch catalog build task panicked")??);
         let mint_addresses: Arc<[Pubkey]> =
             Arc::from(catalog.mints.iter().map(|m| m.address).collect::<Vec<_>>());
         last_generation = Some(catalog.generation);
