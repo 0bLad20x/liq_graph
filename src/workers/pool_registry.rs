@@ -481,6 +481,17 @@ impl PoolRegistry {
             if let Some(pool)=entries.get_mut(&address) {
                 let decision=admission.admission(pool);
                 if decision!=pool.completion_admission {
+                    let previous=pool.completion_admission;
+                    crate::log_event!(Info,"pool admission_transition event={}",
+                        json!({
+                            "pool":address.to_string(),"venue":format!("{:?}",pool.venue),
+                            "source":"mint_qualification","received_at_ms":now,
+                            "before":format!("{previous:?}"),"after":format!("{decision:?}"),
+                            "native_tvl_usd":admission.native_tvl.get(&address).copied(),
+                            "canonical_tvl_usd":pool.tvl_usd,
+                            "completion":format!("{:?}",pool.completion_state),
+                            "completion_reason":pool.completion_reason_code.map(|r|format!("{r:?}")),
+                        }));
                     pool.completion_admission=decision;
                     pool.last_changed_ms=now;
                     updates.push(pool.clone());
@@ -635,9 +646,19 @@ impl PoolRegistry {
                     current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
                         changed=true;
-                        crate::log_event!(Debug,
-                            "admission_transition pool={} venue={:?} previous={previous_admission:?} next={:?} tvl_usd={:?} manifest_retained={}",
-                            current.address,current.venue,current.completion_admission,current.tvl_usd,current.execution_manifest.is_some());
+                        crate::log_event!(Info,"pool admission_transition event={}",
+                            json!({
+                                "pool":current.address.to_string(),
+                                "venue":format!("{:?}",current.venue),
+                                "source":batch.source,"received_at_ms":batch.received_at_ms,
+                                "before":format!("{previous_admission:?}"),
+                                "after":format!("{:?}",current.completion_admission),
+                                "native_tvl_usd":admission.native_tvl.get(&current.address).copied(),
+                                "canonical_tvl_usd":current.tvl_usd,
+                                "completion":format!("{:?}",current.completion_state),
+                                "completion_reason":current.completion_reason_code.map(|r|format!("{r:?}")),
+                                "manifest_retained":current.execution_manifest.is_some(),
+                            }));
                     }
                     if changed {
                         if identity_changed { stats.identity.push(*address); }
