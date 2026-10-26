@@ -326,6 +326,12 @@ pub struct GraphSnapshot {
     pub recomputed_targets:usize,
     pub regenerated_topologies:usize,
     pub reused_topologies:usize,
+    pub added_mint_pairs:usize,
+    pub removed_mint_pairs:usize,
+    pub alternatives_only_pairs:usize,
+    pub discovered_topologies:usize,
+    pub recounted_topologies:usize,
+    pub removed_topologies:usize,
 }
 impl GraphSnapshot {
     pub fn topologies_for_pair(&self,a:Pubkey,b:Pubkey)->&[u32]{
@@ -511,6 +517,7 @@ fn create(
         !old.pair_pools.contains_key(p)&&pairs.contains_key(p)).collect::<HashSet<_>>();
     let removed_edges=changed_pairs.iter().copied().filter(|p|
         old.pair_pools.contains_key(p)&&!pairs.contains_key(p)).count();
+    let alternatives_only_pairs=changed_pairs.len()-new_edges.len()-removed_edges;
     let mut topologies=Vec::with_capacity(old.topologies.len()+new_edges.len()*4);
     let mut reused_count=0_usize;
     let mut recounted_count=0_usize;
@@ -634,7 +641,10 @@ fn create(
         changed_pairs:changed.into(),
         recomputed_targets:new_edges.len()+removed_edges,
         regenerated_topologies:recounted_count+generated_count,
-        reused_topologies:reused_count})
+        reused_topologies:reused_count,
+        added_mint_pairs:new_edges.len(),removed_mint_pairs:removed_edges,
+        alternatives_only_pairs,discovered_topologies:generated_count,
+        recounted_topologies:recounted_count,removed_topologies:removed_count})
 }
 const REBUILD_SPACING:Duration=Duration::from_secs(3);
 /// Registry is the sole writer; every immutable generation publishes atomically.
@@ -746,6 +756,12 @@ pub async fn run(
                         graph.generation,graph.topologies.len(),us);
                 }
                 let total=graph.topologies.len();
+                crate::log_event!(Info,
+                    "graph cp6c_delta generation={} added_mint_pairs={} removed_mint_pairs={} alternatives_only_pairs={} discovered_topologies={} recounted_topologies={} removed_topologies={} reused_topologies={} net_pool_changes={}",
+                    graph.generation,graph.added_mint_pairs,graph.removed_mint_pairs,
+                    graph.alternatives_only_pairs,graph.discovered_topologies,
+                    graph.recounted_topologies,graph.removed_topologies,
+                    graph.reused_topologies,effective);
                 crate::log_event!(Info,
                     "graph incremental generation={} source={} changed_pools={} changed_pairs={} affected_targets={} regenerated_topologies={} reused_topologies={} coalesced_batches={} prepared={} pairs={} compact_topologies={} compact_pair_index_refs={} legacy_groups=0 trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
                     graph.generation,source,changes,graph.changed_pairs.len(),
