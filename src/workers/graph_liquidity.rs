@@ -176,6 +176,9 @@ pub struct GraphSnapshot {
     pub role_pool_refs:usize,
     pub approx_index_bytes:usize,
     pub changed_pairs:Arc<[Pair]>,
+    pub recomputed_targets:usize,
+    pub regenerated_topologies:usize,
+    pub reused_topologies:usize,
 }
 impl GraphSnapshot {
     pub fn topologies_for_pair(&self,a:Pubkey,b:Pubkey)->&[u32]{
@@ -260,6 +263,8 @@ fn create(
             affected.insert((top.settlement,top.target));
         }
     }
+    let retained_count=if initial {0}else{old.topologies.iter()
+        .filter(|t|!affected.contains(&(t.settlement,t.target))).count()};
     let mut topologies=if initial {
         build_topologies(&pairs,&adjacency,wsol,usdc,None)?.0.to_vec()
     } else {
@@ -272,6 +277,7 @@ fn create(
         }
         retained
     };
+    let generated_count=topologies.len().saturating_sub(retained_count);
     topologies.sort_unstable_by_key(|t| (t.settlement,t.target,t.bridge,t.kind));
     ensure!(topologies.windows(2).all(|w|
         (w[0].settlement,w[0].target,w[0].bridge,w[0].kind)
@@ -283,6 +289,28 @@ fn create(
     let mut options=0_u64;
     for (i,t) in topologies.iter().enumerate(){
         let id=i as u32;
+        let roles=t.directed_roles();
+        ensure!(roles.len()>=2 && roles.len()<=4,"invalid compact topology length");
+        ensure!(roles[0].0==t.settlement
+            &&roles[roles.len()-1].1==t.settlement
+            &&roles.windows(2).all(|r|r[0].1==r[1].0),
+            "V10 compact topology route is not a closed mint cycle");
+        let mut encountered=HashSet::new();
+        ensure!(roles.iter().all(|(a,b)|a!=b && encountered.insert(*a)),
+            "V10 compact topology repeats a mint before settlement");
+        let mut expected=if t.kind==RouteTopologyKind::Direct2 {1_u64}else{2_u64};
+        for (leg,&(a,b)) in roles.iter().enumerate(){
+            let count=pairs.get(&pair(a,b)).map_or(0,|p|p.len()) as u64;
+            if t.kind==RouteTopologyKind::Direct2 && leg==1 {continue;}
+            expected=expected.checked_mul(count).context("compact route total overflow")?;
+        }
+        if t.kind==RouteTopologyKind::Direct2 {
+            let count=pairs.get(&pair(roles[0].0,roles[0].1)).map_or(0,|p|p.len()) as u64;
+            expected=count.checked_mul(count.saturating_sub(1))
+                .context("direct2 total overflow")?;
+        }
+        ensure!(expected>0 && expected==t.route_options,
+            "stale compact topology options after incremental update");
         options=options.checked_add(t.route_options).context("route options overflow")?;
         let mut seen_pairs=HashSet::new();
         let mut seen_tokens=HashSet::new();
@@ -307,7 +335,9 @@ fn create(
         mint_pairs:pairs.len(),pair_pools:pairs,pool_pairs,adjacency,
         topologies:topologies.into(),pair_topologies,token_index,
         route_options:options,role_pool_refs:refs,approx_index_bytes:approx,
-        changed_pairs:changed.into()})
+        changed_pairs:changed.into(),
+        recomputed_targets:affected.len(),regenerated_topologies:generated_count,
+        reused_topologies:retained_count})
 }
 const REBUILD_SPACING:Duration=Duration::from_secs(3);
 /// Registry is the sole writer; every immutable generation publishes atomically.
@@ -352,9 +382,10 @@ pub async fn run(
                     .context("graph delta task panicked")??;
                 let total=graph.topologies.len();
                 crate::log_event!(Info,
-                    "graph incremental generation={} source={} changed_pools={} changed_pairs={} coalesced_batches={} prepared={} pairs={} compact_topologies={} compact_pair_index_refs={} legacy_groups=0 trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
-                    graph.generation,source,changes,graph.changed_pairs.len(),batches,
-                    graph.qualified_pools,graph.mint_pairs,total,graph.role_pool_refs,
+                    "graph incremental generation={} source={} changed_pools={} changed_pairs={} affected_targets={} regenerated_topologies={} reused_topologies={} coalesced_batches={} prepared={} pairs={} compact_topologies={} compact_pair_index_refs={} legacy_groups=0 trade_paths={} role_refs={} approx_index_bytes={} build_us={}",
+                    graph.generation,source,changes,graph.changed_pairs.len(),
+                    graph.recomputed_targets,graph.regenerated_topologies,graph.reused_topologies,
+                    batches,graph.qualified_pools,graph.mint_pairs,total,graph.role_pool_refs,
                     graph.route_options,graph.role_pool_refs,graph.approx_index_bytes,micros);
                 let old=output.send_replace(Arc::new(graph));
                 tokio::task::spawn_blocking(move||drop(old));
