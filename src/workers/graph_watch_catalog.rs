@@ -71,9 +71,6 @@ pub struct PoolWatch {
 
 #[derive(Clone, Debug)]
 pub struct PairWatch {
-    /// Canonical, unordered mint addresses.
-    pub mint_a: Pubkey,
-    pub mint_b: Pubkey,
     pub pools: Arc<[Pubkey]>,
     pub contexts: Arc<[PoolContext]>,
 }
@@ -177,7 +174,6 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
             }
         }
     }
-    ensure!(mint_state.len()==graph.token_index.len(),"catalog mint set differs from graph");
     ensure!(pool_state.len()==graph.pair_topologies.keys().map(|p|
         graph.pair_pools.get(p).map_or(0,|v|v.len())).sum::<usize>(),
         "catalog pool set differs from compact topology coverage");
@@ -201,8 +197,7 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
             pair_pool_count,
         }
     }).collect();
-    let pairs: Vec<PairWatch> = pair_state.into_iter().map(|((mint_a, mint_b), state)| PairWatch {
-        mint_a, mint_b,
+    let pairs: Vec<PairWatch> = pair_state.into_values().map(|state| PairWatch {
         pools: Arc::from(state.pools.into_iter().collect::<Vec<_>>()),
         contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
     }).collect();
