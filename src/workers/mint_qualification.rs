@@ -188,7 +188,7 @@ pub async fn run(
                         if is_qualified {qualified.insert(mint);}
                         else {qualified.remove(&mint);}
                         if was_qualified!=is_qualified {
-                            crate::log_event!(Info,"mint qualification_transition event={}",
+                            crate::log_event!(Debug,"mint qualification_transition event={}",
                                 serde_json::json!({
                                     "mint":mint.to_string(),
                                     "source":"jupiter",
