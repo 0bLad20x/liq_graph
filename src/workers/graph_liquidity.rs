@@ -459,7 +459,10 @@ fn compare_reference(graph:&GraphSnapshot)->Result<u128>{
     }
     let wsol:Pubkey=WSOL.parse()?;
     let usdc:Pubkey=USDC.parse()?;
-    let (full,_)=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None)?;
+    let (full,reference_index)=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None)?;
+    ensure!(reference_index==graph.pair_topologies,
+        "CP6C reference mismatch generation={} pair-to-topology inverted index",
+        graph.generation);
     ensure!(full.len()==graph.topologies.len(),
         "CP6C reference mismatch generation={} cardinality delta={} full={}",
         graph.generation,graph.topologies.len(),full.len());
@@ -627,6 +630,10 @@ fn create(
     }
     ensure!(pool_pairs.len()==pairs.values().map(|v|v.len()).sum::<usize>(),
         "graph pool/pair identity accounting mismatch");
+    ensure!(pairs.iter().all(|(mint_pair,addresses)|
+        addresses.windows(2).all(|v|v[0]<v[1])
+        && addresses.iter().all(|pool|pool_pairs.get(pool)==Some(mint_pair))),
+        "CP6C canonical pool alternatives and pair reverse index differ");
     let refs=pair_topologies.values().map(Vec::len).sum::<usize>();
     let approx=pool_pairs.len()*size_of::<PreparedPool>()
         +pairs.values().map(|v|v.len()*size_of::<Pubkey>()).sum::<usize>()
