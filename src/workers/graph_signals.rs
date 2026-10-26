@@ -9,7 +9,7 @@ use crate::core::{
     market_state::{MarketStateEvent,PoolPriceObservation,PriceEventStream,PriceOrigin,PricePipelineTiming},
     signals::{SignalCandidate,SignalCandidateBatch,SignalEvaluation,SignalEvent,SignalLeg,
         SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,SignalRangeBlock,
-        SignalRangeChange,SignalRouteKind,SignalSnapshot,SignalStateUpdate,SignalStream,
+        SignalRangeChange,SignalRouteKind,SignalRouteRange,SignalSnapshot,SignalStateUpdate,SignalStream,
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_BLOCK_RANGES,SIGNAL_LOG_SCALE}};
 use super::{graph_liquidity::{GraphSnapshot,RouteTopologyKind},graph_watch_catalog::WatchCatalog};
 
@@ -683,7 +683,7 @@ pub struct ObservationReport {
     completion_to_consumer_us: Histogram, websocket_frame_to_completion_consumer_us: Histogram,
     ranges_by_kind: BTreeMap<&'static str,u64>, ready_anchors_by_kind: BTreeMap<&'static str,u64>,
     websocket_ready_anchors_by_kind: BTreeMap<&'static str,u64>,
-    examples: Vec<Example>, consumer_processing_ns: Histogram,
+    examples: Vec<Example>, candidate_examples:Vec<SignalCandidate>, consumer_processing_ns: Histogram,
     consumer_logging_ns: u64,
 }
 impl ObservationReport {
@@ -741,6 +741,42 @@ impl Mirror {
             self.prices[c.pool_id]=c.price.clone();
         }
         self.revision=s.revision;
+        Ok(())
+    }
+    fn candidate(&self,b:&SignalCandidateBatch,c:&SignalCandidate)->Result<()>{
+        ensure!(b.revision==self.revision&&b.graph_generation==self.generation,
+            "candidate references another state revision");
+        let plan=self.plan.as_ref().context("candidate before plan snapshot")?;
+        let top=plan.compact_topologies.get(c.topology_id).context("candidate topology absent")?;
+        if c.change==SignalRangeChange::Exited{
+            ensure!(c.witness.is_none(),"exited candidate carries a live witness");
+            return Ok(());
+        }
+        let witness=c.witness.as_ref().context("live candidate missing witness")?;
+        ensure!(witness.legs.len()==top.length
+            && !(top.kind==SignalRouteKind::Direct2&&c.reverse),
+            "candidate topology length or direction mismatch");
+        let mut unique=HashSet::new();
+        let mut sum=0_i128;
+        for (i,leg) in witness.legs.iter().enumerate(){
+            let j=if c.reverse{top.length-1-i}else{i};
+            let (a,b)=top.roles[j];
+            let (input,output)=if c.reverse{(b,a)}else{(a,b)};
+            ensure!(leg.input_mint==input&&leg.output_mint==output,
+                "candidate mint direction mismatch");
+            let pool=self.pools.get(leg.slot/2).context("candidate pool missing")?;
+            ensure!((pool.mint_a,pool.mint_b)==pair(input,output)
+                &&unique.insert(leg.slot/2),"candidate reused pool or wrong pair");
+            let weight=self.prices.get(leg.slot/2).and_then(|p|p.as_ref())
+                .and_then(|p|p.log_weight_units[leg.slot%2])
+                .context("candidate has no current directed price")?;
+            ensure!(weight==leg.log_weight_units,"candidate price revision mismatch");
+            sum+=i128::from(weight);
+        }
+        ensure!(witness.legs.last().is_some_and(|l|l.output_mint==witness.legs[0].input_mint)
+            &&sum==i128::from(witness.log_sum_units)
+            &&witness.log_sum_units<b.threshold_units,
+            "candidate is not a profitable closed route");
         Ok(())
     }
     fn range(&self, b: &SignalRangeBlock, r: &SignalRouteRange) -> Result<()> {
@@ -810,7 +846,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                     report.max_queue_depth=report.max_queue_depth.max(input.len());
                     let sequence=match event.as_ref() {
                         SignalEvent::State(s)=>s.sequence, SignalEvent::Ranges(b)=>b.sequence,
-                        SignalEvent::Evaluated(e)=>e.sequence,
+                        SignalEvent::Candidates(b)=>b.sequence,SignalEvent::Evaluated(e)=>e.sequence,
                     };
                     ensure!(report.awaiting_snapshot || sequence==report.last_sequence+1,"signal event sequence gap");
                     report.last_sequence=sequence;
@@ -840,6 +876,34 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 if let Some(t)=s.price_pipeline {
                                     if let Some(us)=now_us().checked_sub(t.frame_received_at_us) {
                                         report.websocket_frame_to_state_consumer_us.add(us);
+                                    }
+                                }
+                            }
+                        },
+                        SignalEvent::Candidates(b)=>{
+                            ensure!(!b.candidates.is_empty(),"empty CP6A candidate batch");
+                            if report.awaiting_snapshot{report.unverified_ranges+=b.candidates.len() as u64;}
+                            else{
+                                ensure!(pending,"candidate batch without state");
+                                for c in &b.candidates{
+                                    mirror.candidate(b,c)?;
+                                    ranges[change_id(c.change)]+=1;
+                                    let kind=kind_id(mirror.plan.as_ref().unwrap()
+                                        .compact_topologies[c.topology_id].kind);
+                                    let samples=if live(&b.trigger){&mut sample_ws}else{&mut sample_baseline};
+                                    if samples[kind]<settings.sample_limit{
+                                        samples[kind]+=1;report.candidate_examples.push(c.clone());
+                                    }
+                                    if settings.trace{
+                                        crate::log_event!(Info,"graph signals cp6a candidate={}",serde_json::to_string(c)?);
+                                    }
+                                }
+                            }
+                            report.counts.candidate(b);
+                            if live(&b.trigger){
+                                if let Some(t)=b.price_pipeline{
+                                    if let Some(us)=at.checked_sub(t.frame_received_at_us){
+                                        report.websocket_frame_to_range_consumer_us.add(us);
                                     }
                                 }
                             }
