@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze real CP6B graph audit, runtime, and signal JSON without loading audit into RAM."""
+"""Analyze the current real liquidity graph audit, runtime, and signal JSON without loading audit into RAM."""
 import argparse
 import collections
 import csv
@@ -334,7 +334,7 @@ def run(args):
     if not stats["reference_verified_generations"]:
         raise SystemExit("No exact CP6C full route reference comparison observed.")
     if stats["runtime_measured_seconds"] is None or stats["runtime_measured_seconds"]<args.min_duration:
-        raise SystemExit("Real runtime duration was shorter than the requested 30-minute observation.")
+        raise SystemExit("Real runtime duration was shorter than the requested observation period.")
     if not (stats["signal_websocket_evaluations"] or 0)>0 or not (stats["signal_producer_candidates"] or 0)>0:
         raise SystemExit("No real WebSocket price evaluation and compact candidate evidence.")
     ready=consumer.get("websocket_ready_anchors_by_kind") or {}

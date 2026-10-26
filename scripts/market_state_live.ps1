@@ -135,7 +135,7 @@ try {
     if ($Signals) {
         $produced = $evidence.signal_production_report
         $received = $evidence.signal_report
-        Write-RunLog "signals_published=$($produced.counts.events) signals_received=$($received.counts.events) ranges_published=$($produced.counts.ranges) ranges_received=$($received.counts.ranges) lost=$($received.lost_events) delivery_passed=$($evidence.signal_delivery_passed) reference_comparison=false"
+        Write-RunLog "signals_published=$($produced.counts.events) signals_received=$($received.counts.events) candidate_changes_published=$($produced.counts.ranges) candidate_changes_received=$($received.counts.ranges) lost=$($received.lost_events) delivery_passed=$($evidence.signal_delivery_passed) reference_comparison=false"
         Write-RunLog "state_ready_mean_ns=$($produced.steady_state_inputs.state_ready_ns.mean) state_ready_max_ns=$($produced.steady_state_inputs.state_ready_ns.max) query_mean_ns=$($produced.steady_state_inputs.query_ns.mean) processing_max_ns=$($produced.steady_state_inputs.processing_ns.max)"
         if ($ProfileSignals) { Write-RunLog "profile=true details=report.json websocket_inputs=true" }
     }
@@ -153,10 +153,10 @@ try {
     if ($Signals) {
         if (-not $deliveryWarning -and ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true)) { throw "No complete live state/query measurement; inspect both signal reports and worker.log." }
         $signalReport = $evidence.signal_report
-        if ($signalReport.execution_layout -ne "factorized_roles_v1" -or $signalReport.output_layout -ne "versioned_state_ranges_v1") { throw "Unexpected signal execution layout; inspect checkout.json and worker.log." }
+        if ($signalReport.execution_layout -ne "compact_topologies_cp6a" -or $signalReport.output_layout -ne "versioned_best_candidates_cp6a") { throw "Unexpected compact signal execution layout; inspect checkout.json and worker.log." }
         if ($evidence.reference_comparison_performed -ne $false -or $signalReport.reference_comparison_performed -ne $false) { throw "Unexpected reference comparison in measurement run." }
         if ((-not $deliveryWarning -and $produced.counts.ranges -ne $signalReport.counts.ranges) -or
-            $signalReport.output_capacity -ne 256 -or $signalReport.max_ranges_per_block -ne 64) { throw "Signal range delivery or output bounds differ; inspect both signal reports." }
+            $signalReport.output_capacity -ne 16384) { throw "Compact candidate delivery or output capacity differs; inspect both signal reports." }
         $pipeline = $produced.websocket_inputs
         foreach ($stage in @("transport_decode_us", "transport_to_market_us", "market_processing_us", "price_queue_us", "frame_to_worker_us")) {
             if ($pipeline.$stage.count -ne $produced.counts.websocket_evaluations) { throw "Incomplete WebSocket pipeline timing: $stage" }
