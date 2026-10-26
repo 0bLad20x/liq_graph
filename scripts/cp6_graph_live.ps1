@@ -99,6 +99,12 @@ try {
         hydration_record=if($progress.Count){$progress[0].Line}else{$null}
         signal_error=if($null -ne $production){$production.error}else{'missing production report'}
         signal_websocket_evaluations=if($null -ne $production){$production.counts.websocket_evaluations}else{0}
+        shared_dependency_index=if($null -ne $production -and $null -ne $production.last_plan){$production.last_plan.dependency_index_shared}else{$false}
+        compiled_signal_generation=if($null -ne $production -and $null -ne $production.last_plan){$production.last_plan.generation}else{$null}
+        signal_plan_build_ns=if($null -ne $production){$production.catalog_plan_build_ns}else{$null}
+        max_price_queue_depth=if($null -ne $production){$production.max_price_queue_depth}else{$null}
+        price_queue_us=if($null -ne $production){$production.websocket_inputs.price_queue_us}else{$null}
+        websocket_frame_to_range_consumer_us=if($null -ne $consumer){$consumer.websocket_frame_to_range_consumer_us}else{$null}
         consumer_delivery_loss=if($null -ne $consumer){$consumer.lost_events}else{$null}
         websocket_ready_anchors_by_kind=$ready
         ranges_by_kind=$ranges
@@ -110,6 +116,9 @@ try {
     $summary | Format-List
     if ($exitCode -ne 0 -or -not $finished){throw 'CP6 runtime failed or shutdown incomplete; inspect runtime.log'}
     if ($null -eq $production -or $null -eq $consumer){throw 'Missing signal evidence; inspect logs'}
+    if (-not $summary.shared_dependency_index -or $summary.compiled_signal_generation -le 0){
+        throw 'CP6 shared index or compiled real graph generation missing.'
+    }
     if ($production.counts.websocket_evaluations -le 0 -or $consumer.lost_events -gt 0){
         throw 'CP6 websocket evidence missing or consumer events lost'
     }
