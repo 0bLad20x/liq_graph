@@ -294,7 +294,9 @@ pub async fn run(
         let mint_addresses: Arc<[Pubkey]> =
             Arc::from(catalog.mints.iter().map(|m| m.address).collect::<Vec<_>>());
         last_generation = Some(catalog.generation);
-        output.send_replace(catalog.clone());
+        let old=output.send_replace(catalog.clone());
+        // Old catalog projections can own millions of references.
+        tokio::task::spawn_blocking(move || drop(old));
         if let Some(tx) = &jupiter_mints {
             // A topology generation change need not change the mint universe.
             if tx.borrow().as_ref() != mint_addresses.as_ref() {
