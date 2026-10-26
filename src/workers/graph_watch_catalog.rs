@@ -1,6 +1,6 @@
 //! Read-only projection of the V10 graph into a generational, typed watch catalog.
 //! No source calls, prices, market-quality scoring, execution or strategy filters.
-//! All classifications are facts derivable from validated V10 group roles.
+//! All classifications are facts derivable from validated compact topology roles.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
