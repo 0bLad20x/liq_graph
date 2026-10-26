@@ -11,7 +11,7 @@ use crate::core::{
         SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,SignalRangeBlock,
         SignalRangeChange,SignalRouteKind,SignalRouteRange,SignalSnapshot,SignalStateUpdate,SignalStream,
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_BLOCK_RANGES,SIGNAL_LOG_SCALE}};
-use super::{graph_liquidity::{GraphSnapshot,RouteTopologyKind},graph_watch_catalog::WatchCatalog};
+use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
 const EXECUTION_LAYOUT:&str="compact_topologies_cp6a";
 const OUTPUT_LAYOUT:&str="versioned_best_candidates_cp6a";
@@ -389,7 +389,7 @@ impl Engine {
         Ok(())
     }
 }
-pub async fn run(mut input:PriceEventStream,mut catalogs:watch::Receiver<Arc<WatchCatalog>>,
+pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<GraphSnapshot>>,
     output:broadcast::Sender<Arc<SignalEvent>>,settings:Settings)->Result<ProductionReport>{
     let initial=Arc::new(SignalPlan{graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
         roles:Arc::from([]),groups:Arc::from([]),compact_topologies:Arc::from([]),route_options:0});
@@ -401,17 +401,23 @@ pub async fn run(mut input:PriceEventStream,mut catalogs:watch::Receiver<Arc<Wat
         let started=Instant::now();let received=now_us();
         let mut work=e.begin(SignalTrigger::Catalog{generation:0},started,received,None,input.len());
         e.state(&mut work,true,false,Vec::new())?;e.evaluate(work)?;
-        let mut catalog_open=true;
+        let mut graph_open=true;
         crate::log_event!(Info,"graph signals cp6a started=true output_layout={} compact=true",OUTPUT_LAYOUT);
         loop{tokio::select!{
-            change=catalogs.changed(),if catalog_open=>{
-                if change.is_err(){catalog_open=false;continue;}
-                let c=catalogs.borrow_and_update().clone();
-                if c.generation==e.plan.graph_generation{continue;}
+            change=graphs.changed(),if graph_open=>{
+                if change.is_err(){graph_open=false;continue;}
+                let graph=graphs.borrow_and_update().clone();
+                if graph.generation==e.plan.graph_generation{continue;}
                 let started=Instant::now();let received=now_us();
-                for p in c.pools.iter(){e.prices.bind(p.address,p.mint_a,p.mint_b)?;}
-                e.install(c.graph.clone())?;
-                let mut work=e.begin(SignalTrigger::Catalog{generation:c.generation},
+                // Only pools on a valid route need signal identities. Never
+                // build or wait for a separate WatchCatalog projection.
+                for &(a,b) in graph.pair_topologies.keys(){
+                    for &pool in graph.pools_for_pair(a,b){
+                        e.prices.bind(pool,a,b)?;
+                    }
+                }
+                e.install(graph.clone())?;
+                let mut work=e.begin(SignalTrigger::Catalog{generation:graph.generation},
                     started,received,None,input.len());
                 work.stats.plan_build_ns=nanos(started);
                 e.state(&mut work,true,false,Vec::new())?;
