@@ -16,7 +16,6 @@ use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const V10_MAX_DECLARATIONS: usize = 16;
 
 pub type Pair = (Pubkey, Pubkey);
 
@@ -168,7 +167,6 @@ pub struct GraphSnapshot {
     pub mint_pairs:usize,
     pub pair_pools:HashMap<Pair,Arc<[Pubkey]>>,
     pub pool_pairs:HashMap<Pubkey,Pair>,
-    pub adjacency:HashMap<Pubkey,HashSet<Pubkey>>,
     pub topologies:Arc<[RouteTopology]>,
     pub pair_topologies:HashMap<Pair,Vec<u32>>,
     pub token_index:HashMap<Pubkey,Vec<u32>>,
@@ -332,7 +330,7 @@ fn create(
     let mut changed=changed_pairs.into_iter().collect::<Vec<_>>();
     changed.sort_unstable();
     Ok(GraphSnapshot{generation,qualified_pools:pool_pairs.len(),
-        mint_pairs:pairs.len(),pair_pools:pairs,pool_pairs,adjacency,
+        mint_pairs:pairs.len(),pair_pools:pairs,pool_pairs,
         topologies:topologies.into(),pair_topologies,token_index,
         route_options:options,role_pool_refs:refs,approx_index_bytes:approx,
         changed_pairs:changed.into(),
