@@ -527,6 +527,7 @@ struct Counts {
     evaluations: u64, price_evaluations: u64, websocket_evaluations: u64,
     catalog_evaluations: u64, coverage_evaluations: u64, logarithms_prepared: u64,
     range_blocks: u64, ranges: u64, entered_ranges: u64, updated_ranges: u64, exited_ranges: u64,
+    candidate_batches:u64, candidates:u64,
     websocket_ranges: u64, websocket_candidate_ranges: u64,
     groups_visited: u64, logical_routes_affected: u64, anchors_visited: u64, range_queries: u64,
     ready_anchors: [u64;4], websocket_ready_anchors: [u64;4], ranges_by_kind: [u64;4],
@@ -535,6 +536,21 @@ impl Counts {
     fn state(&mut self, s: &SignalStateUpdate) {
         self.events+=1; self.state_updates+=1; self.changed_pools+=s.changes.len() as u64;
         self.plan_snapshots+=u64::from(s.snapshot.is_some()); self.resets+=u64::from(s.clear);
+    }
+    fn candidate(&mut self,b:&SignalCandidateBatch) {
+        self.events+=1;self.candidate_batches+=1;self.candidates+=b.candidates.len() as u64;
+        for c in &b.candidates {
+            self.ranges+=1;
+            match c.change {
+                SignalRangeChange::Entered=>self.entered_ranges+=1,
+                SignalRangeChange::Updated=>self.updated_ranges+=1,
+                SignalRangeChange::Exited=>self.exited_ranges+=1,
+            }
+            if live(&b.trigger) {
+                self.websocket_ranges+=1;
+                self.websocket_candidate_ranges+=u64::from(c.change!=SignalRangeChange::Exited);
+            }
+        }
     }
     fn block(&mut self, b: &SignalRangeBlock) {
         self.events+=1; self.range_blocks+=1; self.ranges+=b.ranges.len() as u64;
@@ -607,17 +623,17 @@ pub struct ProductionReport {
     max_price_queue_depth: usize, max_output_queue_depth: usize,
 }
 impl ProductionReport {
-    fn plan(&mut self, p: &ExecutionPlan, prices: &Prices, ns: u64) {
+    fn plan(&mut self,p:&Arc<SignalPlan>,index:&CompactIndex,prices:&Prices,ns:u64){
         self.catalog_plan_build_ns.add(ns);
         self.last_plan=Some(serde_json::json!({
-            "generation":p.data.graph_generation,"pools":prices.pools.len(),"roles":p.roles.len(),
-            "groups":p.data.groups.len(),"logical_routes":p.data.route_options,
-            "role_slot_references":p.roles.iter().map(|r|r.definition.slots.len()).sum::<usize>(),
-            "ordered_entries_at_install":p.roles.iter().map(|r|r.ordered.len()).sum::<usize>(),
-            "dependency_bindings":p.graph.pool_index.values().map(Vec::len).sum::<usize>(),
+            "generation":p.graph_generation,"pools":prices.pools.len(),
+            "compact_topologies":p.compact_topologies.len(),
+            "legacy_groups_compiled":0,"logical_routes":p.route_options,
+            "directed_price_roles":index.ranked.len(),
+            "ordered_entries_at_install":index.ranked.values().map(BTreeSet::len).sum::<usize>(),
             "dependency_index_shared":true,"build_ns":ns,
         }));
-        crate::log_event!(Info,"graph signals plan={}",self.last_plan.as_ref().unwrap());
+        crate::log_event!(Info,"graph signals cp6a plan={}",self.last_plan.as_ref().unwrap());
     }
     fn record(&mut self, e: &SignalEvaluation) {
         self.counts.evaluation(e); self.all_inputs.record(e);
