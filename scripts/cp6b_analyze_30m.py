@@ -222,11 +222,11 @@ def run(args):
     complete_count=0
     rows=[]
     for gen in all_gen:
-        row={"generation":gen,**graph_rows.get(gen,{}),**graph_deltas.get(gen,{}),**{
-            "reference_verified":gen in verified,
-            "reference_us":verified.get(gen,{}).get("reference_us"),
-            "transition_"+k:v for k,v in graph_summaries.get(gen,{}).items()},
-            **graph_impacts.get(gen,{})}
+        row={"generation":gen,**graph_rows.get(gen,{}),**graph_deltas.get(gen,{}),
+             "reference_verified":gen in verified,
+             "reference_us":verified.get(gen,{}).get("reference_us"),
+             **{"transition_"+k:v for k,v in graph_summaries.get(gen,{}).items()},
+             **graph_impacts.get(gen,{})}
         check=audit_by_gen.get(gen)
         if check:
             complete_count+=1
