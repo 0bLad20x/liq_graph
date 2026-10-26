@@ -65,6 +65,28 @@ pub struct SignalCandidate {
     /// Only present for entering/updating profitable candidates.
     pub witness: Option<SignalWitness>,
 }
+/// Current membership, not an Entered event or an instruction to execute.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SignalActiveCandidate {
+    pub topology_id: usize,
+    pub reverse: bool,
+    pub witness: SignalWitness,
+}
+/// Work and membership changes between the two actually installed generations.
+#[derive(Default, Debug, serde::Serialize)]
+pub struct SignalCatalogReconciliation {
+    pub previous_generation: u64,
+    pub changed_pairs: usize,
+    pub added_topologies: usize,
+    pub removed_topologies: usize,
+    pub reused_topologies: usize,
+    pub reevaluated_topologies: usize,
+    pub entered_candidates: usize,
+    pub updated_candidates: usize,
+    pub exited_candidates: usize,
+    pub unchanged_candidates: usize,
+    pub active_candidates: usize,
+}
 #[derive(Debug, serde::Serialize)]
 pub struct SignalCandidateBatch {
     pub sequence: u64, pub revision: u64, pub graph_generation: u64,
@@ -84,13 +106,18 @@ pub struct SignalPlan {
 pub struct SignalSnapshot {
     pub plan: Arc<SignalPlan>, pub pools: Vec<SignalPool>,
     pub prices: Vec<Option<Arc<SignalPoolPrice>>>,
+    pub threshold_units: i64,
+    /// Authoritative replacement after catalog reconciliation. Missing keys are withdrawn.
+    /// Pool slots and topology IDs refer exclusively to this snapshot's state/plan.
+    pub candidates: Vec<SignalActiveCandidate>,
 }
 #[derive(Debug, serde::Serialize)]
 pub struct SignalPriceChange {
     pub pool_id: usize, pub identity: SignalPool,
     pub price: Option<Arc<SignalPoolPrice>>,
 }
-/// Apply in stream order. A snapshot replaces the generation; clear withdraws all prices.
+/// Apply in stream order. A snapshot replaces the generation AND candidate membership;
+/// clear withdraws all prices and candidates. Neither operation requests execution.
 /// IDs address this published state only, never another worker's private memory.
 #[derive(Debug, serde::Serialize)]
 pub struct SignalStateUpdate {
@@ -129,6 +156,9 @@ pub struct SignalEvaluation {
     pub anchors_visited: u64, pub ready_anchors: [u64; 4], pub range_queries: u64,
     /// Counts best-candidate transitions, not individual pool-combination routes.
     pub ranges: [u64; 3], pub ranges_by_kind: [u64; 4],
+    /// Catalog transitions are delivered by the authoritative State snapshot,
+    /// separately from ordinary Candidates change events counted in ranges.
+    pub catalog: Option<SignalCatalogReconciliation>,
     pub logarithms_prepared: u64, pub price_preparation_ns: u64, pub index_update_ns: u64,
     /// Input acceptance to complete factorized state/index readiness, before output.
     pub state_ready_ns: u64,

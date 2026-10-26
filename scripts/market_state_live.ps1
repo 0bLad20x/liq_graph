@@ -153,7 +153,7 @@ try {
     if ($Signals) {
         if (-not $deliveryWarning -and ($evidence.signal_delivery_passed -ne $true -or $evidence.signal_calculation_passed -ne $true)) { throw "No complete live state/query measurement; inspect both signal reports and worker.log." }
         $signalReport = $evidence.signal_report
-        if ($signalReport.execution_layout -ne "compact_topologies_cp6a" -or $signalReport.output_layout -ne "versioned_best_candidates_cp6a") { throw "Unexpected compact signal execution layout; inspect checkout.json and worker.log." }
+        if ($signalReport.execution_layout -ne "compact_topologies_cp6a" -or $signalReport.output_layout -ne "versioned_candidate_state_cp7") { throw "Unexpected compact signal execution layout; inspect checkout.json and worker.log." }
         if ($evidence.reference_comparison_performed -ne $false -or $signalReport.reference_comparison_performed -ne $false) { throw "Unexpected reference comparison in measurement run." }
         if ((-not $deliveryWarning -and $produced.counts.ranges -ne $signalReport.counts.ranges) -or
             $signalReport.output_capacity -ne 16384) { throw "Compact candidate delivery or output capacity differs; inspect both signal reports." }

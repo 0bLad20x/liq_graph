@@ -1,4 +1,75 @@
-# Graph signals: factorized state and versioned interval output
+# Graph signals: compact candidate state
+
+## CP7: catalog reconciliation (implementation; live acceptance pending)
+
+The current output layout is `versioned_candidate_state_cp7`; numerical price
+weights, threshold, graph admission and the four route forms are unchanged.
+
+On a graph change, `graph_signals` compares the **two actually installed**
+generations, not just the latest graph delta (watch channels may coalesce updates).
+It remaps winners by mathematical topology identity and directed roles. Only new
+topologies or those using changed pool-alternative lists are reevaluated, against
+the prices already retained by the signal worker. Unchanged winners are reused;
+a changed generation-local ID is not a new candidate. Removed topologies are
+withdrawn. No price update or ranking change is required to finish this work.
+
+The published `State.snapshot` atomically replaces plan, prices **and the entire
+current candidate membership**. `snapshot.candidates` contains active witnesses,
+not Entered events or execution commands. Every witness uses this snapshot's pool
+slots, topology IDs, threshold and current observations. Snapshot absence means
+withdrawal of a prior key; IDs from an old plan must never be applied to the new
+one. The regular price/coverage `Candidates` deltas continue after that snapshot.
+`clear` withdraws all prices and candidate keys. Both existing consumers validate
+the replacement and subsequent membership transitions. An existing full snapshot
+also restores candidate membership after output loss; no new replay service,
+snapshot timer or guarantee about the time until that snapshot is added here.
+
+Catalog changes are accounted in `Evaluated.catalog` and cumulative `counts.catalog_*`.
+They do not inflate ordinary `Candidates`/`ranges` counts. The producer logs one
+`cp7_catalog` summary per reconciliation and retains bounded `catalog_examples`
+with actual entered/updated witnesses, topology, source observations and generation.
+`snapshot_candidates` counts membership entries delivered, including reused ones;
+it is not a count of new opportunities. No full reference recomputation is added
+to price processing. Snapshot construction/validation cost remains observable in
+the existing producer/consumer timings.
+
+`execution_candidates` mirrors catalog membership but does not enqueue it. Only
+the existing non-initialization WebSocket Price revisions can enqueue V10 jobs;
+baseline, catalog and coverage remain state-only. Queue policy, seed selection,
+packing, signer/RPC behavior and economic assumptions are outside CP7.
+
+Use the existing full-runtime graph runner with real providers and local `.env`:
+
+```powershell
+git fetch origin
+git switch --track origin/cp7-graph-candidate-reconciliation
+git branch --show-current
+git rev-parse --short HEAD
+git status --short
+.\scripts\graph_live.ps1 -ExpectedBranch cp7-graph-candidate-reconciliation -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 -RequireCatalogReconciliation
+```
+
+For an already existing local branch, switch to it and update with `git pull
+--ff-only` instead of repeating `--track`. Preserve tracked local edits before
+switching. The runner requires a committed clean checkout and locked release
+build; it does not simulate or broadcast transactions. In addition to existing
+graph/reference/four-kind delivery checks, the strict option requires actual
+catalog candidate visibility, withdrawal, unchanged reuse, a real catalog
+witness, matching complete producer/consumer counts and zero loss. A quiet or
+insufficient run fails acceptance while preserving its evidence. Examine
+`summary.json`, `signal_production.json`, `signal_consumer.json`, the catalog
+summaries and the retained graph audit together. Unobserved specific cases
+(e.g. Direct2 threshold crossings) remain unproven; a generic successful run must
+not be represented as proof of every transition category or V10 execution.
+
+Build and live status must be attached to the actual branch HEAD. This document
+does not claim that the CP7 implementation has already passed a real live run.
+
+## Historical interval implementation and earlier measurement context
+
+The sections below describe earlier checkpoints. Their Ranges contracts,
+capacities and startup/production-wiring statements are historical; use the CP7
+contract above and current code for the active compact candidate pipeline.
 
 This branch implements the measurement stage of issue #40. It runs one new signal engine.
 There is no reference engine or performance comparison. An opt-in downstream V10 simulation

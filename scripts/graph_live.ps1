@@ -4,7 +4,8 @@ param(
     [ValidateRange(30,86400)][int]$DurationSeconds = 900,
     [ValidateRange(1,50000)][int]$PoolLimit = 15000,
     [ValidateRange(1,100000)][int]$AccountBudget = 25000,
-    [string]$ExpectedBranch = 'main'
+    [string]$ExpectedBranch = 'main',
+    [switch]$RequireCatalogReconciliation
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -75,6 +76,7 @@ try {
         branch=$branch;head=$head;start_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         duration_seconds=$DurationSeconds;pool_limit=$PoolLimit
         ws_account_budget=$AccountBudget;transactions_sent=0;simulation_enabled=$false
+        require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
     }
     $checkout|ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Graph checkout: $branch $head"
@@ -89,7 +91,10 @@ try {
     & $binary --run 2>&1 | Out-File -FilePath $log -Encoding utf8
     $exitCode=$LASTEXITCODE
     $analyzer=Join-Path $repo 'scripts\graph_live_analyze.py'
-    & python $analyzer --audit $auditPath --runtime $log --output $folder --exit-code $exitCode --min-duration ([Math]::Max(30,$DurationSeconds - 15))
+    $analyzerArgs=@('--audit',$auditPath,'--runtime',$log,'--output',$folder,
+        '--exit-code',"$exitCode",'--min-duration',"$([Math]::Max(30,$DurationSeconds - 15))")
+    if ($RequireCatalogReconciliation) {$analyzerArgs+='--require-catalog-reconciliation'}
+    & python $analyzer @analyzerArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Graph live audit not accepted; all evidence retained in $folder"
     }

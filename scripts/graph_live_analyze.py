@@ -277,7 +277,32 @@ def run(args):
     zero_effect=sum(
         as_int(g.get("transition_effective"))==0 for g in rows if
         g.get("transition_effective") is not None)
+    produced_counts=prod.get("counts") or {}
+    consumed_counts=consumer.get("counts") or {}
+    catalog_visibility=(as_int(produced_counts.get("catalog_entered_candidates"))+
+                        as_int(produced_counts.get("catalog_updated_candidates")))>0
+    catalog_withdrawal=as_int(produced_counts.get("catalog_exited_candidates"))>0
+    catalog_reuse=(as_int(produced_counts.get("catalog_reused_topologies"))>0 and
+                   as_int(produced_counts.get("catalog_unchanged_candidates"))>0)
+    catalog_examples=prod.get("catalog_examples") or []
+    catalog_witness=any(e.get("trigger",{}).get("kind")=="catalog" and
+                        e.get("candidate",{}).get("witness") is not None
+                        for e in catalog_examples)
+    catalog_passed=(not prod.get("error") and not consumer.get("error") and
+                    not consumer.get("lost_events") and produced_counts==consumed_counts and
+                    consumer.get("output_layout")=="versioned_candidate_state_cp7" and
+                    as_int(produced_counts.get("catalog_reconciliations"))>0 and
+                    as_int(produced_counts.get("snapshot_candidates"))>0 and
+                    catalog_visibility and catalog_withdrawal and catalog_reuse and catalog_witness)
     stats={
+        "catalog_reconciliation_required":args.require_catalog_reconciliation,
+        "catalog_reconciliation_passed":catalog_passed,
+        "catalog_candidate_visibility_observed":catalog_visibility,
+        "catalog_candidate_withdrawal_observed":catalog_withdrawal,
+        "catalog_reuse_observed":catalog_reuse,
+        "catalog_witness_observed":catalog_witness,
+        "catalog_counts":{k:v for k,v in produced_counts.items() if k.startswith("catalog_") or k=="snapshot_candidates"},
+        "catalog_examples":catalog_examples,
         "branch":checkout.get("branch"),"head":checkout.get("head"),
         "requested_duration_seconds":checkout.get("duration_seconds"),
         "exit_code":args.exit_code,"runtime_completed":completed,
@@ -344,6 +369,8 @@ def run(args):
     last_plan=prod.get("last_plan") or {}
     if (last_plan.get("legacy_groups_compiled") or 0)!=0 or (last_plan.get("compact_topologies") or 0)<=0:
         raise SystemExit("Compact topology plan missing or legacy signal groups compiled.")
+    if args.require_catalog_reconciliation and not catalog_passed:
+        raise SystemExit("CP7 catalog evidence incomplete: require real candidate visibility, withdrawal, unchanged reuse, snapshot delivery and a catalog witness; inspect summary.json.")
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser()
@@ -352,4 +379,5 @@ if __name__=="__main__":
     parser.add_argument("--output",required=True)
     parser.add_argument("--exit-code",type=int,required=True)
     parser.add_argument("--min-duration",type=int,default=1790)
+    parser.add_argument("--require-catalog-reconciliation",action="store_true")
     run(parser.parse_args())
