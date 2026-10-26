@@ -51,6 +51,12 @@ pub struct SignalGroup {
 fn mint_array<S: serde::Serializer>(v: &[Pubkey; 5], s: S) -> Result<S::Ok, S::Error> {
     serde::Serialize::serialize(&v.map(|p| p.to_string()), s)
 }
+fn optional_mint<S:serde::Serializer>(v:&Option<Pubkey>,s:S)->Result<S::Ok,S::Error>{
+    serde::Serialize::serialize(&v.map(|x|x.to_string()),s)
+}
+fn mint_pairs<S:serde::Serializer>(v:&[(Pubkey,Pubkey);4],s:S)->Result<S::Ok,S::Error>{
+    serde::Serialize::serialize(&v.map(|(a,b)|[a.to_string(),b.to_string()]),s)
+}
 /// Immutable, factored V10 topology for signal and execution consumers.
 /// The ordered mint pairs describe the forward route; the reverse is implicit.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -60,7 +66,9 @@ pub struct SignalTopology {
     pub settlement: Pubkey,
     #[serde(with = "super::execution::pubkey_json")]
     pub target: Pubkey,
+    #[serde(serialize_with = "optional_mint")]
     pub bridge: Option<Pubkey>,
+    #[serde(serialize_with = "mint_pairs")]
     pub roles: [(Pubkey, Pubkey);4],
     pub length: usize,
 }
