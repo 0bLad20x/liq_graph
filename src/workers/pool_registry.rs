@@ -492,6 +492,16 @@ impl PoolRegistry {
                             "completion":format!("{:?}",pool.completion_state),
                             "completion_reason":pool.completion_reason_code.map(|r|format!("{r:?}")),
                         }));
+                    if (previous.is_admitted()&&!decision.is_admitted())
+                        ||(previous==CompletionAdmission::NativeTvlBelowMinimum&&decision.is_admitted()){
+                        crate::log_event!(Info,"pool admission_membership_change event={}",
+                            json!({"pool":address.to_string(),
+                                "source":"mint_qualification","at_ms":now,
+                                "venue":format!("{:?}",pool.venue),
+                                "before":format!("{previous:?}"),"after":format!("{decision:?}"),
+                                "native_tvl_usd":admission.native_tvl.get(&address).copied(),
+                                "canonical_tvl_usd":pool.tvl_usd}));
+                    }
                     pool.completion_admission=decision;
                     pool.last_changed_ms=now;
                     updates.push(pool.clone());
@@ -646,6 +656,18 @@ impl PoolRegistry {
                     current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
                         changed=true;
+                        if (previous_admission.is_admitted()&&!current.completion_admission.is_admitted())
+                            ||(previous_admission==CompletionAdmission::NativeTvlBelowMinimum
+                                &&current.completion_admission.is_admitted()){
+                            crate::log_event!(Info,"pool admission_membership_change event={}",
+                                json!({"pool":current.address.to_string(),
+                                    "source":batch.source,"at_ms":batch.received_at_ms,
+                                    "venue":format!("{:?}",current.venue),
+                                    "before":format!("{previous_admission:?}"),
+                                    "after":format!("{:?}",current.completion_admission),
+                                    "native_tvl_usd":admission.native_tvl.get(&current.address).copied(),
+                                    "canonical_tvl_usd":current.tvl_usd}));
+                        }
                         crate::log_event!(Debug,"pool admission_transition event={}",
                             json!({
                                 "pool":current.address.to_string(),
