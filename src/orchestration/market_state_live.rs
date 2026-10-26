@@ -199,7 +199,7 @@ async fn run_inner(signals_enabled:bool,evidence:&mut serde_json::Value)->Result
             None=>None,
         };
         let observer=Task(tokio::spawn(graph_signals::observe(receiver,cfg)));
-        let worker=Task(tokio::spawn(graph_signals::run(prices.subscribe(),catalog_rx.clone(),output.clone(),cfg)));
+        let worker=Task(tokio::spawn(graph_signals::run(prices.subscribe(),graph_rx.clone(),output.clone(),cfg)));
         (Some(output),Some(worker),Some(observer),execution)
     }else{(None,None,None,None)};
     let mut consumer=Task(tokio::spawn(market_state::observe(price_rx,catalog_rx.clone(),settings.trace)));
