@@ -182,7 +182,7 @@ impl ExecutionPlan {
         let mut slot_roles = vec![None; 2*prices.pools.len()];
         let mut groups = Vec::with_capacity(catalog.graph.groups.len());
         let wsol: Pubkey = WSOL.parse()?; let usdc: Pubkey = USDC.parse()?;
-        for (id,g) in catalog.graph.groups.iter().enumerate() {
+        for g in catalog.graph.groups.iter() {
             let s=g.settlement; let t=g.target;
             ensure!(s == wsol || s == usdc, "unsupported settlement");
             let q=if s == wsol { usdc } else { wsol };
@@ -457,9 +457,20 @@ impl Engine {
 /// Compile a topology on a blocking worker. The active price consumer continues
 /// against its previous immutable generation; no event buffering is introduced.
 fn schedule_compile(builds:&mut JoinSet<Result<(ExecutionPlan,u64)>>,
-    catalog:Arc<WatchCatalog>, prices:&mut Prices) -> Result<()> {
-    for p in catalog.pools.iter() { prices.bind(p.address,p.mint_a,p.mint_b)?; }
-    let mut shadow=prices.clone();
+    catalog:Arc<WatchCatalog>, engine:&mut Engine, active:&ExecutionPlan,
+    depth:usize) -> Result<()> {
+    let before=engine.prices.pools.len();
+    for p in catalog.pools.iter() { engine.prices.bind(p.address,p.mint_a,p.mint_b)?; }
+    if engine.prices.pools.len()!=before {
+        // Pool IDs are append-only and may already be used by live events. Publish
+        // the expanded identity map BEFORE any per-pool price delta references it.
+        let started=Instant::now();let received=now_us();
+        let mut work=engine.begin(active,SignalTrigger::Catalog {
+            generation:active.data.graph_generation },started,received,None,depth);
+        engine.state(active,&mut work,true,false,Vec::new())?;
+        engine.evaluate(active,Scope::None,work)?;
+    }
+    let mut shadow=engine.prices.clone();
     builds.spawn_blocking(move || {
         let started=Instant::now();
         let next=ExecutionPlan::compile(catalog,&mut shadow)?;
@@ -484,7 +495,7 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
         let mut catalog_open=true;
         let initial=catalogs.borrow_and_update().clone();
         if initial.generation!=0 {
-            schedule_compile(&mut builds,initial,&mut e.prices)?;
+            schedule_compile(&mut builds,initial,&mut e,&plan,input.len())?;
         }
         crate::log_event!(Info,"graph signals started=true execution_layout={} output_layout={} price_hotpath_independent_of_plan_build=true execution=false",EXECUTION_LAYOUT,OUTPUT_LAYOUT);
         loop { tokio::select! {
@@ -493,7 +504,7 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
                 let next=catalogs.borrow_and_update().clone();
                 if next.generation==plan.data.graph_generation { continue; }
                 if builds.is_empty() {
-                    schedule_compile(&mut builds,next,&mut e.prices)?;
+                    schedule_compile(&mut builds,next,&mut e,&plan,input.len())?;
                 } else {
                     // Coalesce topology generations, never hold price events for them.
                     pending_catalog=Some(next);
@@ -504,7 +515,7 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
                     .context("signal plan build task panicked")??;
                 if let Some(newer)=pending_catalog.take() {
                     if newer.generation>next.data.graph_generation {
-                        schedule_compile(&mut builds,newer,&mut e.prices)?;
+                        schedule_compile(&mut builds,newer,&mut e,&plan,input.len())?;
                         continue;
                     }
                 }
