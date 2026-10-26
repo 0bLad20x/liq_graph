@@ -178,6 +178,10 @@ pub struct GraphSnapshot {
     pub generation: u64,
     pub qualified_pools: usize,
     pub mint_pairs: usize,
+    /// Canonical source of truth for pair alternatives. Never reconstruct it in a consumer.
+    pub pair_pools: HashMap<Pair, Arc<[Pubkey]>>,
+    /// Pool identity mapped directly to a canonical pair (no traversal or DB lookup).
+    pub pool_pairs: HashMap<Pubkey, Pair>,
     pub groups: Vec<Group>,
     pub token_index: HashMap<Pubkey, Vec<u32>>,
     pub pool_index: HashMap<Pubkey, Vec<u32>>,
@@ -187,6 +191,12 @@ pub struct GraphSnapshot {
 }
 
 impl GraphSnapshot {
+    pub fn pools_for_pair(&self, a: Pubkey, b: Pubkey) -> &[Pubkey] {
+        self.pair_pools.get(&pair(a,b)).map_or(&[], |p| p.as_ref())
+    }
+    pub fn pair_for_pool(&self, pool: Pubkey) -> Option<Pair> {
+        self.pool_pairs.get(&pool).copied()
+    }
     pub fn for_token(&self, mint: Pubkey) -> &[u32] {
         self.token_index.get(&mint).map_or(&[], Vec::as_slice)
     }
@@ -202,10 +212,13 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
     let mut edge_count = 0_usize;
     let mut pairs: HashMap<Pair, Vec<Pubkey>> = HashMap::new();
     let mut known_pools = HashSet::new();
+    let mut pool_pairs = HashMap::new();
     for p in pools {
         ensure!(known_pools.insert(p.address),
             "V10 graph received duplicate Prepared pool address {}", p.address);
-        pairs.entry(pair(p.a, p.b)).or_default().push(p.address);
+        let key = pair(p.a,p.b);
+        pairs.entry(key).or_default().push(p.address);
+        pool_pairs.insert(p.address,key);
         edge_count += 1;
     }
     let mut adjacency: HashMap<Pubkey, HashSet<Pubkey>> = HashMap::new();
@@ -353,7 +366,8 @@ fn build(pools: impl Iterator<Item = PreparedPool>, generation: u64) -> Result<G
         + refs * size_of::<Pubkey>()
         + index_items * size_of::<u32>();
     Ok(GraphSnapshot { generation, qualified_pools:edge_count,
-        mint_pairs:pair_map.len(), groups, token_index, pool_index,
+        mint_pairs:pair_map.len(), pair_pools:pair_map, pool_pairs,
+        groups, token_index, pool_index,
         route_options:routes, role_pool_refs:refs, approx_index_bytes:approx })
 }
 
