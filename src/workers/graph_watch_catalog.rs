@@ -38,27 +38,12 @@ impl RouteKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MintRole {
-    Settlement,
-    Target,
-    Bridge,
-    ConversionQuote,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PoolRole {
     DirectSettlement,
     DirectQuote,
     Intermediate,
     BridgeReturn,
     Conversion,
-}
-
-/// A role is only meaningful in the stated route category, not globally.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MintContext {
-    pub kind: RouteKind,
-    pub role: MintRole,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,9 +55,6 @@ pub struct PoolContext {
 #[derive(Clone, Debug)]
 pub struct MintWatch {
     pub address: Pubkey,
-    pub contexts: Arc<[MintContext]>,
-    /// GraphSnapshot group IDs; only valid for this catalog generation.
-    pub group_ids: Arc<[u32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,9 +87,7 @@ pub struct WatchCatalog {
     pub mints: Arc<[MintWatch]>,
     pub pools: Arc<[PoolWatch]>,
     pub pairs: Arc<[PairWatch]>,
-    mint_index: HashMap<Pubkey, usize>,
     pool_index: HashMap<Pubkey, usize>,
-    pair_index: HashMap<MintPair, usize>,
 }
 
 impl WatchCatalog {
@@ -118,28 +98,14 @@ impl WatchCatalog {
             mints: Arc::from([]),
             pools: Arc::from([]),
             pairs: Arc::from([]),
-            mint_index: HashMap::new(),
             pool_index: HashMap::new(),
-            pair_index: HashMap::new(),
         }
-    }
-
-    pub fn for_mint(&self, address: Pubkey) -> Option<&MintWatch> {
-        self.mint_index.get(&address).map(|&i| &self.mints[i])
     }
 
     pub fn for_pool(&self, address: Pubkey) -> Option<&PoolWatch> {
         self.pool_index.get(&address).map(|&i| &self.pools[i])
     }
 
-    pub fn for_pair(&self, a: Pubkey, b: Pubkey) -> Option<&PairWatch> {
-        self.pair_index.get(&pair(a, b)).map(|&i| &self.pairs[i])
-    }
-}
-
-#[derive(Default)]
-struct MintAccumulator {
-    contexts: BTreeSet<MintContext>,
 }
 
 #[derive(Default)]
@@ -156,16 +122,6 @@ struct PairAccumulator {
 
 fn pair(a: Pubkey, b: Pubkey) -> MintPair {
     if a < b { (a, b) } else { (b, a) }
-}
-
-fn mint_role(
-    mints: &mut BTreeMap<Pubkey, MintAccumulator>,
-    address: Pubkey,
-    kind: RouteKind,
-    role: MintRole,
-) {
-    let entry = mints.entry(address).or_default();
-    entry.contexts.insert(MintContext { kind, role });
 }
 
 fn pool_role(
@@ -190,7 +146,7 @@ fn pool_role(
 fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
     let wsol: Pubkey = WSOL.parse()?;
     let usdc: Pubkey = USDC.parse()?;
-    let mut mint_state = BTreeMap::<Pubkey, MintAccumulator>::new();
+    let mut mint_state = BTreeSet::<Pubkey>::new();
     let mut pool_state = BTreeMap::<Pubkey, PoolAccumulator>::new();
 
     for topology in graph.topologies.iter() {
@@ -199,13 +155,13 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         ensure!(settlement==wsol||settlement==usdc,"catalog invalid settlement");
         let quote=if settlement==wsol{usdc}else{wsol};
         let target=topology.target;
-        mint_role(&mut mint_state,settlement,kind,MintRole::Settlement);
-        mint_role(&mut mint_state,target,kind,MintRole::Target);
+        mint_state.insert(settlement);
+        mint_state.insert(target);
         if kind==RouteKind::Direct3||kind==RouteKind::Triangle4 {
-            mint_role(&mut mint_state,quote,kind,MintRole::ConversionQuote);
+            mint_state.insert(quote);
         }
         if let Some(bridge)=topology.bridge {
-            mint_role(&mut mint_state,bridge,kind,MintRole::Bridge);
+            mint_state.insert(bridge);
         }
         for (i,&(a,b)) in topology.directed_roles().iter().enumerate() {
             let role=match (kind,i) {
@@ -234,11 +190,7 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         pair_entry.contexts.extend(entry.contexts.iter().copied());
     }
 
-    let mints: Vec<MintWatch> = mint_state.into_iter().map(|(address, state)| MintWatch {
-        address,
-        contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
-        group_ids: Arc::from(graph.for_token(address)),
-    }).collect();
+    let mints: Vec<MintWatch> = mint_state.into_iter().map(|address| MintWatch { address }).collect();
     let pools: Vec<PoolWatch> = pool_state.into_iter().map(|(address, state)| {
         let (mint_a, mint_b) = state.pair.expect("catalog pool pair established");
         let pair_pool_count = pair_state[&(mint_a, mint_b)].pools.len();
@@ -255,15 +207,12 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
     }).collect();
 
-    let mint_index = mints.iter().enumerate().map(|(i, mint)| (mint.address, i)).collect();
     let pool_index = pools.iter().enumerate().map(|(i, pool)| (pool.address, i)).collect();
-    let pair_index = pairs.iter().enumerate()
-        .map(|(i, pair)| ((pair.mint_a, pair.mint_b), i)).collect();
 
     Ok(WatchCatalog {
         generation: graph.generation,
         graph, mints: Arc::from(mints), pools: Arc::from(pools),
-        pairs: Arc::from(pairs), mint_index, pool_index, pair_index,
+        pairs: Arc::from(pairs), pool_index,
     })
 }
 
