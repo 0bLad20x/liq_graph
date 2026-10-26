@@ -149,6 +149,7 @@ def run(args):
     graph_rows={}
     graph_summaries={}
     graph_impacts={}
+    graph_deltas={}
     verified={}
     gaps=[]
     websocket_providers=collections.defaultdict(collections.Counter)
@@ -176,6 +177,11 @@ def run(args):
             gen=as_int(values.get("generation"))
             graph_summaries[gen]={k:values.get(k) for k in (
                 "observed","effective","no_effect","distinct","bootstrap","batches")}
+        if "graph cp6c_delta generation=" in line:
+            gen=as_int(values.get("generation"))
+            graph_deltas[gen]={k:values.get(k) for k in (
+                "added_mint_pairs","removed_mint_pairs","alternatives_only_pairs",
+                "recounted_topologies","discovered_topologies","removed_topologies")}
         if "graph reference_verified generation=" in line:
             gen=as_int(values.get("generation"))
             verified[gen]=values
@@ -212,11 +218,11 @@ def run(args):
         if "lost " in line and "batches" in line: errors["lost_batches"]+=1
         if "error=" in line and ("rpc provider=" in line or "rpc websocket" in line):
             errors["provider_errors"]+=1
-    all_gen=sorted(set(graph_rows)|set(graph_summaries)|set(graph_impacts)|set(audit_by_gen))
+    all_gen=sorted(set(graph_rows)|set(graph_summaries)|set(graph_impacts)|set(audit_by_gen)|set(graph_deltas))
     complete_count=0
     rows=[]
     for gen in all_gen:
-        row={"generation":gen,**graph_rows.get(gen,{}),**{
+        row={"generation":gen,**graph_rows.get(gen,{}),**graph_deltas.get(gen,{}),**{
             "reference_verified":gen in verified,
             "reference_us":verified.get(gen,{}).get("reference_us"),
             "transition_"+k:v for k,v in graph_summaries.get(gen,{}).items()},
@@ -239,7 +245,9 @@ def run(args):
         ["generation",*FIELDS,*["transition_"+k for k in
          ("observed","effective","no_effect","distinct","bootstrap","batches")],
          "conversion_pair_changed","recomputed_pct","registry_queue_depth",
-         "audit_observed","audit_published","reference_verified","reference_us"]))
+         "audit_observed","audit_published","reference_verified","reference_us",
+         "added_mint_pairs","removed_mint_pairs","alternatives_only_pairs",
+         "recounted_topologies","discovered_topologies","removed_topologies"]))
     csv_write(out/"graph_generations.csv",columns,rows)
     csv_write(out/"websocket_gap_events.csv",
               ["timestamp_ms","provider","source","reason"],gaps)
@@ -303,6 +311,11 @@ def run(args):
         "signal_lost_events":consumer.get("lost_events"),
         "compact_topologies":((prod.get("last_plan") or {}).get("compact_topologies")),
         "last_graph":graph_rows.get(max(graph_rows)) if graph_rows else None,
+        "delta_pair_changes":sum(as_int(row.get("added_mint_pairs"))+as_int(row.get("removed_mint_pairs")) for row in rows),
+        "delta_alternatives_only_pairs":sum(as_int(row.get("alternatives_only_pairs")) for row in rows),
+        "delta_recounted_topologies":sum(as_int(row.get("recounted_topologies")) for row in rows),
+        "delta_discovered_topologies":sum(as_int(row.get("discovered_topologies")) for row in rows),
+        "delta_removed_topologies":sum(as_int(row.get("removed_topologies")) for row in rows),
     }
     with (out/"summary.json").open("w",encoding="utf-8") as out_file:
         json.dump(stats,out_file,indent=2,ensure_ascii=False)
@@ -318,6 +331,8 @@ def run(args):
         raise SystemExit("Producer/consumer candidate count differs.")
     if len(graph_rows)<2 or not observed_count or not published_count:
         raise SystemExit("Insufficient real graph transition evidence.")
+    if not stats["reference_verified_generations"]:
+        raise SystemExit("No exact CP6C full route reference comparison observed.")
     if stats["runtime_measured_seconds"] is None or stats["runtime_measured_seconds"]<args.min_duration:
         raise SystemExit("Real runtime duration was shorter than the requested 30-minute observation.")
     if not (stats["signal_websocket_evaluations"] or 0)>0 or not (stats["signal_producer_candidates"] or 0)>0:
