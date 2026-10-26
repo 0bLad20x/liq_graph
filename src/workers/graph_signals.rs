@@ -513,12 +513,11 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
             result=builds.join_next(), if !builds.is_empty() => {
                 let (mut next,build_ns)=result.context("missing signal plan build")?
                     .context("signal plan build task panicked")??;
-                if let Some(newer)=pending_catalog.take() {
-                    if newer.generation>next.data.graph_generation {
-                        schedule_compile(&mut builds,newer,&mut e,&plan,input.len())?;
-                        continue;
-                    }
-                }
+                // Always install the first completed real plan. With graph generations
+                // arriving faster than a compile, discarding stale completed plans
+                // would otherwise starve the signal engine indefinitely.
+                let upcoming=pending_catalog.take()
+                    .filter(|catalog|catalog.generation>next.data.graph_generation);
                 next.rebase(&e.prices);
                 let old=std::mem::replace(&mut plan,next);
                 // Do not drop millions of ordered role/group allocations on the price task.
@@ -531,6 +530,9 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
                 // Structural publication is not a price trigger. Price WS updates
                 // continue through the active plan during future compiles.
                 e.evaluate(&plan,Scope::None,work)?;
+                if let Some(newer)=upcoming {
+                    schedule_compile(&mut builds,newer,&mut e,&plan,input.len())?;
+                }
             },
             event=input.recv() => match event {
                 Ok(event) => match event.as_ref() {
