@@ -382,33 +382,54 @@ fn new_edge_targets(new_edges:&HashSet<Pair>,adj:&HashMap<Pubkey,HashSet<Pubkey>
             let ns=adj.get(&s);
             let nq=adj.get(&q);
             if pair(a,b)==pair(s,q) {
-                // A new conversion edge can complete every Direct3 and
-                // Triangle4 family using the opposite Settlement token.
-                for &t in ns.into_iter().flatten() {
+                // The conversion edge can complete paths for all existing
+                // direct targets and bridges. Includes Triangle3 S-T-Q-S.
+                for &t in ns.into_iter().flatten(){
                     if t!=s {targets.insert((s,t));}
                 }
+                continue;
             }
-            for (t,x) in [(a,b),(b,a)] {
-                if t!=s && ns.is_some_and(|n|n.contains(&t)) {
-                    // New direct settlement leg, new T-Q quote leg, or
-                    // a newly connected middle leg's target.
-                    targets.insert((s,t));
-                }
-                if x!=s && ns.is_some_and(|n|n.contains(&x)) {
-                    // Newly available S-X is Triangle3's return leg;
-                    // when Q-X is new this includes Triangle4's bridge leg.
-                    if let Some(nx)=adj.get(&x) {
-                        for &t in nx {
-                            if t!=s && ns.is_some_and(|n|n.contains(&t)) {
-                                targets.insert((s,t));
-                            }
+            if a==s || b==s {
+                let x=if a==s{b}else{a};
+                // First leg S->T, and Triangle3 return B->S where B=X.
+                targets.insert((s,x));
+                if let Some(nx)=adj.get(&x) {
+                    for &t in nx {
+                        if t!=s && t!=x && ns.is_some_and(|n|n.contains(&t)){
+                            targets.insert((s,t));
                         }
                     }
                 }
-                if t!=s && x!=q
-                    && ns.is_some_and(|n|n.contains(&t))
-                    && nq.is_some_and(|n|n.contains(&x)) {
-                    // Newly available T-X can be the middle leg in Triangle4.
+                continue;
+            }
+            if a==q || b==q {
+                let x=if a==q{b}else{a};
+                // New quoted T->Q leg (Direct3), or B->Q (Triangle4).
+                // B need not be S-adjacent: find every S-T-X path.
+                if ns.is_some_and(|n|n.contains(&x)){targets.insert((s,x));}
+                if let Some(nx)=adj.get(&x){
+                    for &t in nx {
+                        if t!=s && ns.is_some_and(|n|n.contains(&t)){
+                            targets.insert((s,t));
+                        }
+                    }
+                }
+                // Triangle3 S->Q->X->S, when S-Q already exists.
+                if ns.is_some_and(|n|n.contains(&q))
+                    && ns.is_some_and(|n|n.contains(&x)){
+                    targets.insert((s,q));
+                }
+                continue;
+            }
+            // Interior leg T-B. Either orientation is possible.
+            // Triangle3 requires S-T and S-B. Triangle4 requires
+            // S-T, B-Q, and the independent conversion edge Q-S.
+            for (t,bridge) in [(a,b),(b,a)]{
+                if t==s||t==q {continue;}
+                if !ns.is_some_and(|n|n.contains(&t)){continue;}
+                if ns.is_some_and(|n|n.contains(&bridge))
+                    ||(nq.is_some_and(|n|n.contains(&bridge))
+                        &&ns.is_some_and(|n|n.contains(&q))){
                     targets.insert((s,t));
                 }
             }
