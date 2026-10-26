@@ -157,12 +157,13 @@ fn transition_json(t:&ObservedTransition,generation:u64,event:&str,
 struct AuditBatch {
     generation:u64,
     bootstrap:bool,
+    no_op:bool,
     traces:Vec<ObservedTransition>,
     before_pairs:HashMap<Pubkey,Option<Pair>>,
     after_pairs:HashMap<Pubkey,Option<Pair>>,
 }
 fn write_audit_batch(writer:&mut BufWriter<File>, batch:AuditBatch)->Result<()>{
-    let AuditBatch{generation,bootstrap,traces,before_pairs,after_pairs}=batch;
+    let AuditBatch{generation,bootstrap,no_op,traces,before_pairs,after_pairs}=batch;
     let get_after=|address:&Pubkey|after_pairs.get(address).copied().flatten();
     let mut observed=0_u64;
     let mut published=0_u64;
@@ -170,13 +171,15 @@ fn write_audit_batch(writer:&mut BufWriter<File>, batch:AuditBatch)->Result<()>{
         let prior=before_pairs.get(&t.address).copied().flatten();
         let after=get_after(&t.address);
         serde_json::to_writer(&mut *writer,
-            &transition_json(t,generation,"observed",prior,after,prior!=after))?;
+            &transition_json(t,generation,if no_op{"cancelled"}else{"observed"},
+                prior,after,prior!=after))?;
         writer.write_all(b"\n")?;
         observed+=1;
     }
     let mut latest=HashMap::new();
     for (i,t) in traces.iter().enumerate(){latest.insert(t.address,i);}
     for (&address,&before) in &before_pairs {
+        if no_op {continue;}
         let after=get_after(&address);
         if before==after{continue;}
         if let Some(&index)=latest.get(&address){
@@ -188,7 +191,8 @@ fn write_audit_batch(writer:&mut BufWriter<File>, batch:AuditBatch)->Result<()>{
         }
     }
     serde_json::to_writer(&mut *writer,&serde_json::json!({
-        "event":"audit_generation_complete","generation":generation,
+        "event":if no_op{"audit_no_op_complete"}else{"audit_generation_complete"},
+        "generation":generation,
         "bootstrap":bootstrap,"observed":observed,"published":published,
         "distinct_pools":before_pairs.len(),
         "no_effect":before_pairs.len().saturating_sub(published as usize)
@@ -648,9 +652,12 @@ pub async fn run(
     let mut generation=0_u64;
     let mut source_open=true;
     let mut pending_batches=0_usize;
+    let mut skipped_no_op_windows=0_u64;
+    let reference_every=std::env::var("CP6C_REFERENCE_EVERY")
+        .ok().and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);
     let mut last_source="persistence_restore";
     let mut next_rebuild=TokioInstant::now();
-    let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str,Vec<ObservedTransition>,HashMap<Pubkey,Option<Pair>>,bool)>>::new();
+    let mut builds=JoinSet::<Result<(GraphSnapshot,u128,usize,usize,&'static str,Vec<ObservedTransition>,HashMap<Pubkey,Option<Pair>>,bool,Option<u128>)>>::new();
     let (audit_tx, audit_writer)=match std::env::var("GRAPH_DIAGNOSTIC_JSONL_PATH") {
         Ok(path) if !path.trim().is_empty()=>{
             let file=File::create(&path).with_context(||format!("create graph audit {path}"))?;
@@ -713,7 +720,7 @@ pub async fn run(
                 Err(broadcast::error::RecvError::Closed)=>source_open=false,
             },
             result=builds.join_next(),if !builds.is_empty()=>{
-                let (graph,micros,changes,batches,source,traces,before_pairs,bootstrap)=result
+                let (graph,micros,changes,batches,source,traces,before_pairs,bootstrap,reference_us)=result
                     .context("missing graph delta build")?
                     .context("graph delta task panicked")??;
                 let effective=before_pairs.iter().filter(|(pool,prior)|
@@ -730,8 +737,13 @@ pub async fn run(
                         .map(|pool|(*pool,graph.pair_for_pool(*pool)))
                         .collect::<HashMap<_,_>>();
                     sink.try_send(AuditBatch{
-                        generation:graph.generation,bootstrap,traces,before_pairs,after_pairs,
+                        generation:graph.generation,bootstrap,no_op:false,traces,before_pairs,after_pairs,
                     }).map_err(|e|anyhow::anyhow!("graph audit queue full/closed: {e}"))?;
+                }
+                if let Some(us)=reference_us{
+                    crate::log_event!(Info,
+                        "graph reference_verified generation={} exact_identity=true directed_roles=true route_options=true checked_topologies={} reference_us={}",
+                        graph.generation,graph.topologies.len(),us);
                 }
                 let total=graph.topologies.len();
                 crate::log_event!(Info,
@@ -753,22 +765,44 @@ pub async fn run(
                 tokio::task::spawn_blocking(move||drop(old));
             },
             _=sleep_until(next_rebuild),if !dirty.is_empty()&&builds.is_empty()=>{
-                generation=generation.checked_add(1).context("graph generation overflow")?;
-                let diff=std::mem::take(&mut dirty);
+                let mut diff=std::mem::take(&mut dirty);
                 let traces=std::mem::take(&mut pending_traces);
                 let count=diff.len();
                 let batches=std::mem::take(&mut pending_batches);
                 let source=last_source;
                 let old=output.borrow().clone();
+                let before_pairs=diff.keys().map(|pool|(*pool,old.pair_for_pool(*pool)))
+                    .collect::<HashMap<_,_>>();
+                // Registry updates may cancel within the three-second window.
+                // Compare against the *published* immutable generation and
+                // never publish an identical pool identity graph.
+                diff.retain(|address,next|
+                    old.pair_for_pool(*address)!=next.map(|p|pair(p.a,p.b)));
                 next_rebuild=TokioInstant::now()+REBUILD_SPACING;
+                if diff.is_empty() {
+                    skipped_no_op_windows+=1;
+                    crate::log_event!(Info,
+                        "graph no_op_window published_generation={} observed={} distinct={} batches={} skipped_total={} registry_queue_depth={}",
+                        old.generation,traces.len(),count,batches,skipped_no_op_windows,input.len());
+                    if let Some(ref sink)=audit_tx {
+                        let after_pairs=before_pairs.clone();
+                        sink.try_send(AuditBatch {
+                            generation:old.generation,bootstrap:false,no_op:true,
+                            traces,before_pairs,after_pairs,
+                        }).map_err(|e|anyhow::anyhow!("graph audit no-op queue full/closed: {e}"))?;
+                    }
+                    continue;
+                }
+                generation=generation.checked_add(1).context("graph generation overflow")?;
+                let verify=reference_every>0 && (generation==1 || generation%reference_every==0);
                 builds.spawn_blocking(move||{
                     let started=Instant::now();
                     let bootstrap=old.generation==0;
-                    let before_pairs=diff.keys().map(|pool|(*pool,old.pair_for_pool(*pool)))
-                        .collect::<HashMap<_,_>>();
                     let next=create(old,diff,generation)?;
-                    Ok((next,started.elapsed().as_micros(),count,batches,source,
-                        traces,before_pairs,bootstrap))
+                    let build_us=started.elapsed().as_micros();
+                    let comparison=if verify {Some(compare_reference(&next)?)}else{None};
+                    Ok((next,build_us,count,batches,source,
+                        traces,before_pairs,bootstrap,comparison))
                 });
             },
         }
