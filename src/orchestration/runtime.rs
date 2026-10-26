@@ -567,7 +567,7 @@ pub async fn run()->Result<()>{
                     result
                 });
             }
-            let signal_input=prices.subscribe(); let signal_catalog=catalog_rx.clone();
+            let signal_input=prices.subscribe(); let signal_catalog=graph_rx.clone();
             critical(&mut tasks,"graph_signals",async move {
                 let report=crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?;
                 if let Ok(path)=env::var("GRAPH_RUNTIME_PRODUCTION_REPORT_PATH") {
