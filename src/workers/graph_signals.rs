@@ -520,7 +520,9 @@ pub async fn run(mut input: PriceEventStream, mut catalogs: watch::Receiver<Arc<
                     }
                 }
                 next.rebase(&e.prices);
-                plan=next;
+                let old=std::mem::replace(&mut plan,next);
+                // Do not drop millions of ordered role/group allocations on the price task.
+                tokio::task::spawn_blocking(move || drop(old));
                 let started=Instant::now(); let received=now_us();
                 let mut work=e.begin(&plan,SignalTrigger::Catalog { generation:plan.data.graph_generation },started,received,None,input.len());
                 work.stats.plan_build_ns=build_ns;
