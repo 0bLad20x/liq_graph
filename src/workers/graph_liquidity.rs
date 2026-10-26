@@ -340,6 +340,109 @@ impl GraphSnapshot {
         self.token_index.get(&mint).map_or(&[],Vec::as_slice)
     }
 }
+// CP6C invariant: a topology is defined only by its directed mint roles.
+// Pools are alternative edges; their number changes route multiplicity,
+// never the mathematical directed cycle. Direct2 uniquely requires n >= 2.
+fn topology_identity(t:&RouteTopology)->(RouteTopologyKind,Pubkey,Pubkey,Option<Pubkey>){
+    (t.kind,t.settlement,t.target,t.bridge)
+}
+fn topology_options(t:&RouteTopology,pairs:&HashMap<Pair,Arc<[Pubkey]>>)->Result<Option<u64>>{
+    let count=|a,b|pairs.get(&pair(a,b)).map_or(0_u64,|v|v.len() as u64);
+    let roles=t.directed_roles();
+    if t.kind==RouteTopologyKind::Direct2{
+        let n=count(roles[0].0,roles[0].1);
+        if n<2{return Ok(None);}
+        return Ok(Some(n.checked_mul(n-1).context("Direct2 option count overflow")?));
+    }
+    let mut options=2_u64; // Exact existing convention: forward + reverse.
+    for &(a,b) in roles{
+        let n=count(a,b);
+        if n==0{return Ok(None);}
+        options=options.checked_mul(n).context("compact route option overflow")?;
+    }
+    Ok(Some(options))
+}
+fn direct2_shape(s:Pubkey,t:Pubkey,n:u64)->Result<RouteTopology>{
+    let options=n.checked_mul(n-1).context("Direct2 option count overflow")?;
+    let mut roles=[(Pubkey::default(),Pubkey::default());4];
+    roles[0]=(s,t);roles[1]=(t,s);
+    Ok(RouteTopology{kind:RouteTopologyKind::Direct2,settlement:s,target:t,
+        bridge:None,roles,length:2,route_options:options})
+}
+/// Every newly possible 2-, 3- or 4-leg mint cycle must contain at least
+/// one previously absent undirected pair. Enumerate candidate targets by
+/// placing that new pair into each of the four supported role positions.
+/// This is a conservative target superset; a final directed-role membership
+/// predicate below excludes all unaffected shapes.
+fn new_edge_targets(new_edges:&HashSet<Pair>,adj:&HashMap<Pubkey,HashSet<Pubkey>>,
+    wsol:Pubkey,usdc:Pubkey)->HashSet<(Pubkey,Pubkey)>{
+    let mut targets=HashSet::new();
+    for &(a,b) in new_edges {
+        for (s,q) in [(wsol,usdc),(usdc,wsol)] {
+            let ns=adj.get(&s);
+            let nq=adj.get(&q);
+            if pair(a,b)==pair(s,q) {
+                // A new conversion edge can complete every Direct3 and
+                // Triangle4 family using the opposite Settlement token.
+                for &t in ns.into_iter().flatten() {
+                    if t!=s {targets.insert((s,t));}
+                }
+            }
+            for (t,x) in [(a,b),(b,a)] {
+                if t!=s && ns.is_some_and(|n|n.contains(&t)) {
+                    // New direct settlement leg, new T-Q quote leg, or
+                    // a newly connected middle leg's target.
+                    targets.insert((s,t));
+                }
+                if x!=s && ns.is_some_and(|n|n.contains(&x)) {
+                    // Newly available S-X is Triangle3's return leg;
+                    // when Q-X is new this includes Triangle4's bridge leg.
+                    if let Some(nx)=adj.get(&x) {
+                        for &t in nx {
+                            if t!=s && ns.is_some_and(|n|n.contains(&t)) {
+                                targets.insert((s,t));
+                            }
+                        }
+                    }
+                }
+                if t!=s && x!=q
+                    && ns.is_some_and(|n|n.contains(&t))
+                    && nq.is_some_and(|n|n.contains(&x)) {
+                    // Newly available T-X can be the middle leg in Triangle4.
+                    targets.insert((s,t));
+                }
+            }
+        }
+    }
+    targets
+}
+/// Live comparison against the *unchanged* original full route enumerator.
+/// It checks exact identity, directed roles, option multiplicities and
+/// the corresponding pair pools. No price or simulated input is involved.
+fn compare_reference(graph:&GraphSnapshot)->Result<u128>{
+    let started=Instant::now();
+    let mut adj=HashMap::<Pubkey,HashSet<Pubkey>>::new();
+    for &(a,b) in graph.pair_pools.keys(){
+        adj.entry(a).or_default().insert(b);
+        adj.entry(b).or_default().insert(a);
+    }
+    let wsol:Pubkey=WSOL.parse()?;
+    let usdc:Pubkey=USDC.parse()?;
+    let (full,_)=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None)?;
+    ensure!(full.len()==graph.topologies.len(),
+        "CP6C reference mismatch generation={} cardinality delta={} full={}",
+        graph.generation,graph.topologies.len(),full.len());
+    for (i,(got,expected)) in graph.topologies.iter().zip(full.iter()).enumerate(){
+        ensure!(topology_identity(got)==topology_identity(expected)
+            &&got.directed_roles()==expected.directed_roles()
+            &&got.route_options==expected.route_options,
+            "CP6C reference mismatch generation={} topology_index={} kind={:?} settlement={} target={} bridge={:?} actual_options={} reference_options={}",
+            graph.generation,i,got.kind,got.settlement,got.target,got.bridge,
+            got.route_options,expected.route_options);
+    }
+    Ok(started.elapsed().as_micros())
+}
+
 fn create(
     old:Arc<GraphSnapshot>, updates:HashMap<Pubkey,Option<PreparedPool>>,generation:u64,
 )->Result<GraphSnapshot>{
@@ -378,50 +481,75 @@ fn create(
     }
     let wsol:Pubkey=WSOL.parse()?;
     let usdc:Pubkey=USDC.parse()?;
-    // Rebuild only (settlement,target) shapes touching a changed pair. A changed
-    // conversion pair legitimately touches every topology using conversion.
-    let previous_targets=old.topologies.iter().map(|t|(t.settlement,t.target))
-        .collect::<HashSet<_>>();
     let initial=old.generation==0;
-    let mut affected=HashSet::<(Pubkey,Pubkey)>::new();
-    for &(a,b) in &changed_pairs {
-        if initial {break;}
-        for &s in &[wsol,usdc]{
-            let mut targets=HashSet::from([a,b]);
-            targets.extend(adjacency.get(&a).into_iter().flatten().copied());
-            targets.extend(adjacency.get(&b).into_iter().flatten().copied());
-            if pair(a,b)==pair(wsol,usdc){
-                targets.extend(adjacency.get(&s).into_iter().flatten().copied());
+    let new_edges=changed_pairs.iter().copied().filter(|p|
+        !old.pair_pools.contains_key(p)&&pairs.contains_key(p)).collect::<HashSet<_>>();
+    let removed_edges=changed_pairs.iter().copied().filter(|p|
+        old.pair_pools.contains_key(p)&&!pairs.contains_key(p)).count();
+    let mut topologies=Vec::with_capacity(old.topologies.len()+new_edges.len()*4);
+    let mut reused_count=0_usize;
+    let mut recounted_count=0_usize;
+    let mut removed_count=0_usize;
+    if initial {
+        topologies=build_topologies(&pairs,&adjacency,wsol,usdc,None)?.0.to_vec();
+    } else {
+        // Fast path: existing cycle shapes survive pool alternative changes.
+        // Recompute multiplicities only for shapes that use a changed pair.
+        for t in old.topologies.iter(){
+            let affected=t.directed_roles().iter().any(|&(a,b)|changed_pairs.contains(&pair(a,b)));
+            if !affected{
+                topologies.push(t.clone());
+                reused_count+=1;
+                continue;
             }
-            for t in targets {
-                if t!=s && (adjacency.get(&s).is_some_and(|n|n.contains(&t))
-                    ||previous_targets.contains(&(s,t))){
-                    affected.insert((s,t));
+            match topology_options(t,&pairs)? {
+                Some(options)=>{
+                    let mut updated=t.clone();
+                    updated.route_options=options;
+                    topologies.push(updated);
+                    recounted_count+=1;
+                },
+                None=>removed_count+=1,
+            }
+        }
+        let existing=old.topologies.iter().map(topology_identity).collect::<HashSet<_>>();
+        // Only new *mint connections* can introduce previously impossible
+        // Direct3/Triangle3/Triangle4 shapes. No global target traversal.
+        if !new_edges.is_empty(){
+            let targets=new_edge_targets(&new_edges,&adjacency,wsol,usdc);
+            if !targets.is_empty(){
+                let (discovered,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&targets))?;
+                for t in discovered.iter(){
+                    if t.kind==RouteTopologyKind::Direct2{continue;}
+                    if existing.contains(&topology_identity(t)){continue;}
+                    if !t.directed_roles().iter().any(|&(a,b)|new_edges.contains(&pair(a,b))){
+                        continue;
+                    }
+                    topologies.push(t.clone());
                 }
             }
         }
-        // Removed pairs may be absent in the new adjacency: discover their old paths.
-        for &id in old.topologies_for_pair(a,b){
-            let top=&old.topologies[id as usize];
-            affected.insert((top.settlement,top.target));
+        // Direct2's unique topology birth is n:1->2, even when the
+        // undirected mint pair existed before this generation.
+        for &(a,b) in &changed_pairs{
+            let old_n=old.pair_pools.get(&pair(a,b)).map_or(0,|v|v.len());
+            let new_n=pairs.get(&pair(a,b)).map_or(0,|v|v.len());
+            if old_n>=2||new_n<2{continue;}
+            for &settlement in &[wsol,usdc]{
+                let target=if a==settlement{b}else if b==settlement{a}else{continue};
+                let candidate=direct2_shape(settlement,target,new_n as u64)?;
+                if !existing.contains(&topology_identity(&candidate)){
+                    topologies.push(candidate);
+                }
+            }
         }
     }
-    let retained_count=if initial {0}else{old.topologies.iter()
-        .filter(|t|!affected.contains(&(t.settlement,t.target))).count()};
-    let mut topologies=if initial {
-        build_topologies(&pairs,&adjacency,wsol,usdc,None)?.0.to_vec()
-    } else {
-        let mut retained=old.topologies.iter()
-            .filter(|t|!affected.contains(&(t.settlement,t.target)))
-            .cloned().collect::<Vec<_>>();
-        if !affected.is_empty() {
-            let (regenerated,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&affected))?;
-            retained.extend(regenerated.iter().cloned());
-        }
-        retained
+    let generated_count=if initial {topologies.len()}else{
+        topologies.len().saturating_sub(reused_count+recounted_count)
     };
-    let generated_count=topologies.len().saturating_sub(retained_count);
     topologies.sort_unstable_by_key(|t| (t.settlement,t.target,t.bridge,t.kind));
+    ensure!(topologies.len()==reused_count+recounted_count+generated_count,
+        "CP6C delta topology accounting mismatch");
     ensure!(topologies.windows(2).all(|w|
         (w[0].settlement,w[0].target,w[0].bridge,w[0].kind)
         !=(w[1].settlement,w[1].target,w[1].bridge,w[1].kind)),
@@ -479,8 +607,9 @@ fn create(
         topologies:topologies.into(),pair_topologies,token_index,
         route_options:options,role_pool_refs:refs,approx_index_bytes:approx,
         changed_pairs:changed.into(),
-        recomputed_targets:affected.len(),regenerated_topologies:generated_count,
-        reused_topologies:retained_count})
+        recomputed_targets:new_edges.len()+removed_edges,
+        regenerated_topologies:recounted_count+generated_count,
+        reused_topologies:reused_count})
 }
 const REBUILD_SPACING:Duration=Duration::from_secs(3);
 /// Registry is the sole writer; every immutable generation publishes atomically.
