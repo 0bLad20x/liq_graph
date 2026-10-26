@@ -144,6 +144,8 @@ def run(args):
     gaps=[]
     websocket_providers=collections.defaultdict(collections.Counter)
     http_stats={}
+    mint_crossings=[]
+    admission_crossings=[]
     errors=collections.Counter()
     completed=False
     for line in pathlib.Path(args.runtime).open(encoding="utf-8",errors="replace"):
@@ -182,6 +184,10 @@ def run(args):
                         "calls","ok","failed","avg_ms","max_ms","http_401","http_403",
                         "http_429","invalid_response","transport","other")}
                 }
+        if "mint qualification_transition event=" in line:
+            mint_crossings.append(json.loads(line.split("mint qualification_transition event=",1)[1]))
+        if "pool admission_membership_change event=" in line:
+            admission_crossings.append(json.loads(line.split("pool admission_membership_change event=",1)[1]))
         if "critical worker " in line: errors["critical_worker"]+=1
         if "lost " in line and "batches" in line: errors["lost_batches"]+=1
         if "error=" in line and ("rpc provider=" in line or "rpc websocket" in line):
@@ -231,6 +237,13 @@ def run(args):
               ["provider","gap_events","disconnects","subscription_reply_timeouts",
                "reconnect_resyncs","handshake_429"],
               sorted(ws_records,key=lambda e:(-e["gap_events"],e["provider"])))
+    csv_write(out/"mint_threshold_crossings.csv",
+              ["mint","source","received_at_ms","was_qualified","is_qualified",
+               "liquidity_usd","market_cap_usd","min_liquidity_usd","min_market_cap_usd"],
+              mint_crossings)
+    csv_write(out/"pool_admission_crossings.csv",
+              ["pool","venue","source","at_ms","before","after","native_tvl_usd",
+               "canonical_tvl_usd"],admission_crossings)
     zero_effect=sum(
         as_int(g.get("transition_effective"))==0 for g in rows if
         g.get("transition_effective") is not None)
@@ -252,6 +265,8 @@ def run(args):
                           for k,v in cause.most_common()],
         "provider_websocket_health":ws_records,
         "provider_gap_total":len(gaps),
+        "mint_threshold_crossings":len(mint_crossings),
+        "pool_admission_crossings":len(admission_crossings),
         "provider_errors":dict(errors),
         "signal_error":prod.get("error"),
         "signal_websocket_evaluations":((prod.get("counts") or {}).get("websocket_evaluations")),
