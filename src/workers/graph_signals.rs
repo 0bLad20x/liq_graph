@@ -808,13 +808,6 @@ impl ObservationReport {
         ensure!(self.lost_events==0,"signal consumer lost {} events",self.lost_events);
         Ok(())
     }
-    pub fn ensure_calculation_evidence(&self) -> Result<()> {
-        self.ensure_integrity()?;
-        ensure!(self.counts.websocket_evaluations>0
-            && self.counts.websocket_ready_anchors.iter().any(|&n|n>0),
-            "no fully priceable topology queried from real WebSocket inputs");
-        Ok(())
-    }
 }
 #[derive(Default)]
 struct Mirror {

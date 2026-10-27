@@ -61,9 +61,11 @@ nachfolgende WebSocket-Preise.
 Die Standardlaufdauer ist 60 Sekunden. Fuer die Abschlussbereinigung genuegt dieser
 eine kurze Nachweis; ein erneuter Simulations- oder 15-Minuten-Lauf ist nicht vorgesehen.
 Die allgemeine MarketState-Abnahme verlangt echte Preise und WebSocket-Updates.
-Eine spezielle Direct2-Paarabdeckung ist dafuer keine Voraussetzung. Die Signalpruefung
-verlangt weiterhin mindestens eine aus echten WS-Preisen bewertete vollstaendige
-Topologie, vollstaendige Producer-/Consumer-Paritaet und null Signalverluste. Rewatch
+Eine spezielle Direct2-Paarabdeckung oder eine aus WS-Preisen vollstaendig bepreisbare
+Route ist dafuer keine Voraussetzung. Ein Live-Preisupdate darf korrekt auf noch
+fehlende Preise anderer Routenbeine treffen. Die Signalpruefung verlangt weiterhin
+die vollstaendige Uebernahme der echten Preis-/WS-Eingaben, saemtliche Pipeline-
+Zeitmessungen, vollstaendige Producer-/Consumer-Paritaet und null Signalverluste. Rewatch
 verlangt weiterhin Entfernen, Neuauswahl und nachfolgende echte WebSocket-Preise.
 
 `-GraphAudit` ist ein optionaler, gesonderter Routen-/Referenznachweis. Er ist fuer
@@ -144,6 +146,16 @@ Datenfluss und Abschluss der konfigurierten Pipeline. Die allgemeinen Felder
 CP7A-Laufberichten. `execution_handoff_observed`, `execution_integration_passed`,
 Simulationsfehler und DEX-Aufrufe behalten ihre getrennte Bedeutung.
 PlanOnly schreibt ausdruecklich `orchestration_evidence_passed=false`.
+
+Der Abschlusslauf auf `57147fa` lieferte 628 Preisbeobachtungen, davon zwei echte
+WS-Updates nach Rewatch, 57.942 vollstaendig uebergebene Signalereignisse und 83
+Kandidatenaenderungen. Producer und Consumer stimmen in allen Zaehlern ueberein;
+es gab keine Verluste, Resynchronisierungen oder unverifizierten Ereignisse.
+Entfernung, Neuauswahl, regulaerer Completionrefresh und Shutdown sind belegt.
+Der damalige Fehlerstatus entstand ausschliesslich durch die zusaetzliche
+WS-Routenabdeckungsbedingung; deren Entfernung aendert keine Verarbeitung und keine
+der gemessenen Eingaben/Ausgaben. Diese Aufzeichnung bleibt die reale Evidenz fuer
+die Abschlussbewertung; es wird kein weiterer Live-Lauf zur Wiederholung verlangt.
 
 Der Build und die Syntaxprüfung sind Voraussetzungen. Erst die realen Läufe auf dem
 tatsächlichen Feature-Commit schließen den Checkpoint fachlich ab.

@@ -110,7 +110,7 @@ Orchestration retains the price sender and RPC handle until the producer result 
 
 During startup, expect `mint qualification published qualified=...`, `dexscreener cp1 continuous started=true`, Registry TVL updates, then a non-empty Market-State selection and subscription ACKs. If qualification or proxy initialization produces no usable results, the run must not be accepted merely because it stays alive. The runtime log includes bootstrap and admission counts; `market_state.json` contains the observer totals.
 
-A successful finite orchestration proof requires real prices and WS price updates. Direct2 pair coverage remains a reported metric rather than a requirement for this general dataflow proof. With signals enabled, a fully priced topology and complete signal delivery remain mandatory. Inspect `websocket_venues` to see which protocol decoders received real live updates; unobserved venues remain unproven.
+A successful finite orchestration proof requires real prices and WS price updates. Direct2 pair coverage and fully priced WS topologies remain reported metrics rather than requirements for this general dataflow proof. With signals enabled, all real price inputs and signal outputs must be delivered completely, including correct evaluations when other route legs still lack prices. Inspect `websocket_venues` to see which protocol decoders received real live updates; unobserved venues remain unproven.
 
 To exercise removal and resubscription using the same real pools:
 

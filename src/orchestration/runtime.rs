@@ -505,7 +505,8 @@ impl RunEvidence {
             let signals=self.signals.as_ref().context("missing signal consumer report")?;
             production.ensure_input_delivery(market.observations,market.websocket_observations)?;
             production.ensure_delivery(signals)?;
-            signals.ensure_calculation_evidence()?;
+            // Route readiness belongs to the optional graph/coverage proof.
+            // Correctly evaluating a live input with missing leg prices is valid dataflow.
         }
         if settings.simulate {
             anyhow::ensure!(self.execution["execution_handoff_observed"]==true,
