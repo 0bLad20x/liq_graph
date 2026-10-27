@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -53,18 +54,12 @@ pub struct PoolContext {
 }
 
 #[derive(Clone, Debug)]
-pub struct MintWatch {
-    pub address: Pubkey,
-}
-
-#[derive(Clone, Debug)]
 pub struct PoolWatch {
     pub address: Pubkey,
     /// Canonical, unordered mint pair; not the on-chain base/quote orientation.
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
     pub contexts: Arc<[PoolContext]>,
-    pub group_ids: Arc<[u32]>,
     /// Other catalog pools for the same mint pair, including this pool.
     pub pair_pool_count: usize,
 }
@@ -81,7 +76,6 @@ pub struct PairWatch {
 pub struct WatchCatalog {
     pub generation: u64,
     pub graph: Arc<GraphSnapshot>,
-    pub mints: Arc<[MintWatch]>,
     pub pools: Arc<[PoolWatch]>,
     pub pairs: Arc<[PairWatch]>,
     pool_index: HashMap<Pubkey, usize>,
@@ -92,7 +86,6 @@ impl WatchCatalog {
         Self {
             generation: 0,
             graph: Arc::new(GraphSnapshot::default()),
-            mints: Arc::from([]),
             pools: Arc::from([]),
             pairs: Arc::from([]),
             pool_index: HashMap::new(),
@@ -143,23 +136,12 @@ fn pool_role(
 fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
     let wsol: Pubkey = WSOL.parse()?;
     let usdc: Pubkey = USDC.parse()?;
-    let mut mint_state = BTreeSet::<Pubkey>::new();
     let mut pool_state = BTreeMap::<Pubkey, PoolAccumulator>::new();
 
     for topology in graph.topologies.iter() {
         let kind=RouteKind::of(topology);
         let settlement=topology.settlement;
         ensure!(settlement==wsol||settlement==usdc,"catalog invalid settlement");
-        let quote=if settlement==wsol{usdc}else{wsol};
-        let target=topology.target;
-        mint_state.insert(settlement);
-        mint_state.insert(target);
-        if kind==RouteKind::Direct3||kind==RouteKind::Triangle4 {
-            mint_state.insert(quote);
-        }
-        if let Some(bridge)=topology.bridge {
-            mint_state.insert(bridge);
-        }
         for (i,&(a,b)) in topology.directed_roles().iter().enumerate() {
             let role=match (kind,i) {
                 (RouteKind::Direct2,_) | (_,0)=>PoolRole::DirectSettlement,
@@ -186,14 +168,12 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         pair_entry.contexts.extend(entry.contexts.iter().copied());
     }
 
-    let mints: Vec<MintWatch> = mint_state.into_iter().map(|address| MintWatch { address }).collect();
     let pools: Vec<PoolWatch> = pool_state.into_iter().map(|(address, state)| {
         let (mint_a, mint_b) = state.pair.expect("catalog pool pair established");
         let pair_pool_count = pair_state[&(mint_a, mint_b)].pools.len();
         PoolWatch {
             address, mint_a, mint_b,
             contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
-            group_ids: Arc::from(graph.topologies_for_pool(address)),
             pair_pool_count,
         }
     }).collect();
@@ -206,12 +186,12 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
 
     Ok(WatchCatalog {
         generation: graph.generation,
-        graph, mints: Arc::from(mints), pools: Arc::from(pools),
+        graph, pools: Arc::from(pools),
         pairs: Arc::from(pairs), pool_index,
     })
 }
 
-/// Graph in; one full catalog out; optional legacy Mint-address projection for
+/// Graph in; one full catalog out; optional Mint-address projection for
 /// Jupiter Search. Both outputs are derived from the identical graph generation.
 pub async fn run(
     mut input: watch::Receiver<Arc<GraphSnapshot>>,
@@ -223,23 +203,37 @@ pub async fn run(
         let graph = input.borrow_and_update().clone();
         if last_generation == Some(graph.generation) { continue; }
         // The projection scans the complete graph. Never block Tokio's price/RPC tasks.
-        let catalog = Arc::new(tokio::task::spawn_blocking(move || build(graph)).await
-            .context("watch catalog build task panicked")??);
-        let mint_addresses: Arc<[Pubkey]> =
-            Arc::from(catalog.mints.iter().map(|m| m.address).collect::<Vec<_>>());
+        let queued=Instant::now();
+        let (catalog,build_us)=tokio::task::spawn_blocking(move || {
+            let started=Instant::now();
+            build(graph).map(|catalog|(catalog,started.elapsed().as_micros()))
+        }).await.context("watch catalog build task panicked")??;
+        let build_elapsed_us=queued.elapsed().as_micros();
+        let catalog=Arc::new(catalog);
         last_generation = Some(catalog.generation);
         let old=output.send_replace(catalog.clone());
-        // Old catalog projections can own millions of references.
+        // Release old projections outside Tokio's price/RPC tasks.
         tokio::task::spawn_blocking(move || drop(old));
+        let mut projected_mints=0;
+        let mut mint_projection_us=0;
         if let Some(tx) = &jupiter_mints {
+            let started=Instant::now();
+            // Every topology is a closed cycle, so its directed source mints
+            // include settlement, target, quote and bridge. No retained copy.
+            let mut mint_addresses=catalog.graph.topologies.iter()
+                .flat_map(|t|t.directed_roles().iter().map(|&(a,_)|a)).collect::<Vec<_>>();
+            mint_addresses.sort_unstable();mint_addresses.dedup();
+            projected_mints=mint_addresses.len();
             // A topology generation change need not change the mint universe.
-            if tx.borrow().as_ref() != mint_addresses.as_ref() {
-                tx.send_replace(mint_addresses);
+            if tx.borrow().as_ref() != mint_addresses.as_slice() {
+                tx.send_replace(Arc::from(mint_addresses));
             }
+            mint_projection_us=started.elapsed().as_micros();
         }
-        crate::log_event!(Info,"graph watch catalog published generation={} groups={} mints={} pools={} mint_pairs={}",
+        crate::log_event!(Info,"graph watch catalog published generation={} groups={} pools={} mint_pairs={} build_us={} build_elapsed_us={} jupiter_projection={} projected_mints={} mint_projection_us={}",
             catalog.generation, catalog.graph.topologies.len(),
-            catalog.mints.len(), catalog.pools.len(), catalog.pairs.len());
+            catalog.pools.len(),catalog.pairs.len(),build_us,build_elapsed_us,
+            jupiter_mints.is_some(),projected_mints,mint_projection_us);
     }
     Ok(())
 }
@@ -254,7 +248,7 @@ pub async fn observe(mut input:watch::Receiver<Arc<WatchCatalog>>)->Result<()>{
         if let Some(p)=c.pools.first(){
             ensure!(c.graph.pair_for_pool(p.address)==Some((p.mint_a,p.mint_b)),
                 "catalog pair differs from graph");
-            for &id in p.group_ids.iter().take(8){
+            for &id in c.graph.topologies_for_pool(p.address).iter().take(8){
                 ensure!(c.graph.topologies.get(id as usize).is_some(),"invalid compact topology ID");
             }
         }

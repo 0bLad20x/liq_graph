@@ -9,6 +9,13 @@
 Basis: `main@12d7a465ffcfec902afd75a69e0e88bcba24c284`, including CP7, CP7A and CP7B.
 Feature branch: `cp7c-graph-index-cleanup`.
 
+CP7C was accepted from the real user artifact `20261027T080736887Z` on feature
+commit `25b880462c8a29b861a5085b28749102ac2898a9`: 600.003 seconds, 111/111 nonempty
+exact route/index references and 24,562 observed/published transitions. PR #67 merged
+it into main at `42a941f84327eadf6d08f56192b394e64e98377c`. MarketState, signals and
+execution were disabled in that proof. CP7D's MarketState/catalog cleanup and its
+separate live acceptance are documented in [MARKET_STATE.md](MARKET_STATE.md#cp7d-selection-and-catalog-cleanup).
+
 `build_topologies()` now returns only a sorted `Vec<RouteTopology>`. Its two
 temporary inverse-index constructions are removed. The initial builder takes
 the vector directly; incremental discovery consumes its new topologies without
@@ -71,10 +78,8 @@ Price/signal/Execution artifacts are absent when those workers are disabled.
 
 The cleanup reduces discarded allocation/index work at bootstrap and new-edge
 discovery; alternatives-only updates already bypass the full enumerator. Neither a
-specific speedup nor live acceptance is inferred from a build. The implementation
-environment has no Rust/PowerShell or real database/RPC configuration; release/syntax
-CI can validate the feature commit, while the ten-minute live proof requires the
-user's configured checkout. CP7C remains open until that real evidence is available.
+specific speedup nor live acceptance is inferred from a build. CP7C's accepted real
+evidence is recorded above; it does not accept later feature commits.
 
 ## CP7: catalog reconciliation (merged)
 
