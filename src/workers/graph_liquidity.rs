@@ -226,27 +226,20 @@ impl RouteTopology {
 }
 
 /// Only distinct mint paths are enumerated. Pool alternatives stay factored by
-/// pair. The legacy Group projection is retained temporarily for CP5 consumers.
+/// pair. The published inverse index belongs to the final generation in create().
 fn build_topologies(
     pairs:&HashMap<Pair,Arc<[Pubkey]>>,
     adjacency:&HashMap<Pubkey,HashSet<Pubkey>>,
     wsol:Pubkey, usdc:Pubkey, target_filter:Option<&HashSet<(Pubkey,Pubkey)>>,
-) -> Result<(Arc<[RouteTopology]>,HashMap<Pair,Vec<u32>>)> {
+) -> Result<Vec<RouteTopology>> {
     let mut result=Vec::<RouteTopology>::new();
-    let mut index=HashMap::<Pair,Vec<u32>>::new();
     let mut push=|kind,settlement,target,bridge,roles:&[(Pubkey,Pubkey)],options:u64| -> Result<()> {
         ensure!(options>0 && roles.len()>=2 && roles.len()<=4,"empty or invalid compact topology");
         ensure!(result.len()<u32::MAX as usize,"too many compact topologies");
-        let id=result.len() as u32;
         let mut storage=[(Pubkey::default(),Pubkey::default());4];
         storage[..roles.len()].copy_from_slice(roles);
         result.push(RouteTopology { kind,settlement,target,bridge,roles:storage,
             length:roles.len(),route_options:options });
-        let mut seen=HashSet::new();
-        for &(a,b) in roles {
-            let p=pair(a,b);
-            if seen.insert(p) { index.entry(p).or_default().push(id); }
-        }
         Ok(())
     };
     let count=|a,b| -> u64 { pairs.get(&pair(a,b)).map_or(0,|v|v.len() as u64) };
@@ -296,15 +289,7 @@ fn build_topologies(
             RouteTopologyKind::Triangle4=>3,
         })
     });
-    index.clear();
-    for (id,topology) in result.iter().enumerate() {
-        let mut seen=HashSet::new();
-        for &(a,b) in topology.directed_roles() {
-            let key=pair(a,b);
-            if seen.insert(key) { index.entry(key).or_default().push(id as u32); }
-        }
-    }
-    Ok((result.into(),index))
+    Ok(result)
 }
 
 /// An immutable generation shares unchanged pair-alternative arcs with its parent.
@@ -455,7 +440,15 @@ fn compare_reference(graph:&GraphSnapshot)->Result<u128>{
     }
     let wsol:Pubkey=WSOL.parse()?;
     let usdc:Pubkey=USDC.parse()?;
-    let (full,reference_index)=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None)?;
+    let full=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None)?;
+    // The optional reference derives its own expected mapping from the full
+    // enumeration. Do not reuse the production index or its construction loop.
+    let mut reference_index=HashMap::<Pair,Vec<u32>>::new();
+    for (id,topology) in full.iter().enumerate() {
+        let mut role_pairs=topology.directed_roles().iter().map(|&(a,b)|pair(a,b)).collect::<Vec<_>>();
+        role_pairs.sort_unstable();role_pairs.dedup();
+        for key in role_pairs {reference_index.entry(key).or_default().push(id as u32);}
+    }
     ensure!(reference_index==graph.pair_topologies,
         "CP6C reference mismatch generation={} pair-to-topology inverted index",
         graph.generation);
@@ -522,7 +515,7 @@ fn create(
     let mut recounted_count=0_usize;
     let mut removed_count=0_usize;
     if initial {
-        topologies=build_topologies(&pairs,&adjacency,wsol,usdc,None)?.0.to_vec();
+        topologies=build_topologies(&pairs,&adjacency,wsol,usdc,None)?;
     } else {
         // Fast path: existing cycle shapes survive pool alternative changes.
         // Recompute multiplicities only for shapes that use a changed pair.
@@ -549,14 +542,14 @@ fn create(
         if !new_edges.is_empty(){
             let targets=new_edge_targets(&new_edges,&adjacency,wsol,usdc);
             if !targets.is_empty(){
-                let (discovered,_)=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&targets))?;
-                for t in discovered.iter(){
+                let discovered=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&targets))?;
+                for t in discovered {
                     if t.kind==RouteTopologyKind::Direct2{continue;}
-                    if existing.contains(&topology_identity(t)){continue;}
+                    if existing.contains(&topology_identity(&t)){continue;}
                     if !t.directed_roles().iter().any(|&(a,b)|new_edges.contains(&pair(a,b))){
                         continue;
                     }
-                    topologies.push(t.clone());
+                    topologies.push(t);
                 }
             }
         }
@@ -751,7 +744,7 @@ pub async fn run(
                 }
                 if let Some(us)=reference_us{
                     crate::log_event!(Info,
-                        "graph reference_verified generation={} exact_identity=true directed_roles=true route_options=true checked_topologies={} reference_us={}",
+                        "graph reference_verified generation={} exact_identity=true directed_roles=true route_options=true pair_index=true checked_topologies={} reference_us={}",
                         graph.generation,graph.topologies.len(),us);
                 }
                 let total=graph.topologies.len();

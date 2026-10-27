@@ -1,10 +1,82 @@
-> Current entrypoint: CP7A uses one `--run` pipeline and `scripts/runtime_live.ps1`.
+> Current entrypoint: one `--run` pipeline and `scripts/runtime_live.ps1`.
 > See [CP7A_RUNTIME.md](CP7A_RUNTIME.md). Earlier checkpoint measurements and output names
 > below describe their historical implementations; output loss now fails a finite proof.
 
 # Graph signals: compact candidate state
 
-## CP7: catalog reconciliation (implementation; live acceptance pending)
+## CP7C: graph index cleanup and focused graph evidence
+
+Basis: `main@12d7a465ffcfec902afd75a69e0e88bcba24c284`, including CP7, CP7A and CP7B.
+Feature branch: `cp7c-graph-index-cleanup`.
+
+`build_topologies()` now returns only a sorted `Vec<RouteTopology>`. Its two
+temporary inverse-index constructions are removed. The initial builder takes
+the vector directly; incremental discovery consumes its new topologies without
+an intermediate Arc/copy. Enumeration, stable sort order, directed roles and
+route multiplicities are unchanged. `create()` constructs the one published
+pair-to-topology index after combining and validating the final generation.
+
+The optional full reference still checks topology identity, directed roles,
+multiplicities and exact inverse-index equality. Its expected mapping is derived
+locally from the full enumeration, using sorted/deduplicated role pairs rather
+than the production indexing loop. Direct2's repeated undirected pair produces
+one reference per topology. A successful reference log explicitly includes
+`pair_index=true`. These temporary proof data are not another published graph.
+The normal runtime keeps reference comparison disabled unless requested.
+
+`-Stage Graph -GraphAudit` uses the same runtime with MarketState and signals
+disabled. Discovery, Registry, Persistence, mint qualification and Completion
+remain on their normal path. There is no price hydration or V10 execution in
+this stage. The shared starter enables the existing reference comparison for
+every generation; other stages with GraphAudit retain the previous interval.
+An account-subscription capacity is not required by the Graph stage.
+
+The requested real observation is ten minutes, after a clean locked release build:
+
+```powershell
+git fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Fetch fehlgeschlagen.' }
+git switch --track origin/cp7c-graph-index-cleanup
+if ($LASTEXITCODE -ne 0) { throw 'Branchwechsel fehlgeschlagen; lokale Aenderungen zuerst sichern.' }
+
+.\scripts\runtime_live.ps1 `
+    -ExpectedBranch cp7c-graph-index-cleanup `
+    -Stage Graph -GraphAudit -DurationSeconds 600
+```
+
+`-Rewatch`, price/signal tracing, catalog candidate acceptance and V10 simulation
+belong to stages with their actual consumers and are rejected when incompatible.
+No new starter or runtime implementation is introduced.
+
+Acceptance requires a completed error-free runtime, actual observed and published
+pool transitions, multiple audited graph generations, a nonempty topology universe,
+and exact route/index references for every published generation. At least one
+verified reference must be nonempty; comparing empty bootstrap graphs is insufficient.
+The analyzer reports `incremental_new_pair_generations`; an unobserved transition
+category is not presented as verified. The source retains all generation invariants
+and pool-alternative consistency checks.
+
+The analyzer measures from `runtime running=true` to `runtime shutdown reason=duration`.
+Build, bootstrap and drain time cannot fill the requested 600 seconds. In this stage,
+normal operator termination before the timer is not a completed duration proof.
+No priced WS route or profitable candidate is required. If optional signal reports
+are present in other stages, their errors, complete counter parity and delivery loss
+remain checked. `-RequireCatalogReconciliation` keeps its separate CP7 witness criteria.
+
+Artifacts remain in `runtime_live/<UTC timestamp>/`: checkout/plan, runtime log/report,
+graph audit JSONL, `graph_summary.json` and the existing CSVs. Relevant graph summary
+fields are `runtime_measured_seconds`, `exact_route_and_index_verified_generations`,
+`nonempty_reference_generations` and `all_published_generations_reference_verified`.
+Price/signal/Execution artifacts are absent when those workers are disabled.
+
+The cleanup reduces discarded allocation/index work at bootstrap and new-edge
+discovery; alternatives-only updates already bypass the full enumerator. Neither a
+specific speedup nor live acceptance is inferred from a build. The implementation
+environment has no Rust/PowerShell or real database/RPC configuration; release/syntax
+CI can validate the feature commit, while the ten-minute live proof requires the
+user's configured checkout. CP7C remains open until that real evidence is available.
+
+## CP7: catalog reconciliation (merged)
 
 The current output layout is `versioned_candidate_state_cp7`; numerical price
 weights, threshold, graph admission and the four route forms are unchanged.
@@ -46,18 +118,19 @@ Use the existing full-runtime graph runner with real providers and local `.env`:
 
 ```powershell
 git fetch origin
-git switch --track origin/cp7-graph-candidate-reconciliation
+git switch main
+git pull --ff-only origin main
 git branch --show-current
 git rev-parse --short HEAD
 git status --short
-.\scripts\runtime_live.ps1 -GraphAudit -ExpectedBranch cp7a-unified-runtime -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 -RequireCatalogReconciliation
+.\scripts\runtime_live.ps1 -Stage Signals -GraphAudit -ExpectedBranch main -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 -RequireCatalogReconciliation
 ```
 
 For an already existing local branch, switch to it and update with `git pull
 --ff-only` instead of repeating `--track`. Preserve tracked local edits before
 switching. The runner requires a committed clean checkout and locked release
 build; it does not simulate or broadcast transactions. In addition to existing
-graph/reference/four-kind delivery checks, the strict option requires actual
+graph/reference and signal-delivery checks, the strict option requires actual
 catalog candidate visibility, withdrawal, unchanged reuse, a real catalog
 witness, matching complete producer/consumer counts and zero loss. A quiet or
 insufficient run fails acceptance while preserving its evidence. Examine
@@ -66,8 +139,9 @@ summaries and the retained graph audit together. Unobserved specific cases
 (e.g. Direct2 threshold crossings) remain unproven; a generic successful run must
 not be represented as proof of every transition category or V10 execution.
 
-Build and live status must be attached to the actual branch HEAD. This document
-does not claim that the CP7 implementation has already passed a real live run.
+Build and live status must be attached to the actual branch HEAD. CP7 and CP7A
+were merged through PR #65 after the recorded real user evidence; CP7B followed
+through PR #66. This does not imply acceptance of a later feature commit.
 
 ## Historical interval implementation and earlier measurement context
 
