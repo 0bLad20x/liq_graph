@@ -5,7 +5,7 @@ param(
     [ValidateRange(0,2147483647)][int]$PoolLimit = 15000,
     [ValidateRange(0,1000000)][int]$AccountBudget = 25000,
     [ValidateSet('Graph','Signals','MarketState')][string]$Stage = 'Signals',
-    [string]$ExpectedBranch = 'cp7a-unified-runtime',
+    [string]$ExpectedBranch = '',
     [switch]$PlanOnly,
     [switch]$Rewatch,
     [switch]$GraphAudit,
@@ -76,6 +76,7 @@ try {
     $values = @{
         RUN_DURATION_SECONDS = "$DurationSeconds"
         RUN_SHUTDOWN_SECONDS = '360'
+        RUN_SIGNAL_PROOF = "$($signals -and -not $SimulateV10)".ToLowerInvariant()
         RUN_REWATCH = "$([bool]$Rewatch)".ToLowerInvariant()
         RUN_FULL_SCAN = 'false'
         IDENTITY_HYDRATION_ONLY = 'false'
@@ -160,15 +161,14 @@ try {
     $runtime = Read-OptionalJson $runtimePath
     $market = Read-OptionalJson $marketPath
     $execution = Read-OptionalJson $executionPath
+    $production = Read-OptionalJson $producerPath
     $refreshes = @(Select-String -LiteralPath $log -Pattern 'lifecycle (unchanged request_id=.* work=Refresh state=Prepared|accepted request_id=.* work=Refresh status=Prepared)').Count
     $lifecycleStarted = [bool](Select-String -LiteralPath $log -Pattern 'lifecycle started' -Quiet)
-    $candidateDelivery = -not $SimulateV10 -or ($null -ne $execution -and
-        $execution.execution_candidates.lost_events -eq 0 -and
-        $execution.execution_candidates.awaiting_snapshot -eq $false)
+    $candidateDelivery = $runtime.candidate_delivery_passed
     $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
         $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and
         (-not $marketEnabled -or $refreshes -gt 0) -and
-        $candidateDelivery -and $clock.Elapsed.TotalSeconds -ge ($DurationSeconds - 1)
+        (-not $SimulateV10 -or $candidateDelivery) -and $clock.Elapsed.TotalSeconds -ge ($DurationSeconds - 1)
     $graphPassed = $null
     if ($GraphAudit) {
         $analyzerArgs = @('--audit',$auditPath,'--runtime',$log,'--output',$folder,
@@ -182,14 +182,23 @@ try {
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
+        diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
         runtime_completed=($null -ne $runtime -and $runtime.run_complete -eq $true)
         orchestration_evidence_passed=[bool]$orchestrationPassed; runtime_evidence=$runtime
+        market_delivery_passed=$runtime.market_delivery_passed
+        signal_delivery_passed=$runtime.signal_delivery_passed
+        rewatch_evidence_passed=$runtime.rewatch_evidence_passed
+        evidence_errors=$runtime.evidence_errors
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; completion_lifecycle_started=$lifecycleStarted
         prepared_refreshes_observed=$refreshes; graph_audit_passed=$graphPassed
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
-        candidate_delivery_passed=$(if ($SimulateV10) { [bool]$candidateDelivery } else { $null })
+        market_account_processing_ns=$market.metrics.processing
+        market_queue_ns=$market.metrics.queue
+        signal_steady_state_processing_ns=$production.steady_state_inputs.processing_ns
+        frame_to_signal_state_us=$production.steady_state_inputs.frame_to_state_ready_us
+        candidate_delivery_passed=$candidateDelivery
         v10_requests=$requests.Count; v10_reports=$reports.Count
         v10_simulation_successes=$execution.simulation_successes
         v10_simulation_failures=$execution.simulation_failures

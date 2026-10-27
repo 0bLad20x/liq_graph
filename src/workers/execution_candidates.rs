@@ -63,7 +63,8 @@ pub struct Selection {
 #[derive(Default, serde::Serialize)]
 pub struct Report {
     pub error: Option<String>, pub requests: Vec<Selection>,
-    events: u64, websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
+    pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
+    websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
     lost_events: u64, resynchronizations: u64, skipped_busy_revisions: u64,
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
@@ -72,6 +73,8 @@ pub struct Report {
 impl Report {
     pub fn ensure_complete(&self)->Result<()> {
         ensure!(self.error.is_none(), "execution candidate worker failed: {}", self.error.as_deref().unwrap_or(""));
+        ensure!(self.lost_events==0 && !self.awaiting_snapshot,
+            "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
         Ok(())
     }
     pub fn ensure_handoff(&self, reports:&[ExecutionReport])->Result<()> {
@@ -343,6 +346,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
             if report.awaiting_snapshot && !matches!(event.as_ref(),SignalEvent::State(s) if s.snapshot.is_some()) {continue;}
             match event.as_ref() {
                 SignalEvent::State(s)=>{
+                    report.state_updates+=1;
                     ensure!(!pending,"candidate state replaced before evaluation completed");
                     state.apply(s,report.awaiting_snapshot)?;
                     if matches!(s.trigger.as_ref(),SignalTrigger::Catalog{..}) {
@@ -355,6 +359,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     pending=true;ranked.clear();
                 },
                 SignalEvent::Candidates(b)=>{
+                    report.candidate_batches+=1;report.candidates+=b.candidates.len() as u64;
                     ensure!(pending&&b.revision==state.revision&&b.graph_generation==state.generation,
                         "candidate batch references wrong state");
                     for candidate in &b.candidates {state.candidate(b,candidate)?;}
@@ -376,6 +381,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     }
                 },
                 SignalEvent::Evaluated(e)=>{
+                    report.evaluations+=1;
                     ensure!(pending && e.revision==state.revision && e.graph_generation==state.generation,"candidate completion references wrong state");
                     pending=false;
                     if let Some(c)=&e.catalog {

@@ -64,12 +64,6 @@ pub struct PoolWatch {
     pub pair_pool_count: usize,
 }
 
-#[derive(Clone, Debug)]
-pub struct PairWatch {
-    pub pools: Arc<[Pubkey]>,
-    pub contexts: Arc<[PoolContext]>,
-}
-
 /// One atomic graph generation plus all its observable mint/pool classifications.
 /// No token is classified as "exotic": a consumer decides exclusion sets and priorities.
 #[derive(Debug)]
@@ -77,7 +71,6 @@ pub struct WatchCatalog {
     pub generation: u64,
     pub graph: Arc<GraphSnapshot>,
     pub pools: Arc<[PoolWatch]>,
-    pub pairs: Arc<[PairWatch]>,
     pool_index: HashMap<Pubkey, usize>,
 }
 
@@ -87,7 +80,6 @@ impl WatchCatalog {
             generation: 0,
             graph: Arc::new(GraphSnapshot::default()),
             pools: Arc::from([]),
-            pairs: Arc::from([]),
             pool_index: HashMap::new(),
         }
     }
@@ -101,12 +93,6 @@ impl WatchCatalog {
 #[derive(Default)]
 struct PoolAccumulator {
     pair: Option<MintPair>,
-    contexts: BTreeSet<PoolContext>,
-}
-
-#[derive(Default)]
-struct PairAccumulator {
-    pools: BTreeSet<Pubkey>,
     contexts: BTreeSet<PoolContext>,
 }
 
@@ -160,34 +146,21 @@ fn build(graph: Arc<GraphSnapshot>) -> Result<WatchCatalog> {
         graph.pair_pools.get(p).map_or(0,|v|v.len())).sum::<usize>(),
         "catalog pool set differs from compact topology coverage");
 
-    let mut pair_state = BTreeMap::<MintPair, PairAccumulator>::new();
-    for (&address, entry) in &pool_state {
-        let key = entry.pair.context("catalog pool has no mint pair")?;
-        let pair_entry = pair_state.entry(key).or_default();
-        pair_entry.pools.insert(address);
-        pair_entry.contexts.extend(entry.contexts.iter().copied());
-    }
-
     let pools: Vec<PoolWatch> = pool_state.into_iter().map(|(address, state)| {
         let (mint_a, mint_b) = state.pair.expect("catalog pool pair established");
-        let pair_pool_count = pair_state[&(mint_a, mint_b)].pools.len();
+        let pair_pool_count = graph.pools_for_pair(mint_a,mint_b).len();
         PoolWatch {
             address, mint_a, mint_b,
             contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
             pair_pool_count,
         }
     }).collect();
-    let pairs: Vec<PairWatch> = pair_state.into_values().map(|state| PairWatch {
-        pools: Arc::from(state.pools.into_iter().collect::<Vec<_>>()),
-        contexts: Arc::from(state.contexts.into_iter().collect::<Vec<_>>()),
-    }).collect();
-
     let pool_index = pools.iter().enumerate().map(|(i, pool)| (pool.address, i)).collect();
 
     Ok(WatchCatalog {
         generation: graph.generation,
         graph, pools: Arc::from(pools),
-        pairs: Arc::from(pairs), pool_index,
+        pool_index,
     })
 }
 
@@ -232,7 +205,7 @@ pub async fn run(
         }
         crate::log_event!(Info,"graph watch catalog published generation={} groups={} pools={} mint_pairs={} build_us={} build_elapsed_us={} jupiter_projection={} projected_mints={} mint_projection_us={}",
             catalog.generation, catalog.graph.topologies.len(),
-            catalog.pools.len(),catalog.pairs.len(),build_us,build_elapsed_us,
+            catalog.pools.len(),catalog.graph.pair_topologies.len(),build_us,build_elapsed_us,
             jupiter_mints.is_some(),projected_mints,mint_projection_us);
     }
     Ok(())

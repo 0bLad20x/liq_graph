@@ -86,7 +86,7 @@ impl ExecutionTasks {
             },
         }
     }
-    pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<()> {
+    pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<execution_candidates::Report> {
         let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
             .context("candidate shutdown timeout")???;
         // The candidate stream has closed. Let accepted jobs and reports drain
@@ -117,6 +117,7 @@ impl ExecutionTasks {
         let acceptance=candidates.ensure_live_evidence(&reports);
         evidence["execution_integration_passed"]=serde_json::json!(acceptance.is_ok());
         evidence["execution_integration_error"]=serde_json::json!(acceptance.err().map(|e|format!("{e:#}")));
-        Ok(())
+        candidates.ensure_complete()?;
+        Ok(candidates)
     }
 }

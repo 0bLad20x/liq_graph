@@ -13,7 +13,6 @@ use crate::core::{
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE}};
 use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
-const EXECUTION_LAYOUT:&str="compact_topologies_cp6a";
 const OUTPUT_LAYOUT:&str="versioned_candidate_state_cp7";
 pub const OUTPUT_CAPACITY:usize=16384;
 
@@ -499,7 +498,9 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                 e.evaluate(work)?;
             },
             event=input.recv()=>match event{
-                Ok(event)=>match event.as_ref(){
+                Ok(event)=>{
+                    e.production.input_events+=1;
+                    match event.as_ref(){
                     MarketStateEvent::Price(p)=>{
                         let started=Instant::now();let received=now_us();let preparing=Instant::now();
                         let (address,old)=e.prices.observe(p)?;
@@ -561,7 +562,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Stats{..}=>{},
-                },
+                }},
                 Err(broadcast::error::RecvError::Lagged(n))=>{
                     e.prices.values.fill(None);
                     e.index.clear_prices();
@@ -636,7 +637,7 @@ struct Counts {
     events: u64, state_updates: u64, plan_snapshots: u64, changed_pools: u64, resets: u64,
     evaluations: u64, price_evaluations: u64, websocket_evaluations: u64,
     catalog_evaluations: u64, coverage_evaluations: u64, logarithms_prepared: u64,
-    range_blocks: u64, ranges: u64, entered_ranges: u64, updated_ranges: u64, exited_ranges: u64,
+    entered_ranges: u64, updated_ranges: u64, exited_ranges: u64,
     candidate_batches:u64, candidates:u64,
     snapshot_candidates:u64, catalog_reconciliations:u64,
     catalog_added_topologies:u64, catalog_removed_topologies:u64, catalog_reused_topologies:u64,
@@ -656,7 +657,6 @@ impl Counts {
     fn candidate(&mut self,b:&SignalCandidateBatch) {
         self.events+=1;self.candidate_batches+=1;self.candidates+=b.candidates.len() as u64;
         for c in &b.candidates {
-            self.ranges+=1;
             match c.change {
                 SignalRangeChange::Entered=>self.entered_ranges+=1,
                 SignalRangeChange::Updated=>self.updated_ranges+=1,
@@ -728,7 +728,7 @@ impl ProductionTimings {
 }
 #[derive(Default, serde::Serialize)]
 pub struct ProductionReport {
-    error: Option<String>, counts: Counts,
+    error: Option<String>, counts: Counts,pub input_events:u64,
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
     steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
     catalog_plan_build_ns: Histogram, last_plan: Option<serde_json::Value>,
@@ -742,10 +742,10 @@ impl ProductionReport {
         self.last_plan=Some(serde_json::json!({
             "generation":p.graph_generation,"pools":prices.pools.len(),
             "compact_topologies":p.compact_topologies.len(),
-            "legacy_groups_compiled":0,"logical_routes":p.route_options,
+            "logical_routes":p.route_options,
             "directed_price_roles":index.ranked.len(),
             "ordered_entries_at_install":index.ranked.values().map(BTreeSet::len).sum::<usize>(),
-            "dependency_index_shared":true,"build_ns":ns,
+            "build_ns":ns,
         }));
         crate::log_event!(Info,"graph signals cp6a plan={}",self.last_plan.as_ref().unwrap());
     }
@@ -769,9 +769,17 @@ impl ProductionReport {
         ensure!(self.counts==r.counts,"signal producer/consumer counts differ");
         Ok(())
     }
-    pub fn ensure_input_delivery(&self, prices: u64, websocket: u64) -> Result<()> {
+    /// Compare with the actual downstream contract consumer, not a second mirror.
+    pub fn ensure_execution_delivery(&self,events:u64,states:u64,batches:u64,candidates:u64,evaluations:u64)->Result<()> {
         self.ensure_complete()?;
-        ensure!(self.counts.price_evaluations==prices && self.counts.websocket_evaluations==websocket,
+        ensure!((self.counts.events,self.counts.state_updates,self.counts.candidate_batches,
+            self.counts.candidates,self.counts.evaluations)==(events,states,batches,candidates,evaluations),
+            "signal producer/ExecutionCandidates delivery counts differ");
+        Ok(())
+    }
+    pub fn ensure_input_delivery(&self, events:u64,prices: u64, websocket: u64) -> Result<()> {
+        self.ensure_complete()?;
+        ensure!(self.input_events==events && self.counts.price_evaluations==prices && self.counts.websocket_evaluations==websocket,
             "Market-State/signal input totals differ");
         let t=&self.websocket_inputs;
         ensure!([&t.transport_decode_us,&t.transport_to_market_us,&t.market_processing_us,
@@ -783,8 +791,6 @@ impl ProductionReport {
 #[derive(Default, serde::Serialize)]
 pub struct ObservationReport {
     pub error: Option<String>, counts: Counts,
-    execution_layout: &'static str, output_layout: &'static str,
-    output_capacity: usize, reference_comparison_performed: bool,
     lost_events: u64, max_queue_depth: usize, last_sequence: u64, last_revision: u64,
     lag_incidents: u64, first_loss_at_us: Option<u64>, last_loss_at_us: Option<u64>,
     resynchronizations: u64, awaiting_snapshot: bool, unverified_events: u64, unverified_ranges: u64,
@@ -802,7 +808,6 @@ impl ObservationReport {
         ensure!(self.error.is_none(),"signal consumer failed: {}",self.error.as_deref().unwrap_or(""));
         Ok(())
     }
-    pub fn has_delivery_loss(&self) -> bool { self.lost_events>0 }
     pub fn ensure_integrity(&self) -> Result<()> {
         self.ensure_complete()?;
         ensure!(self.lost_events==0,"signal consumer lost {} events",self.lost_events);
@@ -894,8 +899,7 @@ impl Mirror {
     }
 }
 pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
-    let mut report=ObservationReport { execution_layout:EXECUTION_LAYOUT,output_layout:OUTPUT_LAYOUT,
-        output_capacity:OUTPUT_CAPACITY,..Default::default() };
+    let mut report=ObservationReport::default();
     let mut mirror=Mirror::default(); let mut pending=false; let mut ranges=[0_u64;3];
     let mut sample_baseline=[0_usize;4]; let mut sample_ws=[0_usize;4];
     let mut ticker=tokio::time::interval(Duration::from_secs(5));
@@ -905,7 +909,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                 let started=Instant::now();
                 crate::log_event!(Info,"graph signals factorized evaluations={} ws={} ready_anchors={} ranges={} entered={} updated={} exited={} max_queue={} reference_comparison=false",
                     report.counts.evaluations,report.counts.websocket_evaluations,
-                    report.counts.websocket_ready_anchors.iter().sum::<u64>(),report.counts.ranges,
+                    report.counts.websocket_ready_anchors.iter().sum::<u64>(),report.counts.candidates,
                     report.counts.entered_ranges,report.counts.updated_ranges,report.counts.exited_ranges,report.max_queue_depth);
                 if settings.profile {
                     crate::log_event!(Info,"graph signals receiver state_age_mean_us={:?} state_age_max_us={:?} completion_age_max_us={:?}",
@@ -1031,7 +1035,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
     report.ready_anchors_by_kind=names(report.counts.ready_anchors);
     report.websocket_ready_anchors_by_kind=names(report.counts.websocket_ready_anchors);
     crate::log_event!(Info,"graph signals consumer complete={} events={} ranges={} lost={} awaiting_snapshot={} delivery_valid={} error={:?}",
-        report.error.is_none(),report.counts.events,report.counts.ranges,report.lost_events,
+        report.error.is_none(),report.counts.events,report.counts.candidates,report.lost_events,
         report.awaiting_snapshot,report.ensure_integrity().is_ok(),report.error);
     Ok(report)
 }

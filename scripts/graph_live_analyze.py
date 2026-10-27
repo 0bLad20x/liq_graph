@@ -68,8 +68,13 @@ def run(args):
     stage = checkout.get("stage")
     prod = read_json(out/"signal_production.json", {})
     consumer = read_json(out/"signal_consumer.json", {})
+    execution=read_json(out/"execution.json", {})
+    simulation=bool(checkout.get("simulation_enabled"))
+    if simulation:
+        if consumer:raise RuntimeError("Simulation unexpectedly retained a diagnostic signal mirror")
+        consumer=execution.get("execution_candidates") or {}
     if bool(prod)!=bool(consumer):
-        raise RuntimeError("Incomplete optional signal report pair")
+        raise RuntimeError("Incomplete signal producer/actual consumer report pair")
     started = as_int(checkout.get("start_ms"))
     audit_seen = collections.Counter()
     audit_by_gen = {}
@@ -304,7 +309,15 @@ def run(args):
         as_int(g.get("transition_effective"))==0 for g in rows if
         g.get("transition_effective") is not None)
     produced_counts=prod.get("counts") or {}
-    consumed_counts=consumer.get("counts") or {}
+    consumed_counts=consumer if simulation else (consumer.get("counts") or {})
+    delivery_keys=("events","state_updates","candidate_batches","candidates","evaluations")
+    delivery_equal=(all(type(produced_counts.get(k)) is int and type(consumed_counts.get(k)) is int
+                        and produced_counts[k]==consumed_counts[k] for k in delivery_keys)
+                    if simulation else produced_counts==consumed_counts)
+    delivery_passed=bool(prod and consumer and delivery_equal and not prod.get("error")
+                         and not consumer.get("error") and not consumer.get("lost_events")
+                         and not consumer.get("awaiting_snapshot") and not consumer.get("unverified_events")
+                         and not consumer.get("unverified_ranges"))
     catalog_visibility=(as_int(produced_counts.get("catalog_entered_candidates"))+
                         as_int(produced_counts.get("catalog_updated_candidates")))>0
     catalog_withdrawal=as_int(produced_counts.get("catalog_exited_candidates"))>0
@@ -315,8 +328,7 @@ def run(args):
                         e.get("candidate",{}).get("witness") is not None
                         for e in catalog_examples)
     catalog_passed=(not prod.get("error") and not consumer.get("error") and
-                    not consumer.get("lost_events") and produced_counts==consumed_counts and
-                    consumer.get("output_layout")=="versioned_candidate_state_cp7" and
+                    delivery_passed and
                     as_int(produced_counts.get("catalog_reconciliations"))>0 and
                     as_int(produced_counts.get("snapshot_candidates"))>0 and
                     catalog_visibility and catalog_withdrawal and catalog_reuse and catalog_witness)
@@ -359,6 +371,8 @@ def run(args):
     timed_catalogs=[r for r in catalog_rows.values() if "build_us" in r]
     stats={
         "stage":stage,"signal_reports_checked":bool(prod),
+        "signal_consumer":"execution_candidates" if simulation else "signal_proof" if prod else None,
+        "signal_delivery_passed":delivery_passed if prod else None,
         "market_selection":{
             "computations_by_mode":dict(modes),"nonempty_computations_by_mode":dict(nonempty_modes),
             "timing_us_by_mode":{mode:timing_stats([as_int(r.get("selection_us")) for r in selections if r.get("mode")==mode]) for mode in modes},
@@ -414,7 +428,7 @@ def run(args):
         "signal_error":prod.get("error"),
         "signal_websocket_evaluations":((prod.get("counts") or {}).get("websocket_evaluations")),
         "signal_producer_candidates":((prod.get("counts") or {}).get("candidates")),
-        "signal_consumer_candidates":((consumer.get("counts") or {}).get("candidates")),
+        "signal_consumer_candidates":consumed_counts.get("candidates"),
         "signal_lost_events":consumer.get("lost_events"),
         "compact_topologies":as_int(graph_rows[max(graph_rows)].get("compact_topologies")) if graph_rows else None,
         "last_graph":graph_rows.get(max(graph_rows)) if graph_rows else None,
@@ -437,9 +451,7 @@ def run(args):
         raise SystemExit("Live runtime incomplete: evidence preserved, no acceptance.")
     if stage=="Signals" and not prod:
         raise SystemExit("Signal stage is missing producer/consumer evidence.")
-    if prod and (prod.get("error") or consumer.get("error") or consumer.get("lost_events")
-                 or consumer.get("awaiting_snapshot") or consumer.get("unverified_events")
-                 or consumer.get("unverified_ranges") or produced_counts!=consumed_counts):
+    if prod and not delivery_passed:
         raise SystemExit("Optional signal reports contain errors, loss or incomplete delivery.")
     if selection_violations or catalog_mismatches:
         raise SystemExit("Selection budget/set invariants or catalog topology counts differ; inspect graph_summary.json.")

@@ -19,7 +19,6 @@ pub struct Settings {
     pub batch_size: usize,
     pub timeout: Duration,
     pub backfill_interval: Duration,
-    pub backfill_on_start: bool,
     pub backfill_limit: usize,
 }
 impl Settings {
@@ -41,12 +40,6 @@ impl Settings {
             .unwrap_or_else(|_| "86400".into()).parse::<u64>()?;
         let backfill_limit = env::var("JUPITER_MINT_BACKFILL_LIMIT")
             .unwrap_or_else(|_| "0".into()).parse::<usize>()?;
-        let backfill_on_start = match env::var("JUPITER_BACKFILL_ON_START")
-            .unwrap_or_else(|_| "true".into()).as_str() {
-                "true" | "1" => true,
-                "false" | "0" => false,
-                _ => bail!("JUPITER_BACKFILL_ON_START must be true or false"),
-            };
         let url = env::var("JUPITER_SEARCH_URL")
             .unwrap_or_else(|_| "https://api.jup.ag/tokens/v2/search".into());
         ensure!(calls_per_minute_per_key.is_finite()
@@ -58,7 +51,7 @@ impl Settings {
         Ok(Self {url,api_keys,calls_per_minute_per_key,batch_size,
             timeout:Duration::from_secs(seconds),
             backfill_interval:Duration::from_secs(backfill_seconds),
-            backfill_on_start,backfill_limit})
+            backfill_limit})
     }
 }
 
@@ -144,9 +137,9 @@ impl Engine {
         let lanes=settings.api_keys.iter().enumerate().map(|(i,key)|Lane {
             key:key.clone(),next_due:now+phase.mul_f64(i as f64),in_flight:false,
         }).collect::<Vec<_>>();
-        crate::log_event!(Info,"jupiter unified started keys={} rpm_per_key={} batch={} backfill_interval_s={} on_start={}",
+        crate::log_event!(Info,"jupiter unified started keys={} rpm_per_key={} batch={} watch_interval_s={}",
             lanes.len(),settings.calls_per_minute_per_key,settings.batch_size,
-            settings.backfill_interval.as_secs(),settings.backfill_on_start);
+            settings.backfill_interval.as_secs());
         Ok(Self{http,settings,lanes,pending:JoinSet::new()})
     }
     fn dispatch(&mut self,lane:usize,work:Work) {
@@ -292,11 +285,9 @@ impl Engine {
 /// CP1: preserve the existing API lanes and targeted watch scheduler but
 /// never start the full-catalogue scan as part of active qualification.
 /// The dedicated --jupiter-mint-backfill command remains available separately.
-pub async fn run_targeted(http:Client,mut settings:Settings,
+pub async fn run_targeted(http:Client,settings:Settings,
     mut input:watch::Receiver<Arc<[Pubkey]>>,
     output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {
-    // The targeted mode never triggers backfill, regardless of inherited ENV.
-    settings.backfill_on_start=false;
     let mut engine=Engine::new(http,settings).await?;
     loop {
         let deadline=Instant::now()+engine.settings.backfill_interval;
