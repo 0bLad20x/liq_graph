@@ -93,8 +93,15 @@ impl AdmissionIndex {
             .any(|mint| !references.contains(&mint) && self.qualified.contains(&mint));
         let native_below_minimum=native_source(pool.venue).is_some()
             && self.native_tvl.get(&pool.address).is_some_and(|v|*v<MIN_NATIVE_TVL_USD);
-        CompletionAdmission::from_qualification(
-            pool.mint_a,pool.mint_b,mint_qualified,native_below_minimum)
+        let (Some(a),Some(b))=(pool.mint_a,pool.mint_b) else {
+            return CompletionAdmission::MissingIdentity;
+        };
+        if a==b || a==Pubkey::default() || b==Pubkey::default() {
+            return CompletionAdmission::MissingIdentity;
+        }
+        if !mint_qualified {return CompletionAdmission::MintNotQualified;}
+        if native_below_minimum {return CompletionAdmission::NativeTvlBelowMinimum;}
+        CompletionAdmission::Admitted
     }
 }
 
@@ -197,6 +204,7 @@ impl PoolRegistry {
             if p.completion_admission==CompletionAdmission::NativeTvlBelowMinimum {native_veto+=1;}
             if p.completion_admission==CompletionAdmission::MintNotQualified {missing_qualification+=1;}
         }
+        drop(entries);
         crate::log_event!(Info,
             "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} native_tvl_veto={} mint_not_qualified={}",
             known,admitted,prepared,prepared_admitted,native_veto,missing_qualification);
@@ -262,6 +270,31 @@ impl PoolRegistry {
         Ok(entries.len())
     }
 
+    /// Publish the restored owner state before starting the Registry writer.
+    /// Subscribers must be connected first. This is not a database write or a
+    /// second admission policy; restore() has already computed every decision.
+    pub fn publish_bootstrap(&self,output:&broadcast::Sender<Arc<PoolUpdateBatch>>)->Result<usize> {
+        let pools:Vec<_>={
+            let entries=self.entries.read().expect("pool registry lock poisoned");
+            entries.values().filter(|p|p.completion_state==CompletionState::Prepared)
+                .cloned().collect()
+        };
+        let prepared=pools.len();
+        let admitted=pools.iter().filter(|p|p.completion_admission.is_admitted()).count();
+        let references=reference_mints();
+        let conversion=pools.iter().filter(|p|p.completion_admission.is_admitted()
+            && matches!((p.mint_a,p.mint_b),(Some(a),Some(b))
+                if a!=b && references.contains(&a) && references.contains(&b))).count();
+        if !pools.is_empty() {
+            output.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,
+                source:"registry_bootstrap",received_at_ms:now_unix_ms()?,pools,
+                persist_identity:Vec::new()}))
+                .map_err(|_|anyhow::anyhow!("Registry bootstrap has no subscriber"))?;
+        }
+        crate::log_event!(Info,"pool registry bootstrap prepared={prepared} admitted={admitted} conversion_pools={conversion} source=restored_registry");
+        Ok(prepared)
+    }
+
     /// Re-evaluate canonical TVL even when no new REST/DexScreener event arrives.
     /// Historical last_observation stays intact; expired quotes never masquerade
     /// as current liquidity. Called only by the Registry's single writer.
@@ -303,7 +336,8 @@ impl PoolRegistry {
     }
 
     /// Update only pools touched by changed qualified Mint identities.
-    fn apply_qualified(&self, mints: &[Pubkey], now: u64) -> Vec<PoolState> {
+    /// Collect optional audit facts; format and emit only after locks are released.
+    fn apply_qualified(&self, mints: &[Pubkey], now: u64, audit: bool) -> QualifiedStats {
         let mut entries=self.entries.write().expect("pool registry lock poisoned");
         let mut admission=self.admission.write().expect("admission index lock poisoned");
         let next:HashSet<Pubkey>=mints.iter().copied().collect();
@@ -315,47 +349,27 @@ impl PoolRegistry {
                 affected.extend(pools.iter().copied());
             }
         }
-        let affected_count=affected.len();
+        let mut stats=QualifiedStats{qualified:next.len(),changed_mints:changed.len(),
+            affected:affected.len(),updates:Vec::new(),audit:Vec::new()};
         admission.qualified=next;
-        let mut updates=Vec::new();
         for address in affected {
             if let Some(pool)=entries.get_mut(&address) {
                 let decision=admission.admission(pool);
                 if decision!=pool.completion_admission {
-                    let previous=pool.completion_admission;
-                    crate::log_event!(Debug,"pool admission_transition event={}",
-                        json!({
-                            "pool":address.to_string(),"venue":format!("{:?}",pool.venue),
-                            "source":"mint_qualification","received_at_ms":now,
-                            "before":format!("{previous:?}"),"after":format!("{decision:?}"),
-                            "native_tvl_usd":admission.native_tvl.get(&address).copied(),
-                            "canonical_tvl_usd":pool.tvl_usd,
-                            "completion":format!("{:?}",pool.completion_state),
-                            "completion_reason":pool.completion_reason_code.map(|r|format!("{r:?}")),
-                        }));
-                    if (previous.is_admitted()&&!decision.is_admitted())
-                        ||(previous==CompletionAdmission::NativeTvlBelowMinimum&&decision.is_admitted()){
-                        crate::log_event!(Info,"pool admission_membership_change event={}",
-                            json!({"pool":address.to_string(),
-                                "source":"mint_qualification","at_ms":now,
-                                "venue":format!("{:?}",pool.venue),
-                                "before":format!("{previous:?}"),"after":format!("{decision:?}"),
-                                "native_tvl_usd":admission.native_tvl.get(&address).copied(),
-                                "canonical_tvl_usd":pool.tvl_usd}));
+                    if audit {
+                        AdmissionAudit::capture(&mut stats.audit,pool,pool.completion_admission,decision,
+                            admission.native_tvl.get(&address).copied(),"mint_qualification",now);
                     }
                     pool.completion_admission=decision;
                     pool.last_changed_ms=now;
-                    updates.push(pool.clone());
+                    stats.updates.push(pool.clone());
                 }
             }
         }
-        crate::log_event!(Info,
-            "pool registry mint_admission qualified={} changed_mints={} affected_pools={} admission_updates={}",
-            admission.qualified.len(),changed.len(),affected_count,updates.len());
-        updates
+        stats
     }
 
-    fn apply(&self, batch: &DataBatch) -> BatchStats {
+    fn apply(&self, batch: &DataBatch, audit: bool) -> BatchStats {
         let mut stats = BatchStats::default();
         let mut entries = self.entries.write().expect("pool registry lock poisoned");
         let mut quotes = self.quotes.write().expect("pool market state lock poisoned");
@@ -391,8 +405,7 @@ impl PoolRegistry {
                         last_seen_ms: batch.received_at_ms,
                         last_changed_ms: batch.received_at_ms,
                         tvl_usd: selected.map(|v|v.value),
-                        completion_admission: CompletionAdmission::from_inputs(
-                            *mint_a,*mint_b,None),
+                        completion_admission: CompletionAdmission::MissingIdentity,
                         pool_config: metadata.map(|patch|combine_metadata(None,patch,batch.source,batch.received_at_ms)),
                         last_observation: selected.map(|v|Arc::new(json!({
                             "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
@@ -429,7 +442,7 @@ impl PoolRegistry {
                     {
                         stats.conflicts += 1;
                         stats.metadata_skipped += 1;
-                        crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
+                        if stats.conflict_samples.len()<3 {stats.conflict_samples.push(*address);}
                         continue;
                     }
                     let metadata=record.config.as_ref().filter(|_|native_source(*venue)==Some(batch.source));
@@ -497,31 +510,11 @@ impl PoolRegistry {
                     current.completion_admission=admission.admission(current);
                     if current.completion_admission!=previous_admission {
                         changed=true;
-                        if (previous_admission.is_admitted()&&!current.completion_admission.is_admitted())
-                            ||(previous_admission==CompletionAdmission::NativeTvlBelowMinimum
-                                &&current.completion_admission.is_admitted()){
-                            crate::log_event!(Info,"pool admission_membership_change event={}",
-                                json!({"pool":current.address.to_string(),
-                                    "source":batch.source,"at_ms":batch.received_at_ms,
-                                    "venue":format!("{:?}",current.venue),
-                                    "before":format!("{previous_admission:?}"),
-                                    "after":format!("{:?}",current.completion_admission),
-                                    "native_tvl_usd":admission.native_tvl.get(&current.address).copied(),
-                                    "canonical_tvl_usd":current.tvl_usd}));
+                        stats.admission_updates+=1;
+                        if audit {
+                            AdmissionAudit::capture(&mut stats.audit,current,previous_admission,current.completion_admission,
+                                admission.native_tvl.get(&current.address).copied(),batch.source,batch.received_at_ms);
                         }
-                        crate::log_event!(Debug,"pool admission_transition event={}",
-                            json!({
-                                "pool":current.address.to_string(),
-                                "venue":format!("{:?}",current.venue),
-                                "source":batch.source,"received_at_ms":batch.received_at_ms,
-                                "before":format!("{previous_admission:?}"),
-                                "after":format!("{:?}",current.completion_admission),
-                                "native_tvl_usd":admission.native_tvl.get(&current.address).copied(),
-                                "canonical_tvl_usd":current.tvl_usd,
-                                "completion":format!("{:?}",current.completion_state),
-                                "completion_reason":current.completion_reason_code.map(|r|format!("{r:?}")),
-                                "manifest_retained":current.execution_manifest.is_some(),
-                            }));
                     }
                     if changed {
                         if identity_changed { stats.identity.push(*address); }
@@ -563,6 +556,7 @@ impl PoolRegistry {
                 // Transient RPC/validation failures must not overwrite previously
                 // validated manifests or turn an Unknown pool into a terminal state.
                 stats.retryable += 1;
+                CompletionIssue::record(&mut stats.issues,pool,result);
                 if pool.completion_state == CompletionState::Unknown {
                     pool.completion_reason = result.reason.clone();
                     pool.completion_reason_code = result.reason_code;
@@ -649,10 +643,6 @@ impl PoolRegistry {
             pool.completion_reason = result.reason.clone();
             pool.completion_reason_code = result.reason_code;
             pool.completion_checked_at_ms = result.checked_at_ms;
-            crate::log_event!(Debug,
-                "completion_contract pool={} venue={:?} state={:?} reason_code={:?} checked_at_ms={:?} slot={slot} admission={:?}",
-                pool.address,pool.venue,pool.completion_state,pool.completion_reason_code,
-                pool.completion_checked_at_ms,pool.completion_admission);
             pool.last_changed_ms = pool.last_changed_ms.max(changed_at_ms);
             stats.applied += 1;
             match result.status {
@@ -660,14 +650,72 @@ impl PoolRegistry {
                 CompletionStatus::Incomplete => stats.incomplete += 1,
                 CompletionStatus::Retryable => (),
             }
+            if result.status==CompletionStatus::Incomplete {
+                CompletionIssue::record(&mut stats.issues,pool,result);
+            }
             stats.updates.push(pool.clone());
         }
         stats
     }
 }
 
+// Small owner summaries, never another pool/manifest mirror.
+struct CompletionIssue {
+    venue:Venue,
+    reason:crate::core::CompletionReason,
+    count:u64,
+    sample_pool:Pubkey,
+    sample:String,
+}
+impl CompletionIssue {
+    fn record(issues:&mut Vec<Self>,pool:&PoolState,result:&crate::core::CompletionResult) {
+        let Some(reason)=result.reason_code else{return};
+        if let Some(issue)=issues.iter_mut().find(|i|i.venue==pool.venue && i.reason==reason) {
+            issue.count+=1;
+        } else {
+            issues.push(Self{venue:pool.venue,reason,count:1,sample_pool:pool.address,
+                sample:result.reason.as_deref().unwrap_or("").chars().take(512).collect()});
+        }
+    }
+}
+struct QualifiedStats {
+    qualified:usize,
+    changed_mints:usize,
+    affected:usize,
+    updates:Vec<PoolState>,
+    audit:Vec<AdmissionAudit>,
+}
+struct AdmissionAudit {
+    pool:Pubkey,
+    venue:Venue,
+    source:&'static str,
+    at_ms:u64,
+    before:CompletionAdmission,
+    after:CompletionAdmission,
+    native_tvl:Option<f64>,
+    canonical_tvl:Option<f64>,
+}
+impl AdmissionAudit {
+    fn capture(events:&mut Vec<Self>,pool:&PoolState,before:CompletionAdmission,after:CompletionAdmission,
+        native_tvl:Option<f64>,source:&'static str,at_ms:u64) {
+        if (before.is_admitted() && !after.is_admitted())
+            || (before==CompletionAdmission::NativeTvlBelowMinimum && after.is_admitted()) {
+            events.push(Self{pool:pool.address,venue:pool.venue,source,at_ms,before,after,
+                native_tvl,canonical_tvl:pool.tvl_usd});
+        }
+    }
+    fn emit(self) {
+        crate::log_event!(Info,"pool admission_membership_change event={}",json!({
+            "pool":self.pool.to_string(),"venue":format!("{:?}",self.venue),
+            "source":self.source,"at_ms":self.at_ms,
+            "before":format!("{:?}",self.before),"after":format!("{:?}",self.after),
+            "native_tvl_usd":self.native_tvl,"canonical_tvl_usd":self.canonical_tvl}));
+    }
+}
+
 #[derive(Default)]
 struct CompletionStats {
+    issues:Vec<CompletionIssue>,
     received: usize,
     applied: usize,
     prepared: usize,
@@ -686,6 +734,9 @@ struct CompletionStats {
 
 #[derive(Default)]
 struct BatchStats {
+    audit:Vec<AdmissionAudit>,
+    admission_updates:usize,
+    conflict_samples:Vec<Pubkey>,
     inserted: usize,
     changed: usize,
     unchanged: usize,
@@ -711,6 +762,10 @@ pub async fn run(
     fail_on_lag: bool,
     mut qualified: Option<watch::Receiver<Arc<[Pubkey]>>>,
 ) -> Result<()> {
+    let audit=std::env::var("POOL_REGISTRY_ADMISSION_AUDIT").ok()
+        .is_some_and(|v|v=="1" || v.eq_ignore_ascii_case("true"));
+    let mut issues:Vec<CompletionIssue>=Vec::new();
+    let mut admission_updates=0_usize;
     let mut batches = 0_u64;
     let mut input_records = 0_u64;
     let mut inserted = 0_u64;
@@ -757,8 +812,11 @@ pub async fn run(
                     Ok(())=>{
                         let next=qualified.as_mut().expect("qualified channel")
                             .borrow_and_update().clone();
-                        let changed=registry.apply_qualified(&next,now_unix_ms()?);
-                        for pools in changed.chunks(2048) {
+                        let started=std::time::Instant::now();
+                        let stats=registry.apply_qualified(&next,now_unix_ms()?,audit);
+                        let install_us=started.elapsed().as_micros();
+                        admission_updates+=stats.updates.len();
+                        for pools in stats.updates.chunks(2048) {
                             output.send(Arc::new(PoolUpdateBatch{
                                 kind:PoolUpdateKind::Source,
                                 source:"mint_admission",
@@ -767,9 +825,13 @@ pub async fn run(
                                 persist_identity:Vec::new(),
                             })).map_err(|_|anyhow::anyhow!("Registry mint admission has no subscriber"))?;
                         }
+                        crate::log_event!(Info,
+                            "pool registry mint_admission qualified={} changed_mints={} affected_pools={} admission_updates={} install_us={install_us}",
+                            stats.qualified,stats.changed_mints,stats.affected,stats.updates.len());
+                        for event in stats.audit {event.emit();}
                     }
                     Err(_)=>{
-                        crate::log_event!(Warn,"pool registry mint_qualification channel_closed");
+                        crate::log_event!(Debug,"pool registry mint_qualification channel_closed");
                         qualified=None;
                     }
                 }
@@ -794,7 +856,8 @@ pub async fn run(
                     batches += 1;
                     input_records += batch.records.len() as u64;
                     *by_source.entry(batch.source).or_default() += batch.records.len() as u64;
-                    let stats = registry.apply(&batch);
+                    let stats = registry.apply(&batch,audit);
+                    admission_updates+=stats.admission_updates;
                     inserted += stats.inserted as u64;
                     changed += stats.changed as u64;
                     unchanged += stats.unchanged as u64;
@@ -813,6 +876,11 @@ pub async fn run(
                         })).is_err() {
                             crate::log_event!(Warn,"pool registry update_broadcast_no_subscribers");
                         }
+                    }
+                    for event in stats.audit {event.emit();}
+                    if stats.conflicts>0 {
+                        crate::log_event!(Warn,"pool registry identity_conflicts source={} count={} sample_pools={:?}",
+                            batch.source,stats.conflicts,stats.conflict_samples);
                     }
                     if batches == 1 || batches % 25 == 0 {
                         crate::log_event!(Debug,
@@ -848,6 +916,11 @@ pub async fn run(
                     prepared_delta += stats.prepared_delta;
                     incomplete_delta += stats.incomplete_delta;
                     manifest_delta += stats.manifest_delta;
+                    for issue in stats.issues {
+                        if let Some(total)=issues.iter_mut().find(|i|i.venue==issue.venue && i.reason==issue.reason) {
+                            total.count+=issue.count;
+                        } else {issues.push(issue);}
+                    }
                     let updated = stats.updates.len();
                     crate::log_event!(Debug,"pool registry completion source={} received={} applied={} preserved_retryable={} prepared={} incomplete={} retryable={} stale={} invalid={} missing_pool={} updates_published={}",
                         batch.source, stats.received, stats.applied, stats.preserved_retryable,
@@ -870,6 +943,11 @@ pub async fn run(
         }
     }
 
+    for issue in issues {
+        crate::log_event!(Info,"pool registry completion_issue venue={:?} reason={:?} count={} sample_pool={} sample={:?}",
+            issue.venue,issue.reason,issue.count,issue.sample_pool,issue.sample);
+    }
+    crate::log_event!(Info,"pool registry admission_summary updates={admission_updates} audit={audit}");
     let snapshot = registry.snapshot();
     let with_tvl = snapshot.iter().filter(|p| p.tvl_usd.is_some()).count();
     let prepared = snapshot.iter().filter(|p| p.completion_state == CompletionState::Prepared).count();

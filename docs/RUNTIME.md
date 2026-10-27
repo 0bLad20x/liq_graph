@@ -7,6 +7,7 @@ optionale V10-Simulation. Endliche und dauerhafte Läufe verwenden dieselbe Verk
 Worker bleiben über ihre vorhandenen CLI-Einstiege eigenständig ausführbar.
 Discovery-Module, gemeinsame Startverkabelung und begrenzte Einzelaufrufe beschreibt
 [DISCOVERY.md](DISCOVERY.md).
+Completion-Module und der gemeinsame Einzelstart sind in [COMPLETION.md](COMPLETION.md) beschrieben.
 
 ## Werkzeuge
 
@@ -20,7 +21,7 @@ Unter `scripts/` bleiben genau drei wiederverwendbare Dateien:
 
 Historische Checkpoint-Starter, Flashloan-Presets, DB-Wrapper, SQL-Vergleiche,
 Migration und Reset-Werkzeuge sind entfernt. Benötigte Workerfunktionen bleiben
-erhalten, darunter `--cp1-live`, `--completion-lifecycle-live` und
+erhalten, darunter `--cp1-live`, `--completion-live PROTOCOL` und
 `--jupiter-mint-backfill`. Schema und Completion-Serialisierung beschreibt
 [PERSISTENCE.md](PERSISTENCE.md). Es wird keine Datenbankmigration oder Löschung durch
 diesen Cleanup ausgeführt.
@@ -149,3 +150,37 @@ WS-Signalverarbeitung in ns und Frame-bis-Signalzustand in µs. P95/P99 sind
 Histogrammobergrenzen. Graphbuild, Catalogbuild und Auswahlzeiten bleiben im Log
 und bei Audit in der Offline-Auswertung. Vergleiche benötigen ähnliche Last und
 Auswahlgröße; dieser Cleanup verspricht keinen vorab erfundenen Beschleunigungsfaktor.
+
+## Completion-Abschluss und 30-Minuten-Integration
+
+Der vollstaendige Aufruf mit allen laufenden Stufen und V10-Simulation steht in
+[COMPLETION.md](COMPLETION.md#registry-bootstrap-correction-and-30-minute-integration).
+`CompletionRefreshSeconds` und `CompletionRecheckSeconds` sind optionale Overrides;
+0 bedeutet die bestehenden Einstellungen uebernehmen. Der Runtime-Starter setzt
+keinen Completion-Kohortenfilter. PumpSwap verwendet im Simulationslauf den aus
+`WalletPath` lokal ermittelten oeffentlichen Signer; die Cache-Kompatibilitaetspruefung
+bleibt aktiv. Ein einmaliger Full-RPC-Inventarscan ist weiterhin ein eigener
+Bootstrap, kein regelmaessiger Runtime-Worker.
+
+Die Zusammenfassung enthaelt zusaetzlich `completion_protocols`,
+`completion_protocol_evidence_passed`, `completion_issues`,
+`discovery_records_by_source`, `log_bytes` und `log_levels`.
+Registry-Abhaengigkeitsupdates werden unveraendert veroeffentlicht, ohne
+Einzellogging unter Schreibsperren. Der optionale Graph-Audit behaelt seine
+Membership-Uebergaenge; normale Laeufe verwenden Zusammenfassungen.
+
+`SimulationLimit=0` ist der Standard und bedeutet kein Gesamtlimit. Die reale
+Parallelitaet bleibt bei einer Simulation plus einem wartenden Request. Positive
+Limits bleiben fuer gezielte Kurzlaeufe moeglich. Das begrenzte Eingangsangebot
+bleibt erhalten; ausgelastete Revisionen werden gezaehlt und uebersprungen.
+
+Registry publiziert den restaurierten Prepared-Anfangsbestand mit berechneter
+Admission vor den ersten Writer-Deltas. Nach dem Drain prueft `graph_membership`
+konkrete Pooladressen und Mintpaare gegen die finale Registry. Fehlende,
+unberechtigte oder falsch zugeordnete Graph-Pools verhindern die endliche Abnahme.
+Der Vergleich laeuft einmalig beim Abschluss und startet keinen Diagnosekonsumenten.
+
+MarketState unterscheidet im Abschlussbericht `selected_pools`, strukturell
+installierte `hydrated_pools`, nach Baseline betriebsbereite `ready_pools` und
+`priced_pools`. Der alte Final-Logname `prepared` fuer installierte Pools entfaellt;
+Completion-Prepared und Preisbereitschaft werden dadurch nicht verwechselt.

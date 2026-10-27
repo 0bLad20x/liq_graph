@@ -11,7 +11,7 @@ use tokio::{sync::broadcast, task::JoinSet, time::MissedTickBehavior};
 
 use crate::{
     core::{now_unix_ms, DataBatch, DataRecord, PoolUpdateBatch, RecordIdentity, Venue},
-    workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
+    core::rpc::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const SOURCE: &str = "multi_venue_identity_hydration";

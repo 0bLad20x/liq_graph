@@ -7,6 +7,8 @@ param(
     [ValidateSet('Graph','Signals','MarketState')][string]$Stage = 'Signals',
     [string]$ExpectedBranch = '',
     [switch]$PlanOnly,
+    [ValidateRange(0,86400)][int]$CompletionRefreshSeconds = 0,
+    [ValidateRange(0,86400)][int]$CompletionRecheckSeconds = 0,
     [switch]$Rewatch,
     [switch]$GraphAudit,
     [switch]$RequireCatalogReconciliation,
@@ -19,7 +21,7 @@ param(
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
     [switch]$SimulateV10,
     [string]$WalletPath,
-    [ValidateRange(1,5000)][int]$SimulationLimit = 10,
+    [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
     [ValidateSet('All','Direct2','Direct3','Triangle3','Triangle4')][string]$RouteKind = 'All',
     [string]$ExecutionParametersPath
 )
@@ -79,6 +81,8 @@ try {
         RUN_SIGNAL_PROOF = "$($signals -and -not $SimulateV10)".ToLowerInvariant()
         RUN_REWATCH = "$([bool]$Rewatch)".ToLowerInvariant()
         RUN_FULL_SCAN = 'false'
+        COMPLETION_LIFECYCLE_POOL_LIMIT = '0'
+        POOL_REGISTRY_ADMISSION_AUDIT = $(if ($GraphAudit) { '1' } else { '0' })
         IDENTITY_HYDRATION_ONLY = 'false'
         RUN_REPORT_PATH = $runtimePath
         RUN_MARKET_REPORT_PATH = $marketPath
@@ -111,12 +115,21 @@ try {
         LIQ_GRAPH_LOG = (@(
             'warn','liq_graph::orchestration::runtime=info',
             'liq_graph::workers::persistence=info','liq_graph::workers::pool_registry=info',
-            'liq_graph::workers::completion_lifecycle=info','liq_graph::workers::graph_liquidity=info',
+            'liq_graph::workers::completion::lifecycle=info','liq_graph::orchestration::completion=info',
+            'liq_graph::workers::graph_liquidity=info',
             'liq_graph::workers::graph_watch_catalog=info','liq_graph::workers::market_state=info',
             'liq_graph::workers::mint_extensions=info','liq_graph::workers::mint_qualification=info',
             'liq_graph::workers::graph_signals=info','liq_graph::workers::execution_candidates=info',
             'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info'
         ) -join ',')
+    }
+    if ($CompletionRefreshSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_REFRESH_SECONDS = "$CompletionRefreshSeconds" }
+    if ($CompletionRecheckSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_RECHECK_SECONDS = "$CompletionRecheckSeconds" }
+    if ($SimulateV10 -and -not $PlanOnly) {
+        # Resolve only the public signer. The keypair remains local and is never logged.
+        $walletPublicKey = & $binary --v10-wallet $WalletPath
+        if ($LASTEXITCODE -ne 0 -or @($walletPublicKey).Count -ne 1) { throw 'Cannot resolve execution wallet public key.' }
+        $values.PUMPSWAP_V10_WALLET = "$walletPublicKey".Trim()
     }
     foreach ($name in $values.Keys) {
         $previous[$name] = [Environment]::GetEnvironmentVariable($name,'Process')
@@ -134,6 +147,9 @@ try {
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
+        completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
+        completion_recheck_seconds=$CompletionRecheckSeconds
+        log_filter=$values.LIQ_GRAPH_LOG
         plan_only=[bool]$PlanOnly; transactions_sent=0; plan=$plan
     }
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
@@ -145,6 +161,10 @@ try {
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
         Write-Host 'Plan only: no RPC connections, database reads or live acceptance.'
         return
+    }
+    if ($SimulateV10) {
+        if ($SimulationLimit -eq 0) { Write-Host 'Simulation requests: no total cap; one executor and one queued request, broadcasts=false.' }
+        else { Write-Host "Simulation requests: total cap=$SimulationLimit, broadcasts=false." }
     }
     if ($marketEnabled -and $plan.websocket_plan.account_capacity -le 0) { throw 'No WebSocket account capacity selected.' }
     Write-Host "Starting $DurationSeconds-second live run; full log: $log"
@@ -162,8 +182,29 @@ try {
     $market = Read-OptionalJson $marketPath
     $execution = Read-OptionalJson $executionPath
     $production = Read-OptionalJson $producerPath
-    $refreshes = @(Select-String -LiteralPath $log -Pattern 'lifecycle (unchanged request_id=.* work=Refresh state=Prepared|accepted request_id=.* work=Refresh status=Prepared)').Count
+    $refreshRecord = Select-String -LiteralPath $log -Pattern 'lifecycle stats final=true .*? prepared_refreshes=(\d+)' | Select-Object -Last 1
+    $refreshes = if ($null -ne $refreshRecord) { [long]$refreshRecord.Matches[0].Groups[1].Value } else { 0 }
     $lifecycleStarted = [bool](Select-String -LiteralPath $log -Pattern 'lifecycle started' -Quiet)
+    $protocols = @(Select-String -LiteralPath $log -Pattern 'lifecycle protocol_summary venue=(\w+) dispatched=(\d+) accepted=(\d+) proofs=(\d+) unchanged=(\d+) prepared=(\d+) incomplete=(\d+) retryable=(\d+)' | ForEach-Object {
+        $fields = $_.Matches[0].Groups
+        [ordered]@{venue=$fields[1].Value; dispatched=[long]$fields[2].Value; accepted=[long]$fields[3].Value
+            proofs=[long]$fields[4].Value; unchanged=[long]$fields[5].Value; prepared=[long]$fields[6].Value
+            incomplete=[long]$fields[7].Value; retryable=[long]$fields[8].Value}
+    })
+    $protocolEvidence = $protocols.Count -eq 10 -and @($protocols | Where-Object { $_.accepted -eq 0 }).Count -eq 0
+    $discovery = [ordered]@{}
+    $sourceRecord = Select-String -LiteralPath $log -Pattern 'pool registry discovery_sources=' | Select-Object -Last 1
+    if ($null -ne $sourceRecord) {
+        $sourcePart = ($sourceRecord.Line -split 'discovery_sources=',2)[1] -replace ' unique_by_venue=.*$', ''
+        foreach ($match in [regex]::Matches($sourcePart, '\("([^"\r\n]+)", (\d+)\)')) {
+            $discovery[$match.Groups[1].Value] = [long]$match.Groups[2].Value
+        }
+    }
+    $logLevels = [ordered]@{ERROR=0; WARN=0; INFO=0; DEBUG=0}
+    foreach ($record in Select-String -LiteralPath $log -Pattern 'level=(ERROR|WARN|INFO|DEBUG) ') {
+        $logLevels[$record.Matches[0].Groups[1].Value]++
+    }
+    $issueRecords = @(Select-String -LiteralPath $log -Pattern 'pool registry completion_issue ' | ForEach-Object { $_.Line })
     $candidateDelivery = $runtime.candidate_delivery_passed
     $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
         $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and
@@ -188,10 +229,17 @@ try {
         market_delivery_passed=$runtime.market_delivery_passed
         signal_delivery_passed=$runtime.signal_delivery_passed
         rewatch_evidence_passed=$runtime.rewatch_evidence_passed
+        graph_membership_passed=$runtime.graph_membership_passed
+        graph_membership=$runtime.graph_membership
         evidence_errors=$runtime.evidence_errors
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; completion_lifecycle_started=$lifecycleStarted
         prepared_refreshes_observed=$refreshes; graph_audit_passed=$graphPassed
+        completion_protocol_evidence_passed=[bool]$protocolEvidence; completion_protocols=$protocols
+        completion_issues=$issueRecords; discovery_records_by_source=$discovery
+        log_bytes=(Get-Item -LiteralPath $log).Length; log_levels=$logLevels
+        selected_pools=$market.selected_pools; hydrated_pools=$market.hydrated_pools
+        ready_pools=$market.ready_pools; priced_pools=$market.priced_pools
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
         market_account_processing_ns=$market.metrics.processing
@@ -208,6 +256,7 @@ try {
     }
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
+    if (-not $protocolEvidence) { Write-Warning 'Nicht fuer jedes Completion-Protokoll angenommene Arbeit nachgewiesen; protocol_summary pruefen.' }
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
     Write-Host "Orchestrierungsnachweis bestanden. Artefakte: $folder"
     if ($SimulateV10) {

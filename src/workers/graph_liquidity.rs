@@ -331,6 +331,57 @@ impl GraphSnapshot {
         self.pool_pairs.get(&pool).copied()
     }
 }
+/// One exact end-of-run comparison after both owners have drained. No live mirror.
+#[derive(serde::Serialize)]
+pub struct MembershipReport {
+    pub passed:bool,
+    pub registry_eligible_pools:usize,
+    pub graph_pools:usize,
+    pub registry_conversion_pools:usize,
+    pub graph_conversion_pools:usize,
+    pub missing_pools:Vec<String>,
+    pub unexpected_pools:Vec<String>,
+    pub pair_mismatches:Vec<String>,
+}
+impl MembershipReport {
+    pub fn ensure_complete(&self)->Result<()> {
+        ensure!(self.passed,
+            "Registry/Graph membership mismatch: expected={} graph={} missing={} unexpected={} pair_mismatches={}; inspect graph_membership in runtime.json",
+            self.registry_eligible_pools,self.graph_pools,self.missing_pools.len(),
+            self.unexpected_pools.len(),self.pair_mismatches.len());
+        Ok(())
+    }
+}
+pub fn compare_registry(graph:&GraphSnapshot,registry:&[PoolState])->Result<MembershipReport> {
+    let expected:HashMap<_,_>=registry.iter().filter_map(eligible)
+        .map(|p|(p.address,pair(p.a,p.b))).collect();
+    let conversion=pair(WSOL.parse()?,USDC.parse()?);
+    let mut missing_pools=Vec::new();let mut unexpected_pools=Vec::new();let mut pair_mismatches=Vec::new();
+    for (address,mints) in &expected {
+        match graph.pool_pairs.get(address) {
+            None=>missing_pools.push(address.to_string()),
+            Some(actual) if actual!=mints=>pair_mismatches.push(address.to_string()),
+            _=>{},
+        }
+    }
+    for address in graph.pool_pairs.keys() {
+        if !expected.contains_key(address){unexpected_pools.push(address.to_string());}
+    }
+    missing_pools.sort_unstable();unexpected_pools.sort_unstable();pair_mismatches.sort_unstable();
+    let passed=missing_pools.is_empty() && unexpected_pools.is_empty() && pair_mismatches.is_empty()
+        && graph.qualified_pools==graph.pool_pairs.len();
+    let report=MembershipReport{passed,registry_eligible_pools:expected.len(),graph_pools:graph.pool_pairs.len(),
+        registry_conversion_pools:expected.values().filter(|p|**p==conversion).count(),
+        graph_conversion_pools:graph.pool_pairs.values().filter(|p|**p==conversion).count(),
+        missing_pools,unexpected_pools,pair_mismatches};
+    crate::log_event!(Info,
+        "graph registry_membership passed={} registry_pools={} graph_pools={} registry_conversion={} graph_conversion={} missing={} unexpected={} pair_mismatches={}",
+        report.passed,report.registry_eligible_pools,report.graph_pools,
+        report.registry_conversion_pools,report.graph_conversion_pools,report.missing_pools.len(),
+        report.unexpected_pools.len(),report.pair_mismatches.len());
+    Ok(report)
+}
+
 // CP6C invariant: a topology is defined only by its directed mint roles.
 // Pools are alternative edges; their number changes route multiplicity,
 // never the mathematical directed cycle. Direct2 uniquely requires n >= 2.

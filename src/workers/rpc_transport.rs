@@ -13,40 +13,15 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot, watch, Mutex, Semaphore},
+    sync::{broadcast, mpsc, watch, Mutex, Semaphore},
     task::JoinHandle,
     time::{sleep, sleep_until, Instant},
 };
 
 use crate::core::now_unix_ms;
 
-pub use crate::core::account_stream::{AccountData,AccountView};
-use crate::core::account_stream::{AccountEvent,AccountEventStream,AccountStreamControl};
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub enum AccountFilter {
-    DataSize(usize),
-    Memcmp { offset: usize, bytes: Vec<u8> },
-}
-
-#[derive(Clone, Debug)]
-pub enum RpcOperation {
-    Multiple { addresses: Vec<Pubkey>, view: AccountView, min_context_slot: Option<u64> },
-    Account { address: Pubkey, view: AccountView },
-    Program { program: Pubkey, filters: Vec<AccountFilter>, view: AccountView },
-    ProgramV2 {
-        program: Pubkey, filters: Vec<AccountFilter>, view: AccountView,
-        cursor: Option<String>, changed_since_slot: Option<u64>, limit: usize,
-    },
-    Slot { commitment: String },
-    GenesisHash,
-    LatestBlockhash { min_context_slot: Option<u64> },
-    /// Read-only execution. Signature verification is always enabled; never broadcasts.
-    Simulate { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
-    /// Simulation-only: RPC replaces the blockhash and skips signature verification.
-    SimulateFast { transaction: Vec<u8>, min_context_slot: Option<u64>, accounts: Vec<Pubkey> },
-}
+use crate::core::rpc::{AccountData,AccountView,AccountFilter,RpcOperation,RpcAnswer,RpcResponse,RpcHandle,Call};
+use crate::core::account_stream::AccountStreamControl;
 
 impl RpcOperation {
     fn method(&self) -> &'static str {
@@ -59,18 +34,6 @@ impl RpcOperation {
             Self::GenesisHash => "getGenesisHash",
             Self::LatestBlockhash { .. } => "getLatestBlockhash",
             Self::Simulate { .. } | Self::SimulateFast { .. } => "simulateTransaction",
-        }
-    }
-    fn bit(&self) -> u64 {
-        match self {
-            Self::Multiple { .. } => 1,
-            Self::Account { .. } => 2,
-            Self::Program { .. } => 4,
-            Self::ProgramV2 { .. } => 8,
-            Self::Slot { .. } => 16,
-            Self::GenesisHash => 32,
-            Self::LatestBlockhash { .. } => 64,
-            Self::Simulate { .. } | Self::SimulateFast { .. } => 128,
         }
     }
     fn params(&self, commitment: &str, account_limit: usize, v2_limit: usize) -> Result<Value> {
@@ -140,51 +103,6 @@ impl RpcOperation {
         })
     }
 }
-
-#[derive(Debug)]
-pub enum RpcAnswer {
-    Multiple { slot: u64, accounts: Vec<Option<AccountData>> },
-    Account { slot: u64, account: Option<AccountData> },
-    Program { accounts: Vec<AccountData>, next_cursor: Option<String> },
-    Slot(u64),
-    GenesisHash(String),
-    LatestBlockhash { slot: u64, blockhash: String, last_valid_block_height: u64 },
-    Simulation { slot: u64, value: Value },
-}
-
-#[derive(Debug)]
-pub struct RpcResponse {
-    pub provider: String,
-    pub received_at_ms: u64,
-    pub answer: RpcAnswer,
-}
-
-#[derive(Clone)]
-pub struct RpcHandle {
-    requests: mpsc::Sender<Call>,
-    stream: AccountStreamControl,
-    events: broadcast::Sender<AccountEvent>,
-    account_batch_size: usize,
-    capabilities: u64,
-}
-
-impl RpcHandle {
-    pub async fn call(&self, operation: RpcOperation) -> Result<RpcResponse> {
-        let (reply, receive)=oneshot::channel();
-        self.requests.send(Call{operation,reply,queued_at:Instant::now()}).await.context("RPC worker stopped")?;
-        receive.await.context("RPC worker dropped response")?
-    }
-
-    pub fn account_batch_size(&self)->usize {self.account_batch_size}
-    pub fn account_stream(&self)->(AccountStreamControl,AccountEventStream) {
-        (self.stream.clone(),self.events.subscribe())
-    }
-    pub fn supports(&self, operation: &RpcOperation) -> bool {
-        self.capabilities & operation.bit() != 0
-    }
-}
-
-struct Call {operation:RpcOperation,reply:oneshot::Sender<Result<RpcResponse>>,queued_at:Instant}
 
 #[derive(Clone, Debug)]
 struct HttpSettings {

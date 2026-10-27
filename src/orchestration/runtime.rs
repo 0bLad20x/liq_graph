@@ -3,15 +3,12 @@ use crate::workers::discovery::identity_hydration as identity_hydration_venues;
 use std::{env, future::Future, io::{self, BufRead}, sync::{Arc,Mutex}, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
-use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, PoolState,
-        PoolUpdateBatch, PoolUpdateKind, Venue},
-    workers::{completion_lifecycle, completion_meteora_dlmm, completion_meteora_damm_v2, completion_orca_whirlpool,
-        completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm,
-        completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest,
-        completion_pumpswap, execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
+use crate::{core::{self, DataBatch, CompletionResultBatch,
+        PoolUpdateBatch, Venue},
+    workers::{execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
         graph_signals, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint, execution_v10}};
-use super::{discovery,jupiter_settings,v10_simulation::ExecutionTasks};
+use super::{completion,discovery,jupiter_settings,v10_simulation::ExecutionTasks};
 
 pub(super) struct AbortOnDrop<T>(pub(super) JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {fn drop(&mut self) {self.0.abort();}}
@@ -26,7 +23,7 @@ fn enabled(key:&str)->Result<bool>{
             _=>bail!("{key} must be true or false")}
     }
 }
-fn critical<F>(tasks:&mut JoinSet<Result<()>>,name:&'static str,run:F)
+pub(super) fn critical<F>(tasks:&mut JoinSet<Result<()>>,name:&'static str,run:F)
 where F:Future<Output=Result<()>>+Send+'static {
     crate::log_event!(Info,"runtime worker={name} policy=fatal started=true");
     tasks.spawn(async move {
@@ -76,7 +73,7 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     }
 }
 // Cancel input producers on operator stop; state-owning consumers drain normally.
-async fn until_stop<F>(mut stop:watch::Receiver<bool>,run:F)->Result<()>
+pub(super) async fn until_stop<F>(mut stop:watch::Receiver<bool>,run:F)->Result<()>
 where F:Future<Output=Result<()>> {
     if *stop.borrow(){return Ok(());}
     tokio::select! {
@@ -84,217 +81,6 @@ where F:Future<Output=Result<()>> {
         _=stop.changed()=>Ok(()),
     }
 }
-/// Wiring shared by production, the finite protocol mode and the CP2 live run.
-/// Protocol code and scheduling stay in their respective workers.
-#[derive(Clone, Copy)]
-pub(super) struct CompletionExecutors {
-    pub(super) dlmm:Option<completion_meteora_dlmm::Settings>,
-    pub(super) damm_v2:Option<completion_meteora_damm_v2::Settings>,
-    pub(super) orca:Option<completion_orca_whirlpool::Settings>,
-    pub(super) pancakeswap_clmm:Option<completion_pancakeswap_clmm::Settings>,
-    pub(super) byreal_clmm:Option<completion_byreal_clmm::Settings>,
-    pub(super) pumpswap:Option<completion_pumpswap::Settings>,
-    pub(super) manifest:Option<completion_manifest::Settings>,
-    pub(super) raydium_amm_v4:Option<completion_raydium_amm_v4::Settings>,
-    pub(super) raydium_cpmm:Option<completion_raydium_cpmm::Settings>,
-    pub(super) raydium_clmm:Option<completion_raydium_clmm::Settings>,
-}
-
-pub(super) fn spawn_completion_lifecycle(tasks:&mut JoinSet<Result<()>>,
-    registry:&pool_registry::PoolRegistry,
-    updates:&broadcast::Sender<Arc<PoolUpdateBatch>>,
-    results:broadcast::Sender<Arc<CompletionResultBatch>>,
-    source_done:watch::Receiver<bool>,
-    stop:(watch::Sender<bool>,watch::Receiver<bool>),rpc:rpc_transport::RpcHandle,
-    configured:CompletionExecutors,
-    finite:bool,attempt_limit:usize,
-)->Result<()> {
-    anyhow::ensure!(configured.dlmm.is_some()||configured.damm_v2.is_some()||configured.orca.is_some()
-        ||configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()
-        ||configured.raydium_clmm.is_some()||configured.pancakeswap_clmm.is_some()
-        ||configured.byreal_clmm.is_some()||configured.pumpswap.is_some()||configured.manifest.is_some(),
-        "no lifecycle executor configured");
-    let input=updates.subscribe();
-    let seed=registry.snapshot();
-    if let Some(pump)=configured.pumpswap {
-        completion_pumpswap::ensure_wallet_cache(&seed,pump.wallet)?;
-    }
-    let settings=completion_lifecycle::Settings::from_env(finite,attempt_limit)?;
-    let (responses,response_rx)=tokio::sync::mpsc::channel(4);
-    let mut executors=Vec::new();
-    macro_rules! executor {
-        ($module:ident,$venue:path,$configured:expr)=>{
-            executor!($module,$venue,$configured,|_|false);
-        };
-        ($module:ident,$venue:path,$configured:expr,$configuration_ready:expr)=>{
-            if let Some((config,batch_size))=$configured {
-                let (jobs,job_rx)=tokio::sync::mpsc::channel(4);
-                executors.push(completion_lifecycle::Executor{venue:$venue,requests:jobs,
-                    batch_size,max_in_flight:config.parallel_batches*batch_size,
-                    configuration_ready:($configuration_ready)(config)});
-                critical(tasks,concat!("completion.",stringify!($module)),
-                    $module::run(job_rx,rpc.clone(),config,responses.clone()));
-            }
-        };
-    }
-    executor!(completion_meteora_dlmm,Venue::MeteoraDlmm,configured.dlmm.map(|s|(s,16)));
-    executor!(completion_meteora_damm_v2,Venue::MeteoraDammV2,configured.damm_v2.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_orca_whirlpool,Venue::OrcaWhirlpool,configured.orca.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_pancakeswap_clmm,Venue::PancakeSwapClmm,configured.pancakeswap_clmm.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_byreal_clmm,Venue::ByrealClmm,configured.byreal_clmm.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_manifest,Venue::Manifest,configured.manifest.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_pumpswap,Venue::PumpSwap,configured.pumpswap.map(|s|(s,s.pools_per_batch())),
-        |settings:completion_pumpswap::Settings|settings.wallet.is_some());
-    executor!(completion_raydium_amm_v4,Venue::RaydiumAmmV4,configured.raydium_amm_v4.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_raydium_cpmm,Venue::RaydiumCpmm,configured.raydium_cpmm.map(|s|(s,s.pools_per_batch())));
-    executor!(completion_raydium_clmm,Venue::RaydiumClmm,configured.raydium_clmm.map(|s|(s,s.pools_per_batch())));
-    drop(responses);
-    // One lifecycle instance receives every registered executor's responses.
-    critical(tasks,"completion_lifecycle",async move{
-        let _stop_owner=stop.0;
-        completion_lifecycle::run(seed,input,response_rx,executors,results,
-            source_done,stop.1,settings).await
-    });
-    Ok(())
-}
-
-/// Bounded real-provider proof for selected migrated executors. Uses the same
-/// dispatch, execution, Registry and single-writer path as --run.
-pub async fn completion_lifecycle_live()->Result<()> {
-    let duration=number("RUN_DURATION_SECONDS",300)?;
-    anyhow::ensure!((30..=86400).contains(&duration),"live duration must be 30..86400");
-    let selected=env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").unwrap_or_else(|_|"dlmm".into());
-    anyhow::ensure!(matches!(selected.as_str(),"dlmm"|"damm_v2"|"both"|"raydium_amm_v4"
-        |"raydium_cpmm"|"raydium_clmm"|"raydium"|"orca"|"pancakeswap"|"byreal"|"pumpswap"|"manifest"|"all"),
-        "COMPLETION_LIFECYCLE_LIVE_VENUE must be dlmm, damm_v2, both, raydium_amm_v4, raydium_cpmm, raydium_clmm, raydium, orca, pancakeswap, byreal, pumpswap, manifest or all");
-    let configured=CompletionExecutors {
-        dlmm:matches!(selected.as_str(),"dlmm"|"both"|"all")
-            .then(completion_meteora_dlmm::Settings::from_env).transpose()?,
-        damm_v2:matches!(selected.as_str(),"damm_v2"|"both"|"all")
-            .then(completion_meteora_damm_v2::Settings::from_env).transpose()?,
-        orca:matches!(selected.as_str(),"orca"|"all")
-            .then(completion_orca_whirlpool::Settings::from_env).transpose()?,
-        pancakeswap_clmm:matches!(selected.as_str(),"pancakeswap"|"all")
-            .then(completion_pancakeswap_clmm::Settings::from_env).transpose()?,
-        byreal_clmm:matches!(selected.as_str(),"byreal"|"all")
-            .then(completion_byreal_clmm::Settings::from_env).transpose()?,
-        pumpswap:matches!(selected.as_str(),"pumpswap"|"all")
-            .then(completion_pumpswap::Settings::from_env).transpose()?,
-        manifest:matches!(selected.as_str(),"manifest"|"all")
-            .then(completion_manifest::Settings::from_env).transpose()?,
-        raydium_amm_v4:matches!(selected.as_str(),"raydium_amm_v4"|"raydium"|"all")
-            .then(completion_raydium_amm_v4::Settings::from_env).transpose()?,
-        raydium_cpmm:matches!(selected.as_str(),"raydium_cpmm"|"raydium"|"all")
-            .then(completion_raydium_cpmm::Settings::from_env).transpose()?,
-        raydium_clmm:matches!(selected.as_str(),"raydium_clmm"|"raydium"|"all")
-            .then(completion_raydium_clmm::Settings::from_env).transpose()?,
-    };
-    if let Some(pump)=configured.pumpswap {
-        anyhow::ensure!(pump.wallet.is_some(),
-            "PumpSwap Prepared-refresh live proof requires PUMPSWAP_V10_WALLET");
-    }
-    let enrichment=if configured.pumpswap.is_some()||configured.manifest.is_some() {
-        Some(jupiter_settings()?.context("PumpSwap/Manifest live TVL enrichment requires JUPITER_SEARCH_API_KEYS")?)
-    }else{None};
-    let mut venues=Vec::new();
-    if configured.dlmm.is_some(){venues.push(Venue::MeteoraDlmm);}
-    if configured.damm_v2.is_some(){venues.push(Venue::MeteoraDammV2);}
-    if configured.orca.is_some(){venues.push(Venue::OrcaWhirlpool);}
-    if configured.pancakeswap_clmm.is_some(){venues.push(Venue::PancakeSwapClmm);}
-    if configured.byreal_clmm.is_some(){venues.push(Venue::ByrealClmm);}
-    if configured.pumpswap.is_some(){venues.push(Venue::PumpSwap);}
-    if configured.manifest.is_some(){venues.push(Venue::Manifest);}
-    if configured.raydium_amm_v4.is_some(){venues.push(Venue::RaydiumAmmV4);}
-    if configured.raydium_cpmm.is_some(){venues.push(Venue::RaydiumCpmm);}
-    if configured.raydium_clmm.is_some(){venues.push(Venue::RaydiumClmm);}
-    let database=persistence::Persistence::connect().await?;
-    let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
-    let restored=database.restore().await?.into_iter()
-        .filter(|p|venues.contains(&p.venue)).collect();
-    let registry=pool_registry::PoolRegistry::default();
-    let restored_count=registry.restore(restored)?;
-    let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
-    let (sources,source_rx)=broadcast::channel(256);
-    let (updates,_)=broadcast::channel(256);
-    let (results,result_rx)=broadcast::channel(256);
-    let (done,done_rx)=watch::channel(false);
-    let (stop,stop_rx)=watch::channel(false);
-    let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-    let mut tasks=JoinSet::new();
-    critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
-        registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone())));
-    let mut mint_stream=enrichment.as_ref().map(|_|broadcast::channel::<Arc<DataBatch>>(256));
-    let mint_store_rx=mint_stream.as_ref().map(|(out,_)|out.subscribe());
-    critical(&mut tasks,"persistence",database.run_with_mints(
-        updates.subscribe(),mint_store_rx,None));
-    if selected=="all" {
-        let (graph_out,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
-        critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
-            updates.subscribe(),graph_out,graph_liquidity::Settings::from_env()?));
-        critical(&mut tasks,"observer.graph_liquidity",graph_liquidity::observe(graph_rx));
-    }
-    spawn_completion_lifecycle(&mut tasks,&registry,&updates,results,done_rx,
-        (stop.clone(),stop_rx.clone()),rpc.clone(),configured,false,0)?;
-    let client=core::http_client()?;
-    if let Some(enrichment)=enrichment {
-        // Reuse the existing CP1 mint rules and TVL provider. Historical DB
-        // observations and RPC vault balances never substitute canonical TVL.
-        let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-        let (jupiter_out,jupiter_rx)=mint_stream.take().context("missing Jupiter stream")?;
-        critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
-            mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
-                jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
-        critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
-            source_jupiter_mint::run_targeted(client.clone(),enrichment,target_rx,jupiter_out)));
-        critical(&mut tasks,"source_dexscreener.cp1",until_stop(stop_rx.clone(),
-            source_dexscreener::run_live(qualified_rx,registry.clone(),sources.clone())));
-        crate::log_event!(Info,"lifecycle live enrichment=cp1");
-    } else {
-        // The restored RAM Mint Registry remains authoritative even when
-        // standalone Completion has no Jupiter API credentials.
-        let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(16);
-        let (target_tx,_target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
-        critical(&mut tasks,"mint_qualification",until_stop(stop_rx.clone(),
-            mint_qualification::run(registry.snapshot(),mint_registry,updates.subscribe(),
-                jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
-        let _keep_jupiter_sender=jupiter_out;
-    }
-    let mut discovery_workers=Vec::new();
-    if configured.pumpswap.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::PumpSwap,false,None)?); }
-    if configured.manifest.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Manifest,false,None)?); }
-    if configured.dlmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Dlmm,false,None)?); }
-    if configured.damm_v2.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::DammV2,false,None)?); }
-    if configured.orca.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Orca,false,None)?); }
-    if configured.pancakeswap_clmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::PancakeSwap,false,None)?); }
-    if configured.byreal_clmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Byreal,false,None)?); }
-    if configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()||configured.raydium_clmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Raydium,false,None)?); }
-    discovery::spawn_continuous(&mut tasks,discovery_workers,discovery::Resources {
-        http:client,rpc:Some(rpc.clone()),output:sources.clone(),stop:stop_rx,
-    });
-    drop(sources);
-    critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
-    drop(updates);drop(rpc);
-    crate::log_event!(Info,"lifecycle live started restored={restored_count} duration_s={duration} executors={} venues={venues:?}",venues.len());
-    tokio::select! {
-        _=tokio::time::sleep(Duration::from_secs(duration))=>{},
-        result=tasks.join_next()=>{
-            let result=result.context("all lifecycle live tasks ended")?;
-            result.context("lifecycle live task panicked")??;
-            bail!("lifecycle live worker ended before duration");
-        },
-    }
-    stop.send_replace(true);
-    // Drain active real requests, Registry acceptance and database writes.
-    // The outer bound permits the configured executor request timeout.
-    let drain_ms=number("COMPLETION_LIFECYCLE_ATTEMPT_SECONDS",180)?*1000+150000;
-    tokio::time::timeout(Duration::from_millis(drain_ms),async {
-        while let Some(result)=tasks.join_next().await{result??;}
-        Ok::<(),anyhow::Error>(())
-    }).await.context("lifecycle live drain timed out")??;
-    crate::log_event!(Info,"lifecycle live complete=true persisted=true");
-    Ok(())
-}
-
 /// Isolated CP1 live checkpoint: real Jupiter and DexScreener, restored
 /// Registry and the single PostgreSQL writer; NO discovery or Completion RPC.
 pub async fn cp1_live() -> Result<()> {
@@ -398,6 +184,10 @@ pub fn plan()->Result<serde_json::Value> {
     let settings=RunSettings::from_env()?;
     if settings.market {market_state::Settings::from_env()?;}
     if settings.signals {graph_signals::Settings::from_env()?;}
+    if !settings.hydration_only {
+        completion::configured("all")?;
+        crate::workers::completion::lifecycle::Settings::from_env()?;
+    }
     let mut plan=settings.describe();
     plan["websocket_plan"]=serde_json::to_value(rpc_transport::settings_from_env()?.websocket_plan()?)?;
     Ok(plan)
@@ -412,11 +202,15 @@ struct RunEvidence {
     production:Option<graph_signals::ProductionReport>,
     signals:Option<graph_signals::ObservationReport>,
     execution:serde_json::Value,
+    graph_membership:Option<graph_liquidity::MembershipReport>,
 }
 impl RunEvidence {
     fn checks(&self,settings:RunSettings)->Vec<(&'static str,Result<()>)> {
         let mut checks=Vec::new();
         if settings.hydration_only {return checks;}
+        checks.push(("graph_membership",self.graph_membership.as_ref()
+            .context("missing final Registry/Graph membership comparison")
+            .and_then(|report|report.ensure_complete())));
         if settings.market {
             checks.push(("market_delivery",(||->Result<()> {
                 let source=self.market.as_ref().context("missing MarketState report")?;
@@ -471,9 +265,11 @@ pub async fn run()->Result<()> {
     report["orchestration_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_none());
     report["error"]=serde_json::json!(result.as_ref().err().or(acceptance).map(|e|format!("{e:#}")));
     for (check,field) in [("market_delivery","market_delivery_passed"),
-        ("signal_delivery","signal_delivery_passed"),("rewatch","rewatch_evidence_passed")] {
+        ("signal_delivery","signal_delivery_passed"),("rewatch","rewatch_evidence_passed"),
+        ("graph_membership","graph_membership_passed")] {
         report[field]=serde_json::json!(checks.iter().find(|(name,_)|*name==check).map(|(_,r)|r.is_ok()));
     }
+    report["graph_membership"]=serde_json::to_value(&evidence.graph_membership)?;
     report["candidate_delivery_passed"]=if settings.simulate {report["signal_delivery_passed"].clone()}
         else {serde_json::Value::Null};
     report["evidence_errors"]=serde_json::json!(checks.iter().filter_map(|(stage,check)|
@@ -507,6 +303,10 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     anyhow::ensure!((32..=65536).contains(&source_capacity)
         && (32..=65536).contains(&registry_capacity),"broadcast capacity must be 32..=65536");
     let graph_settings=graph_liquidity::Settings::from_env()?;
+    let completion_workers=if settings.hydration_only {Vec::new()}
+        else {completion::configured("all")?};
+    let completion_settings=if settings.hydration_only {None}
+        else {Some(crate::workers::completion::lifecycle::Settings::from_env()?)};
     let http=core::http_client()?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let mut rpc_task=AbortOnDrop(rpc_task);
@@ -554,25 +354,23 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     // Existing V10 PumpSwap Prepared manifests contain signer-specific PDAs.
     // Check the current signer before seeding the graph with persisted blocks.
-    completion_pumpswap::ensure_wallet_cache(
-        &restored,completion_pumpswap::Settings::from_env()?.wallet)?;
-    let graph_boot:Vec<PoolState>=restored.iter()
-        .filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();
+    let completion_settings=completion_settings.context("missing enabled Completion settings")?;
+    completion::validate_bootstrap(&completion_workers,&restored)?;
     let registry=pool_registry::PoolRegistry::default();
     let count=registry.restore(restored)?;
-    crate::log_event!(Info,"runtime bootstrap restored={count} prepared={} lifecycle_executors=10 backpressure_unchanged=true",graph_boot.len());
+    crate::log_event!(Info,"runtime bootstrap restored={count} lifecycle_executors=10 backpressure_unchanged=true");
 
     let (stop_tx,stop_rx)=watch::channel(false);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(source_capacity);
     let (updates,_)=broadcast::channel::<Arc<PoolUpdateBatch>>(registry_capacity);
     let (completions,completion_rx)=broadcast::channel::<Arc<CompletionResultBatch>>(256);
-    let (source_done,done_rx)=watch::channel(false);
+    let (source_done,_)=watch::channel(false);
     let (graph_tx,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
+    let final_graph=graph_rx.clone();
     let (catalog_tx,catalog_rx)=watch::channel(Arc::new(graph_watch_catalog::WatchCatalog::empty()));
     let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let registry_qualified=qualified_rx.clone();
     let mut tasks=JoinSet::<Result<()>>::new();
-    critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
-        registry.clone(),updates.clone(),source_done,true,Some(qualified_rx.clone())));
     let (jupiter_out,_)=broadcast::channel::<Arc<DataBatch>>(256);
     let (onchain_tx,onchain_rx)=tokio::sync::mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
     let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
@@ -721,27 +519,13 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     critical(&mut tasks,"rpc_transport",async move{(&mut rpc_task.0).await?});
 
-    // Seed graph before completion can change a Prepared state.
-    if !graph_boot.is_empty(){
-        updates.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,
-            source:"persistence_restore",received_at_ms:0,
-            pools:graph_boot,persist_identity:Vec::new()}))
-            .map_err(|_|anyhow!("no graph bootstrap subscriber"))?;
-    }
-    spawn_completion_lifecycle(&mut tasks,&registry,&updates,completions.clone(),done_rx.clone(),
-        (stop_tx.clone(),stop_rx.clone()),rpc.clone(),
-        CompletionExecutors {
-            dlmm:Some(completion_meteora_dlmm::Settings::from_env()?),
-            damm_v2:Some(completion_meteora_damm_v2::Settings::from_env()?),
-            orca:Some(completion_orca_whirlpool::Settings::from_env()?),
-            pancakeswap_clmm:Some(completion_pancakeswap_clmm::Settings::from_env()?),
-            byreal_clmm:Some(completion_byreal_clmm::Settings::from_env()?),
-            pumpswap:Some(completion_pumpswap::Settings::from_env()?),
-            manifest:Some(completion_manifest::Settings::from_env()?),
-            raydium_amm_v4:Some(completion_raydium_amm_v4::Settings::from_env()?),
-            raydium_cpmm:Some(completion_raydium_cpmm::Settings::from_env()?),
-            raydium_clmm:Some(completion_raydium_clmm::Settings::from_env()?),
-        },false,0)?;
+    // Connect every subscriber first. Publish the Registry's restored decisions
+    // before its writer can emit qualification/source/completion deltas.
+    registry.publish_bootstrap(&updates)?;
+    critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
+        registry.clone(),updates.clone(),source_done,true,Some(registry_qualified)));
+    completion::start(&mut tasks,&registry,&updates,completions.clone(),
+        (stop_tx.clone(),stop_rx.clone()),rpc.clone(),completion_workers,completion_settings,None)?;
     drop(completions);
     let discovery_resources=discovery::Resources {
         http,rpc:Some(rpc.clone()),output:source.clone(),stop:stop_rx.clone(),
@@ -827,6 +611,10 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         }
     }
     if let Some(error)=error{return Err(error);}
+    let graph=final_graph.borrow().clone();
+    let membership=graph_liquidity::compare_registry(&graph,&registry.snapshot())?;
+    evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
+        .graph_membership=Some(membership);
     crate::log_event!(Info,"runtime shutdown complete=true");
     Ok(())
 }

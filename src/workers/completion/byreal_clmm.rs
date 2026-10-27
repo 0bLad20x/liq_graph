@@ -12,7 +12,7 @@ use crate::{
     core::{CompletionReason, AccountMeta, CompletionEvidence, CompletionResult, CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch,
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue},
-    workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
+    core::rpc::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const SOURCE: &str = "byreal_clmm_execution_completion";

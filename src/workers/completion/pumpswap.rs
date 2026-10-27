@@ -9,7 +9,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 use crate::{
     core::{CompletionReason, AccountMeta,CompletionEvidence,CompletionResult,CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch,CompletionResponse,CompletionResponseBatch,
         CompletionState,CompletionStatus,ExecutionManifest,MintProof,PoolState,Venue},
-    workers::rpc_transport::{AccountData,AccountView,RpcAnswer,RpcHandle,RpcOperation},
+    core::rpc::{AccountData,AccountView,RpcAnswer,RpcHandle,RpcOperation},
 };
 
 const SOURCE:&str="pumpswap_v10_completion";
@@ -264,8 +264,9 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
     let token_2022:Pubkey=TOKEN_2022.parse().expect("Token-2022 program");
     let associated:Pubkey=ASSOCIATED.parse().expect("Associated token program");
     let global_addr=global_key(program);
-    // Pool is revalidated in the SAME request as mints, vaults and global state:
-    // no separate per-pool RPC call and no trust in a stale discovery snapshot.
+    // Pool/global state and dependent mint/vault/fee accounts are read in
+    // successive batches with minContextSlot. This is not one atomic snapshot;
+    // pool_snapshot_slot and rpc_last_slot record the distinct contexts.
     let mut addresses=Vec::new();
     let mut used=HashSet::new();
     for address in std::iter::once(global_addr)

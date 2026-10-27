@@ -4,6 +4,7 @@ use crate::workers::discovery::meteora_dlmm as discovery_meteora_dlmm;
 use std::{env, sync::Arc};
 
 mod runtime;
+mod completion;
 mod discovery;
 use discovery::SourceSet;
 mod v10_simulation;
@@ -12,279 +13,60 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, source_dexscreener, graph_liquidity, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{          graph_watch_catalog, source_jupiter_mint, source_dexscreener, graph_liquidity, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
-
-struct CompletionConfig {
-    lifecycle_limit: usize,
-    rpc: rpc_transport::RpcHandle,
-    dlmm: Option<completion_meteora_dlmm::Settings>,
-    damm_v2: Option<completion_meteora_damm_v2::Settings>,
-    orca: Option<completion_orca_whirlpool::Settings>,
-    raydium_amm_v4: Option<completion_raydium_amm_v4::Settings>,
-    raydium_cpmm: Option<completion_raydium_cpmm::Settings>,
-    raydium_clmm: Option<completion_raydium_clmm::Settings>,
-    pancakeswap_clmm: Option<completion_pancakeswap_clmm::Settings>,
-    byreal_clmm: Option<completion_byreal_clmm::Settings>,
-    manifest: Option<completion_manifest::Settings>,
-    pumpswap: Option<completion_pumpswap::Settings>,
-}
 
 struct Cli {
-    meteora: discovery_meteora_dlmm::Settings,
-    jupiter_only: bool,
-    rpc_live: bool,
-    http_transport_live: bool,
-    completion_live: bool,
-    damm_v2_completion_live: bool,
-    orca_completion_live: bool,
-    raydium_amm_v4_completion_live: bool,
-    raydium_cpmm_completion_live: bool,
-    raydium_clmm_completion_live: bool,
-    pancakeswap_clmm_completion_live: bool,
-    byreal_clmm_completion_live: bool,
-    manifest_completion_live: bool,
-    pumpswap_discovery_live: bool,
-    pumpswap_completion_live: bool,
-    pumpswap_rolling: bool,
-    rpc_full_scan_live: bool,
-    graph_live: bool,
-    completion_limit: Option<usize>,
-    persistence_write_live: bool,
-    persistence_restore_live: bool,
-    persistence_v2_live: bool,
-    stability_live: bool,
-    rest_discovery_live: bool,
-    rest_source_only: Option<SourceSet>,
+    meteora:discovery_meteora_dlmm::Settings,
+    jupiter_only:bool,rpc_live:bool,http_transport_live:bool,
+    pumpswap_discovery_live:bool,rpc_full_scan_live:bool,
+    persistence_restore_live:bool,persistence_v2_live:bool,
+    rest_discovery_live:bool,rest_source_only:Option<SourceSet>,
 }
-
-fn settings(args: impl Iterator<Item=String>) -> Result<Cli> {
-    let mut args = args;
-    let mut once = false;
-    let mut max_pages = None;
-    let mut jupiter_only = false;
-    let mut rpc_live = false;
-    let mut http_transport_live = false;
-    let mut completion_live = false;
-    let mut damm_v2_completion_live = false;
-    let mut orca_completion_live = false;
-    let mut raydium_amm_v4_completion_live = false;
-    let mut raydium_cpmm_completion_live = false;
-    let mut raydium_clmm_completion_live = false;
-    let mut pancakeswap_clmm_completion_live = false;
-    let mut byreal_clmm_completion_live = false;
-    let mut manifest_completion_live = false;
-    let mut pumpswap_discovery_live = false;
-    let mut pumpswap_completion_live = false;
-    let mut pumpswap_rolling = false;
-    let mut rpc_full_scan_live = false;
-    let mut graph_live = false;
-    let mut completion_limit = None;
-    let mut persistence_write_live = false;
-    let mut persistence_restore_live = false;
-    let mut persistence_v2_live = false;
-    let mut stability_live = false;
-    let mut rest_discovery_live = false;
-    let mut rest_source_only = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--once" => once = true,
-            "--jupiter-only" => jupiter_only = true,
-            "--rpc-live" => rpc_live = true,
-            "--http-transport-live" => http_transport_live = true,
-            "--completion-live" => { completion_live = true; once = true; },
-            "--damm-v2-completion-live" => { damm_v2_completion_live = true; once = true; },
-            "--orca-completion-live" => { orca_completion_live = true; once = true; },
-            "--raydium-amm-v4-completion-live" => { raydium_amm_v4_completion_live = true; once = true; },
-            "--raydium-cpmm-completion-live" => { raydium_cpmm_completion_live = true; once = true; },
-            "--raydium-clmm-completion-live" => { raydium_clmm_completion_live = true; once = true; },
-            "--pancakeswap-clmm-completion-live" => { pancakeswap_clmm_completion_live = true; once = true; },
-            "--byreal-clmm-completion-live" => { byreal_clmm_completion_live = true; once = true; },
-            "--manifest-completion-live" => { manifest_completion_live = true; once = true; },
-            "--pumpswap-discovery-live" => { pumpswap_discovery_live = true; once = true; },
-            "--pumpswap-completion-live" => { pumpswap_completion_live = true; once = true; },
-            "--pumpswap-rolling" => { pumpswap_rolling = true; },
-            "--rpc-full-scan-live" => { rpc_full_scan_live = true; once = true; },
-            "--graph-live" => { graph_live = true; once = true; },
-            "--persistence-write-live" => { persistence_write_live = true; once = true; },
-            "--persistence-restore-live" => { persistence_restore_live = true; once = true; },
-            "--persistence-v2-live" => { persistence_v2_live = true; once = true; },
-            "--stability-live" => stability_live = true,
-            "--rest-discovery-live" => { rest_discovery_live = true; once = true; },
-            "--raydium-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Raydium); once = true; },
-            "--pancakeswap-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::PancakeSwap); once = true; },
-            "--byreal-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Byreal); once = true; },
-            "--manifest-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Manifest); once = true; },
-            "--orca-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::Orca); once = true; },
-            "--damm-v2-live" => { ensure!(rest_source_only.is_none(), "select only one REST source"); rest_source_only = Some(SourceSet::DammV2); once = true; },
-            "--completion-limit" => {
-                let count: usize = args.next()
-                    .context("--completion-limit requires a positive number")?
-                    .parse().context("invalid --completion-limit value")?;
-                ensure!(count <= 5000, "--completion-limit must be 0 (unbounded) or 1..=5000");
-                completion_limit = Some(count);
-            }
-            "--pages" => {
-                let count: u32 = args.next()
-                    .context("--pages requires a positive number")?
-                    .parse().context("invalid --pages value")?;
-                ensure!(count > 0, "--pages must be positive");
-                max_pages = Some(count);
-            }
-            _ => bail!("unknown argument {arg}; use --once, --pages N, --jupiter-only, --rpc-live, --http-transport-live, --completion-live, --damm-v2-completion-live, --orca-completion-live, --raydium-amm-v4-completion-live, --raydium-cpmm-completion-live, --raydium-clmm-completion-live, --pancakeswap-clmm-completion-live, --byreal-clmm-completion-live, --manifest-completion-live, --manifest-live, --persistence-write-live, --persistence-restore-live, --persistence-v2-live, --stability-live, --rest-discovery-live, --raydium-live, --pancakeswap-live, --byreal-live, --orca-live, --damm-v2-live, --graph-live or --completion-limit N"),
+fn settings(args:impl Iterator<Item=String>)->Result<Cli> {
+    let mut args=args;let mut once=false;let mut max_pages=None;
+    let mut cli=Cli{meteora:discovery_meteora_dlmm::Settings{once:false,max_pages:None},
+        jupiter_only:false,rpc_live:false,http_transport_live:false,
+        pumpswap_discovery_live:false,rpc_full_scan_live:false,
+        persistence_restore_live:false,persistence_v2_live:false,
+        rest_discovery_live:false,rest_source_only:None};
+    while let Some(arg)=args.next() {
+        let source=match arg.as_str() {
+            "--once"=>{once=true;None},
+            "--pages"=>{let n=args.next().context("--pages requires a number")?.parse::<u32>()?;
+                ensure!(n>0,"--pages must be positive");max_pages=Some(n);None},
+            "--jupiter-only"=>{cli.jupiter_only=true;None},
+            "--rpc-live"=>{cli.rpc_live=true;None},
+            "--http-transport-live"=>{cli.http_transport_live=true;None},
+            "--pumpswap-discovery-live"=>{cli.pumpswap_discovery_live=true;once=true;None},
+            "--rpc-full-scan-live"=>{cli.rpc_full_scan_live=true;once=true;None},
+            "--persistence-restore-live"=>{cli.persistence_restore_live=true;once=true;None},
+            "--persistence-v2-live"=>{cli.persistence_v2_live=true;once=true;None},
+            "--rest-discovery-live"=>{cli.rest_discovery_live=true;once=true;None},
+            "--raydium-live"=>Some(SourceSet::Raydium),
+            "--pancakeswap-live"=>Some(SourceSet::PancakeSwap),
+            "--byreal-live"=>Some(SourceSet::Byreal),
+            "--manifest-live"=>Some(SourceSet::Manifest),
+            "--orca-live"=>Some(SourceSet::Orca),
+            "--damm-v2-live"=>Some(SourceSet::DammV2),
+            _=>bail!("unknown argument {arg}; use --run, --discovery-live SOURCE or --completion-live PROTOCOL"),
+        };
+        if let Some(source)=source {
+            ensure!(cli.rest_source_only.is_none(),"select only one REST source");
+            cli.rest_source_only=Some(source);once=true;
         }
     }
-    ensure!(!(manifest_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || orca_completion_live
-        || raydium_amm_v4_completion_live || raydium_cpmm_completion_live
-        || raydium_clmm_completion_live || pancakeswap_clmm_completion_live
-        || byreal_clmm_completion_live || graph_live || persistence_write_live
-        || persistence_restore_live || persistence_v2_live || stability_live
-        || rest_discovery_live || rest_source_only.is_some())),
-        "--manifest-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(matches!(rest_source_only, Some(SourceSet::Manifest)) && max_pages.is_some()),
-        "Manifest /tickers has no pagination; do not use --pages");
-    ensure!(!(byreal_clmm_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || orca_completion_live
-        || raydium_amm_v4_completion_live || raydium_cpmm_completion_live
-        || raydium_clmm_completion_live || pancakeswap_clmm_completion_live
-        || graph_live || persistence_write_live || persistence_restore_live
-        || persistence_v2_live || stability_live || rest_discovery_live
-        || rest_source_only.is_some())),
-        "--byreal-clmm-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(pancakeswap_clmm_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || orca_completion_live
-        || raydium_amm_v4_completion_live || raydium_cpmm_completion_live
-        || raydium_clmm_completion_live || graph_live || persistence_write_live
-        || persistence_restore_live || persistence_v2_live || stability_live
-        || rest_discovery_live || rest_source_only.is_some())),
-        "--pancakeswap-clmm-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(raydium_clmm_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || orca_completion_live
-        || raydium_amm_v4_completion_live || raydium_cpmm_completion_live || graph_live
-        || persistence_write_live || persistence_restore_live || persistence_v2_live
-        || stability_live || rest_discovery_live || rest_source_only.is_some())),
-        "--raydium-clmm-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(raydium_cpmm_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || orca_completion_live
-        || raydium_amm_v4_completion_live || graph_live || persistence_write_live
-        || persistence_restore_live || persistence_v2_live || stability_live
-        || rest_discovery_live || rest_source_only.is_some())),
-        "--raydium-cpmm-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(raydium_amm_v4_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || orca_completion_live || graph_live
-        || persistence_write_live || persistence_restore_live || persistence_v2_live
-        || stability_live || rest_discovery_live || rest_source_only.is_some())),
-        "--raydium-amm-v4-completion-live is an exclusive REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(orca_completion_live && (rpc_live || http_transport_live || jupiter_only
-        || completion_live || damm_v2_completion_live || graph_live
-        || persistence_write_live || persistence_restore_live || persistence_v2_live
-        || stability_live || rest_discovery_live || rest_source_only.is_some())),
-        "--orca-completion-live is an exclusive Orca REST/RPC/Registry/PostgreSQL/Graph checkpoint");
-    ensure!(!(rpc_live && (jupiter_only || once || max_pages.is_some() || stability_live || rest_discovery_live)),
-        "--rpc-live is an exclusive RPC transport check");
-    ensure!(!((rest_discovery_live || rest_source_only.is_some()) && (completion_live || graph_live || persistence_write_live
-        || persistence_restore_live || stability_live || rpc_live || jupiter_only || completion_limit.is_some()
-        || (rest_discovery_live && rest_source_only.is_some()))),
-        "--rest-discovery-live is an API-only checkpoint with optional --pages");
-    ensure!(!(persistence_v2_live && (persistence_write_live || persistence_restore_live
-        || completion_live || damm_v2_completion_live || graph_live || stability_live || rest_discovery_live
-        || rest_source_only.is_some() || rpc_live || jupiter_only
-        || completion_limit.is_some())),
-        "--persistence-v2-live is an exclusive REST+PostgreSQL checkpoint");
-    ensure!(!(completion_live && graph_live), "--completion-live and --graph-live are exclusive");
-    ensure!(!(damm_v2_completion_live && (graph_live || persistence_write_live
-        || persistence_restore_live || persistence_v2_live || stability_live || rpc_live
-        || rest_discovery_live || rest_source_only.is_some() || jupiter_only)),
-        "--damm-v2-completion-live is an integrated RPC/Registry/PostgreSQL/Graph mode; only --completion-live may be combined to enable both DEXes");
-    ensure!(!(stability_live && (completion_live || graph_live || persistence_write_live
-        || persistence_restore_live || rpc_live || jupiter_only || once)),
-        "--stability-live is continuous and cannot be combined with other live modes or --once");
-    ensure!(!(persistence_write_live && (completion_live || graph_live || persistence_restore_live)),
-        "--persistence-write-live is exclusive");
-    ensure!(!(persistence_restore_live && (completion_live || graph_live || jupiter_only
-        || rpc_live || max_pages.is_some() || completion_limit.is_some())),
-        "--persistence-restore-live is exclusive and does not use API/RPC flags");
-    ensure!(!(rpc_live && persistence_write_live), "--rpc-live and --persistence-write-live are exclusive");
-    ensure!(!(graph_live && jupiter_only), "--graph-live cannot be combined with --jupiter-only");
-    ensure!(!(persistence_write_live && jupiter_only), "--persistence-write-live cannot use Jupiter-only");
-    ensure!(!(completion_live && jupiter_only),
-        "--completion-live cannot be combined with --jupiter-only");
-    ensure!(completion_limit.is_none() || completion_live || damm_v2_completion_live
-        || orca_completion_live || raydium_amm_v4_completion_live
-        || raydium_cpmm_completion_live || raydium_clmm_completion_live
-        || pancakeswap_clmm_completion_live || byreal_clmm_completion_live
-        || manifest_completion_live || pumpswap_completion_live || pumpswap_rolling || graph_live || persistence_write_live || stability_live,
-        "--completion-limit requires a Completion/Graph/Persistence/Stability live mode");
-    ensure!(
-        !(jupiter_only && (once || max_pages.is_some())),
-        "--jupiter-only cannot be combined with --once or --pages"
-    );
-    ensure!(!http_transport_live || (!rpc_live && !jupiter_only && !once
-        && max_pages.is_none() && completion_limit.is_none() && !completion_live
-        && !damm_v2_completion_live && !orca_completion_live && !raydium_amm_v4_completion_live
-        && !raydium_cpmm_completion_live && !raydium_clmm_completion_live
-        && !graph_live && !persistence_write_live
-        && !persistence_restore_live && !persistence_v2_live && !stability_live
-        && !rest_discovery_live && rest_source_only.is_none()),
-        "--http-transport-live must be used alone");
-    let pump_modes = usize::from(pumpswap_discovery_live)
-        + usize::from(pumpswap_completion_live) + usize::from(pumpswap_rolling);
-    ensure!(pump_modes <= 1, "select only one PumpSwap mode");
-    if rpc_full_scan_live {
-        ensure!(!jupiter_only && !rpc_live && !http_transport_live && !completion_live
-            && !damm_v2_completion_live && !orca_completion_live && !raydium_amm_v4_completion_live
-            && !raydium_cpmm_completion_live && !raydium_clmm_completion_live
-            && !pancakeswap_clmm_completion_live && !byreal_clmm_completion_live
-            && !manifest_completion_live && pump_modes == 0 && !graph_live
-            && !persistence_write_live && !persistence_restore_live && !persistence_v2_live
-            && !stability_live && !rest_discovery_live && rest_source_only.is_none()
-            && max_pages.is_none() && completion_limit.is_none(),
-            "RPC Full Scan checkpoint mode is exclusive; no --pages or Completion");
-    }
-    if pump_modes > 0 {
-        ensure!(!jupiter_only && !rpc_live && !http_transport_live
-            && !completion_live && !damm_v2_completion_live && !orca_completion_live
-            && !raydium_amm_v4_completion_live && !raydium_cpmm_completion_live
-            && !raydium_clmm_completion_live && !pancakeswap_clmm_completion_live
-            && !byreal_clmm_completion_live && !manifest_completion_live
-            && !graph_live && !persistence_write_live && !persistence_restore_live
-            && !persistence_v2_live && !stability_live && !rest_discovery_live
-            && rest_source_only.is_none(),
-            "PumpSwap checkpoint mode is exclusive");
-        ensure!(!pumpswap_rolling || (!once && max_pages.is_none()),
-            "continuous PumpSwap rolling cannot use --once or --pages");
-        ensure!(!pumpswap_discovery_live || completion_limit.is_none(),
-            "PumpSwap discovery alone does not support --completion-limit");
-    }
-    Ok(Cli {
-        meteora: discovery_meteora_dlmm::Settings { once, max_pages },
-        jupiter_only,
-        rpc_live,
-        http_transport_live,
-        completion_live,
-        damm_v2_completion_live,
-        orca_completion_live,
-        raydium_amm_v4_completion_live,
-        raydium_cpmm_completion_live,
-        raydium_clmm_completion_live,
-        pancakeswap_clmm_completion_live,
-        byreal_clmm_completion_live,
-        manifest_completion_live,
-        pumpswap_discovery_live,
-        pumpswap_completion_live,
-        pumpswap_rolling,
-        rpc_full_scan_live,
-        graph_live,
-        completion_limit,
-        persistence_write_live,
-        persistence_restore_live,
-        persistence_v2_live,
-        stability_live,
-        rest_discovery_live,
-        rest_source_only,
-    })
+    let modes=usize::from(cli.jupiter_only)+usize::from(cli.rpc_live)+usize::from(cli.http_transport_live)
+        +usize::from(cli.pumpswap_discovery_live)+usize::from(cli.rpc_full_scan_live)
+        +usize::from(cli.persistence_restore_live)+usize::from(cli.persistence_v2_live)
+        +usize::from(cli.rest_discovery_live)+usize::from(cli.rest_source_only.is_some());
+    ensure!(modes<=1,"select only one standalone mode");
+    ensure!(!(cli.jupiter_only&&(once||max_pages.is_some())),"Jupiter-only is continuous and has no pages");
+    ensure!(!(cli.rpc_live||cli.http_transport_live)||(!once&&max_pages.is_none()),"transport checks have no pages/once");
+    ensure!(!(cli.rpc_full_scan_live||cli.persistence_restore_live
+        ||cli.rest_source_only==Some(SourceSet::Manifest))||max_pages.is_none(),"selected mode has no pages");
+    cli.meteora=discovery_meteora_dlmm::Settings{once,max_pages};
+    Ok(cli)
 }
 
 fn jupiter_settings() -> Result<Option<source_jupiter_mint::Settings>> {
@@ -297,7 +79,6 @@ fn jupiter_settings() -> Result<Option<source_jupiter_mint::Settings>> {
 fn spawn_sources(
     tasks: &mut JoinSet<Result<()>>,
     settings: discovery_meteora_dlmm::Settings,
-    completion: Option<CompletionConfig>,
     graph: Option<graph_liquidity::Settings>,
     jupiter: Option<source_jupiter_mint::Settings>,
     initial_registry: Option<pool_registry::PoolRegistry>,
@@ -305,7 +86,6 @@ fn spawn_sources(
     source_set: SourceSet,
     strict_lag: bool,
 ) -> Result<()> {
-    let pump_rpc = completion.as_ref().map(|cfg|cfg.rpc.clone());
     let source_capacity: usize = env::var("REST_BROADCAST_CAPACITY")
         .unwrap_or_else(|_| "256".into()).parse().context("invalid REST_BROADCAST_CAPACITY")?;
     let registry_capacity: usize = env::var("REGISTRY_BROADCAST_CAPACITY")
@@ -319,8 +99,7 @@ fn spawn_sources(
     let (registry_output, registry_observer) =
         broadcast::channel::<Arc<core::PoolUpdateBatch>>(registry_capacity);
     let registry = initial_registry.unwrap_or_default();
-    let completion_live = completion.is_some();
-    let (source_done_tx,source_done_rx) = watch::channel(false);
+    let (source_done_tx,_) = watch::channel(false);
     let persistence_input = persist.as_ref().map(|_| registry_output.subscribe());
     if let Some(settings) = graph {
         let (tx, rx) = watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
@@ -331,36 +110,8 @@ fn spawn_sources(
         ensure!(jupiter.is_none(), "Jupiter Search requires a liquidity graph");
     }
 
-    let completion_input = if let Some(config) = completion {
-        let (completion_output, _) =
-            broadcast::channel::<Arc<core::CompletionResultBatch>>(256);
-        let receiver = completion_output.subscribe();
-        if config.dlmm.is_some() || config.damm_v2.is_some() || config.orca.is_some()
-            || config.raydium_amm_v4.is_some() || config.raydium_cpmm.is_some()
-            || config.raydium_clmm.is_some() || config.pancakeswap_clmm.is_some()
-            || config.byreal_clmm.is_some() || config.pumpswap.is_some() || config.manifest.is_some() {
-            if config.dlmm.is_some() && config.damm_v2.is_none()
-                && config.orca.is_none() && config.lifecycle_limit>0 {
-                tasks.spawn(completion_meteora_dlmm::observe(completion_output.subscribe()));
-            }
-            runtime::spawn_completion_lifecycle(tasks,&registry,&registry_output,
-                completion_output.clone(),source_done_rx.clone(),watch::channel(false),
-                config.rpc.clone(),runtime::CompletionExecutors {
-                    dlmm:config.dlmm,damm_v2:config.damm_v2,orca:config.orca,
-                    pancakeswap_clmm:config.pancakeswap_clmm,
-                    byreal_clmm:config.byreal_clmm,
-                    pumpswap:config.pumpswap,
-                    manifest:config.manifest,
-                    raydium_amm_v4:config.raydium_amm_v4,raydium_cpmm:config.raydium_cpmm,
-                    raydium_clmm:config.raydium_clmm,
-                },settings.once,config.lifecycle_limit)?;
-        }
-        // Registry closes only after every completion producer has finished.
-        drop(completion_output);
-        Some(receiver)
-    } else { None };
     tasks.spawn(diagnostic_source::run(input, strict_lag));
-    tasks.spawn(pool_registry::observe_updates(registry_observer, completion_live, strict_lag));
+    tasks.spawn(pool_registry::observe_updates(registry_observer, false, strict_lag));
     // Seed restored, historically validated pool records before any fresh source.
     // All recipients are already subscribed; the SQL writer ignores Source batches.
     let restored = registry.snapshot();
@@ -378,12 +129,12 @@ fn spawn_sources(
     if let Some(writer) = persist {
         tasks.spawn(writer.run(persistence_input.expect("persistence receiver subscribed")));
     }
-    tasks.spawn(pool_registry::run(registry_input, completion_input, registry,
+    tasks.spawn(pool_registry::run(registry_input, None, registry,
         registry_output, source_done_tx, strict_lag, None));
     let (_stop,stop_rx)=watch::channel(false);
     let workers=discovery::configured(source_set,settings.once,settings.max_pages)?;
     discovery::spawn_finite(tasks,workers,discovery::Resources {
-        http:core::http_client()?,rpc:pump_rpc,output,stop:stop_rx,
+        http:core::http_client()?,rpc:None,output,stop:stop_rx,
     });
     Ok(())
 }
@@ -439,16 +190,6 @@ fn spawn_jupiter(
 
 fn test_command(worker: &str) -> Result<&'static str> {
     let legacy=match worker {
-        "completion_meteora_dlmm"=>"--completion-live",
-        "completion_meteora_damm_v2"=>"--damm-v2-completion-live",
-        "completion_orca_whirlpool"=>"--orca-completion-live",
-        "completion_raydium_amm_v4"=>"--raydium-amm-v4-completion-live",
-        "completion_raydium_cpmm"=>"--raydium-cpmm-completion-live",
-        "completion_raydium_clmm"=>"--raydium-clmm-completion-live",
-        "completion_pancakeswap_clmm"=>"--pancakeswap-clmm-completion-live",
-        "completion_byreal_clmm"=>"--byreal-clmm-completion-live",
-        "completion_manifest"=>"--manifest-completion-live",
-        "completion_pumpswap"=>"--pumpswap-completion-live",
         "discovery_meteora_dlmm"=>"--once",
         "discovery_meteora_damm_v2"=>"--damm-v2-live",
         "discovery_orca_whirlpool"=>"--orca-live",
@@ -458,10 +199,7 @@ fn test_command(worker: &str) -> Result<&'static str> {
         "discovery_manifest"=>"--manifest-live",
         "discovery_pumpswap"=>"--pumpswap-discovery-live",
         "discovery_rpc_full"=>"--rpc-full-scan-live",
-        "discovery_pumpswap_rolling"=>"--pumpswap-rolling",
         "source_jupiter_mint"=>"--jupiter-only",
-        "graph_liquidity"=>"--graph-live",
-        "persistence_write"=>"--persistence-write-live",
         "persistence_restore"=>"--persistence-restore-live",
         "persistence_discovery"=>"--persistence-v2-live",
         "rpc_transport"=>"--rpc-live",
@@ -478,9 +216,18 @@ pub async fn run() -> Result<()> {
         Err(error) if error.not_found() => {}
         Err(error) => return Err(error).context("load .env"),
     }
-    core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
+    core::logging::init()?;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str)==Some("--completion-live") {
+        ensure!(args.len()>=2,"use --completion-live PROTOCOL|all [--duration-seconds N] [--pool-limit N] [--revalidate] [--persist]");
+        return completion::live(&args[1..]).await;
+    }
+    if args.len()>=2 && args[0]=="--test" && args[1].starts_with("completion_") {
+        let mut selected=vec![args[1].trim_start_matches("completion_").to_owned()];
+        selected.extend_from_slice(&args[2..]);
+        return completion::live(&selected).await;
+    }
     if args.first().map(String::as_str)==Some("--discovery-live") {
         return discovery::live(&args[1..]).await;
     }
@@ -511,15 +258,10 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
     if args.len() == 1 && args[0] == "--run" {
-        anyhow::ensure!(!matches!(env::var("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE").as_deref(),Ok("true"|"1")),
-            "legacy Byreal one-shot recheck may not run in production; use bounded --completion-lifecycle-live");
         return runtime::run().await;
     }
     if args.len()==1 && args[0]=="--cp1-live" {
         return runtime::cp1_live().await;
-    }
-    if args.len()==1 && args[0]=="--completion-lifecycle-live" {
-        return runtime::completion_lifecycle_live().await;
     }
     // Standalone backfill: the source only calls Jupiter; persistence owns SQL.
     if (args.len()==1 && args[0]=="--jupiter-mint-backfill")
@@ -625,7 +367,7 @@ pub async fn run() -> Result<()> {
         let restored=registry.restore(database.restore().await?)?;
         crate::log_event!(Info,"orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
         let mut tasks=JoinSet::new();
-        spawn_sources(&mut tasks,cli.meteora,None,None,None,
+        spawn_sources(&mut tasks,cli.meteora,None,None,
             Some(registry),Some(database),SourceSet::All,true)?;
         while let Some(result)=tasks.join_next().await {result??;}
         crate::log_event!(Info,"orchestration persistence-v2-live complete rpc_calls=0");
@@ -655,111 +397,6 @@ pub async fn run() -> Result<()> {
         crate::log_event!(Info,"persistence restore-live complete restored_pools={restored} rpc_calls=0");
         return Ok(());
     }
-    if cli.completion_live || cli.damm_v2_completion_live
-        || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
-        || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
-        || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-        || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling || cli.graph_live || cli.persistence_write_live || cli.stability_live {
-        let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
-        let mut tasks = JoinSet::new();
-        // Protocol completion workers share the RPC transport configuration;
-        // only instantiate a protocol's settings if that worker actually runs.
-        // Zero allows a whole-universe scan in finite/continuous modes.
-        let completion_limit = cli.completion_limit.unwrap_or(
-            if cli.stability_live {0}
-            else if cli.graph_live || cli.persistence_write_live {5000}
-            else if cli.orca_completion_live {200}
-            else if cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-                || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {0}
-            else {100});
-
-        let graph = if cli.graph_live || cli.persistence_write_live
-            || cli.stability_live || cli.damm_v2_completion_live
-            || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
-            || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
-            || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-            || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {
-            let graph_settings=graph_liquidity::Settings::from_env()?;
-            Some(graph_settings)
-        } else {None};
-        let (registry, writer) = if cli.persistence_write_live
-            || cli.stability_live || cli.damm_v2_completion_live
-            || cli.orca_completion_live || cli.raydium_amm_v4_completion_live
-            || cli.raydium_cpmm_completion_live || cli.raydium_clmm_completion_live
-            || cli.pancakeswap_clmm_completion_live || cli.byreal_clmm_completion_live
-            || cli.manifest_completion_live || cli.pumpswap_completion_live || cli.pumpswap_rolling {
-            let db = persistence::Persistence::connect().await?;
-            let registry = pool_registry::PoolRegistry::default();
-            let restored_data = db.restore().await?;
-            let restored = registry.restore(restored_data)?;
-            crate::log_event!(Info,"orchestration initial persistence restored_pools={restored}");
-            (Some(registry), Some(db))
-        } else {(None,None)};
-        if cli.stability_live {
-            crate::log_event!(Info,"orchestration stability-live continuous_source=true pages={:?} completion_limit={} (0=unbounded) postgres=true graph=true",
-                cli.meteora.max_pages, completion_limit);
-        }
-        let source_set = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
-            SourceSet::PumpSwap
-        } else if cli.manifest_completion_live {
-            SourceSet::Manifest
-        } else if cli.byreal_clmm_completion_live {
-            SourceSet::Byreal
-        } else if cli.pancakeswap_clmm_completion_live {
-            SourceSet::PancakeSwap
-        } else if cli.orca_completion_live {
-            SourceSet::Orca
-        } else if cli.raydium_amm_v4_completion_live || cli.raydium_cpmm_completion_live
-            || cli.raydium_clmm_completion_live {
-            SourceSet::Raydium
-        } else if cli.damm_v2_completion_live {
-            if cli.completion_live { SourceSet::DlmmDammV2 } else { SourceSet::DammV2 }
-        } else { SourceSet::Dlmm };
-        let damm_v2 = if cli.damm_v2_completion_live {
-            Some(completion_meteora_damm_v2::Settings::from_env()?)
-        } else { None };
-        let dlmm = if !cli.orca_completion_live && !cli.raydium_amm_v4_completion_live
-            && !cli.raydium_cpmm_completion_live && !cli.raydium_clmm_completion_live
-            && !cli.pancakeswap_clmm_completion_live && !cli.byreal_clmm_completion_live
-            && !cli.manifest_completion_live && !cli.pumpswap_completion_live && !cli.pumpswap_rolling
-            && (!cli.damm_v2_completion_live || cli.completion_live) {
-            Some(completion_meteora_dlmm::Settings::from_env()?)
-        } else {None};
-        let orca = if cli.orca_completion_live {
-            Some(completion_orca_whirlpool::Settings::from_env()?)
-        } else {None};
-        let raydium_amm_v4 = if cli.raydium_amm_v4_completion_live {
-            Some(completion_raydium_amm_v4::Settings::from_env()?)
-        } else { None };
-        let raydium_cpmm = if cli.raydium_cpmm_completion_live {
-            Some(completion_raydium_cpmm::Settings::from_env()?)
-        } else { None };
-        let raydium_clmm = if cli.raydium_clmm_completion_live {
-            Some(completion_raydium_clmm::Settings::from_env()?)
-        } else { None };
-        let pancakeswap_clmm = if cli.pancakeswap_clmm_completion_live {
-            Some(completion_pancakeswap_clmm::Settings::from_env()?)
-        } else { None };
-        let byreal_clmm = if cli.byreal_clmm_completion_live {
-            Some(completion_byreal_clmm::Settings::from_env()?)
-        } else {None};
-        let pumpswap = if cli.pumpswap_completion_live || cli.pumpswap_rolling {
-            Some(completion_pumpswap::Settings::from_env()?)
-        } else {None};
-        let manifest = if cli.manifest_completion_live {
-            Some(completion_manifest::Settings::from_env()?)
-        } else {None};
-        let jupiter = if cli.stability_live { jupiter_settings()? } else { None };
-        spawn_sources(&mut tasks, cli.meteora,
-            Some(CompletionConfig {lifecycle_limit:completion_limit,rpc:rpc.clone(), dlmm, damm_v2, orca, raydium_amm_v4, raydium_cpmm, raydium_clmm, pancakeswap_clmm, byreal_clmm, manifest, pumpswap}),
-            graph, jupiter, registry, writer, source_set, false)?;
-        // Completion owns the last handle. The HTTP transport terminates once it completes.
-        drop(rpc);
-        tasks.spawn(async move { rpc_task.await? });
-        while let Some(result) = tasks.join_next().await { result??; }
-        return Ok(());
-    }
-
     let rpc_handle = if !cli.meteora.once && rpc_transport::configured() {
         let (handle, task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         // Keep the transport available to future worker consumers.
@@ -783,7 +420,7 @@ pub async fn run() -> Result<()> {
     } else { SourceSet::Dlmm });
     let fail_on_lag = cli.rest_discovery_live || cli.rest_source_only.is_some()
         || env::var("REST_FAIL_ON_LAG").ok().as_deref() == Some("true");
-    spawn_sources(&mut tasks, cli.meteora, None, graph, jupiter, registry, None,
+    spawn_sources(&mut tasks, cli.meteora, graph, jupiter, registry, None,
         source_set, fail_on_lag)?;
 
     let _rpc_handle = if let Some((handle, task)) = rpc_handle {

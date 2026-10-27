@@ -1,5 +1,5 @@
 //! File source -> typed channel -> execution worker -> JSON report. No route decisions.
-use std::{env,path::Path,time::Duration};
+use std::{collections::HashMap,env,path::Path,time::Duration};
 use anyhow::{Context, Result, bail, ensure};
 use tokio::{sync::{mpsc,watch},task::JoinHandle};
 use crate::{core::{execution::{ExecutionOutcome,ExecutionReport,ExecutionRequest},signals::SignalStream},
@@ -40,7 +40,7 @@ pub(super) struct ExecutionTasks {
 }
 impl ExecutionTasks {
     pub(super) fn start(settings:execution_v10::Settings,input:SignalStream,
-        registry:pool_registry::PoolRegistry,rpc:rpc_transport::RpcHandle)->Result<Self> {
+        registry:pool_registry::PoolRegistry,rpc:crate::core::rpc::RpcHandle)->Result<Self> {
         let cfg=execution_candidates::Settings::from_env(settings.wallet(),execution_v10::validate)?;
         let (jobs,requests)=mpsc::channel(1);
         let (output,mut responses)=mpsc::channel(1);
@@ -104,17 +104,19 @@ impl ExecutionTasks {
         // All artifacts share the existing run directory; no additional code hierarchy.
         if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
             let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
+            let by_id:HashMap<_,_>=reports.iter().map(|r|(r.id.as_str(),r)).collect();
             for (i,selection) in candidates.requests.iter().enumerate() {
                 std::fs::write(folder.join(format!("request-{:02}.json",i+1)),serde_json::to_vec_pretty(&selection.request)?)?;
                 std::fs::write(folder.join(format!("selection-{:02}.json",i+1)),serde_json::to_vec_pretty(selection)?)?;
-                if let Some(report)=reports.iter().find(|r|r.id==selection.request.id) {
+                if let Some(report)=by_id.get(selection.request.id.as_str()) {
                     std::fs::write(folder.join(format!("simulation-{:02}.json",i+1)),serde_json::to_vec_pretty(report)?)?;
                 }
             }
         }
         executed?;
-        evidence["execution_handoff_observed"]=serde_json::json!(candidates.ensure_handoff(&reports).is_ok());
-        let acceptance=candidates.ensure_live_evidence(&reports);
+        let handoff=candidates.ensure_handoff(&reports);
+        evidence["execution_handoff_observed"]=serde_json::json!(handoff.is_ok());
+        let acceptance=handoff.and_then(|_|candidates.ensure_successful_simulation(&reports));
         evidence["execution_integration_passed"]=serde_json::json!(acceptance.is_ok());
         evidence["execution_integration_error"]=serde_json::json!(acceptance.err().map(|e|format!("{e:#}")));
         candidates.ensure_complete()?;
