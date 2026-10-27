@@ -41,6 +41,54 @@ fn tvl(pool:&Value)->Option<f64>{
     let value=raw.as_f64().or_else(||raw.as_str()?.parse::<f64>().ok())?;
     (value.is_finite()&&value>=0.0).then_some(value)
 }
+fn configuration(payload: &Value) -> Option<crate::core::PoolConfigUpdate> {
+    let mapping: &[(&str, &str)] = &[
+            ("/feeRate", "fee.rate_raw"),
+            ("/protocolFeeRate", "fee.protocol_rate_raw"),
+            ("/tickSpacing", "tick_spacing"),
+            ("/feeTierIndex", "fee_tier_index"),
+            ("/whirlpoolsConfig", "config_account"),
+            ("/tokenVaultA", "vault_a"),
+            ("/tokenVaultB", "vault_b"),
+            ("/addressLookupTable", "address_lookup_table"),
+            ("/adaptiveFeeEnabled", "fee.adaptive_enabled"),
+            ("/adaptiveFee/constants/adaptiveFeeControlFactor", "fee.adaptive.control_factor"),
+            ("/adaptiveFee/constants/decayPeriod", "fee.adaptive.decay_period"),
+            ("/adaptiveFee/constants/filterPeriod", "fee.adaptive.filter_period"),
+            ("/adaptiveFee/constants/majorSwapThresholdTicks", "fee.adaptive.major_swap_threshold_ticks"),
+            ("/adaptiveFee/constants/maxVolatilityAccumulator", "fee.adaptive.max_volatility_accumulator"),
+            ("/adaptiveFee/constants/reductionFactor", "fee.adaptive.reduction_factor"),
+            ("/adaptiveFee/constants/tickGroupSize", "fee.adaptive.tick_group_size"),
+            ("/adaptiveFee/maxRate", "fee.adaptive.max_rate_raw"),
+            ("/adaptiveFee/currentRate", "fee.snapshot_adaptive_rate_raw"),
+            ("/adaptiveFee/variables/lastMajorSwapTimestamp", "fee.snapshot_adaptive_last_major_swap_timestamp"),
+            ("/adaptiveFee/variables/lastReferenceUpdateTimestamp", "fee.snapshot_adaptive_last_reference_update_timestamp"),
+            ("/adaptiveFee/variables/tickGroupIndexReference", "fee.snapshot_adaptive_tick_group_index_reference"),
+            ("/adaptiveFee/variables/volatilityAccumulator", "fee.snapshot_adaptive_volatility_accumulator"),
+            ("/adaptiveFee/variables/volatilityReference", "fee.snapshot_adaptive_volatility_reference"),
+        ];
+    let mut values = serde_json::Map::new();
+    for &(path, name) in mapping {
+        if let Some(value) = payload.pointer(path)
+            .filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
+            values.insert(name.to_owned(), value.clone());
+        }
+    }
+    if let Some(adaptive) = payload.get("adaptiveFee") {
+        values.insert("fee.adaptive_available".into(), Value::Bool(adaptive.is_object()));
+    }
+    let clear = values.get("fee.adaptive_available") == Some(&Value::Bool(false));
+    if values.is_empty() { return None; }
+    let observation = values.keys().any(|k| k.starts_with("fee.snapshot_")).then_some(
+        crate::core::ConfigObservation { value_prefix: "fee.snapshot_", timestamp_key: "fee.snapshot_at_ms" });
+    Some(crate::core::PoolConfigUpdate {
+        values,
+        remove_prefixes: if clear { &["fee.adaptive.", "fee.snapshot_adaptive_"] } else { &[] },
+        remove_keys: if clear { &["fee.snapshot_at_ms"] } else { &[] },
+        observation,
+    })
+}
+
 fn decode(payload:Value)->Result<DataRecord>{
     let address=key(&payload,"/address")?;
     let mint_a=key(&payload,"/tokenMintA")?;
@@ -51,6 +99,7 @@ fn decode(payload:Value)->Result<DataRecord>{
             address,venue:Venue::OrcaWhirlpool,mint_a:Some(mint_a),mint_b:Some(mint_b),
         },
         tvl_usd:tvl(&payload),
+        config: configuration(&payload),
         payload,
     })
 }
@@ -154,22 +203,13 @@ pub async fn run(client:reqwest::Client,output:broadcast::Sender<Arc<DataBatch>>
         let http=client.clone();
         let limiter=gate.clone();
         let tx=output.clone();
-        tasks.spawn(async move{
-            let result=lane(http,limiter,tx,settings,name,sort,direction,filter).await;
-            if !settings.once{
-                if let Err(err)=&result{crate::log_event!(Warn,"orca route_stopped route={name} error={err:#}");}
-                Ok(())
-            }else{result}
-        });
+        tasks.spawn(lane(http,limiter,tx,settings,name,sort,direction,filter));
     }
-    let mut first_error=None;
-    while let Some(joined)=tasks.join_next().await{
-        match joined.context("Orca route task panicked")?{
-            Ok(())=>{},
-            Err(err)=>{if first_error.is_none(){first_error=Some(err);}},
-        }
+    // A lost lane is a worker failure. The orchestrator restarts this complete
+    // source; remaining lanes must not hide a permanently stopped cursor.
+    while let Some(joined)=tasks.join_next().await {
+        joined.context("Orca route task panicked")??;
     }
-    if let Some(err)=first_error{return Err(err);}
     if !settings.once{bail!("all Orca API routes stopped");}
     Ok(())
 }

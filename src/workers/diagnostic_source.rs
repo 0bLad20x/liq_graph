@@ -136,6 +136,9 @@ impl PayloadAudit {
                     "received_at_ms": batch.received_at_ms,
                     "identity": identity,
                     "tvl_usd": record.tvl_usd,
+                    "normalized_config": record.config.as_ref().map(|patch| &patch.values),
+                    "config_remove_prefixes": record.config.as_ref().map(|patch|patch.remove_prefixes),
+                    "config_remove_keys": record.config.as_ref().map(|patch|patch.remove_keys),
                     "payload": &record.payload,
                 }));
             }
@@ -258,6 +261,6 @@ pub async fn run(mut input: broadcast::Receiver<Arc<DataBatch>>, fail_on_lag: bo
     );
     let mut per_source = sources.into_iter().collect::<Vec<_>>();
     per_source.sort_by_key(|(name, _)| *name);
-    crate::log_event!(Debug, "DataBatch per_source_batches_records={per_source:?} strict_lag={fail_on_lag}");
+    crate::log_event!(Info, "DataBatch per_source_batches_records={per_source:?} strict_lag={fail_on_lag}");
     Ok(())
 }

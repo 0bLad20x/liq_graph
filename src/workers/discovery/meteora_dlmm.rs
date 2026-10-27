@@ -22,6 +22,7 @@ const MAX_IN_FLIGHT: usize = 8;
 const MIN_REQUEST_SPACING: Duration = Duration::from_millis(34);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy)]
 pub struct Settings {
     pub once: bool,
     pub max_pages: Option<u32>,
@@ -44,6 +45,36 @@ fn optional_mint(pool: &Value, pointer: &str) -> Option<Pubkey> {
     pool.pointer(pointer)
         .and_then(Value::as_str)
         .and_then(|value| value.parse().ok())
+        .filter(|value| *value != Pubkey::default())
+}
+
+fn configuration(payload: &Value) -> Option<crate::core::PoolConfigUpdate> {
+    let mapping: &[(&str, &str)] = &[
+            ("/pool_config/bin_step", "bin_step"),
+            ("/pool_config/base_fee_pct", "fee.base_pct"),
+            ("/pool_config/max_fee_pct", "fee.max_pct"),
+            ("/pool_config/protocol_fee_pct", "fee.protocol_pct"),
+            ("/pool_config/collect_fee_mode", "fee.collect_mode"),
+            ("/reserve_x", "vault_x"),
+            ("/reserve_y", "vault_y"),
+            ("/dynamic_fee_pct", "fee.snapshot_dynamic_pct"),
+        ];
+    let mut values = serde_json::Map::new();
+    for &(path, name) in mapping {
+        if let Some(value) = payload.pointer(path)
+            .filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
+            values.insert(name.to_owned(), value.clone());
+        }
+    }
+    if values.is_empty() { return None; }
+    let observation = values.keys().any(|k| k.starts_with("fee.snapshot_")).then_some(
+        crate::core::ConfigObservation { value_prefix: "fee.snapshot_", timestamp_key: "fee.snapshot_at_ms" });
+    Some(crate::core::PoolConfigUpdate {
+        values,
+        remove_prefixes: &[],
+        remove_keys: &[],
+        observation,
+    })
 }
 
 fn decode_pool(payload: Value) -> Result<DataRecord> {
@@ -55,6 +86,7 @@ fn decode_pool(payload: Value) -> Result<DataRecord> {
     ensure!(address != Pubkey::default(), "zero DLMM pool address");
     let mint_a = optional_mint(&payload, "/token_x/address");
     let mint_b = optional_mint(&payload, "/token_y/address");
+    ensure!(!mint_a.is_some_and(|a|mint_b==Some(a)), "identical DLMM mints");
     Ok(DataRecord {
         identity: RecordIdentity::Pool {
             address, venue: Venue::MeteoraDlmm, mint_a, mint_b,
@@ -62,6 +94,7 @@ fn decode_pool(payload: Value) -> Result<DataRecord> {
         tvl_usd: payload.get("tvl")
             .and_then(|v| v.as_f64().or_else(||v.as_str()?.parse::<f64>().ok()))
             .filter(|v|v.is_finite() && *v>=0.0),
+        config: configuration(&payload),
         payload,
     })
 }
@@ -140,8 +173,9 @@ async fn fetch_with_retry(
 }
 
 /// One decoded response is one broadcast message.
-fn publish(output: &broadcast::Sender<Arc<DataBatch>>, batch: DataBatch) -> bool {
-    output.send(Arc::new(batch)).is_ok()
+fn publish(output: &broadcast::Sender<Arc<DataBatch>>, batch: DataBatch) -> Result<()> {
+    output.send(Arc::new(batch)).map_err(|_|anyhow::anyhow!("DLMM source has no consumer"))?;
+    Ok(())
 }
 
 pub async fn run(
@@ -158,7 +192,7 @@ pub async fn run(
         let pages = settings.max_pages.unwrap_or(total_pages).min(total_pages);
         let mut records = first.batch.records.len();
         let mut rejected = first.rejected;
-        let mut unconsumed_batches = usize::from(!publish(&output, first.batch));
+        publish(&output, first.batch)?;
         let mut scanned = 1_u32;
 
         let mut pending = JoinSet::new();
@@ -176,13 +210,13 @@ pub async fn run(
                 let page = task.context("Meteora page task stopped unexpectedly")?;
                 records += page.batch.records.len();
                 rejected += page.rejected;
-                unconsumed_batches += usize::from(!publish(&output, page.batch));
+                publish(&output, page.batch)?;
                 scanned += 1;
             }
         }
 
         crate::log_event!(Info,
-            "meteora source pages={scanned}/{total_pages} decoded_pools={records} rejected_pools={rejected} unconsumed_batches={unconsumed_batches} elapsed_ms={}",
+            "meteora source pages={scanned}/{total_pages} decoded_pools={records} rejected_pools={rejected} elapsed_ms={}",
             started.elapsed().as_millis()
         );
         if settings.once {

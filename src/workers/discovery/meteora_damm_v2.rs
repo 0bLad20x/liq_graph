@@ -1,5 +1,5 @@
 //! Meteora DAMM v2 REST discovery: unfiltered paginated source -> complete pool JSON.
-//! Only address, token mints and USD TVL are interpreted before the Registry.
+//! Identity, USD TVL and source configuration are normalized before the Registry.
 use std::{sync::Arc,time::Duration};
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::Deserialize;
@@ -35,6 +35,46 @@ fn tvl(pool:&Value)->Option<f64>{
     let value=raw.as_f64().or_else(||raw.as_str()?.parse::<f64>().ok())?;
     (value.is_finite()&&value>=0.0).then_some(value)
 }
+fn configuration(payload: &Value) -> Option<crate::core::PoolConfigUpdate> {
+    let mapping: &[(&str, &str)] = &[
+            ("/pool_config/base_fee_pct", "fee.base_pct"),
+            ("/pool_config/base_fee_mode", "fee.base_mode"),
+            ("/pool_config/protocol_fee_pct", "fee.protocol_pct"),
+            ("/pool_config/partner_fee_pct", "fee.partner_pct"),
+            ("/pool_config/referral_fee_pct", "fee.referral_pct"),
+            ("/pool_config/compounding_fee_pct", "fee.compounding_pct"),
+            ("/pool_config/collect_fee_mode", "fee.collect_mode"),
+            ("/pool_config/dynamic_fee_initialized", "fee.dynamic_initialized"),
+            ("/pool_config/has_fee_scheduler", "fee.has_scheduler"),
+            ("/pool_config/is_fee_scheduler_active", "fee.snapshot_scheduler_active"),
+            ("/pool_config/pool_type", "pool_type"),
+            ("/pool_config/concentrated_liquidity", "concentrated_liquidity"),
+            ("/pool_config/min_price", "min_price"),
+            ("/pool_config/max_price", "max_price"),
+            ("/pool_config/activation_type", "activation_type"),
+            ("/pool_config/activation_point", "activation_point"),
+            ("/vault_x", "vault_x"),
+            ("/vault_y", "vault_y"),
+            ("/alpha_vault", "alpha_vault"),
+        ];
+    let mut values = serde_json::Map::new();
+    for &(path, name) in mapping {
+        if let Some(value) = payload.pointer(path)
+            .filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
+            values.insert(name.to_owned(), value.clone());
+        }
+    }
+    if values.is_empty() { return None; }
+    let observation = values.keys().any(|k| k.starts_with("fee.snapshot_")).then_some(
+        crate::core::ConfigObservation { value_prefix: "fee.snapshot_", timestamp_key: "fee.snapshot_at_ms" });
+    Some(crate::core::PoolConfigUpdate {
+        values,
+        remove_prefixes: &[],
+        remove_keys: &[],
+        observation,
+    })
+}
+
 fn decode(payload:Value)->Result<DataRecord>{
     let address:Pubkey=payload.pointer("/address").and_then(Value::as_str)
         .context("DAMM v2 address missing")?.parse().context("invalid DAMM v2 address")?;
@@ -47,6 +87,7 @@ fn decode(payload:Value)->Result<DataRecord>{
             address,venue:Venue::MeteoraDammV2,mint_a,mint_b,
         },
         tvl_usd:tvl(&payload),
+        config: configuration(&payload),
         payload,
     })
 }

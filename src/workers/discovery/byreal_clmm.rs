@@ -57,6 +57,34 @@ fn tvl(pool: &Value) -> Option<f64> {
     (value.is_finite() && value >= 0.0).then_some(value)
 }
 
+fn configuration(payload: &Value) -> Option<crate::core::PoolConfigUpdate> {
+    let mapping: &[(&str, &str)] = &[
+            ("/feeRate/fixFeeRate", "fee.fixed_rate_raw"),
+            ("/decayFeeFlag", "fee.decay_flag"),
+            ("/feeRate/decayFeeInitFeeRate", "fee.decay_initial_rate_raw"),
+            ("/feeRate/decayFeeDecreaseRate", "fee.decay_decrease_rate_raw"),
+            ("/feeRate/decayFeeDecreaseInterval", "fee.decay_decrease_interval_raw"),
+            ("/feeRate/decayFeeInUse", "fee.snapshot_decay_in_use_raw"),
+            ("/openTime", "open_time"),
+        ];
+    let mut values = serde_json::Map::new();
+    for &(path, name) in mapping {
+        if let Some(value) = payload.pointer(path)
+            .filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
+            values.insert(name.to_owned(), value.clone());
+        }
+    }
+    if values.is_empty() { return None; }
+    let observation = values.keys().any(|k| k.starts_with("fee.snapshot_")).then_some(
+        crate::core::ConfigObservation { value_prefix: "fee.snapshot_", timestamp_key: "fee.snapshot_at_ms" });
+    Some(crate::core::PoolConfigUpdate {
+        values,
+        remove_prefixes: &[],
+        remove_keys: &[],
+        observation,
+    })
+}
+
 fn decode(payload: Value) -> Result<DataRecord> {
     // The listing has no programId. Completion verifies the pool owner on-chain.
     let address = key(&payload, "/poolAddress")?;
@@ -71,6 +99,7 @@ fn decode(payload: Value) -> Result<DataRecord> {
             mint_b: Some(mint_b),
         },
         tvl_usd: tvl(&payload),
+        config: configuration(&payload),
         payload,
     })
 }

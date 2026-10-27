@@ -1,5 +1,6 @@
 //! Shared worker contracts and generic HTTP infrastructure.
 pub mod logging;
+pub mod source;
 pub mod execution;
 pub mod market_state;
 pub mod signals;
@@ -84,35 +85,7 @@ pub enum Venue {
     PumpSwap,
 }
 
-/// An immutable decoded response, fan-out via Arc<DataBatch> without payload copies.
-#[derive(Debug)]
-pub struct DataBatch {
-    pub source: &'static str,
-    pub received_at_ms: u64,
-    pub records: Vec<DataRecord>,
-}
-
-#[derive(Debug)]
-pub struct DataRecord {
-    pub identity: RecordIdentity,
-    /// Source-normalized USD TVL. Never infer this from provider JSON in a consumer.
-    pub tvl_usd: Option<f64>,
-    /// Complete source object: no filtering, flattening or consumer-specific projection.
-    pub payload: Value,
-}
-
-#[derive(Debug)]
-pub enum RecordIdentity {
-    Pool {
-        address: Pubkey,
-        venue: Venue,
-        mint_a: Option<Pubkey>,
-        mint_b: Option<Pubkey>,
-    },
-    Mint {
-        address: Pubkey,
-    },
-}
+pub use source::{DataBatch, DataRecord, RecordIdentity, PoolConfigUpdate, ConfigObservation};
 
 pub fn now_unix_ms() -> Result<u64> {
     Ok(u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?)

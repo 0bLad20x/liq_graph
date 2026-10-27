@@ -3,19 +3,58 @@
 //! curl's --compressed handles providers that serve gzip even for Accept-Encoding: identity.
 use std::{
     collections::HashSet, env, io::{BufReader, Write}, process::{Command, Stdio},
-    sync::Arc, thread, time::{Duration, Instant},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant},
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor}};
 use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use crate::core::{DataBatch, DataRecord, RecordIdentity, Venue, now_unix_ms};
 
 const SOURCE: &str = "rpc_full_scan";
 const PUMP: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const PUMP_DISC: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
 const BATCH: usize = 512;
+
+/// Shared only by this worker's blocking reader and its cancellation guard.
+/// Keep the Child reachable while stdout is blocked, so stop can close the pipe.
+#[derive(Default)]
+struct ScanControl {
+    stopped: AtomicBool,
+    child: Mutex<Option<std::process::Child>>,
+}
+impl ScanControl {
+    fn stopped(&self) -> bool { self.stopped.load(Ordering::Acquire) }
+    fn kill_child(&self) {
+        if let Some(child)=self.child.lock().expect("scan child lock poisoned").as_mut() {
+            let _=child.kill();
+        }
+    }
+    fn stop(&self) { self.stopped.store(true,Ordering::Release); self.kill_child(); }
+    fn wait_child(&self) -> Result<std::process::ExitStatus> {
+        loop {
+            {
+                let mut child=self.child.lock().expect("scan child lock poisoned");
+                if let Some(status)=child.as_mut().context("full scan child missing")?.try_wait()? {
+                    child.take();
+                    return Ok(status);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+struct CancelOnDrop(Arc<ScanControl>);
+impl Drop for CancelOnDrop { fn drop(&mut self) { self.0.stop(); } }
+struct ChildCleanup<'a>(&'a ScanControl);
+impl Drop for ChildCleanup<'_> {
+    fn drop(&mut self) {
+        self.0.kill_child();
+        let mut child=self.0.child.lock().expect("scan child lock poisoned").take();
+        if let Some(child)=child.as_mut() { let _=child.wait(); }
+    }
+}
 
 #[derive(Clone)]
 pub struct Settings {
@@ -95,6 +134,7 @@ struct AccountHeader { owner: String, data: (String, String) }
 struct Entry { pubkey: String, account: AccountHeader }
 
 struct Collector {
+    control: Arc<ScanControl>,
     expected_owner: String,
     venue: Venue,
     output: broadcast::Sender<Arc<DataBatch>>,
@@ -103,9 +143,11 @@ struct Collector {
     pending: Vec<DataRecord>,
     accepted: u64,
     duplicates: u64,
+    published: u64,
 }
 impl Collector {
     fn accept(&mut self, entry: Entry) -> Result<()> {
+        ensure!(!self.control.stopped(),"full scan cancelled");
         ensure!(entry.account.owner == self.expected_owner,
             "getProgramAccounts returned account with wrong program owner");
         ensure!(entry.account.data.0.is_empty() && entry.account.data.1 == "base64",
@@ -119,6 +161,7 @@ impl Collector {
         self.pending.push(DataRecord {
             identity: RecordIdentity::Pool { address, venue: self.venue, mint_a: None, mint_b: None },
             tvl_usd: None,
+            config: None,
             payload: json!({"kind": "rpc_full_scan_address_v1"}),
         });
         self.accepted += 1;
@@ -131,13 +174,19 @@ impl Collector {
     }
     fn flush(&mut self) -> Result<()> {
         if self.pending.is_empty() { return Ok(()); }
+        ensure!(!self.control.stopped(),"full scan cancelled");
         let records = std::mem::replace(&mut self.pending, Vec::with_capacity(BATCH));
+        let count=records.len();
         self.output.send(Arc::new(DataBatch {
             source: SOURCE, received_at_ms: now_unix_ms()?, records,
         })).map_err(|_| anyhow::anyhow!("full scan has no Registry receiver"))?;
+        self.published+=count as u64;
         // The existing Registry/Persistence pipeline is broadcast-based, not an ACK queue.
         // Rate-gate batches rather than flooding its bounded channels.
-        thread::sleep(Duration::from_millis(self.batch_spacing_ms));
+        let until=Instant::now()+Duration::from_millis(self.batch_spacing_ms);
+        while Instant::now()<until && !self.control.stopped() {
+            thread::sleep(until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+        }
         Ok(())
     }
 }
@@ -221,22 +270,30 @@ fn scan_one(index: usize, url: &str, settings: &Settings, collector: &mut Collec
             "-H", "Content-Type: application/json", "--data-raw", &body])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().context("spawn curl full scan HTTP transport (curl required on PATH)")?;
+    let stdin=child.stdin.take();
+    let stdout=child.stdout.take();
+    *collector.control.child.lock().expect("scan child lock poisoned")=Some(child);
+    let control=collector.control.clone();
+    let _cleanup=ChildCleanup(&control);
+    // Cancellation can race with process creation. Never leave a newly installed
+    // child running after the async side has already requested stop.
+    ensure!(!control.stopped(),"full scan cancelled");
     // URL (potentially containing a key) stays out of the command-line argument list.
     {
-        let mut stdin = child.stdin.take().context("curl stdin missing")?;
+        let mut stdin = stdin.context("curl stdin missing")?;
         writeln!(stdin, "url = \"{url}\"").context("write curl URL config")?;
     }
     let started = Instant::now();
     let parse = {
-        let stdout = child.stdout.take().context("curl stdout missing")?;
+        let stdout = stdout.context("curl stdout missing")?;
         let mut deserializer = serde_json::Deserializer::from_reader(
             BufReader::with_capacity(256 * 1024, stdout));
         let parsed = EnvelopeSeed(collector).deserialize(&mut deserializer)
             .context("streaming getProgramAccounts JSON response");
         parsed.and_then(|_| deserializer.end().context("trailing JSON after RPC response"))
     };
-    if parse.is_err() { let _ = child.kill(); }
-    let exit = child.wait().context("wait for curl RPC request")?;
+    if parse.is_err() { control.kill_child(); }
+    let exit = control.wait_child().context("wait for curl RPC request")?;
     parse?;
     ensure!(exit.success(), "full scan RPC_{index} HTTP transfer failed: {exit}");
     collector.flush()?;
@@ -244,15 +301,18 @@ fn scan_one(index: usize, url: &str, settings: &Settings, collector: &mut Collec
         index, collector.accepted, collector.duplicates, started.elapsed().as_millis());
     Ok(())
 }
-fn blocking_run(settings: Settings, output: broadcast::Sender<Arc<DataBatch>>) -> Result<()> {
+fn blocking_run(settings: Settings, output: broadcast::Sender<Arc<DataBatch>>,
+    control: Arc<ScanControl>) -> Result<()> {
     let mut collector = Collector {
+        control:control.clone(),
         expected_owner: settings.program.to_string(), venue: settings.venue, output,
         batch_spacing_ms: settings.batch_spacing_ms,
         seen: HashSet::new(), pending: Vec::with_capacity(BATCH),
-        accepted: 0, duplicates: 0,
+        accepted: 0, duplicates: 0, published:0,
     };
     let mut errors = Vec::new();
     for (index,url) in &settings.providers {
+        if control.stopped() { break; }
         crate::log_event!(Info,"rpc full scan start provider={} venue={:?} program={} slice_bytes=0",
             index, settings.venue, settings.program);
         match scan_one(*index, url, &settings, &mut collector) {
@@ -262,14 +322,31 @@ fn blocking_run(settings: Settings, output: broadcast::Sender<Arc<DataBatch>>) -
                 return Ok(());
             },
             Err(e) => {
+                if control.stopped() { break; }
                 crate::log_event!(Warn,"rpc full scan provider={} failed={} retrying_next_provider=true",index,e);
                 errors.push(format!("RPC_{index}: {e}"));
             }
         }
     }
+    if control.stopped() {
+        crate::log_event!(Info,"rpc full scan summary complete=false cancelled=true unique={} published={} unpublished={}",
+            collector.accepted,collector.published,collector.pending.len());
+        return Ok(());
+    }
     bail!("all full scan HTTP providers failed: {}", errors.join("; "))
 }
-pub async fn run(output: broadcast::Sender<Arc<DataBatch>>, settings: Settings) -> Result<()> {
-    tokio::task::spawn_blocking(move || blocking_run(settings, output))
-        .await.context("full scan blocking transport task panicked")?
+pub async fn run(output: broadcast::Sender<Arc<DataBatch>>, settings: Settings,
+    mut stop:watch::Receiver<bool>) -> Result<()> {
+    if *stop.borrow() { return Ok(()); }
+    let control=Arc::new(ScanControl::default());
+    let _cancel=CancelOnDrop(control.clone());
+    let reader_control=control.clone();
+    let mut reader=tokio::task::spawn_blocking(move || blocking_run(settings,output,reader_control));
+    tokio::select! {
+        result=&mut reader=>result.context("full scan blocking transport task panicked")?,
+        _=stop.changed()=>{
+            control.stop();
+            reader.await.context("cancelled full scan reader panicked")?
+        },
+    }
 }

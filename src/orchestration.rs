@@ -1,18 +1,19 @@
 //! Resource provisioning, channel connections, and worker lifecycle only.
+use crate::workers::discovery::meteora_dlmm as discovery_meteora_dlmm;
 
 use std::{env, sync::Arc};
 
 mod runtime;
+mod discovery;
+use discovery::SourceSet;
 mod v10_simulation;
 
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, source_dexscreener, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, source_dexscreener, graph_liquidity, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
-#[derive(Clone, Copy, Debug)]
-enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
 
 struct CompletionConfig {
     lifecycle_limit: usize,
@@ -379,50 +380,11 @@ fn spawn_sources(
     }
     tasks.spawn(pool_registry::run(registry_input, completion_input, registry,
         registry_output, source_done_tx, strict_lag, None));
-    if matches!(source_set, SourceSet::Raydium | SourceSet::All) {
-        let rps: u32 = env::var("RAYDIUM_API_RPS")
-            .unwrap_or_else(|_| "10".into()).parse().context("invalid RAYDIUM_API_RPS")?;
-        tasks.spawn(discovery_raydium::run(core::http_client()?, output.clone(), discovery_raydium::Settings {
-            once: settings.once, max_pages: settings.max_pages, rps,
-        }));
-    }
-    if matches!(source_set, SourceSet::Byreal | SourceSet::All) {
-        let rpm:u32=env::var("BYREAL_API_RPM")
-            .unwrap_or_else(|_| "57".into()).parse().context("invalid BYREAL_API_RPM")?;
-        tasks.spawn(discovery_byreal_clmm::run(core::http_client()?,output.clone(),discovery_byreal_clmm::Settings {
-            once: settings.once,max_pages:settings.max_pages,rpm,
-        }));
-    }
-    if matches!(source_set, SourceSet::PumpSwap) {
-        let rpc = pump_rpc.context("PumpSwap rolling requires the configured shared RPC transport")?;
-        let settings = discovery_pumpswap::Settings::from_env(settings.once, settings.max_pages)?;
-        tasks.spawn(discovery_pumpswap::run(rpc, output.clone(), settings));
-    }
-    if matches!(source_set, SourceSet::Manifest | SourceSet::All) {
-        tasks.spawn(discovery_manifest::run(core::http_client()?,output.clone(),
-            discovery_manifest::Settings {once:settings.once}));
-    }
-    if matches!(source_set, SourceSet::PancakeSwap | SourceSet::All) {
-        let rpm: u32 = env::var("PANCAKESWAP_API_RPM")
-            .unwrap_or_else(|_| "57".into()).parse().context("invalid PANCAKESWAP_API_RPM")?;
-        tasks.spawn(discovery_pancakeswap_clmm::run(core::http_client()?, output.clone(), discovery_pancakeswap_clmm::Settings {
-            once: settings.once, max_pages: settings.max_pages, rpm,
-        }));
-    }
-    if matches!(source_set, SourceSet::Orca | SourceSet::All) {
-        let rps: u32 = env::var("ORCA_API_RPS")
-            .unwrap_or_else(|_| "10".into()).parse().context("invalid ORCA_API_RPS")?;
-        tasks.spawn(discovery_orca_whirlpool::run(core::http_client()?, output.clone(), discovery_orca_whirlpool::Settings {
-            once: settings.once, max_pages: settings.max_pages, rps,
-        }));
-    }
-    if matches!(source_set, SourceSet::DammV2 | SourceSet::DlmmDammV2 | SourceSet::All) {
-        tasks.spawn(discovery_meteora_damm_v2::run(core::http_client()?, output.clone(),
-            discovery_meteora_damm_v2::Settings { once: settings.once, max_pages: settings.max_pages }));
-    }
-    if matches!(source_set, SourceSet::Dlmm | SourceSet::DlmmDammV2 | SourceSet::All) {
-        tasks.spawn(discovery_meteora_dlmm::run(core::http_client()?, output, settings));
-    }
+    let (_stop,stop_rx)=watch::channel(false);
+    let workers=discovery::configured(source_set,settings.once,settings.max_pages)?;
+    discovery::spawn_finite(tasks,workers,discovery::Resources {
+        http:core::http_client()?,rpc:pump_rpc,output,stop:stop_rx,
+    });
     Ok(())
 }
 
@@ -519,6 +481,15 @@ pub async fn run() -> Result<()> {
     core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str)==Some("--discovery-live") {
+        return discovery::live(&args[1..]).await;
+    }
+    if args.len()>=2 && args[0]=="--test" && args[1]=="discovery_identity_hydration" {
+        let mut selected=vec!["identity_hydration".to_owned()];
+        selected.extend_from_slice(&args[2..]);
+        return discovery::live(&selected).await;
+    }
+
     if args.len()==1 && args[0]=="--rpc-ws-plan" {
         let settings=rpc_transport::settings_from_env()?;
         println!("{}",serde_json::to_string(&settings.websocket_plan()?)?);
@@ -598,44 +569,14 @@ pub async fn run() -> Result<()> {
     }
     let cli = settings(args.into_iter())?;
     if cli.rpc_full_scan_live {
-        let settings = discovery_rpc_full::Settings::from_env()?;
-        let db = persistence::Persistence::connect().await?;
-        let registry = pool_registry::PoolRegistry::default();
-        let restored = registry.restore(db.restore().await?)?;
-        crate::log_event!(Info,"rpc full scan initial restored_pools={restored}");
-        let (source, source_rx) = broadcast::channel::<Arc<core::DataBatch>>(256);
-        let registry_rx = source.subscribe();
-        let (updates, _) = broadcast::channel::<Arc<core::PoolUpdateBatch>>(256);
-        let writer_rx = updates.subscribe();
-        let (source_done, _) = watch::channel(false);
-        let mut tasks = JoinSet::new();
-        tasks.spawn(diagnostic_source::run(source_rx, true));
-        tasks.spawn(db.run(writer_rx));
-        tasks.spawn(pool_registry::run(registry_rx, None, registry, updates.clone(), source_done, true, None));
-        drop(updates);
-        let scanned = discovery_rpc_full::run(source, settings).await;
-        let mut downstream = Ok(());
-        while let Some(result) = tasks.join_next().await {
-            if let Err(e) = result.context("full scan downstream task join").and_then(|r|r) {
-                downstream = Err(e);
-                tasks.abort_all();
-                break;
-            }
-        }
-        downstream?;
-        scanned?;
-        crate::log_event!(Info,"rpc full scan live complete=true");
-        return Ok(());
+        return discovery::live(&["rpc_full".into(),"--persist".into()]).await;
     }
     if cli.pumpswap_discovery_live {
-        let (rpc, rpc_task) = rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
-        let (output, input) = broadcast::channel::<Arc<core::DataBatch>>(256);
-        let observer = tokio::spawn(diagnostic_source::run(input, true));
-        let settings = discovery_pumpswap::Settings::from_env(true, cli.meteora.max_pages)?;
-        discovery_pumpswap::run(rpc, output, settings).await?;
-        observer.await??;
-        rpc_task.await??;
-        return Ok(());
+        let mut selected=vec!["pumpswap".to_owned()];
+        if let Some(pages)=cli.meteora.max_pages {
+            selected.extend(["--max-pages".into(),pages.to_string()]);
+        }
+        return discovery::live(&selected).await;
     }
     if cli.http_transport_live {
         http_transport::live_diagnostic().await?;

@@ -158,6 +158,7 @@ fn decode(pool: Pubkey, venue: Venue, account: &AccountData, slot: u64) -> Resul
             address: pool, venue, mint_a: Some(a), mint_b: Some(b),
         },
         tvl_usd: None,
+        config: None,
         payload: json!({"kind":"multi_venue_identity_hydration_v1",
             "validated_slot":slot}),
     })
