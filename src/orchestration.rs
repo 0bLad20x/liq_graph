@@ -1,4 +1,5 @@
 //! Resource provisioning, channel connections, and worker lifecycle only.
+use crate::workers::discovery::{meteora_dlmm as discovery_meteora_dlmm, meteora_damm_v2 as discovery_meteora_damm_v2, raydium as discovery_raydium, orca_whirlpool as discovery_orca_whirlpool, pancakeswap_clmm as discovery_pancakeswap_clmm, byreal_clmm as discovery_byreal_clmm, manifest as discovery_manifest, pumpswap as discovery_pumpswap, rpc_full as discovery_rpc_full};
 
 use std::{env, sync::Arc};
 
@@ -9,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, task::JoinSet};
 
-use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, source_dexscreener, graph_liquidity, discovery_meteora_dlmm, discovery_meteora_damm_v2, discovery_raydium, discovery_pancakeswap_clmm, discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full, discovery_orca_whirlpool, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
+use crate::{core, workers::{completion_meteora_damm_v2, completion_orca_whirlpool, completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm, completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest, completion_pumpswap, completion_meteora_dlmm, graph_watch_catalog, source_jupiter_mint, source_dexscreener, graph_liquidity, persistence, pool_registry, rpc_transport, http_transport, diagnostic_source}};
 
 #[derive(Clone, Copy, Debug)]
 enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }

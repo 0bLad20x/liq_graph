@@ -1,4 +1,5 @@
 //! Production task supervision and wiring. No DEX logic in the orchestrator.
+use crate::workers::discovery::{meteora_dlmm as discovery_meteora_dlmm, meteora_damm_v2 as discovery_meteora_damm_v2, raydium as discovery_raydium, orca_whirlpool as discovery_orca_whirlpool, pancakeswap_clmm as discovery_pancakeswap_clmm, byreal_clmm as discovery_byreal_clmm, manifest as discovery_manifest, pumpswap as discovery_pumpswap, rpc_full as discovery_rpc_full, identity_hydration as identity_hydration_venues};
 use std::{env, future::Future, io::{self, BufRead}, sync::{Arc,Mutex}, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
@@ -7,11 +8,8 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
     workers::{completion_lifecycle, completion_meteora_dlmm, completion_meteora_damm_v2, completion_orca_whirlpool,
         completion_raydium_amm_v4, completion_raydium_cpmm, completion_raydium_clmm,
         completion_pancakeswap_clmm, completion_byreal_clmm, completion_manifest,
-        completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
-        discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
-        discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
-        execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
-        identity_hydration_venues, graph_signals, market_state, persistence, pool_registry,
+        completion_pumpswap, execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
+        graph_signals, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint, execution_v10}};
 use super::{jupiter_settings,v10_simulation::ExecutionTasks};
 
