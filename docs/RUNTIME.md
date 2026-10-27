@@ -44,7 +44,7 @@ Simulation verlangt zusätzlich eindeutig zugeordnete Antworten aller angenommen
 Requests. Ein On-Chain-Fehler darf diesen Übergabenachweis erfüllen; erfolgreiche
 Swaps, DEX-Aufrufe je Routenform und Profitabilität sind eigene Ergebnisse für CP8.
 
-## CP7E/F: Implementierung und noch ausstehende Live-Abnahme
+## CP7E/F: Implementierung und Live-Evidenz
 
 Basis: gemergte CP7D-`main` mit `bc511df4894598731f80d909838da436824159cc`.
 Branch: `cp7ef-runtime-tooling-cleanup`. CP8 bleibt separat.
@@ -60,7 +60,22 @@ Beobachters entfallen.
 Der locked Release-Build und die Syntaxprüfung sind Voraussetzungen. Erst reale
 Artefakte auf dem tatsächlich übergebenen Commit schließen diesen Checkpoint ab.
 In der Implementierungsumgebung fehlen Rust/PowerShell und konfigurierte DB/RPC-
-Zugänge; der Build wird über Repository-CI geprüft. Es wird hier kein Live-Erfolg behauptet.
+Zugänge; der Build wird über Repository-CI geprüft.
+
+Der reale Lauf `20261027T114819833Z` auf `0d0e5f7` belegt 60,005 Sekunden,
+null Diagnosekonsumenten und vollständige Übergabe: 28.689 MarketState-Ereignisse,
+546 Preise einschließlich eines WS-Preises sowie 57.519 Signalereignisse und
+475 Kandidatenänderungen kamen jeweils beim tatsächlichen Folgekonsumenten an.
+Keine Verluste, Decoderfehler oder unverifizierten Execution-Eingaben; sauberer Shutdown.
+Entfernen und Neuauswahl nach Rewatch sind sichtbar, ein nachfolgender WS-Preis
+und ein echter V10-Request fehlen. Diese beiden Nachweise bleiben unvollständig.
+Eine einzelne gewöhnliche WS-Auswertung ist kein belastbarer Geschwindigkeitstest.
+
+Die erste Zusammenfassung setzte `candidate_delivery_passed` fälschlich aus dem
+Gesamtabnahmestatus ab. Das ist korrigiert: Markt-/Signalübergabe, Rewatch und
+Request-Handoff werden unabhängig geprüft. `evidence_errors` nennt alle fehlenden
+Nachweise. Die Gesamtabnahme bleibt bei einem fehlenden angeforderten Nachweis falsch;
+die erfolgreiche Kandidatenübergabe wird dadurch nicht mehr als gescheitert angezeigt.
 
 Ein kurzer gemeinsamer Lauf prüft die Verschlankung am echten Execution-Eingang:
 
@@ -72,7 +87,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Branchwechsel fehlgeschlagen.' }
 
 .\scripts\runtime_live.ps1 `
     -ExpectedBranch cp7ef-runtime-tooling-cleanup `
-    -DurationSeconds 60 -PoolLimit 15000 -AccountBudget 25000 `
+    -DurationSeconds 60 -PoolLimit 1000 -AccountBudget 25000 `
     -Rewatch -SimulateV10 -SimulationLimit 3 `
     -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
 ```
@@ -81,6 +96,11 @@ Bei bereits vorhandenem lokalem Branch einmal `git switch` und `git pull --ff-on
 verwenden. Kein Reset, Clean oder Stash. Der Starter akzeptiert jeden sauberen Branch;
 `ExpectedBranch` kann den vorgesehenen Checkout ausdrücklich absichern. Er prüft
 Branch/HEAD/Working Tree, baut `cargo build --locked --release` und prüft das Lockfile.
+
+Für diesen gezielten Nachweis werden nur 1000 Pools beobachtet, damit Rewatch nicht
+mit der erneuten Initialisierung der gesamten Auswahl konkurriert. Der Graph behält
+sein vollständiges Routenuniversum. Dies ist kein Leistungsnachweis für 15.000
+vollständig hydrierte Pools.
 
 Kein zusätzlicher zehn- oder fünfzehnminütiger Pflichtlauf. Liefert der kurze Lauf
 keine benötigten echten Ereignisse, bleibt der entsprechende Nachweis unvollständig;
@@ -119,6 +139,8 @@ Im vorgesehenen Simulationslauf müssen `diagnostic_consumers=0`,
 zur Signalproduktion passen; Signal-Event/State/Batch/Kandidaten/Evaluation-Zähler
 müssen zum wirklichen ExecutionCandidates-Bericht passen. Es darf kein
 `signal_consumer.json` entstehen. Fehlende Messwerte werden nicht als Nullerfolg ausgegeben.
+`market_delivery_passed`, `signal_delivery_passed` und `rewatch_evidence_passed`
+zeigen ihre jeweils eigenen Prüfungen; deaktivierte Prüfungen bleiben null.
 
 `summary.json` enthält Account-Verarbeitung und Queue in ns, gewöhnliche
 WS-Signalverarbeitung in ns und Frame-bis-Signalzustand in µs. P95/P99 sind

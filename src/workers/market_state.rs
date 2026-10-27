@@ -1507,12 +1507,15 @@ pub struct ProductionReport {
     selected_pools:usize,hydrated_pools:usize,priced_pools:usize,metrics:Metrics,
 }
 impl ProductionReport {
-    pub fn ensure_delivery_evidence(&self,rewatch:bool)->Result<()> {
+    pub fn ensure_delivery_evidence(&self)->Result<()> {
         ensure!(self.observations>0 && self.websocket_observations>0,"no real WebSocket price observations");
         ensure!(self.metrics.lost==0 && self.metrics.no_receiver==0,
             "MarketState lost account inputs or published without a consumer");
-        if rewatch {ensure!(self.metrics.selection_changes>=3 && self.metrics.removals>0 && self.post_rewatch_websocket_observations>0,
-            "rewatch did not complete removal, reselection and subsequent WebSocket prices");}
+        Ok(())
+    }
+    pub fn ensure_rewatch_evidence(&self)->Result<()> {
+        ensure!(self.metrics.selection_changes>=3 && self.metrics.removals>0 && self.post_rewatch_websocket_observations>0,
+            "rewatch did not complete removal, reselection and subsequent WebSocket prices");
         Ok(())
     }
 }

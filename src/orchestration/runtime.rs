@@ -499,36 +499,48 @@ struct RunEvidence {
     execution:serde_json::Value,
 }
 impl RunEvidence {
-    fn ensure_orchestration(&self,settings:RunSettings)->Result<()> {
-        if settings.hydration_only {return Ok(());}
+    fn checks(&self,settings:RunSettings)->Vec<(&'static str,Result<()>)> {
+        let mut checks=Vec::new();
+        if settings.hydration_only {return checks;}
         if settings.market {
-            self.market.as_ref().context("missing MarketState report")?
-                .ensure_delivery_evidence(settings.rewatch)?;
+            checks.push(("market_delivery",(||->Result<()> {
+                let source=self.market.as_ref().context("missing MarketState report")?;
+                source.ensure_delivery_evidence()?;
+                if settings.signals {
+                    self.production.as_ref().context("missing signal producer report")?
+                        .ensure_input_delivery(source.events,source.observations,source.websocket_observations)?;
+                }else{
+                    let consumer=self.market_consumer.as_ref().context("missing standalone MarketState consumer report")?;
+                    anyhow::ensure!((source.events,source.observations,source.websocket_observations)
+                        ==(consumer.events,consumer.observations,consumer.websocket_observations),
+                        "standalone MarketState output delivery counts differ");
+                }
+                Ok(())
+            })()));
         }
         if settings.signals {
-            let market=self.market.as_ref().context("missing MarketState report")?;
-            let production=self.production.as_ref().context("missing signal producer report")?;
-            production.ensure_input_delivery(market.events,market.observations,market.websocket_observations)?;
-            if settings.simulate {
-                let consumer=self.candidates.as_ref().context("missing actual ExecutionCandidates report")?;
-                consumer.ensure_complete()?;
-                production.ensure_execution_delivery(consumer.events,consumer.state_updates,
-                    consumer.candidate_batches,consumer.candidates,consumer.evaluations)?;
-            }else{
-                production.ensure_delivery(self.signals.as_ref().context("missing signal proof report")?)?;
-            }
-        }else if settings.market {
-            let source=self.market.as_ref().context("missing MarketState report")?;
-            let consumer=self.market_consumer.as_ref().context("missing standalone MarketState consumer report")?;
-            anyhow::ensure!((source.events,source.observations,source.websocket_observations)
-                ==(consumer.events,consumer.observations,consumer.websocket_observations),
-                "standalone MarketState output delivery counts differ");
+            checks.push(("signal_delivery",(||->Result<()> {
+                let production=self.production.as_ref().context("missing signal producer report")?;
+                if settings.simulate {
+                    let consumer=self.candidates.as_ref().context("missing actual ExecutionCandidates report")?;
+                    consumer.ensure_complete()?;
+                    production.ensure_execution_delivery(consumer.events,consumer.state_updates,
+                        consumer.candidate_batches,consumer.candidates,consumer.evaluations)?;
+                }else{
+                    production.ensure_delivery(self.signals.as_ref().context("missing signal proof report")?)?;
+                }
+                Ok(())
+            })()));
+        }
+        if settings.rewatch {
+            checks.push(("rewatch",self.market.as_ref().context("missing MarketState report")
+                .and_then(|market|market.ensure_rewatch_evidence())));
         }
         if settings.simulate {
-            anyhow::ensure!(self.execution["execution_handoff_observed"]==true,
-                "no complete candidate -> request -> V10 simulation handoff; inspect execution.json");
+            checks.push(("execution_handoff",if self.execution["execution_handoff_observed"]==true {Ok(())}
+                else {Err(anyhow!("no complete candidate -> request -> V10 simulation handoff; inspect execution.json"))}));
         }
-        Ok(())
+        checks
     }
 }
 
@@ -537,11 +549,20 @@ pub async fn run()->Result<()> {
     let evidence=Arc::new(Mutex::new(RunEvidence::default()));
     let result=run_pipeline(settings,evidence.clone()).await;
     let evidence=evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?;
-    let acceptance=evidence.ensure_orchestration(settings);
+    let checks=evidence.checks(settings);
+    let acceptance=checks.iter().find_map(|(_,check)|check.as_ref().err());
     let mut report=settings.describe();
     report["run_complete"]=serde_json::json!(result.is_ok());
-    report["orchestration_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_ok());
-    report["error"]=serde_json::json!(result.as_ref().err().or(acceptance.as_ref().err()).map(|e|format!("{e:#}")));
+    report["orchestration_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_none());
+    report["error"]=serde_json::json!(result.as_ref().err().or(acceptance).map(|e|format!("{e:#}")));
+    for (check,field) in [("market_delivery","market_delivery_passed"),
+        ("signal_delivery","signal_delivery_passed"),("rewatch","rewatch_evidence_passed")] {
+        report[field]=serde_json::json!(checks.iter().find(|(name,_)|*name==check).map(|(_,r)|r.is_ok()));
+    }
+    report["candidate_delivery_passed"]=if settings.simulate {report["signal_delivery_passed"].clone()}
+        else {serde_json::Value::Null};
+    report["evidence_errors"]=serde_json::json!(checks.iter().filter_map(|(stage,check)|
+        check.as_ref().err().map(|error|serde_json::json!({"stage":stage,"error":format!("{error:#}")}))).collect::<Vec<_>>());
     report["execution_handoff_observed"]=evidence.execution["execution_handoff_observed"].clone();
     report["execution_integration_passed"]=evidence.execution["execution_integration_passed"].clone();
     if let Ok(path)=env::var("RUN_REPORT_PATH") {
@@ -551,7 +572,7 @@ pub async fn run()->Result<()> {
     result?;
     // A finite live proof must not exit successfully with incomplete delivery.
     // Continuous operation may be stopped before any market activity occurs.
-    if settings.duration>0 {acceptance?;}
+    if settings.duration>0 {if let Some(error)=acceptance {bail!("{error:#}");}}
     Ok(())
 }
 

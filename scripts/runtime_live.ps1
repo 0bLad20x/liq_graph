@@ -164,10 +164,7 @@ try {
     $production = Read-OptionalJson $producerPath
     $refreshes = @(Select-String -LiteralPath $log -Pattern 'lifecycle (unchanged request_id=.* work=Refresh state=Prepared|accepted request_id=.* work=Refresh status=Prepared)').Count
     $lifecycleStarted = [bool](Select-String -LiteralPath $log -Pattern 'lifecycle started' -Quiet)
-    $candidateDelivery = if ($SimulateV10) { $null -ne $execution -and
-        $execution.execution_candidates.lost_events -eq 0 -and
-        $execution.execution_candidates.awaiting_snapshot -eq $false -and
-        $runtime.orchestration_evidence_passed -eq $true } else { $null }
+    $candidateDelivery = $runtime.candidate_delivery_passed
     $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
         $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and
         (-not $marketEnabled -or $refreshes -gt 0) -and
@@ -188,6 +185,10 @@ try {
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
         runtime_completed=($null -ne $runtime -and $runtime.run_complete -eq $true)
         orchestration_evidence_passed=[bool]$orchestrationPassed; runtime_evidence=$runtime
+        market_delivery_passed=$runtime.market_delivery_passed
+        signal_delivery_passed=$runtime.signal_delivery_passed
+        rewatch_evidence_passed=$runtime.rewatch_evidence_passed
+        evidence_errors=$runtime.evidence_errors
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; completion_lifecycle_started=$lifecycleStarted
         prepared_refreshes_observed=$refreshes; graph_audit_passed=$graphPassed
