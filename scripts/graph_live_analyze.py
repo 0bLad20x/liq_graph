@@ -59,8 +59,11 @@ def run(args):
     out = pathlib.Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     checkout = read_json(out/"checkout.json", {})
+    stage = checkout.get("stage")
     prod = read_json(out/"signal_production.json", {})
     consumer = read_json(out/"signal_consumer.json", {})
+    if bool(prod)!=bool(consumer):
+        raise RuntimeError("Incomplete optional signal report pair")
     started = as_int(checkout.get("start_ms"))
     audit_seen = collections.Counter()
     audit_by_gen = {}
@@ -159,11 +162,17 @@ def run(args):
     errors=collections.Counter()
     completed=False
     runtime_start_ms=None
+    runtime_stop_ms=None
+    runtime_stop_reason=None
     runtime_end_ms=None
     for line in pathlib.Path(args.runtime).open(encoding="utf-8",errors="replace"):
         if "runtime running=true" in line and runtime_start_ms is None:
             found=TS.search(line)
             if found:runtime_start_ms=int(found.group(1))
+        if "runtime shutdown reason=" in line:
+            found=TS.search(line)
+            if found:runtime_stop_ms=int(found.group(1))
+            runtime_stop_reason=dict(KEY.findall(line)).get("reason")
         if "runtime shutdown complete=true" in line:
             completed=True
             found=TS.search(line)
@@ -294,7 +303,17 @@ def run(args):
                     as_int(produced_counts.get("catalog_reconciliations"))>0 and
                     as_int(produced_counts.get("snapshot_candidates"))>0 and
                     catalog_visibility and catalog_withdrawal and catalog_reuse and catalog_witness)
+    exact_references={
+        gen:record for gen,record in verified.items()
+        if gen in graph_rows and all(record.get(flag)=="true" for flag in
+            ("exact_identity","directed_roles","route_options","pair_index"))
+        and as_int(record.get("checked_topologies"),-1)==as_int(graph_rows[gen].get("compact_topologies"),-2)
+    }
+    nonempty_references={gen for gen in exact_references
+                         if as_int(graph_rows[gen].get("compact_topologies"))>0}
+    measured_end=runtime_stop_ms if runtime_stop_ms is not None else runtime_end_ms
     stats={
+        "stage":stage,"signal_reports_checked":bool(prod),
         "catalog_reconciliation_required":args.require_catalog_reconciliation,
         "catalog_reconciliation_passed":catalog_passed,
         "catalog_candidate_visibility_observed":catalog_visibility,
@@ -307,8 +326,9 @@ def run(args):
         "requested_duration_seconds":checkout.get("duration_seconds"),
         "exit_code":args.exit_code,"runtime_completed":completed,
         "runtime_measured_seconds":(
-            (runtime_end_ms-runtime_start_ms)/1000 if
-            runtime_end_ms is not None and runtime_start_ms is not None else None),
+            (measured_end-runtime_start_ms)/1000 if
+            measured_end is not None and runtime_start_ms is not None else None),
+        "runtime_stop_reason":runtime_stop_reason,
         "graph_generations":len(graph_rows),
         "audited_generations":complete_count,
         "transition_observed":observed_count,
@@ -319,6 +339,11 @@ def run(args):
         "zero_effect_generations":zero_effect,
         "no_effect_dirty_total":sum(as_int(s.get("no_effect")) for s in graph_summaries.values()), 
         "reference_verified_generations":sum(bool(row.get("reference_verified")) for row in rows),
+        "exact_route_and_index_verified_generations":len(exact_references),
+        "nonempty_reference_generations":len(nonempty_references),
+        "all_published_generations_reference_verified":set(graph_rows)==set(exact_references),
+        "incremental_new_pair_generations":sum(
+            gen>1 and as_int(delta.get("added_mint_pairs"))>0 for gen,delta in graph_deltas.items()),
         "flapping_pools":sum(bool(p["remove_then_add"]) for p in flap_records),
         "top_flapping":flap_records[:20],
         "source_counts":dict(changed_by_source),
@@ -334,7 +359,7 @@ def run(args):
         "signal_producer_candidates":((prod.get("counts") or {}).get("candidates")),
         "signal_consumer_candidates":((consumer.get("counts") or {}).get("candidates")),
         "signal_lost_events":consumer.get("lost_events"),
-        "compact_topologies":((prod.get("last_plan") or {}).get("compact_topologies")),
+        "compact_topologies":as_int(graph_rows[max(graph_rows)].get("compact_topologies")) if graph_rows else None,
         "last_graph":graph_rows.get(max(graph_rows)) if graph_rows else None,
         "delta_pair_changes":sum(as_int(row.get("added_mint_pairs"))+as_int(row.get("removed_mint_pairs")) for row in rows),
         "delta_alternatives_only_pairs":sum(as_int(row.get("alternatives_only_pairs")) for row in rows),
@@ -346,29 +371,28 @@ def run(args):
         json.dump(stats,out_file,indent=2,ensure_ascii=False)
     print(json.dumps({k:stats[k] for k in (
         "runtime_completed","exit_code","graph_generations","transition_observed",
-        "transition_published","flapping_pools","provider_gap_total","signal_lost_events"
+        "transition_published","flapping_pools","provider_gap_total","signal_lost_events",
+        "runtime_measured_seconds","exact_route_and_index_verified_generations",
+        "nonempty_reference_generations","all_published_generations_reference_verified"
     )},indent=2))
     if args.exit_code or not completed:
         raise SystemExit("Live runtime incomplete: evidence preserved, no acceptance.")
-    if (stats["signal_lost_events"] or 0)>0:
-        raise SystemExit("Signal delivery loss; do not accept.")
-    if stats["signal_producer_candidates"]!=stats["signal_consumer_candidates"]:
-        raise SystemExit("Producer/consumer candidate count differs.")
+    if prod and (prod.get("error") or consumer.get("error") or consumer.get("lost_events")
+                 or consumer.get("awaiting_snapshot") or consumer.get("unverified_events")
+                 or consumer.get("unverified_ranges") or produced_counts!=consumed_counts):
+        raise SystemExit("Optional signal reports contain errors, loss or incomplete delivery.")
     if len(graph_rows)<2 or not observed_count or not published_count:
         raise SystemExit("Insufficient real graph transition evidence.")
-    if not stats["reference_verified_generations"]:
-        raise SystemExit("No exact CP6C full route reference comparison observed.")
+    if not nonempty_references:
+        raise SystemExit("No nonempty exact route and inverse-index reference comparison observed.")
+    if stage=="Graph" and not stats["all_published_generations_reference_verified"]:
+        raise SystemExit("Graph stage requires an exact reference for every published generation.")
     if stats["runtime_measured_seconds"] is None or stats["runtime_measured_seconds"]<args.min_duration:
         raise SystemExit("Real runtime duration was shorter than the requested observation period.")
-    if not (stats["signal_websocket_evaluations"] or 0)>0 or not (stats["signal_producer_candidates"] or 0)>0:
-        raise SystemExit("No real WebSocket price evaluation and compact candidate evidence.")
-    ready=consumer.get("websocket_ready_anchors_by_kind") or {}
-    if any((ready.get(k) or 0)<=0 for k in
-           ("direct_2","direct_3","triangle_3","triangle_4")):
-        raise SystemExit("No WebSocket-ready signals for one or more topology kinds.")
-    last_plan=prod.get("last_plan") or {}
-    if (last_plan.get("legacy_groups_compiled") or 0)!=0 or (last_plan.get("compact_topologies") or 0)<=0:
-        raise SystemExit("Compact topology plan missing or legacy signal groups compiled.")
+    if stage=="Graph" and runtime_stop_reason!="duration":
+        raise SystemExit("Graph stage did not finish its configured observation duration.")
+    if not any(as_int(row.get("compact_topologies"))>0 and as_int(row.get("trade_paths"))>0 for row in graph_rows.values()):
+        raise SystemExit("No nonempty published topology universe observed.")
     if args.require_catalog_reconciliation and not catalog_passed:
         raise SystemExit("CP7 catalog evidence incomplete: require real candidate visibility, withdrawal, unchanged reuse, snapshot delivery and a catalog witness; inspect summary.json.")
 

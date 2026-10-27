@@ -1,10 +1,10 @@
-# One production pipeline for finite MarketState, signal and V10 simulation proofs.
+# One production pipeline for finite graph, MarketState, signal and V10 simulation proofs.
 # Uses the local .env. Never broadcasts transactions or modifies provider credentials.
 param(
     [ValidateRange(30,86400)][int]$DurationSeconds = 60,
     [ValidateRange(0,2147483647)][int]$PoolLimit = 15000,
     [ValidateRange(0,1000000)][int]$AccountBudget = 25000,
-    [ValidateSet('Signals','MarketState')][string]$Stage = 'Signals',
+    [ValidateSet('Graph','Signals','MarketState')][string]$Stage = 'Signals',
     [string]$ExpectedBranch = 'cp7a-unified-runtime',
     [switch]$PlanOnly,
     [switch]$Rewatch,
@@ -25,9 +25,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $signals = $Stage -eq 'Signals'
-if (($SimulateV10 -or $GraphAudit -or $RequireCatalogReconciliation -or $TraceSignals -or $ProfileSignals) -and -not $signals) {
+$marketEnabled = $Stage -ne 'Graph'
+if (($SimulateV10 -or $RequireCatalogReconciliation -or $TraceSignals -or $ProfileSignals) -and -not $signals) {
     throw 'Simulation and signal diagnostics require -Stage Signals.'
 }
+if (($Rewatch -or $TracePrices) -and -not $marketEnabled) { throw 'Rewatch and TracePrices require MarketState.' }
+if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires GraphAudit for actual graph/reference evidence.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -78,7 +81,7 @@ try {
         IDENTITY_HYDRATION_ONLY = 'false'
         RUN_REPORT_PATH = $runtimePath
         RUN_MARKET_REPORT_PATH = $marketPath
-        MARKET_STATE_ENABLED = 'true'
+        MARKET_STATE_ENABLED = "$marketEnabled".ToLowerInvariant()
         GRAPH_SIGNALS_ENABLED = "$signals".ToLowerInvariant()
         CP1_MARKET_ENRICHMENT_ENABLED = 'true'
         MARKET_STATE_POOL_LIMIT = "$PoolLimit"
@@ -103,7 +106,7 @@ try {
         GRAPH_EXECUTION_PARAMETERS_PATH = $ExecutionParametersPath
         GRAPH_EXECUTION_REPORT_PATH = $executionPath
         GRAPH_DIAGNOSTIC_JSONL_PATH = $(if ($GraphAudit) { $auditPath } else { $null })
-        CP6C_REFERENCE_EVERY = $(if ($GraphAudit) { '10' } else { '0' })
+        CP6C_REFERENCE_EVERY = $(if ($GraphAudit -and $Stage -eq 'Graph') { '1' } elseif ($GraphAudit) { '10' } else { '0' })
         LIQ_GRAPH_LOG = (@(
             'warn','liq_graph::orchestration::runtime=info',
             'liq_graph::workers::persistence=info','liq_graph::workers::pool_registry=info',
@@ -142,7 +145,7 @@ try {
         Write-Host 'Plan only: no RPC connections, database reads or live acceptance.'
         return
     }
-    if ($plan.websocket_plan.account_capacity -le 0) { throw 'No WebSocket account capacity selected.' }
+    if ($marketEnabled -and $plan.websocket_plan.account_capacity -le 0) { throw 'No WebSocket account capacity selected.' }
     Write-Host "Starting $DurationSeconds-second live run; full log: $log"
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $priorPreference = $ErrorActionPreference
@@ -163,12 +166,13 @@ try {
         $execution.execution_candidates.lost_events -eq 0 -and
         $execution.execution_candidates.awaiting_snapshot -eq $false)
     $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
-        $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and $refreshes -gt 0 -and
+        $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and
+        (-not $marketEnabled -or $refreshes -gt 0) -and
         $candidateDelivery -and $clock.Elapsed.TotalSeconds -ge ($DurationSeconds - 1)
     $graphPassed = $null
     if ($GraphAudit) {
         $analyzerArgs = @('--audit',$auditPath,'--runtime',$log,'--output',$folder,
-            '--exit-code',"$exitCode",'--min-duration',"$([Math]::Max(30,$DurationSeconds - 15))",
+            '--exit-code',"$exitCode",'--min-duration',"$DurationSeconds",
             '--summary-name','graph_summary.json')
         if ($RequireCatalogReconciliation) { $analyzerArgs += '--require-catalog-reconciliation' }
         & python (Join-Path $PSScriptRoot 'graph_live_analyze.py') @analyzerArgs
@@ -177,7 +181,7 @@ try {
     $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
     $summary = [ordered]@{
-        branch=$branch; head=$head; pipeline='runtime'; exit_code=$exitCode
+        branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
         runtime_completed=($null -ne $runtime -and $runtime.run_complete -eq $true)
         orchestration_evidence_passed=[bool]$orchestrationPassed; runtime_evidence=$runtime
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
@@ -185,7 +189,7 @@ try {
         prepared_refreshes_observed=$refreshes; graph_audit_passed=$graphPassed
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
-        candidate_delivery_passed=[bool]$candidateDelivery
+        candidate_delivery_passed=$(if ($SimulateV10) { [bool]$candidateDelivery } else { $null })
         v10_requests=$requests.Count; v10_reports=$reports.Count
         v10_simulation_successes=$execution.simulation_successes
         v10_simulation_failures=$execution.simulation_failures
@@ -196,7 +200,7 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
-    Write-Host "CP7A-Orchestrierungsnachweis bestanden. Artefakte: $folder"
+    Write-Host "Orchestrierungsnachweis bestanden. Artefakte: $folder"
     if ($SimulateV10) {
         Write-Host "V10: Uebergabe an Simulation nachgewiesen; erfolgreiche Simulationen=$($execution.simulation_successes), fehlgeschlagene=$($execution.simulation_failures), DEX-Aufrufberichte=$($execution.simulation_dex_calls_observed)."
         Write-Host 'Erfolgreiche Handelsausfuehrung und Profitabilitaet bleiben gesondert nachzuweisen (CP8).'
@@ -204,6 +208,7 @@ try {
         Write-Host 'V10-Simulation war in diesem Lauf deaktiviert.'
     }
     if ($GraphAudit -and -not $graphPassed) { throw "Zusaetzlich angeforderter Graphaudit unvollstaendig; Orchestrierung bestanden. Details: $folder" }
+    if ($GraphAudit) { Write-Host 'Graphnachweis bestanden: reale Uebergaenge und exakter Routen-/Indexreferenzvergleich.' }
 } finally {
     # Only restore values actually saved, including after a guard/build failure.
     foreach ($name in $previous.Keys) {
