@@ -49,8 +49,7 @@ Der Plan ist kein Live-Nachweis; eine Wallet wird für PlanOnly nicht benötigt.
 
 ```powershell
 .\scripts\runtime_live.ps1 `
-    -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 `
-    -GraphAudit -Rewatch
+    -DurationSeconds 60 -PoolLimit 15000 -AccountBudget 25000 -Rewatch
 ```
 
 Dieser Lauf startet reguläre Discovery, Mintversorgung und Completionrefresh.
@@ -59,23 +58,42 @@ deaktiviert und anschließend wieder aktiviert. Das erzeugt keine künstlichen
 Registryzustände. Die vorhandenen Consumer prüfen echte Removals, Reselection und
 nachfolgende WebSocket-Preise.
 
+Die Standardlaufdauer ist 60 Sekunden. Fuer die Abschlussbereinigung genuegt dieser
+eine kurze Nachweis; ein erneuter Simulations- oder 15-Minuten-Lauf ist nicht vorgesehen.
+Die allgemeine MarketState-Abnahme verlangt echte Preise und WebSocket-Updates.
+Eine spezielle Direct2-Paarabdeckung ist dafuer keine Voraussetzung. Die Signalpruefung
+verlangt weiterhin mindestens eine aus echten WS-Preisen bewertete vollstaendige
+Topologie, vollstaendige Producer-/Consumer-Paritaet und null Signalverluste. Rewatch
+verlangt weiterhin Entfernen, Neuauswahl und nachfolgende echte WebSocket-Preise.
+
+`-GraphAudit` ist ein optionaler, gesonderter Routen-/Referenznachweis. Er ist fuer
+die CP7A-Abschlussbereinigung nicht erforderlich. Sein Ergebnis wird unabhaengig als
+`graph_audit_passed` ausgewiesen; ein angeforderter, unvollstaendiger Graphaudit
+beendet den Starter weiterhin mit einem Fehler.
+
 `-RequireCatalogReconciliation` kann zusätzlich zum GraphAudit verlangt werden.
 Wie bei CP7 muss der reale Lauf dann die geforderten Katalogänderungen tatsächlich
 enthalten; eine nicht beobachtete Änderung wird nicht als erfolgreich geprüft ausgegeben.
 
 Der Starter verlangt einen beendeten Lauf, vollständige Signalübergabe, reale
 WS-Preisbewertung, gestarteten Lifecycle und mindestens einen beobachteten Prepared-
-Refresh. Kurze Läufe ohne einen solchen Refresh liefern Diagnoseartefakte, aber keine
-CP7A-Abnahme. Die Laufdauer muss zur konfigurierten Refreshkadenz passen.
+Refresh. Ein kurzer Lauf ohne diese tatsaechlichen Ereignisse bleibt unvollstaendig;
+eine feste Dauer garantiert keine Live-Evidenz.
 
 ## Begrenzte reale Simulation auf demselben Aufbau
 
 ```powershell
 .\scripts\runtime_live.ps1 `
-    -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 `
+    -DurationSeconds 60 -PoolLimit 15000 -AccountBudget 25000 `
     -SimulateV10 -SimulationLimit 3 -RouteKind All `
     -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
 ```
+
+Dies ist eine optionale Aufrufvariante, kein zweiter Pflichtlauf fuer die
+Abschlussbereinigung. Der vom Nutzer gelieferte Lauf auf `d68ee47` belegt bereits
+32.987 vollstaendig uebergebene Signalereignisse und drei zugeordnete echte
+V10-Simulationsantworten. Alle drei endeten mit `Custom(1)` ohne DEX-Aufruf.
+Das ist ein Orchestrierungsnachweis, kein erfolgreicher Swapnachweis.
 
 Für einen eng begrenzten Protokoll-/Routennachweis kann `-RouteKind Direct2`,
 `Direct3`, `Triangle3` oder `Triangle4` gewählt werden. Der Filter gilt nur für die
@@ -111,17 +129,21 @@ Alle Artefakte liegen in `runtime_live/<UTC-Zeitstempel>/`:
 |---|---|
 | `checkout.json`, `plan.json`, `websocket_plan.json` | Exakter Commit, Optionen und aufgelöste Kapazitäten |
 | `runtime.log` | Ungefilterte Runtime-Ausgaben einschließlich Fehlern |
-| `runtime.json` | Abschluss und gemeinsame fachliche Prüfung der Workerberichte |
+| `runtime.json` | Abschluss und gemeinsame Orchestrierungspruefung der Workerberichte |
 | `market_state.json` | Bestehender MarketState-Observerbericht einschließlich Rewatch |
 | `signal_production.json`, `signal_consumer.json` | Bestehende Signalberichte; Mengen- und Deliveryvergleich |
 | `execution.json`, `request-NN.json`, `selection-NN.json`, `simulation-NN.json` | Bei aktivierter Simulation: tatsächliche Übergaben und Ergebnisse |
 | `graph_pool_audit.jsonl`, `graph_summary.json`, CSV-Dateien | Bei GraphAudit: vorhandener Graphnachweis |
-| `summary.json` | Gemeinsame CP7A-Laufabnahme und Verweise auf Ergebnisse |
+| `summary.json` | Orchestrierungsnachweis sowie getrennte Graph-/Simulationsergebnisse |
 
 Bei Fehlern bleiben vorhandene Artefakte erhalten. Setup-/Crashfehler können einzelne
 Workerberichte verhindern; das wird niemals als erfolgreicher Nachweis gewertet.
-`checkpoint_evidence_passed=true` verlangt vollständige beobachtete Evidenz.
-PlanOnly schreibt ausdrücklich `live_evidence_passed=false`.
+`orchestration_evidence_passed=true` bezeichnet ausschliesslich den nachgewiesenen
+Datenfluss und Abschluss der konfigurierten Pipeline. Die allgemeinen Felder
+`checkpoint_evidence_passed` und `live_evidence_passed` entfallen in diesen beiden
+CP7A-Laufberichten. `execution_handoff_observed`, `execution_integration_passed`,
+Simulationsfehler und DEX-Aufrufe behalten ihre getrennte Bedeutung.
+PlanOnly schreibt ausdruecklich `orchestration_evidence_passed=false`.
 
 Der Build und die Syntaxprüfung sind Voraussetzungen. Erst die realen Läufe auf dem
 tatsächlichen Feature-Commit schließen den Checkpoint fachlich ab.

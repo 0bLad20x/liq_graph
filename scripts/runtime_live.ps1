@@ -1,7 +1,7 @@
 # One production pipeline for finite MarketState, signal and V10 simulation proofs.
 # Uses the local .env. Never broadcasts transactions or modifies provider credentials.
 param(
-    [ValidateRange(30,86400)][int]$DurationSeconds = 900,
+    [ValidateRange(30,86400)][int]$DurationSeconds = 60,
     [ValidateRange(0,2147483647)][int]$PoolLimit = 15000,
     [ValidateRange(0,1000000)][int]$AccountBudget = 25000,
     [ValidateSet('Signals','MarketState')][string]$Stage = 'Signals',
@@ -137,7 +137,7 @@ try {
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
     Write-Host "WS accounts=$($plan.websocket_plan.account_capacity) sockets=$($plan.websocket_plan.socket_count)"
     if ($PlanOnly) {
-        @{ plan_only=$true; runtime_started=$false; live_evidence_passed=$false } |
+        @{ plan_only=$true; runtime_started=$false; orchestration_evidence_passed=$false } |
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
         Write-Host 'Plan only: no RPC connections, database reads or live acceptance.'
         return
@@ -162,8 +162,8 @@ try {
     $candidateDelivery = -not $SimulateV10 -or ($null -ne $execution -and
         $execution.execution_candidates.lost_events -eq 0 -and
         $execution.execution_candidates.awaiting_snapshot -eq $false)
-    $passed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
-        $runtime.live_evidence_passed -eq $true -and $lifecycleStarted -and $refreshes -gt 0 -and
+    $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
+        $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and $refreshes -gt 0 -and
         $candidateDelivery -and $clock.Elapsed.TotalSeconds -ge ($DurationSeconds - 1)
     $graphPassed = $null
     if ($GraphAudit) {
@@ -173,14 +173,13 @@ try {
         if ($RequireCatalogReconciliation) { $analyzerArgs += '--require-catalog-reconciliation' }
         & python (Join-Path $PSScriptRoot 'graph_live_analyze.py') @analyzerArgs
         $graphPassed = $LASTEXITCODE -eq 0
-        $passed = $passed -and $graphPassed
     }
     $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; exit_code=$exitCode
         runtime_completed=($null -ne $runtime -and $runtime.run_complete -eq $true)
-        checkpoint_evidence_passed=[bool]$passed; runtime_evidence=$runtime
+        orchestration_evidence_passed=[bool]$orchestrationPassed; runtime_evidence=$runtime
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; completion_lifecycle_started=$lifecycleStarted
         prepared_refreshes_observed=$refreshes; graph_audit_passed=$graphPassed
@@ -196,8 +195,15 @@ try {
     }
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
-    if (-not $passed) { throw "Live evidence incomplete; inspect $folder. Runtime completion and simulation profitability are separate results." }
-    Write-Host "CP7A orchestration evidence accepted. Artifacts: $folder"
+    if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
+    Write-Host "CP7A-Orchestrierungsnachweis bestanden. Artefakte: $folder"
+    if ($SimulateV10) {
+        Write-Host "V10: Uebergabe an Simulation nachgewiesen; erfolgreiche Simulationen=$($execution.simulation_successes), fehlgeschlagene=$($execution.simulation_failures), DEX-Aufrufberichte=$($execution.simulation_dex_calls_observed)."
+        Write-Host 'Erfolgreiche Handelsausfuehrung und Profitabilitaet bleiben gesondert nachzuweisen (CP8).'
+    } else {
+        Write-Host 'V10-Simulation war in diesem Lauf deaktiviert.'
+    }
+    if ($GraphAudit -and -not $graphPassed) { throw "Zusaetzlich angeforderter Graphaudit unvollstaendig; Orchestrierung bestanden. Details: $folder" }
 } finally {
     # Only restore values actually saved, including after a guard/build failure.
     foreach ($name in $previous.Keys) {

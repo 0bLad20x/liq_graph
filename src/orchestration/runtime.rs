@@ -493,11 +493,11 @@ struct RunEvidence {
     execution:serde_json::Value,
 }
 impl RunEvidence {
-    fn ensure_live(&self,settings:RunSettings)->Result<()> {
+    fn ensure_orchestration(&self,settings:RunSettings)->Result<()> {
         if settings.hydration_only {return Ok(());}
         if settings.market {
             self.market.as_ref().context("missing MarketState report")?
-                .ensure_live_evidence(settings.rewatch)?;
+                .ensure_delivery_evidence(settings.rewatch)?;
         }
         if settings.signals {
             let market=self.market.as_ref().context("missing MarketState report")?;
@@ -520,10 +520,10 @@ pub async fn run()->Result<()> {
     let evidence=Arc::new(Mutex::new(RunEvidence::default()));
     let result=run_pipeline(settings,evidence.clone()).await;
     let evidence=evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?;
-    let acceptance=evidence.ensure_live(settings);
+    let acceptance=evidence.ensure_orchestration(settings);
     let mut report=settings.describe();
     report["run_complete"]=serde_json::json!(result.is_ok());
-    report["live_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_ok());
+    report["orchestration_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_ok());
     report["error"]=serde_json::json!(result.as_ref().err().or(acceptance.as_ref().err()).map(|e|format!("{e:#}")));
     report["execution_handoff_observed"]=evidence.execution["execution_handoff_observed"].clone();
     report["execution_integration_passed"]=evidence.execution["execution_integration_passed"].clone();

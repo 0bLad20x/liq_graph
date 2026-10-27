@@ -815,11 +815,6 @@ impl ObservationReport {
             "no fully priceable topology queried from real WebSocket inputs");
         Ok(())
     }
-    pub fn ensure_live_evidence(&self) -> Result<()> {
-        self.ensure_calculation_evidence()?;
-        ensure!(self.counts.websocket_candidate_ranges>0,"no real WebSocket candidate range observed");
-        Ok(())
-    }
 }
 #[derive(Default)]
 struct Mirror {

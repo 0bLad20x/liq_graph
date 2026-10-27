@@ -26,9 +26,9 @@ jobs:
           git rev-parse --short HEAD
           git status --short
           git diff --exit-code -- Cargo.lock
-      - name: Build without lockfile changes
+      - name: Release build without lockfile changes
         run: |
-          cargo build --locked
+          cargo build --locked --release
           git diff --exit-code -- Cargo.lock
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; ast.parse(pathlib.Path('scripts/graph_live_analyze.py').read_text(encoding='utf-8'))"
