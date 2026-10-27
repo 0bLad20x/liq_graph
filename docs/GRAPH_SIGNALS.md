@@ -1,4 +1,79 @@
-# Graph signals: factorized state and versioned interval output
+> Current entrypoint: CP7A uses one `--run` pipeline and `scripts/runtime_live.ps1`.
+> See [CP7A_RUNTIME.md](CP7A_RUNTIME.md). Earlier checkpoint measurements and output names
+> below describe their historical implementations; output loss now fails a finite proof.
+
+# Graph signals: compact candidate state
+
+## CP7: catalog reconciliation (implementation; live acceptance pending)
+
+The current output layout is `versioned_candidate_state_cp7`; numerical price
+weights, threshold, graph admission and the four route forms are unchanged.
+
+On a graph change, `graph_signals` compares the **two actually installed**
+generations, not just the latest graph delta (watch channels may coalesce updates).
+It remaps winners by mathematical topology identity and directed roles. Only new
+topologies or those using changed pool-alternative lists are reevaluated, against
+the prices already retained by the signal worker. Unchanged winners are reused;
+a changed generation-local ID is not a new candidate. Removed topologies are
+withdrawn. No price update or ranking change is required to finish this work.
+
+The published `State.snapshot` atomically replaces plan, prices **and the entire
+current candidate membership**. `snapshot.candidates` contains active witnesses,
+not Entered events or execution commands. Every witness uses this snapshot's pool
+slots, topology IDs, threshold and current observations. Snapshot absence means
+withdrawal of a prior key; IDs from an old plan must never be applied to the new
+one. The regular price/coverage `Candidates` deltas continue after that snapshot.
+`clear` withdraws all prices and candidate keys. Both existing consumers validate
+the replacement and subsequent membership transitions. An existing full snapshot
+also restores candidate membership after output loss; no new replay service,
+snapshot timer or guarantee about the time until that snapshot is added here.
+
+Catalog changes are accounted in `Evaluated.catalog` and cumulative `counts.catalog_*`.
+They do not inflate ordinary `Candidates`/`ranges` counts. The producer logs one
+`cp7_catalog` summary per reconciliation and retains bounded `catalog_examples`
+with actual entered/updated witnesses, topology, source observations and generation.
+`snapshot_candidates` counts membership entries delivered, including reused ones;
+it is not a count of new opportunities. No full reference recomputation is added
+to price processing. Snapshot construction/validation cost remains observable in
+the existing producer/consumer timings.
+
+`execution_candidates` mirrors catalog membership but does not enqueue it. Only
+the existing non-initialization WebSocket Price revisions can enqueue V10 jobs;
+baseline, catalog and coverage remain state-only. Queue policy, seed selection,
+packing, signer/RPC behavior and economic assumptions are outside CP7.
+
+Use the existing full-runtime graph runner with real providers and local `.env`:
+
+```powershell
+git fetch origin
+git switch --track origin/cp7-graph-candidate-reconciliation
+git branch --show-current
+git rev-parse --short HEAD
+git status --short
+.\scripts\runtime_live.ps1 -GraphAudit -ExpectedBranch cp7a-unified-runtime -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 -RequireCatalogReconciliation
+```
+
+For an already existing local branch, switch to it and update with `git pull
+--ff-only` instead of repeating `--track`. Preserve tracked local edits before
+switching. The runner requires a committed clean checkout and locked release
+build; it does not simulate or broadcast transactions. In addition to existing
+graph/reference/four-kind delivery checks, the strict option requires actual
+catalog candidate visibility, withdrawal, unchanged reuse, a real catalog
+witness, matching complete producer/consumer counts and zero loss. A quiet or
+insufficient run fails acceptance while preserving its evidence. Examine
+`summary.json`, `signal_production.json`, `signal_consumer.json`, the catalog
+summaries and the retained graph audit together. Unobserved specific cases
+(e.g. Direct2 threshold crossings) remain unproven; a generic successful run must
+not be represented as proof of every transition category or V10 execution.
+
+Build and live status must be attached to the actual branch HEAD. This document
+does not claim that the CP7 implementation has already passed a real live run.
+
+## Historical interval implementation and earlier measurement context
+
+The sections below describe earlier checkpoints. Their Ranges contracts,
+capacities and startup/production-wiring statements are historical; use the CP7
+contract above and current code for the active compact candidate pipeline.
 
 This branch implements the measurement stage of issue #40. It runs one new signal engine.
 There is no reference engine or performance comparison. An opt-in downstream V10 simulation
@@ -229,17 +304,17 @@ selection only as before. No wallet is needed.
 PowerShell:
 
     git fetch origin
-    git switch agent/factorized-route-state
+    git switch --track origin/cp7a-unified-runtime
     git pull --ff-only
-    .\scripts\graph_signals_live.ps1 -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals
+    .\scripts\runtime_live.ps1 -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals
 
 Use the normal error guards if running these commands in a block. The runner requires a clean
 tracked checkout and cargo build --locked --release before any live subscription. Keep
 TracePrices/TraceSignals off for the measurement. PoolLimit limits observation, not the full
 graph catalog's topology universe.
 
-The existing runner writes checkout.json, websocket_plan.json, report.json and worker.log
-under graph_signals_live/<timestamp>. Upload all four, including failed/partial runs.
+The common runner writes checkout.json, websocket_plan.json, runtime.json and runtime.log
+under runtime_live/<timestamp>. See [CP7A_RUNTIME.md](CP7A_RUNTIME.md) for the current artifact names and commands.
 Report startup, resynchronization, catalog pauses and steady-state values separately.
 One low-load measurement does not establish behavior at arbitrary fan-out or pool counts.
 
@@ -295,9 +370,10 @@ Every selected pool must still be admitted and Prepared in the Registry, have a 
 for the direction used, and supply matching manifests/mint proofs for the configured
 wallet. The resulting ExecutionRequest freezes those exact inputs. No mint-proof lookup,
 manifest repair, fee/depth/slippage model, amount optimization or send operation is added.
-The finite live harness continues to load persisted manifests and refresh TVL admission;
-it does **not** start completion refresh. `manifest_checked_at_ms` and
-`manifest_validated_slot` retain the actual proof ages; `manifest_refresh_performed=false`.
+CP7A uses the normal runtime for finite runs too: restore bootstraps the Registry,
+then the regular CompletionLifecycle refreshes manifests. The candidate worker itself
+still performs no refresh; `manifest_refresh_performed=false` refers to that worker.
+`manifest_checked_at_ms` and `manifest_validated_slot` retain actual proof ages.
 Fresh market prices must not be mistaken for a fresh execution manifest.
 
 The signal producer never awaits this consumer or the simulator. The candidate worker
@@ -311,7 +387,7 @@ There is no transport change, replay request, extra snapshot or generation optim
 Use the existing runner, existing provider configuration and the real wallet path:
 
 ```powershell
-.\scripts\graph_signals_live.ps1 `
+.\scripts\runtime_live.ps1 `
     -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals `
     -SimulateV10 `
     -WalletPath (Join-Path $env:USERPROFILE ".solana\meteora-arb-test.json") `
@@ -325,20 +401,22 @@ forms: only fully priced, qualifying, packable live inputs can produce requests.
 otherwise the shared Rust defaults apply, including trade_size=0 and no_failure=false.
 No parameter is changed just to manufacture a successful simulation. `-SimulateV10` is
 explicit opt-in. Without it the runner sets GRAPH_EXECUTION_SIMULATE=false and neither
-loads a signer nor starts either execution worker. The production `--run` is unchanged.
+loads a signer nor starts either execution worker. Both settings use the same `--run`.
 
-Native configuration for the existing `--graph-signals-live` entry is:
+Native configuration for the common `--run` entry additionally requires
+MARKET_STATE_ENABLED=true, GRAPH_SIGNALS_ENABLED=true and the usual live admission settings:
+
 
 - GRAPH_EXECUTION_SIMULATE=true
 - GRAPH_EXECUTION_WALLET_PATH=<absolute keypair path>
-- GRAPH_EXECUTION_MAX_REQUESTS=10 (1..1000; successful queue submissions, not profitability)
+- GRAPH_EXECUTION_MAX_REQUESTS=10 (1..5000; successful queue submissions, not profitability)
 - GRAPH_EXECUTION_ROUTE_KIND=All
 - GRAPH_EXECUTION_PARAMETERS_PATH=<optional ExecutionParameters JSON path>
 
 The runner builds with --locked --release before opening connections and preserves the
 existing environment afterward. No private key bytes are logged or copied into artifacts.
 After the live duration it drains accepted simulations with RPC still available (up to
-300 seconds), then writes additional flat files beside checkout.json/report.json/worker.log:
+300 seconds), then writes additional flat files beside checkout.json/runtime.json/runtime.log:
 
 - request-NN.json: complete reusable ExecutionRequest;
 - selection-NN.json: trigger, generation/revision, direction, original indicative seed,
@@ -346,7 +424,7 @@ After the live duration it drains accepted simulations with RPC still available 
   counts and timings;
 - simulation-NN.json: actual existing executor report with the same request ID.
 
-report.json also retains execution_candidates, execution_reports, simulation_successes,
+execution.json retains execution_candidates, execution_reports, simulation_successes,
 simulation_failures and simulation_dex_calls_observed. Per request, selection_ns includes
 ranking and rejected seed attempts through construction; frame_to_request_us starts at
 local WebSocket frame read, signal_to_request_us at signal state readiness. The original

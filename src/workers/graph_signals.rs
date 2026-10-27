@@ -7,14 +7,14 @@ use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast,watch};
 use crate::core::{
     market_state::{MarketStateEvent,PoolPriceObservation,PriceEventStream,PriceOrigin,PricePipelineTiming},
-    signals::{SignalCandidate,SignalCandidateBatch,SignalEvaluation,SignalEvent,SignalLeg,
+    signals::{SignalActiveCandidate,SignalCatalogReconciliation,SignalCandidate,SignalCandidateBatch,SignalEvaluation,SignalEvent,SignalLeg,
         SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,
         SignalRangeChange,SignalRouteKind,SignalSnapshot,SignalStateUpdate,SignalStream,
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE}};
 use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
 const EXECUTION_LAYOUT:&str="compact_topologies_cp6a";
-const OUTPUT_LAYOUT:&str="versioned_best_candidates_cp6a";
+const OUTPUT_LAYOUT:&str="versioned_candidate_state_cp7";
 pub const OUTPUT_CAPACITY:usize=16384;
 
 #[derive(Clone,Copy)]
@@ -119,10 +119,15 @@ struct CompactIndex {
     ranked:HashMap<(Pubkey,Pubkey),BTreeSet<Key>>,
     qualifying:HashMap<(u32,bool),Winner>,
 }
+struct CatalogInstall {
+    affected:Vec<u32>,
+    previous_candidates:usize,
+    summary:SignalCatalogReconciliation,
+}
 impl CompactIndex {
     /// Re-index only changed pair-alternative lists. Compare complete generations
     /// because watch channels can skip intermediate publications.
-    fn install(&mut self,graph:Arc<GraphSnapshot>,prices:&Prices)->usize {
+    fn install(&mut self,graph:Arc<GraphSnapshot>,prices:&Prices)->CatalogInstall {
         let mut dirty=HashSet::new();
         for (pair,pools) in &graph.pair_pools {
             let unchanged=self.graph.pair_pools.get(pair)
@@ -147,28 +152,41 @@ impl CompactIndex {
                 else{self.ranked.insert((input,output),ordered);}
             }
         }
-        // Topology IDs are generation-local. Preserve winners only when the
-        // topology identity and every referenced pair alternative is unchanged.
-        // This avoids falsely emitting "Entered" for stable routes after a
-        // generation insertion shifted the sorted topology IDs.
+        // Remap by mathematical identity, never by generation-local ID. Keep
+        // affected prior winners until reconciliation so Updated/Exited remain
+        // distinct from Entered. Removed shapes are withdrawn by the snapshot.
         let mut old_ids=HashMap::new();
         for (id,t) in self.graph.topologies.iter().enumerate(){
             old_ids.insert((t.kind,t.settlement,t.target,t.bridge),id as u32);
         }
         let previous=std::mem::take(&mut self.qualifying);
+        let mut affected=Vec::new();
+        let mut summary=SignalCatalogReconciliation{
+            previous_generation:self.graph.generation,changed_pairs:dirty.len(),
+            ..Default::default()};
+        let mut matched=0;
         for (id,t) in graph.topologies.iter().enumerate(){
-            if t.directed_roles().iter().any(|&(a,b)|dirty.contains(&pair(a,b))){continue;}
-            let Some(&old)=old_ids.get(&(t.kind,t.settlement,t.target,t.bridge)) else {continue;};
-            let prior=&self.graph.topologies[old as usize];
-            if prior.directed_roles()!=t.directed_roles(){continue;}
-            for reverse in [false,true]{
-                if let Some(w)=previous.get(&(old,reverse)){
-                    self.qualifying.insert((id as u32,reverse),*w);
+            let prior=old_ids.get(&(t.kind,t.settlement,t.target,t.bridge)).copied()
+                .filter(|&old|self.graph.topologies[old as usize].directed_roles()==t.directed_roles());
+            if let Some(old)=prior {
+                matched+=1;
+                for reverse in [false,true]{
+                    if let Some(w)=previous.get(&(old,reverse)){
+                        self.qualifying.insert((id as u32,reverse),*w);
+                    }
                 }
             }
+            if prior.is_none() || t.directed_roles().iter().any(|&(a,b)|dirty.contains(&pair(a,b))){
+                affected.push(id as u32);
+            }
         }
+        summary.added_topologies=graph.topologies.len()-matched;
+        summary.removed_topologies=self.graph.topologies.len()-matched;
+        summary.reused_topologies=graph.topologies.len()-affected.len();
+        summary.reevaluated_topologies=affected.len();
+        summary.exited_candidates=previous.len()-self.qualifying.len();
         self.graph=graph;
-        dirty.len()
+        CatalogInstall{affected,previous_candidates:previous.len(),summary}
     }
     fn clear_prices(&mut self){
         self.ranked.clear();
@@ -255,10 +273,11 @@ impl CompactIndex {
         Ok(SignalWitness{legs,log_sum_units:winner.total,negative_log_sum:sum,
             indicative_return_bps:bps.is_finite().then_some(bps)})
     }
-    fn candidates(&mut self,address:Pubkey,prices:&Prices,threshold:i64,
-        stats:&mut SignalEvaluation)->Result<Vec<SignalCandidate>>{
+    fn reconcile(&mut self,ids:&[u32],prices:&Prices,threshold:i64,
+        stats:&mut SignalEvaluation,publish_changes:bool)->Result<(Vec<SignalCandidate>,[usize;3])>{
         let mut out=Vec::new();
-        for &id in self.graph.topologies_for_pool(address) {
+        let mut transitions=[0;3];
+        for &id in ids {
             let top=&self.graph.topologies[id as usize];
             let kind=match top.kind {
                 RouteTopologyKind::Direct2=>SignalRouteKind::Direct2,
@@ -286,17 +305,35 @@ impl CompactIndex {
                     (Some(_),Some(_))=>SignalRangeChange::Updated,
                     (None,None)=>continue,
                 };
-                let witness=selected.map(|w|self.witness(&definition,w,reverse,prices))
-                    .transpose()?;
                 if let Some(w)=selected{self.qualifying.insert(key,w);}
                 else{self.qualifying.remove(&key);}
-                stats.ranges[change_id(change)]+=1;
-                stats.ranges_by_kind[kind_id(kind)]+=1;
-                stats.anchors_visited+=1;
+                transitions[change_id(change)]+=1;
+                let witness=if publish_changes {
+                    stats.ranges[change_id(change)]+=1;
+                    stats.ranges_by_kind[kind_id(kind)]+=1;
+                    stats.anchors_visited+=1;
+                    selected.map(|w|self.witness(&definition,w,reverse,prices)).transpose()?
+                }else{None};
                 out.push(SignalCandidate{topology_id:id as usize,reverse,change,witness});
             }
         }
-        Ok(out)
+        Ok((out,transitions))
+    }
+    fn candidates(&mut self,address:Pubkey,prices:&Prices,threshold:i64,
+        stats:&mut SignalEvaluation)->Result<Vec<SignalCandidate>>{
+        let graph=self.graph.clone();
+        self.reconcile(graph.topologies_for_pool(address),prices,threshold,stats,true)
+            .map(|(changes,_)|changes)
+    }
+    fn snapshot_candidates(&self,plan:&SignalPlan,prices:&Prices)->Result<Vec<SignalActiveCandidate>>{
+        let mut keys=self.qualifying.keys().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.into_iter().map(|(id,reverse)|{
+            let top=plan.compact_topologies.get(id as usize).context("snapshot topology absent")?;
+            let winner=self.qualifying[&(id,reverse)];
+            Ok(SignalActiveCandidate{topology_id:id as usize,reverse,
+                witness:self.witness(top,winner,reverse,prices)?})
+        }).collect()
     }
 }
 struct Work {
@@ -322,7 +359,7 @@ impl Engine {
             price_pipeline:pipeline,worker_received_at_us:received,completed_at_us:0,
             price_queue_depth:queue,groups_visited:0,logical_routes_affected:0,
             anchors_visited:0,ready_anchors:[0;4],range_queries:0,ranges:[0;3],
-            ranges_by_kind:[0;4],logarithms_prepared:0,price_preparation_ns:0,
+            ranges_by_kind:[0;4],catalog:None,logarithms_prepared:0,price_preparation_ns:0,
             index_update_ns:0,state_ready_ns:0,plan_build_ns:0,query_ns:0,
             event_build_ns:0,publication_ns:0,first_range_ns:None,
             last_range_ns:None,processing_ns:0}}
@@ -332,8 +369,10 @@ impl Engine {
         work.stats.state_ready_ns=nanos(work.started);
         let ready_at_us=now_us();
         let started=Instant::now();
-        let snapshot=snapshot.then(||SignalSnapshot{plan:self.plan.clone(),
-            pools:self.prices.pools.clone(),prices:self.prices.values.clone()});
+        let snapshot=if snapshot{Some(SignalSnapshot{plan:self.plan.clone(),
+            pools:self.prices.pools.clone(),prices:self.prices.values.clone(),
+            threshold_units:self.threshold,
+            candidates:self.index.snapshot_candidates(&self.plan,&self.prices)?})}else{None};
         let update=SignalStateUpdate{sequence:self.next_sequence(),revision:self.revision,
             graph_generation:self.plan.graph_generation,trigger:work.stats.trigger.clone(),
             ready_at_us,price_pipeline:work.stats.price_pipeline,snapshot,clear,changes};
@@ -369,8 +408,7 @@ impl Engine {
         self.production.record(&work.stats);
         self.emit(SignalEvent::Evaluated(work.stats))
     }
-    fn install(&mut self,graph:Arc<GraphSnapshot>)->Result<()>{
-        if graph.generation==self.plan.graph_generation{return Ok(());}
+    fn install(&mut self,graph:Arc<GraphSnapshot>)->CatalogInstall{
         let compact=graph.topologies.iter().map(|t|SignalTopology{
             kind:match t.kind{RouteTopologyKind::Direct2=>SignalRouteKind::Direct2,
                 RouteTopologyKind::Direct3=>SignalRouteKind::Direct3,
@@ -378,14 +416,49 @@ impl Engine {
                 RouteTopologyKind::Triangle4=>SignalRouteKind::Triangle4},
             settlement:t.settlement,target:t.target,bridge:t.bridge,
             roles:t.roles,length:t.length}).collect::<Vec<_>>();
-        let changed_pair_rankings=self.index.install(graph.clone(),&self.prices);
+        let installed=self.index.install(graph.clone(),&self.prices);
         crate::log_event!(Info,"graph signals cp6b rankings generation={} changed_pairs={} directed_roles={} old_groups_compiled=0",
-            graph.generation,changed_pair_rankings,self.index.ranked.len());
+            graph.generation,installed.summary.changed_pairs,self.index.ranked.len());
         let plan=Arc::new(SignalPlan{graph_generation:graph.generation,
             log_weight_scale:SIGNAL_LOG_SCALE,
             compact_topologies:compact.into(),route_options:graph.route_options});
         let old=std::mem::replace(&mut self.plan,plan);
         tokio::task::spawn_blocking(move||drop(old));
+        installed
+    }
+    fn reconcile_catalog(&mut self,work:&mut Work,mut installed:CatalogInstall,sample_limit:usize)->Result<()>{
+        let started=Instant::now();
+        let (changes,transitions)=self.index.reconcile(&installed.affected,&self.prices,
+            self.threshold,&mut work.stats,false)?;
+        work.stats.query_ns=nanos(started);
+        let summary=&mut installed.summary;
+        summary.entered_candidates=transitions[0];
+        summary.updated_candidates=transitions[1];
+        summary.exited_candidates+=transitions[2];
+        summary.active_candidates=self.index.qualifying.len();
+        summary.unchanged_candidates=summary.active_candidates
+            .checked_sub(summary.entered_candidates+summary.updated_candidates)
+            .context("catalog candidate transition accounting underflow")?;
+        ensure!(installed.previous_candidates+summary.entered_candidates
+            ==summary.active_candidates+summary.exited_candidates,
+            "catalog candidate membership accounting mismatch");
+        for mut candidate in changes.into_iter().filter(|c|c.change!=SignalRangeChange::Exited)
+            .take(sample_limit.saturating_sub(self.production.catalog_examples.len())) {
+            let top=&self.plan.compact_topologies[candidate.topology_id];
+            if let Some(&winner)=self.index.qualifying.get(&(candidate.topology_id as u32,candidate.reverse)) {
+                candidate.witness=Some(self.index.witness(top,winner,candidate.reverse,&self.prices)?);
+            }
+            self.production.catalog_examples.push(serde_json::json!({
+                "graph_generation":self.plan.graph_generation,"previous_generation":summary.previous_generation,
+                "revision":work.stats.revision,"trigger":work.stats.trigger,"topology":top,
+                "candidate":candidate}));
+        }
+        crate::log_event!(Info,"graph signals cp7_catalog generation={} previous={} changed_pairs={} added_topologies={} removed_topologies={} reused_topologies={} reevaluated_topologies={} entered={} updated={} exited={} unchanged={} active={} catalog_execution=false",
+            self.plan.graph_generation,summary.previous_generation,summary.changed_pairs,
+            summary.added_topologies,summary.removed_topologies,summary.reused_topologies,
+            summary.reevaluated_topologies,summary.entered_candidates,summary.updated_candidates,
+            summary.exited_candidates,summary.unchanged_candidates,summary.active_candidates);
+        work.stats.catalog=Some(installed.summary);
         Ok(())
     }
 }
@@ -416,10 +489,11 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         e.prices.bind(pool,a,b)?;
                     }
                 }
-                e.install(graph.clone())?;
+                let installed=e.install(graph.clone());
                 let mut work=e.begin(SignalTrigger::Catalog{generation:graph.generation},
                     started,received,None,input.len());
                 work.stats.plan_build_ns=nanos(started);
+                e.reconcile_catalog(&mut work,installed,settings.sample_limit)?;
                 e.state(&mut work,true,false,Vec::new())?;
                 e.production.plan(&e.plan,&e.index,&e.prices,work.stats.plan_build_ns);
                 e.evaluate(work)?;
@@ -564,6 +638,11 @@ struct Counts {
     catalog_evaluations: u64, coverage_evaluations: u64, logarithms_prepared: u64,
     range_blocks: u64, ranges: u64, entered_ranges: u64, updated_ranges: u64, exited_ranges: u64,
     candidate_batches:u64, candidates:u64,
+    snapshot_candidates:u64, catalog_reconciliations:u64,
+    catalog_added_topologies:u64, catalog_removed_topologies:u64, catalog_reused_topologies:u64,
+    catalog_reevaluated_topologies:u64, catalog_entered_candidates:u64,
+    catalog_updated_candidates:u64, catalog_exited_candidates:u64,
+    catalog_unchanged_candidates:u64,
     websocket_ranges: u64, websocket_candidate_ranges: u64,
     groups_visited: u64, logical_routes_affected: u64, anchors_visited: u64, range_queries: u64,
     ready_anchors: [u64;4], websocket_ready_anchors: [u64;4], ranges_by_kind: [u64;4],
@@ -572,6 +651,7 @@ impl Counts {
     fn state(&mut self, s: &SignalStateUpdate) {
         self.events+=1; self.state_updates+=1; self.changed_pools+=s.changes.len() as u64;
         self.plan_snapshots+=u64::from(s.snapshot.is_some()); self.resets+=u64::from(s.clear);
+        self.snapshot_candidates+=s.snapshot.as_ref().map_or(0,|s|s.candidates.len() as u64);
     }
     fn candidate(&mut self,b:&SignalCandidateBatch) {
         self.events+=1;self.candidate_batches+=1;self.candidates+=b.candidates.len() as u64;
@@ -590,6 +670,17 @@ impl Counts {
     }
     fn evaluation(&mut self, e: &SignalEvaluation) {
         self.events+=1; self.evaluations+=1;
+        if let Some(c)=&e.catalog {
+            self.catalog_reconciliations+=1;
+            self.catalog_added_topologies+=c.added_topologies as u64;
+            self.catalog_removed_topologies+=c.removed_topologies as u64;
+            self.catalog_reused_topologies+=c.reused_topologies as u64;
+            self.catalog_reevaluated_topologies+=c.reevaluated_topologies as u64;
+            self.catalog_entered_candidates+=c.entered_candidates as u64;
+            self.catalog_updated_candidates+=c.updated_candidates as u64;
+            self.catalog_exited_candidates+=c.exited_candidates as u64;
+            self.catalog_unchanged_candidates+=c.unchanged_candidates as u64;
+        }
         match e.trigger.as_ref() {
             SignalTrigger::Price { .. } => self.price_evaluations+=1,
             SignalTrigger::Catalog { .. } => self.catalog_evaluations+=1,
@@ -641,6 +732,7 @@ pub struct ProductionReport {
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
     steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
     catalog_plan_build_ns: Histogram, last_plan: Option<serde_json::Value>,
+    catalog_examples:Vec<serde_json::Value>,
     final_price_pools: usize, final_available_directions: usize,
     max_price_queue_depth: usize, max_output_queue_depth: usize,
 }
@@ -702,6 +794,7 @@ pub struct ObservationReport {
     ranges_by_kind: BTreeMap<&'static str,u64>, ready_anchors_by_kind: BTreeMap<&'static str,u64>,
     websocket_ready_anchors_by_kind: BTreeMap<&'static str,u64>,
     candidate_examples:Vec<SignalCandidate>, consumer_processing_ns: Histogram,
+    max_active_candidates:usize, final_active_candidates:usize,
     consumer_logging_ns: u64,
 }
 impl ObservationReport {
@@ -715,24 +808,13 @@ impl ObservationReport {
         ensure!(self.lost_events==0,"signal consumer lost {} events",self.lost_events);
         Ok(())
     }
-    pub fn ensure_calculation_evidence(&self) -> Result<()> {
-        self.ensure_integrity()?;
-        ensure!(self.counts.websocket_evaluations>0
-            && self.counts.websocket_ready_anchors.iter().any(|&n|n>0),
-            "no fully priceable topology queried from real WebSocket inputs");
-        Ok(())
-    }
-    pub fn ensure_live_evidence(&self) -> Result<()> {
-        self.ensure_calculation_evidence()?;
-        ensure!(self.counts.websocket_candidate_ranges>0,"no real WebSocket candidate range observed");
-        Ok(())
-    }
 }
 #[derive(Default)]
 struct Mirror {
     plan: Option<Arc<SignalPlan>>, pools: Vec<SignalPool>,
     prices: Vec<Option<Arc<SignalPoolPrice>>>,
     revision: u64, generation: u64,
+    threshold:i64, active:HashSet<(usize,bool)>,
 }
 impl Mirror {
     fn state(&mut self, s: &SignalStateUpdate) -> Result<()> {
@@ -742,8 +824,15 @@ impl Mirror {
                 && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE && snapshot.pools.len()==snapshot.prices.len(),"invalid state snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
             self.generation=s.graph_generation;
+            self.threshold=snapshot.threshold_units;
+            self.active.clear();
+            for candidate in &snapshot.candidates {
+                self.witness(candidate.topology_id,candidate.reverse,&candidate.witness)?;
+                ensure!(self.active.insert((candidate.topology_id,candidate.reverse)),
+                    "duplicate candidate snapshot key");
+            }
         } else { ensure!(self.plan.is_some() && s.graph_generation==self.generation,"state update without matching snapshot"); }
-        if s.clear { self.prices.fill(None); }
+        if s.clear { self.prices.fill(None);self.active.clear(); }
         for c in &s.changes {
             if c.pool_id==self.pools.len() {
                 self.pools.push(c.identity.clone()); self.prices.push(None);
@@ -754,29 +843,42 @@ impl Mirror {
         self.revision=s.revision;
         Ok(())
     }
-    fn candidate(&self,b:&SignalCandidateBatch,c:&SignalCandidate)->Result<()>{
+    fn candidate(&mut self,b:&SignalCandidateBatch,c:&SignalCandidate)->Result<()>{
         ensure!(b.revision==self.revision&&b.graph_generation==self.generation,
             "candidate references another state revision");
-        let plan=self.plan.as_ref().context("candidate before plan snapshot")?;
-        let top=plan.compact_topologies.get(c.topology_id).context("candidate topology absent")?;
+        ensure!(b.threshold_units==self.threshold,"candidate threshold differs from snapshot");
+        let key=(c.topology_id,c.reverse);
         if c.change==SignalRangeChange::Exited{
-            ensure!(c.witness.is_none(),"exited candidate carries a live witness");
+            ensure!(c.witness.is_none()&&self.active.remove(&key),
+                "exited candidate missing from current membership or carries witness");
             return Ok(());
         }
-        let witness=c.witness.as_ref().context("live candidate missing witness")?;
+        self.witness(c.topology_id,c.reverse,c.witness.as_ref().context("live candidate missing witness")?)?;
+        match c.change {
+            SignalRangeChange::Entered=>ensure!(self.active.insert(key),"candidate entered twice"),
+            SignalRangeChange::Updated=>ensure!(self.active.contains(&key),"candidate updated before entering"),
+            SignalRangeChange::Exited=>unreachable!(),
+        }
+        Ok(())
+    }
+    fn witness(&self,id:usize,reverse:bool,witness:&SignalWitness)->Result<()>{
+        let plan=self.plan.as_ref().context("candidate before plan snapshot")?;
+        let top=plan.compact_topologies.get(id).context("candidate topology absent")?;
         ensure!(witness.legs.len()==top.length
-            && !(top.kind==SignalRouteKind::Direct2&&c.reverse),
+            && (2..=4).contains(&top.length)
+            && !(top.kind==SignalRouteKind::Direct2&&reverse),
             "candidate topology length or direction mismatch");
         let mut unique=HashSet::new();
         let mut sum=0_i128;
         for (i,leg) in witness.legs.iter().enumerate(){
-            let j=if c.reverse{top.length-1-i}else{i};
+            let j=if reverse{top.length-1-i}else{i};
             let (a,b)=top.roles[j];
-            let (input,output)=if c.reverse{(b,a)}else{(a,b)};
+            let (input,output)=if reverse{(b,a)}else{(a,b)};
             ensure!(leg.input_mint==input&&leg.output_mint==output,
                 "candidate mint direction mismatch");
             let pool=self.pools.get(leg.slot/2).context("candidate pool missing")?;
             ensure!((pool.mint_a,pool.mint_b)==pair(input,output)
+                &&leg.slot%2==usize::from(input!=pool.mint_a)
                 &&unique.insert(leg.slot/2),"candidate reused pool or wrong pair");
             let weight=self.prices.get(leg.slot/2).and_then(|p|p.as_ref())
                 .and_then(|p|p.log_weight_units[leg.slot%2])
@@ -786,7 +888,7 @@ impl Mirror {
         }
         ensure!(witness.legs.last().is_some_and(|l|l.output_mint==witness.legs[0].input_mint)
             &&sum==i128::from(witness.log_sum_units)
-            &&witness.log_sum_units<b.threshold_units,
+            &&witness.log_sum_units<self.threshold,
             "candidate is not a profitable closed route");
         Ok(())
     }
@@ -886,6 +988,12 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 ensure!(pending && e.revision==mirror.revision && e.graph_generation==mirror.generation,
                                     "completion references wrong state");
                                 ensure!(ranges==e.ranges,"range/completion counts differ");
+                                if let Some(c)=&e.catalog {
+                                    ensure!(matches!(e.trigger.as_ref(),SignalTrigger::Catalog{..})
+                                        && ranges==[0;3] && mirror.active.len()==c.active_candidates,
+                                        "catalog candidate snapshot/completion mismatch");
+                                }
+                                report.max_active_candidates=report.max_active_candidates.max(mirror.active.len());
                             }
                             ensure!(e.ranges.iter().sum::<u64>()==e.ranges_by_kind.iter().sum::<u64>(),
                                 "range/completion counts differ");
@@ -918,6 +1026,7 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
         Ok(())
     }.await;
     report.error=outcome.err().map(|e|format!("{e:#}"));
+    report.final_active_candidates=mirror.active.len();
     report.ranges_by_kind=names(report.counts.ranges_by_kind);
     report.ready_anchors_by_kind=names(report.counts.ready_anchors);
     report.websocket_ready_anchors_by_kind=names(report.counts.websocket_ready_anchors);

@@ -127,11 +127,11 @@ Primary references:
 
 ## Optional signal input (draft)
 
-The finite `--graph-signals-live` runner can now opt into the existing simulation worker
+The common `scripts/runtime_live.ps1` starter can opt into the existing simulation worker
 via `-SimulateV10 -WalletPath ... -SimulationLimit 10`. See
 [GRAPH_SIGNALS.md](GRAPH_SIGNALS.md#optional-live-signal---v10-simulation-handoff) for the
 selection policy, four route-form mappings, actual proof-age reporting, artifacts and
-acceptance criteria. Production `--run` and the manual file-input mode are unchanged.
+acceptance criteria. Finite runs use the production `--run` pipeline, including Completionrefresh. The manual file-input mode remains available.
 
 The new upstream `execution_candidates` worker supplies the existing ExecutionRequest
 contract. `execution_v10::validate` exposes the same unsigned packing checks used by the

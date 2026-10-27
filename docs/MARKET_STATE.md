@@ -1,3 +1,7 @@
+> CP7A current run instructions and acceptance: [CP7A_RUNTIME.md](CP7A_RUNTIME.md).
+> Finite and continuous full-pipeline runs now share one orchestration implementation.
+> Earlier acceptance records below remain historical evidence for their stated commits.
+
 # Market-State stream
 
 ## Scope and boundaries
@@ -13,8 +17,10 @@ The consumer joins prices to the existing generational `WatchCatalog` and report
 ## Input and selection
 
 - Production `--run`: current Registry snapshot, followed by Registry notifications. A five-second reconciliation rechecks selected pools; a lagged notification stream rebuilds the derived identity index from the current Registry. Losing Prepared/admitted status removes a selected pool and its derived price. Newly eligible pools enter the bounded selection.
-- `--market-state-live`: persisted Registry proof seed, the existing CP1 mint qualification/Jupiter/DexScreener admission flow, and a real RPC/WebSocket price stream. PostgreSQL restore intentionally leaves live TVL unknown, so cached Prepared status alone cannot enter the admitted watch set or graph. The single Registry writer establishes current admission from real enrichment results; the common gate remains unchanged. Startup logs distinguish `persisted_prepared` from the admitted Prepared count in `Selection.prepared`. An initial empty selection is expected during enrichment warmup; it must advance once qualified pools receive current TVL.
-- This finite mode starts no protocol pool discovery, Completion, execution or pool-cache persistence writer. It does not refresh cached manifests. Existing targeted Jupiter processing may update its mint catalogue; existing persistence schema initialization is unchanged. Historic TVL is never promoted to current TVL.
+- Finite `--run` uses the same persisted Registry proof seed, the existing CP1 mint qualification/Jupiter/DexScreener admission flow, and a real RPC/WebSocket price stream. PostgreSQL restore intentionally leaves live TVL unknown, so cached Prepared status alone cannot enter the admitted watch set or graph. The single Registry writer establishes current admission from real enrichment results; the common gate remains unchanged. Startup logs distinguish `persisted_prepared` from the admitted Prepared count in `Selection.prepared`. An initial empty selection is expected during enrichment warmup; it must advance once qualified pools receive current TVL.
+- CP7A finite runs use the normal discovery, CompletionLifecycle and Persistence workers.
+  `-Stage MarketState` disables downstream signals/simulation, not Completionrefresh.
+  Historic TVL is never promoted to current TVL.
 - `MARKET_STATE_POOL_LIMIT=1000` by default. `0` removes this pool limit; configured provider/account limits remain in force.
 - Selection is deterministic by unordered mint pair, then address. This keeps pair alternatives together but is not a profitability ranking. It does not guarantee that a capped selection contains every venue or a trade opportunity.
 - The limit counts pools. Required subscriptions count distinct account addresses. Reserve-based venues may require three accounts per pool; shared accounts are deduplicated. Insufficient configured WS capacity fails explicitly with the required and available counts. There is no silent capacity truncation.
@@ -63,7 +69,7 @@ Provider assignment preserves existing addresses and balances new accounts acros
 
 ## Configuration
 
-Use the existing `DATABASE_URL` (or `LIQ_GRAPH_DATABASE_URL`), `JUPITER_SEARCH_API_KEYS`, CP1 mint-catalogue/HTTP-proxy configuration and `RPC_N_*` configuration. The standalone entrypoint now runs the same existing admission producers that production uses; DexScreener requires verified working proxies. No signer or wallet is needed. An RPC WebSocket URL alone does not enable account subscriptions. Each provider used for WS must have explicitly configured account capabilities and capacity, for example:
+Use the existing `DATABASE_URL` (or `LIQ_GRAPH_DATABASE_URL`), `JUPITER_SEARCH_API_KEYS`, CP1 mint-catalogue/HTTP-proxy configuration and `RPC_N_*` configuration. The finite entrypoint is the production pipeline; DexScreener requires verified working proxies. No signer or wallet is needed. An RPC WebSocket URL alone does not enable account subscriptions. Each provider used for WS must have explicitly configured account capabilities and capacity, for example:
 
 ```dotenv
 RPC_1_WS_ACCOUNT_SUBSCRIBE=true
@@ -76,7 +82,7 @@ RPC_1_WS_SUBSCRIBE_SPACING_MS=20
 The numbers above are an example configuration, not a statement about a provider's permitted limits. Set them to your actual plan. Additional `RPC_2_*`, `RPC_3_*` providers use the same mechanism. HTTP and WS need to refer to the same Solana network and compatible commitment. Existing HTTP capability flags, rate limits and `RPC_ACCOUNT_BATCH_SIZE` are respected.
 
 ```dotenv
-# Enable in the normal full runtime; standalone live mode starts it directly.
+# Enable in the common runtime; runtime_live.ps1 sets this for finite proofs.
 MARKET_STATE_ENABLED=true
 MARKET_STATE_POOL_LIMIT=1000
 MARKET_STATE_TRACE=0
@@ -91,28 +97,28 @@ Use the committed feature checkout. Preserve any local tracked changes before sw
 ```powershell
 git fetch origin
 if ($LASTEXITCODE -ne 0) { throw "Fetch fehlgeschlagen." }
-git switch agent/market-state-stream
+git switch --track origin/cp7a-unified-runtime
 if ($LASTEXITCODE -ne 0) { throw "Branchwechsel fehlgeschlagen; lokale Änderungen zuerst sichern." }
 git pull --ff-only
 if ($LASTEXITCODE -ne 0) { throw "Synchronisierung fehlgeschlagen." }
-.\scripts\market_state_live.ps1 -DurationSeconds 600 -PoolLimit 1000
+.\scripts\runtime_live.ps1 -Stage MarketState -DurationSeconds 900 -PoolLimit 1000
 ```
 
-The script records branch, exact HEAD and working-tree status, runs `cargo build --locked --release`, verifies lockfile hygiene and captures `worker.log`, `checkout.json` and `report.json` under `market_state_live/<UTC timestamp>/`. Default output samples the first 16 baselines, first 16 live pool updates and first 16 unavailable/removal events; counters cover the entire stream. `-TracePrices` prints every event.
+The script records branch, exact HEAD and working-tree status, runs `cargo build --locked --release`, verifies lockfile hygiene and captures `runtime.log`, `checkout.json`, `runtime.json` and `market_state.json` under `runtime_live/<UTC timestamp>/`. Default output samples the first 16 baselines, first 16 live pool updates and first 16 unavailable/removal events; counters cover the entire stream. `-TracePrices` prints every event.
 
-Orchestration retains the price sender and RPC handle until the producer result is joined, then releases them for normal consumer/transport shutdown. This prevents an early producer failure from being reported only as an unexpectedly closed consumer or RPC task. A failed startup may have no final `report.json`; inspect the original producer error in `worker.log`.
+Orchestration retains the price sender and RPC handle until the producer result is joined, then releases them for normal consumer/transport shutdown. This prevents an early producer failure from being reported only as an unexpectedly closed consumer or RPC task. Setup errors are retained in `runtime.json` where possible; inspect the original error in `runtime.log`.
 
-During startup, expect `mint qualification published qualified=...`, `dexscreener cp1 continuous started=true`, Registry TVL updates, then a non-empty Market-State selection and subscription ACKs. If qualification or proxy initialization produces no usable results, the run must not be accepted merely because it stays alive. `report.json` includes restored Prepared and live TVL counts.
+During startup, expect `mint qualification published qualified=...`, `dexscreener cp1 continuous started=true`, Registry TVL updates, then a non-empty Market-State selection and subscription ACKs. If qualification or proxy initialization produces no usable results, the run must not be accepted merely because it stays alive. The runtime log includes bootstrap and admission counts; `market_state.json` contains the observer totals.
 
-A successful finite run requires real WS price updates and at least one actual graph Direct2 pair with prices for two selected pools, including a WS observation on that pair. Lack of an arbitrage opportunity is irrelevant here. Inspect `websocket_venues` to see which protocol decoders received real live updates; unobserved venues remain unproven.
+A successful finite orchestration proof requires real prices and WS price updates. Direct2 pair coverage and fully priced WS topologies remain reported metrics rather than requirements for this general dataflow proof. With signals enabled, all real price inputs and signal outputs must be delivered completely, including correct evaluations when other route legs still lack prices. Inspect `websocket_venues` to see which protocol decoders received real live updates; unobserved venues remain unproven.
 
 To exercise removal and resubscription using the same real pools:
 
 ```powershell
-.\scripts\market_state_live.ps1 -DurationSeconds 600 -PoolLimit 1000 -Rewatch
+.\scripts\runtime_live.ps1 -Stage MarketState -DurationSeconds 900 -PoolLimit 1000 -Rewatch
 ```
 
-At half-time this disables observations for six seconds and enables them again. It does not alter Registry states or invent a pool update. The run requires reselection, removals and subsequent WS prices; `rpc_transport` debug ACK logs additionally expose actual `unsubscribed=...` and `subscribed=...` responses. This verifies observation-control removal, not a live Prepared-to-Incomplete transition. That transition uses the same production selection reconciliation but needs a real Registry lifecycle event for a separate live proof.
+At half-time this disables observations for six seconds and enables them again. It does not alter Registry states or invent a pool update. The run requires reselection, removals and subsequent WS prices; The common observer verifies removals, reselection and post-rewatch WebSocket prices. This verifies observation-control removal, not a live Prepared-to-Incomplete transition. That transition uses the same production selection reconciliation but needs a real Registry lifecycle event for a separate live proof.
 
 ## Confirmed live acceptance
 

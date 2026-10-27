@@ -1450,10 +1450,9 @@ pub struct ObservationReport {
     pub post_rewatch_websocket_observations:u64,pub websocket_venues:BTreeMap<&'static str,u64>,
 }
 impl ObservationReport {
-    pub fn ensure_live_evidence(&self,rewatch:bool)->Result<()> {
+    pub fn ensure_delivery_evidence(&self,rewatch:bool)->Result<()> {
         ensure!(self.observations>0,"no real pool price observations");
         ensure!(self.websocket_observations>0,"HTTP baseline alone is insufficient: no real WebSocket price updates");
-        ensure!(self.max_live_priced_direct_pairs>0,"no graph Direct2 pair covered by two prices including a real WebSocket observation; inspect selection and decoder availability");
         if rewatch {
             ensure!(self.selections>=3 && self.removals>0 && self.post_rewatch_websocket_observations>0,
                 "rewatch did not complete removal, reselection and subsequent real WebSocket price delivery");

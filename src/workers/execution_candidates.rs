@@ -6,7 +6,7 @@ use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc};
 use crate::core::{CompletionState, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionParameters, ExecutionPool, ExecutionReport, ExecutionRequest}, market_state::{PriceOrigin,PricePipelineTiming},
-    signals::{SignalCandidate, SignalEvent, SignalPlan, SignalPool, SignalPoolPrice, SignalTopology,
+    signals::{SignalCandidate, SignalCandidateBatch, SignalEvent, SignalPlan, SignalPool, SignalPoolPrice, SignalTopology,SignalWitness,
         SignalRangeChange, SignalRouteKind, SignalStateUpdate,
         SignalStream, SignalTrigger, SIGNAL_LOG_SCALE}};
 use super::pool_registry::PoolRegistry;
@@ -67,6 +67,7 @@ pub struct Report {
     lost_events: u64, resynchronizations: u64, skipped_busy_revisions: u64,
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
+    catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
 }
 impl Report {
     pub fn ensure_complete(&self)->Result<()> {
@@ -104,6 +105,7 @@ struct State {
     prices: Vec<Option<Arc<SignalPoolPrice>>>, revision: u64, generation: u64,
     ready_at_us: u64, received_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
+    threshold:i64, active:HashSet<(usize,bool)>,
 }
 impl State {
     fn apply(&mut self, s:&SignalStateUpdate, recovering:bool)->Result<()> {
@@ -115,8 +117,15 @@ impl State {
                 && snapshot.pools.len()==snapshot.prices.len(), "invalid candidate snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
             self.generation=s.graph_generation;
+            self.threshold=snapshot.threshold_units;
+            self.active.clear();
+            for candidate in &snapshot.candidates {
+                self.witness(candidate.topology_id,candidate.reverse,&candidate.witness)?;
+                ensure!(self.active.insert((candidate.topology_id,candidate.reverse)),
+                    "duplicate execution candidate snapshot key");
+            }
         } else {ensure!(self.plan.is_some() && s.graph_generation==self.generation, "candidate delta without snapshot");}
-        if s.clear {self.prices.fill(None);}
+        if s.clear {self.prices.fill(None);self.active.clear();}
         for change in &s.changes {
             if change.pool_id==self.pools.len() {self.pools.push(change.identity.clone()); self.prices.push(None);}
             ensure!(self.pools.get(change.pool_id)==Some(&change.identity), "candidate pool identity mismatch");
@@ -127,6 +136,45 @@ impl State {
     }
     fn weight(&self, slot:usize)->Option<i64> {
         self.prices.get(slot/2)?.as_ref()?.log_weight_units[slot%2]
+    }
+    fn witness(&self,id:usize,reverse:bool,witness:&SignalWitness)->Result<()> {
+        let top=self.plan.as_ref().and_then(|p|p.compact_topologies.get(id))
+            .context("candidate state topology absent")?;
+        ensure!(witness.legs.len()==top.length && (2..=4).contains(&top.length)
+            && !(top.kind==SignalRouteKind::Direct2&&reverse),"candidate state length/direction invalid");
+        let mut unique=HashSet::new();let mut sum=0_i128;
+        for (i,leg) in witness.legs.iter().enumerate(){
+            let j=if reverse{top.length-1-i}else{i};
+            let (a,b)=top.roles[j];let (input,output)=if reverse{(b,a)}else{(a,b)};
+            let p=self.pools.get(leg.slot/2).context("candidate state pool absent")?;
+            ensure!((leg.input_mint,leg.output_mint)==(input,output)
+                && (p.mint_a,p.mint_b)==(input.min(output),input.max(output))
+                && leg.slot%2==usize::from(input!=p.mint_a)
+                && unique.insert(leg.slot/2),"candidate state pool/direction invalid");
+            ensure!(self.weight(leg.slot)==Some(leg.log_weight_units),"candidate state weight mismatch");
+            sum+=i128::from(leg.log_weight_units);
+        }
+        ensure!(witness.legs[0].input_mint==top.settlement
+            && witness.legs.last().is_some_and(|l|l.output_mint==top.settlement)
+            && witness.legs.windows(2).all(|l|l[0].output_mint==l[1].input_mint)
+            && sum==i128::from(witness.log_sum_units) && witness.log_sum_units<self.threshold,
+            "candidate state score/closed route invalid");
+        Ok(())
+    }
+    fn candidate(&mut self,b:&SignalCandidateBatch,c:&SignalCandidate)->Result<()> {
+        ensure!(b.threshold_units==self.threshold,"candidate threshold changed without snapshot");
+        let key=(c.topology_id,c.reverse);
+        match c.change {
+            SignalRangeChange::Exited=>ensure!(c.witness.is_none()&&self.active.remove(&key),
+                "execution candidate exit missing or carries witness"),
+            SignalRangeChange::Entered|SignalRangeChange::Updated=>{
+                self.witness(c.topology_id,c.reverse,c.witness.as_ref().context("candidate witness absent")?)?;
+                if c.change==SignalRangeChange::Entered {
+                    ensure!(self.active.insert(key),"execution candidate entered twice");
+                } else {ensure!(self.active.contains(&key),"execution candidate updated before entering");}
+            },
+        }
+        Ok(())
     }
     fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey)
         ->Result<(ExecutionPool,PoolEvidence)> {
@@ -297,12 +345,19 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                 SignalEvent::State(s)=>{
                     ensure!(!pending,"candidate state replaced before evaluation completed");
                     state.apply(s,report.awaiting_snapshot)?;
+                    if matches!(s.trigger.as_ref(),SignalTrigger::Catalog{..}) {
+                        if let Some(snapshot)=&s.snapshot {
+                            report.catalog_snapshots+=1;
+                            report.catalog_snapshot_candidates+=snapshot.candidates.len() as u64;
+                        }
+                    }
                     if report.awaiting_snapshot {report.resynchronizations+=1;report.awaiting_snapshot=false;}
                     pending=true;ranked.clear();
                 },
                 SignalEvent::Candidates(b)=>{
                     ensure!(pending&&b.revision==state.revision&&b.graph_generation==state.generation,
                         "candidate batch references wrong state");
+                    for candidate in &b.candidates {state.candidate(b,candidate)?;}
                     if report.requests.len()>=cfg.limit
                         ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket,..})
                         ||!b.price_pipeline.is_some_and(|t|!t.initialization_replay){continue;}
@@ -323,6 +378,12 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                 SignalEvent::Evaluated(e)=>{
                     ensure!(pending && e.revision==state.revision && e.graph_generation==state.generation,"candidate completion references wrong state");
                     pending=false;
+                    if let Some(c)=&e.catalog {
+                        ensure!(matches!(e.trigger.as_ref(),SignalTrigger::Catalog{..})
+                            && ranked.is_empty() && state.active.len()==c.active_candidates,
+                            "execution catalog snapshot mismatch or attempted catalog execution");
+                    }
+                    report.max_active_candidates=report.max_active_candidates.max(state.active.len());
                     if matches!(e.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket,..}) {
                         report.websocket_revisions+=1;
                         if e.price_pipeline.is_some_and(|t|t.initialization_replay) {report.initialization_revisions+=1;}
