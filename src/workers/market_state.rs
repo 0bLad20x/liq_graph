@@ -914,6 +914,36 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)->Vec<PoolInput>{
     let started=Instant::now();
     let max_pools=if limit==0 {usize::MAX}else{limit};
+    // Both paths use the same generation's graph-relevant identities. Registry
+    // notifications and catalog publication may advance independently.
+    let eligible=catalog.pools.iter().filter_map(|pool|{
+        candidates.get(&pool.address).copied().filter(|p|
+            (p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b))==(pool.mint_a,pool.mint_b))
+    }).map(|p|(p.address,p)).collect::<HashMap<_,_>>();
+    let required_accounts=eligible.values().map(|p|watch_cost(p.venue)).sum::<usize>();
+    let (picked,used,backbone,mode)=if eligible.len()<=max_pools && required_accounts<=account_budget {
+        // All admissible catalog pools fit. Ranking cannot improve this set.
+        (eligible.keys().copied().collect::<HashSet<_>>(),required_accounts,0,"all_fit")
+    }else{
+        let (picked,used,backbone)=select_budgeted(&eligible,catalog,limit,account_budget,previous,registry);
+        (picked,used,backbone,"budgeted")
+    };
+    // Keep actual route coverage; there is no historical comparison selection.
+    let actual=route_coverage(catalog,&picked);
+    let mut result=picked.into_iter().map(|p|eligible[&p]).collect::<Vec<_>>();
+    result.sort_unstable_by_key(|p|p.address);
+    crate::log_event!(Info,
+        "market state selection mode={} generation={} catalog_pools={} eligible_pools={} selected={} pool_limit={} account_upper_bound={} required_accounts={} ws_budget={} groups_by_kind={:?} alternatives_by_kind={:?} conversion_backbone={} selection_us={}",
+        mode,catalog.generation,catalog.pools.len(),eligible.len(),result.len(),limit,
+        used,required_accounts,account_budget,actual.0,actual.1,backbone,started.elapsed().as_micros());
+    result
+}
+
+// The existing route-package heuristic is needed only when a budget binds.
+fn select_budgeted(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
+    limit:usize,account_budget:usize,previous:&[PoolInput],registry:&PoolRegistry)
+    ->(HashSet<Pubkey>,usize,usize){
+    let max_pools=if limit==0 {usize::MAX}else{limit};
     let existing:HashSet<Pubkey>=previous.iter().map(|p|p.address).collect();
     let quality:HashMap<Pubkey,f64>=candidates.keys().map(|address|(*address,
         registry.get(*address).and_then(|p|p.tvl_usd)
@@ -1068,23 +1098,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
         let cost=watch_cost(p.venue);
         if used+cost<=account_budget {picked.insert(p.address);used+=cost;}
     }
-    let actual=route_coverage(catalog,&picked);
-    let mut alpha=candidates.values().copied().collect::<Vec<_>>();
-    alpha.sort_by_key(|p|(p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b),p.address));
-    let mut legacy=HashSet::new();let mut legacy_cost=0;
-    for p in alpha {
-        let cost=watch_cost(p.venue);
-        if legacy.len()>=max_pools {break;}
-        if legacy_cost+cost<=account_budget {legacy.insert(p.address);legacy_cost+=cost;}
-    }
-    let baseline=route_coverage(catalog,&legacy);
-    crate::log_event!(Info,
-        "market state cp5 coverage selected={} account_upper_bound={} ws_budget={} groups_by_kind={:?} alternatives_by_kind={:?} alphabetical_groups_by_kind={:?} alphabetical_alternatives_by_kind={:?} conversion_backbone={} selection_ms={}",
-        picked.len(),used,account_budget,actual.0,actual.1,baseline.0,baseline.1,
-        backbone.len(),started.elapsed().as_millis());
-    let mut result=picked.into_iter().filter_map(|p|candidates.get(&p).copied()).collect::<Vec<_>>();
-    result.sort_unstable_by_key(|p|p.address);
-    result
+    (picked,used,backbone.len())
 }
 
 fn send(out:&broadcast::Sender<Arc<MarketStateEvent>>,event:MarketStateEvent) {
@@ -1260,7 +1274,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let mut selector_jobs=tokio::task::JoinSet::<(u64,Vec<PoolInput>)>::new();
     let mut selected_ready:Option<Vec<PoolInput>>=None;
     let mut next_selection_at=time::Instant::now();
-    crate::log_event!(Info,"market state cp5 selector_async=true interval_ms={selection_interval_ms} pool_limit={} account_budget={} transport_capacity={}",
+    crate::log_event!(Info,"market state selector_async=true interval_ms={selection_interval_ms} pool_limit={} account_budget={} transport_capacity={}",
         *limit.borrow(),selection_capacity,control.capacity());
     let mut tick=time::interval(Duration::from_secs(1));tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
@@ -1290,7 +1304,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             let started=Instant::now();
             let failed:Vec<_>=retry.keys().copied().filter(|key|!engine.pool_index.contains_key(key)).collect();
             let next=watches(&engine,&failed)?;
-            ensure!(next.len()<=selection_capacity,"market state selected {} pools require {} accounts; CP5 WS budget={} configured WS capacity={}",
+            ensure!(next.len()<=selection_capacity,"market state selected {} pools require {} accounts; WS budget={} configured WS capacity={}",
                 selected.len(),next.len(),selection_capacity,control.capacity());
             if next!=wanted {
                 let old:HashMap<_,_>=wanted.iter().map(|w|(w.address,w.view)).collect();
@@ -1362,7 +1376,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 if *limit.borrow()>0 {next.truncate(*limit.borrow());}
                 if source_generation!=catalog.borrow().generation {
                     rebuild=true;
-                    crate::log_event!(Debug,"market state cp5 selection_generation_advanced old={} new={}",
+                    crate::log_event!(Debug,"market state selection_generation_advanced old={} new={}",
                         source_generation,catalog.borrow().generation);
                 }
                 selected_ready=Some(next);

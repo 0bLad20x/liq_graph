@@ -12,7 +12,98 @@ The Registry remains the sole pool-state writer. Completion lifecycle continues 
 
 `rpc_transport` owns provider configuration, HTTP limits/retries, WebSocket connections, account assignment, ACKs and reconnects. Its extension accepts an account plus a requested view (full account or byte slice). There is one desired watch-set owner per transport instance. The runtime assigns it to Market-State; existing Completion workers continue to use HTTP. Do not run an additional watch-set owner on that same handle.
 
-The consumer joins prices to the existing generational `WatchCatalog` and reports price coverage of actual Direct2 pairs. The topology graph still contains Prepared pools without prices. Future priced route evaluation must restrict itself to pools with current observations. This checkpoint does not yet implement logarithmic edge weights, cycle detection, thresholds, candidate ranking or V10 execution jobs.
+The consumer joins prices to the existing generational `WatchCatalog` and reports price coverage of actual Direct2 pairs. The topology graph still contains Prepared pools without prices. Directed route evaluation and candidate delivery belong to the downstream Signal Engine; V10 packing and simulation belong to Execution. See [GRAPH_SIGNALS.md](GRAPH_SIGNALS.md) for those contracts.
+
+## CP7D: selection and catalog cleanup
+
+Basis: merged `main@42a941f84327eadf6d08f56192b394e64e98377c` (CP7C/PR #67).
+Feature branch: `cp7d-selection-catalog-cleanup`.
+
+Selection first intersects the current Registry-derived identities with the supplied
+WatchCatalog generation, including canonical mint-pair identity. Both selection paths
+use this same admissible set. If its entire pool count and conservative account cost
+fit, `mode=all_fit` returns every eligible pool without TVL ranking, package scoring or
+conversion-backbone selection. `pool_limit=0` still means no pool-count cap. Effective
+account capacity remains the minimum of configured MarketState budget and transport
+capacity; the existing one/three-account venue costs are conservative upper bounds,
+not a claim about the exact deduplicated watch count.
+
+If either bound binds, `mode=budgeted` uses the existing route-package heuristic on
+that same admissible set. Final output remains sorted by pool address. Real selection
+coverage is computed once; the alphabetical CP5 comparison set, its sort, budget scan
+and second coverage pass are deleted. Admission and the price/hydration pipeline are
+unchanged. Async selection completion still reconciles current identities and schedules
+another selection if the catalog generation advanced.
+
+WatchCatalog no longer stores `PoolWatch.group_ids`, `MintWatch`, or an independent
+mint-address array. Topology dependencies are read from the shared GraphSnapshot index;
+the catalog observer checks that original index directly. Pool identity, contexts,
+pair alternatives, pair summaries, generation and graph reference remain because the
+selector and price observer use them. Only an explicitly connected optional Jupiter
+output materializes sorted/deduplicated mint addresses from the same graph's closed
+cycles. The standalone Jupiter path remains supported. The normal `--run` pipeline
+passes no such output and does no mint projection here; its Jupiter targets continue
+to come from the existing mint qualification worker.
+
+Existing logs expose selection mode/generation, catalog/eligible/selected pool counts,
+total required and selected account upper bounds, limits, actual route coverage and
+`selection_us`. Catalog logs distinguish `build_us` inside the blocking closure from
+`build_elapsed_us` including scheduling, and report whether a Jupiter projection ran.
+These times measure this run; they are not a controlled before/after benchmark. The
+catalog still performs its full role/pool projection for each consumed generation.
+
+Use one requested ten-minute production-pipeline observation, with actual MarketState
+and signal consumers enabled and simulation disabled:
+
+```powershell
+git fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Fetch fehlgeschlagen.' }
+git switch --track origin/cp7d-selection-catalog-cleanup
+if ($LASTEXITCODE -ne 0) { throw 'Branchwechsel fehlgeschlagen; lokale Aenderungen zuerst sichern.' }
+
+.\scripts\runtime_live.ps1 `
+    -ExpectedBranch cp7d-selection-catalog-cleanup `
+    -Stage Signals -GraphAudit -Rewatch `
+    -DurationSeconds 600 -PoolLimit 15000 -AccountBudget 25000
+```
+
+The existing starter requires a clean feature checkout and a locked release build.
+`summary.json` must show successful orchestration and graph audit, and
+`graph_summary.json` must show at least 600 seconds from running to shutdown start,
+exact nonempty graph/index references, signal producer/consumer parity and no delivery
+loss. Rewatch additionally requires real removals, reselection and subsequent WS prices.
+No four-kind profitable opportunity or V10 simulation is an acceptance requirement.
+
+The analyzer also checks logged selection set/count/budget invariants, all-fit
+completeness, catalog topology counts, final catalog generation delivery, and absence
+of historical comparison or unused Jupiter projection work. It records per-mode
+timings and `market_selection.nonempty_computations_by_mode`. Empty bootstrap selections
+do not prove an exercised nonempty path. Computation logs describe the read-only job;
+actual applied selections and price delivery remain separately observable in the
+MarketState report and native runtime acceptance.
+
+Both a nonempty all-fit path and a nonempty budgeted path need real evidence for the
+full checkpoint scope. The ten-minute run may exercise both naturally; do not infer
+an unobserved path from an overall pass. Only if budgeted selection is missing, run a
+targeted short observation using the same pipeline and a restrictive pool cap:
+
+```powershell
+.\scripts\runtime_live.ps1 `
+    -ExpectedBranch cp7d-selection-catalog-cleanup `
+    -Stage Signals -GraphAudit `
+    -DurationSeconds 60 -PoolLimit 1000 -AccountBudget 25000
+```
+
+If all-fit was not observed because the universe exceeds the configured budgets, use
+provider-permitted sufficient budgets before claiming that path; never relax the
+account-capacity guard. Keep the actual branch/HEAD and artifacts of each scope.
+The optional standalone Jupiter output is not exercised by the normal runtime and
+must not be presented as live-verified by this run.
+
+Implementation status: live evidence pending. The implementation environment has no
+Rust/PowerShell, database configuration or RPC credentials. Feature release/syntax CI
+and the user's configured real run are separate evidence. No synthetic/unit/mock or
+regression suite, alternate runtime, additional starter or dependency is introduced.
 
 ## Input and selection
 
@@ -21,10 +112,10 @@ The consumer joins prices to the existing generational `WatchCatalog` and report
 - CP7A finite runs use the normal discovery, CompletionLifecycle and Persistence workers.
   `-Stage MarketState` disables downstream signals/simulation, not Completionrefresh.
   Historic TVL is never promoted to current TVL.
-- `MARKET_STATE_POOL_LIMIT=1000` by default. `0` removes this pool limit; configured provider/account limits remain in force.
-- Selection is deterministic by unordered mint pair, then address. This keeps pair alternatives together but is not a profitability ranking. It does not guarantee that a capped selection contains every venue or a trade opportunity.
+- `MARKET_STATE_POOL_LIMIT=15000` by default. `0` removes this pool limit; configured provider/account limits remain in force.
+- CP7D selects the complete admissible catalog set when both budgets fit; otherwise it uses route completeness, breadth, account cost, retained pools and TVL to prioritize packages. Output is sorted by address. This is not a profitability ranking and a capped set need not contain every venue or a trade opportunity.
 - The limit counts pools. Required subscriptions count distinct account addresses. Reserve-based venues may require three accounts per pool; shared accounts are deduplicated. Insufficient configured WS capacity fails explicitly with the required and available counts. There is no silent capacity truncation.
-- The initial RPC 5/6 setup uses 24 account subscriptions per provider, 48 total. Use `-PoolLimit 16` for that acceptance run. Raising only the pool limit to 10,000 does not expand provider account capacity. Increase observation scope only with matching configured and provider-permitted capacity.
+- The historical initial RPC 5/6 acceptance setup used 24 account subscriptions per provider, 48 total, with `-PoolLimit 16`. Raising only the pool limit does not expand provider account capacity. Increase observation scope only with matching configured and provider-permitted capacity.
 - A manifest refresh with unchanged pool identity does not rebuild subscriptions. A changed selection does re-establish a fresh baseline.
 
 CP7B separates structural installation from dynamic baselines. A baseline keeps live

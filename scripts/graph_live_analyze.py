@@ -6,6 +6,7 @@ import csv
 import json
 import pathlib
 import re
+import statistics
 
 FIELDS = (
     "generation", "source", "changed_pools", "changed_pairs", "affected_targets",
@@ -34,6 +35,11 @@ def as_int(value, fallback=0):
         return int(value)
     except (ValueError, TypeError):
         return fallback
+def timing_stats(values):
+    values=sorted(values)
+    if not values:return None
+    return {"count":len(values),"min":values[0],"median":statistics.median(values),
+            "p95":values[(95*len(values)+99)//100-1],"max":values[-1]}
 def event_record(event):
     prev = event.get("before") or {}
     nxt = event.get("after") or {}
@@ -154,6 +160,9 @@ def run(args):
     graph_impacts={}
     graph_deltas={}
     verified={}
+    catalog_rows={}
+    selections=[]
+    historical_selections=0
     gaps=[]
     websocket_providers=collections.defaultdict(collections.Counter)
     http_stats={}
@@ -194,6 +203,14 @@ def run(args):
         if "graph reference_verified generation=" in line:
             gen=as_int(values.get("generation"))
             verified[gen]=values
+        if "graph watch catalog published generation=" in line:
+            catalog_rows[as_int(values.get("generation"))]=values
+        if "market state selection mode=" in line:
+            selections.append({k:values.get(k) for k in (
+                "mode","generation","catalog_pools","eligible_pools","selected","pool_limit",
+                "account_upper_bound","required_accounts","ws_budget","selection_us")})
+        if "alphabetical_groups_by_kind=" in line:
+            historical_selections+=1
         if "graph impact generation=" in line:
             gen=as_int(values.get("generation"))
             graph_impacts[gen]={k:values.get(k) for k in (
@@ -312,8 +329,48 @@ def run(args):
     nonempty_references={gen for gen in exact_references
                          if as_int(graph_rows[gen].get("compact_topologies"))>0}
     measured_end=runtime_stop_ms if runtime_stop_ms is not None else runtime_end_ms
+    selection_violations=[]
+    for record in selections:
+        numbers={k:as_int(record.get(k),-1) for k in (
+            "generation","catalog_pools","eligible_pools","selected","pool_limit",
+            "account_upper_bound","required_accounts","ws_budget","selection_us")}
+        if any(v<0 for v in numbers.values()):
+            selection_violations.append("missing or negative selection field")
+            continue
+        n=numbers
+        if (n["generation"]==0 and n["catalog_pools"]!=0) or (n["generation"]>0 and (
+                n["generation"] not in catalog_rows
+                or n["catalog_pools"]!=as_int(catalog_rows[n["generation"]].get("pools"),-1))):
+            selection_violations.append(f"selection catalog generation/count mismatch at generation {n['generation']}")
+        all_fit=(not n["pool_limit"] or n["eligible_pools"]<=n["pool_limit"]) and n["required_accounts"]<=n["ws_budget"]
+        if (n["selected"]>n["eligible_pools"] or n["eligible_pools"]>n["catalog_pools"]
+                or (n["pool_limit"] and n["selected"]>n["pool_limit"])
+                or n["account_upper_bound"]>n["ws_budget"]
+                or n["account_upper_bound"]>n["required_accounts"]):
+            selection_violations.append(f"selection exceeds eligible set or budget at generation {n['generation']}")
+        if record.get("mode")!=("all_fit" if all_fit else "budgeted"):
+            selection_violations.append(f"selection mode contradicts budgets at generation {n['generation']}")
+        if all_fit and (n["selected"]!=n["eligible_pools"] or n["account_upper_bound"]!=n["required_accounts"]):
+            selection_violations.append(f"incomplete all-fit selection at generation {n['generation']}")
+    modes=collections.Counter(r.get("mode") for r in selections)
+    nonempty_modes=collections.Counter(r.get("mode") for r in selections if as_int(r.get("selected"))>0)
+    catalog_mismatches=[gen for gen,r in catalog_rows.items() if gen not in graph_rows
+                        or as_int(r.get("groups"),-1)!=as_int(graph_rows[gen].get("compact_topologies"),-2)]
+    timed_catalogs=[r for r in catalog_rows.values() if "build_us" in r]
     stats={
         "stage":stage,"signal_reports_checked":bool(prod),
+        "market_selection":{
+            "computations_by_mode":dict(modes),"nonempty_computations_by_mode":dict(nonempty_modes),
+            "timing_us_by_mode":{mode:timing_stats([as_int(r.get("selection_us")) for r in selections if r.get("mode")==mode]) for mode in modes},
+            "violations":selection_violations,"historical_comparison_records":historical_selections,
+            "last":selections[-1] if selections else None},
+        "watch_catalog":{
+            "generations":len(catalog_rows),"topology_count_mismatches":catalog_mismatches,
+            "missing_graph_generations":sorted(set(graph_rows)-set(catalog_rows)),
+            "final_generation_matches_graph":bool(catalog_rows and graph_rows and max(catalog_rows)==max(graph_rows)),
+            "build_us":timing_stats([as_int(r["build_us"]) for r in timed_catalogs]),
+            "build_elapsed_us":timing_stats([as_int(r.get("build_elapsed_us")) for r in timed_catalogs]),
+            "jupiter_projection_generations":sum(r.get("jupiter_projection")=="true" for r in timed_catalogs)},
         "catalog_reconciliation_required":args.require_catalog_reconciliation,
         "catalog_reconciliation_passed":catalog_passed,
         "catalog_candidate_visibility_observed":catalog_visibility,
@@ -373,14 +430,23 @@ def run(args):
         "runtime_completed","exit_code","graph_generations","transition_observed",
         "transition_published","flapping_pools","provider_gap_total","signal_lost_events",
         "runtime_measured_seconds","exact_route_and_index_verified_generations",
-        "nonempty_reference_generations","all_published_generations_reference_verified"
+        "nonempty_reference_generations","all_published_generations_reference_verified",
+        "market_selection","watch_catalog"
     )},indent=2))
     if args.exit_code or not completed:
         raise SystemExit("Live runtime incomplete: evidence preserved, no acceptance.")
+    if stage=="Signals" and not prod:
+        raise SystemExit("Signal stage is missing producer/consumer evidence.")
     if prod and (prod.get("error") or consumer.get("error") or consumer.get("lost_events")
                  or consumer.get("awaiting_snapshot") or consumer.get("unverified_events")
                  or consumer.get("unverified_ranges") or produced_counts!=consumed_counts):
         raise SystemExit("Optional signal reports contain errors, loss or incomplete delivery.")
+    if selection_violations or catalog_mismatches:
+        raise SystemExit("Selection budget/set invariants or catalog topology counts differ; inspect graph_summary.json.")
+    if stage in ("Graph","MarketState","Signals") and timed_catalogs and (historical_selections or any(r.get("jupiter_projection")!="false" or as_int(r.get("projected_mints")) or as_int(r.get("mint_projection_us")) for r in timed_catalogs)):
+        raise SystemExit("Standard runtime computed a historical selection or unused Jupiter projection.")
+    if catalog_rows and not stats["watch_catalog"]["final_generation_matches_graph"]:
+        raise SystemExit("Watch catalog did not deliver the final graph generation.")
     if len(graph_rows)<2 or not observed_count or not published_count:
         raise SystemExit("Insufficient real graph transition evidence.")
     if not nonempty_references:
