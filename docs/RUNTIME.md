@@ -150,3 +150,21 @@ WS-Signalverarbeitung in ns und Frame-bis-Signalzustand in µs. P95/P99 sind
 Histogrammobergrenzen. Graphbuild, Catalogbuild und Auswahlzeiten bleiben im Log
 und bei Audit in der Offline-Auswertung. Vergleiche benötigen ähnliche Last und
 Auswahlgröße; dieser Cleanup verspricht keinen vorab erfundenen Beschleunigungsfaktor.
+
+## Completion-Abschluss und 15-Minuten-Integration
+
+Der vollstaendige Aufruf mit allen laufenden Stufen und V10-Simulation steht in
+[COMPLETION.md](COMPLETION.md#closing-fix-and-complete-integration-run).
+`CompletionRefreshSeconds` und `CompletionRecheckSeconds` sind optionale Overrides;
+0 bedeutet die bestehenden Einstellungen uebernehmen. Der Runtime-Starter setzt
+keinen Completion-Kohortenfilter. PumpSwap verwendet im Simulationslauf den aus
+`WalletPath` lokal ermittelten oeffentlichen Signer; die Cache-Kompatibilitaetspruefung
+bleibt aktiv. Ein einmaliger Full-RPC-Inventarscan ist weiterhin ein eigener
+Bootstrap, kein regelmaessiger Runtime-Worker.
+
+Die Zusammenfassung enthaelt zusaetzlich `completion_protocols`,
+`completion_protocol_evidence_passed`, `completion_issues`,
+`discovery_records_by_source`, `log_bytes` und `log_levels`.
+Registry-Abhaengigkeitsupdates werden unveraendert veroeffentlicht, ohne
+Einzellogging unter Schreibsperren. Der optionale Graph-Audit behaelt seine
+Membership-Uebergaenge; normale Laeufe verwenden Zusammenfassungen.

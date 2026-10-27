@@ -47,15 +47,18 @@ before running. No additional starter or automated test suite is introduced.
 ```powershell
 .\target\release\liq_graph.exe --completion-live all `
     --duration-seconds 60 --pool-limit 8 --revalidate --persist `
-    2>&1 | Tee-Object -FilePath completion_live.log
+    2>&1 | Out-File -FilePath completion_live.log -Encoding utf8
 if ($LASTEXITCODE -ne 0) { throw 'Completion-Nachweis fehlgeschlagen; Log pruefen.' }
 ```
 
 `--pool-limit` bounds a fixed cohort per protocol. `--revalidate` forces an initial
 full check even for a paused durable reason; a successful Registry acceptance
 consumes that one-shot override. Normal retry/backoff then applies. This mode uses
-restored real pools/mints, current discovery and the same MintQualification input
-as production. Jupiter is optional when the persisted mint catalog suffices.
+restored real pools/mints and the same MintQualification policy as production.
+Discovery and Jupiter enrichment are disabled by default for this bounded profile.
+`--discover` enables the selected venues' continuous sources; `--enrich` enables
+Jupiter and requires configured API keys. These flags do not change the normal
+`--run` pipeline: its Discovery and enrichment remain enabled as configured.
 It cannot grant admission using invented TVL or a diagnostic shortcut.
 
 A single protocol is selectable, for example `--completion-live byreal_clmm`.
@@ -68,7 +71,7 @@ the stored signer binding. Use the existing `--v10-wallet KEYPAIR.json` utility 
 resolve a public key if needed. The proof never broadcasts or simulates a transaction.
 
 The command prints per-protocol `dispatched`, `accepted`, `proofs` and `unchanged`
-counts. Zero accepted work in any requested protocol fails evidence. With
+`prepared`, `incomplete` and `retryable` counts. Zero accepted work in any requested protocol fails evidence. With
 `--revalidate`, at least one accepted full proof per requested protocol is required.
 An Incomplete result is a valid checked result; these counters do not imply that
 every pool was Prepared or that a trade is executable. Shutdown drains protocol
@@ -89,9 +92,71 @@ A short downstream integration run uses the existing starter:
 ```
 
 No Rewatch or V10 proof is requested for this structural change. Existing market
-and signal delivery requirements remain active. Lifecycle refresh evidence now
-uses the final owner counter, instead of parsing per-pool Info logs; those details
-are Debug only. No additional production diagnostic consumers are started.
+and signal delivery requirements remain active. Lifecycle refresh evidence uses final owner counters instead of per-pool logs. No additional production diagnostic consumers are started.
+
+## Closing fix and complete integration run
+
+The supplied all-protocol log showed 75 accepted proofs (66 Prepared, 9 Incomplete)
+and 5 Retryable responses across 80 requests. All ten venues had accepted work;
+there were no rejected Registry writes or missing acknowledgements. This was an
+individual Completion proof, not a full-system or light-refresh proof.
+
+Its excessive output was concrete: 130,940 Debug lines from Registry, including
+130,794 admission-transition records. Registry no longer formats or emits per-pool
+admission or completion logs while holding its locks. Mint updates publish the
+unchanged typed pool updates, then log one aggregate with `install_us`. Ordinary
+Discovery admission changes contribute to a final aggregate. Membership-crossing
+records needed by the graph analyzer remain opt-in via
+`POOL_REGISTRY_ADMISSION_AUDIT=1`, set automatically by `-GraphAudit`, and are emitted
+after publication and lock release. This does not alter admission policy.
+
+Incomplete/Retryable outcomes retain per-venue/reason counts and one bounded sample
+pool plus diagnostic message per reason in the Registry's final `completion_issue`
+records. Lifecycle's final `protocol_summary` distinguishes full Prepared/Incomplete,
+light Unchanged and Retryable outcomes. These are small owner summaries, not extra
+consumers. Debug output now always requires an explicit `LIQ_GRAPH_LOG` setting,
+including the `--test` aliases. The runtime starter overrides inherited Debug filters,
+writes worker logs to a file and prints the final summary.
+
+For the requested 15-minute full-system run, use the existing starter:
+
+```powershell
+.\scripts\runtime_live.ps1 `
+    -ExpectedBranch refactor-completion-boundaries `
+    -DurationSeconds 900 -Stage Signals `
+    -PoolLimit 15000 -AccountBudget 25000 `
+    -CompletionRefreshSeconds 120 -CompletionRecheckSeconds 120 `
+    -GraphAudit -Rewatch -SimulateV10 -SimulationLimit 100 -RouteKind All `
+    -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
+```
+
+This uses the normal Discovery, enrichment, persistence and all ten Completion
+workers, then Graph, MarketState, signals, ExecutionCandidates and the V10 executor.
+Completion has no inspection cohort limit. The two 120-second overrides exercise
+repeat/light checks within 900 seconds; they are run configuration, not new defaults,
+and are restored with the other process variables. The independent one-shot full
+inventory RPC bootstrap remains excluded, as in the normal runtime: it is not a
+missing continuous Discovery source. Pump rolling Discovery requires a configured
+RPC V2 provider; disabled sources are explicitly logged. The starter resolves the
+simulation wallet's public key for PumpSwap, without printing or moving its secret
+key; the existing persisted signer compatibility guard still applies.
+
+`summary.json` adds all ten Completion protocol counters, aggregated diagnostic
+samples, actual Registry input counts by Discovery source, log size and level counts.
+`completion_protocol_evidence_passed` requires accepted work for every protocol;
+light refresh is proven only by positive `unchanged` counts. This is reported
+separately from market/signal delivery and V10 results. `RouteKind All` permits all
+four route forms; it does not guarantee that the bounded request sample contains
+each form. At most 100 real simulations are requested and no transaction is sent.
+A correct simulation handoff with on-chain errors does not prove successful swaps.
+The graph reference audit adds diagnostic work, so its timings represent this
+integration configuration rather than a clean production speed benchmark.
+
+The live run must execute on the operator's configured checkout. The implementation
+environment has no Rust/PowerShell, database, RPC or wallet configuration. CI checks
+the locked build and script syntax on the exact feature head; it cannot substitute
+for this live evidence. Keep the checkpoint open until the resulting artifact folder
+has been evaluated.
 
 ## Remaining protocol verification
 

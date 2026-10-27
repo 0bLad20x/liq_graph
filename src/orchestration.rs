@@ -216,7 +216,7 @@ pub async fn run() -> Result<()> {
         Err(error) if error.not_found() => {}
         Err(error) => return Err(error).context("load .env"),
     }
-    core::logging::init(env::args().nth(1).as_deref()==Some("--test"))?;
+    core::logging::init()?;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str)==Some("--completion-live") {

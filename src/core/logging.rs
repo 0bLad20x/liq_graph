@@ -23,8 +23,8 @@ struct Config {default:Level, modules:Vec<(String,Level)>}
 static CONFIG:OnceLock<Config>=OnceLock::new();
 
 /// Call after dotenv has loaded. A failed configuration rejects startup.
-pub fn init(test_mode:bool)->Result<()> {
-    let mut parsed=Config{default:if test_mode{Level::Debug}else{Level::Info},modules:Vec::new()};
+pub fn init()->Result<()> {
+    let mut parsed=Config{default:Level::Info,modules:Vec::new()};
     if let Ok(raw)=env::var("LIQ_GRAPH_LOG") {
         for part in raw.split(',').map(str::trim).filter(|part|!part.is_empty()) {
             if let Some((module,level))=part.split_once('=') {

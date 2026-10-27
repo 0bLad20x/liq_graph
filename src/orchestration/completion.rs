@@ -149,24 +149,27 @@ pub(super) fn start(tasks:&mut JoinSet<Result<()>>,registry:&pool_registry::Pool
 }
 
 /// A bounded profile of the same Registry/admission/lifecycle/protocol wiring.
-/// Restore is the input basis; current discovery and optional Jupiter keep it updated.
+/// Restore is the input basis; discovery and Jupiter are explicit opt-ins.
 /// Only an explicit --persist starts the single database writer.
 pub(super) async fn live(args:&[String])->Result<()> {
     let name=args.first().map(String::as_str).unwrap_or("all");
     let mut duration=60_u64;let mut pool_limit=8_usize;
-    let mut revalidate=false;let mut persist=false;let mut index=1;
+    let mut revalidate=false;let mut persist=false;let mut discover=false;let mut enrich=false;let mut index=1;
     while index<args.len() {
         match args[index].as_str() {
             "--duration-seconds"=>{index+=1;duration=args.get(index).context("missing duration")?.parse()?;},
             "--pool-limit"=>{index+=1;pool_limit=args.get(index).context("missing pool limit")?.parse()?;},
             "--revalidate"=>revalidate=true,
             "--persist"=>persist=true,
+            "--discover"=>discover=true,
+            "--enrich"=>enrich=true,
             other=>bail!("unknown Completion argument {other}"),
         }
         index+=1;
     }
     ensure!((10..=86400).contains(&duration),"Completion duration must be 10..86400 seconds");
     ensure!((1..=100000).contains(&pool_limit),"Completion live pool limit must be 1..100000 per protocol");
+    let enrichment=if enrich {Some(jupiter_settings()?.context("--enrich requires JUPITER_SEARCH_API_KEYS")?)}else{None};
     let workers=configured(name)?;
     let mut settings=lifecycle::Settings::from_env()?;
     settings.pool_limit=pool_limit;settings.revalidate_once=revalidate;
@@ -197,13 +200,14 @@ pub(super) async fn live(args:&[String])->Result<()> {
     }
     critical(&mut tasks,"mint_qualification",mint_qualification::run(registry.snapshot(),mints,
         updates.subscribe(),jupiter_rx,qualified_tx,target_tx,None,None,None,Some(stop_rx.clone())));
-    if let Some(settings)=jupiter_settings()? {
+    if let Some(settings)=enrichment {
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
             crate::workers::source_jupiter_mint::run_targeted(core::http_client()?,settings,target_rx,jupiter_out.clone())));
     }
     let (report_tx,report_rx)=oneshot::channel();
     start(&mut tasks,&registry,&updates,results,(stop.clone(),stop_rx.clone()),
         rpc.clone(),workers,settings,Some(report_tx))?;
+    if discover {
     let mut sources=Vec::new();
     for venue in &venues {
         let set=match venue {
@@ -223,9 +227,10 @@ pub(super) async fn live(args:&[String])->Result<()> {
     for set in sources {discovery_workers.extend(discovery::configured(set,false,None)?);}
     discovery::spawn_continuous(&mut tasks,discovery_workers,discovery::Resources{
         http:core::http_client()?,rpc:Some(rpc.clone()),output:source.clone(),stop:stop_rx});
+    }
     critical(&mut tasks,"rpc_transport",async move{(&mut rpc_task.0).await?});
     drop(rpc);drop(source);drop(updates);
-    crate::log_event!(Info,"completion live started protocols={venues:?} restored={restored_count} duration_s={duration} pool_limit={pool_limit} revalidate={revalidate} persist={persist}");
+    crate::log_event!(Info,"completion live started protocols={venues:?} restored={restored_count} duration_s={duration} pool_limit={pool_limit} revalidate={revalidate} persist={persist} discovery={discover} enrichment={enrich}");
     let failure=tokio::select! {
         _=tokio::time::sleep(Duration::from_secs(duration))=>None,
         joined=tasks.join_next()=>Some(match joined {
@@ -245,10 +250,11 @@ pub(super) async fn live(args:&[String])->Result<()> {
     let report=report_rx.await.context("missing Completion owner report")?;
     let protocols=report.protocols.iter().map(|p|serde_json::json!({
         "venue":format!("{:?}",p.venue),"dispatched":p.dispatched,"accepted":p.accepted,
-        "proofs":p.proofs,"unchanged":p.unchanged})).collect::<Vec<_>>();
+        "proofs":p.proofs,"unchanged":p.unchanged,
+        "prepared":p.prepared,"incomplete":p.incomplete,"retryable":p.retryable})).collect::<Vec<_>>();
     let passed=report.protocols.iter().all(|p|p.accepted>0 && (!revalidate || p.proofs>0));
     let evidence=serde_json::json!({"run_complete":true,"completion_evidence_passed":passed,
-        "revalidate":revalidate,"persisted":persist,"protocols":protocols,"broadcasts":false});
+        "revalidate":revalidate,"persisted":persist,"discovery_enabled":discover,"enrichment_enabled":enrich,"protocols":protocols,"broadcasts":false});
     if let Ok(path)=env::var("COMPLETION_REPORT_PATH") {
         std::fs::write(path,serde_json::to_vec_pretty(&evidence)?).context("write Completion evidence")?;
     }

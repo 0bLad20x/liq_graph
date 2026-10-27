@@ -90,6 +90,9 @@ pub struct ProtocolReport {
     pub accepted:u64,
     pub proofs:u64,
     pub unchanged:u64,
+    pub prepared:u64,
+    pub incomplete:u64,
+    pub retryable:u64,
 }
 pub struct Report {pub protocols:Vec<ProtocolReport>}
 #[derive(Default)]
@@ -211,6 +214,11 @@ impl Scheduler {
             self.counters.accepted+=1;
             let counters=self.counters.venue(pool.venue);
             counters.accepted+=1;counters.proofs+=1;
+            match result.status {
+                CompletionStatus::Prepared=>counters.prepared+=1,
+                CompletionStatus::Incomplete=>counters.incomplete+=1,
+                CompletionStatus::Retryable=>unreachable!(),
+            }
             entry.force_once=false;
             if settings.revalidate_once && flight.force_full {self.revalidated.insert(key);}
             match result.status {
@@ -345,6 +353,7 @@ impl Scheduler {
                     && result.checked_at_ms.is_none() && result.manifest.is_none(),
                     "invalid transient lifecycle response");
                 self.counters.retryable+=1;
+                self.counters.venue(entry.pool.venue).retryable+=1;
                 Self::retry(entry,settings,now);
                 crate::log_event!(Debug,"lifecycle retry request_id={} pool={} next_due_ms={:?} failures={} proof_retained=true",
                     response.id,pool,entry.due,entry.failures);
@@ -452,7 +461,7 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
     let mut scheduler=Scheduler::new();
     for executor in &executors {
         scheduler.counters.protocols.push(ProtocolReport{venue:executor.venue,
-            dispatched:0,accepted:0,proofs:0,unchanged:0});
+            dispatched:0,accepted:0,proofs:0,unchanged:0,prepared:0,incomplete:0,retryable:0});
     }
     let now=now_unix_ms()?;
     for pool in seed {
@@ -539,8 +548,8 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         "lifecycle final accounting has unacknowledged requests");
     scheduler.report(&executors,now_unix_ms()?,true);
     for p in &scheduler.counters.protocols {
-        crate::log_event!(Info,"lifecycle protocol_summary venue={:?} dispatched={} accepted={} proofs={} unchanged={}",
-            p.venue,p.dispatched,p.accepted,p.proofs,p.unchanged);
+        crate::log_event!(Info,"lifecycle protocol_summary venue={:?} dispatched={} accepted={} proofs={} unchanged={} prepared={} incomplete={} retryable={}",
+            p.venue,p.dispatched,p.accepted,p.proofs,p.unchanged,p.prepared,p.incomplete,p.retryable);
     }
     Ok(Report{protocols:scheduler.counters.protocols})
 }
