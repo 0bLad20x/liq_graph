@@ -3,8 +3,8 @@ use crate::workers::discovery::identity_hydration as identity_hydration_venues;
 use std::{env, future::Future, io::{self, BufRead}, sync::{Arc,Mutex}, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
-use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, PoolState,
-        PoolUpdateBatch, PoolUpdateKind, Venue},
+use crate::{core::{self, DataBatch, CompletionResultBatch,
+        PoolUpdateBatch, Venue},
     workers::{execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
         graph_signals, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint, execution_v10}};
@@ -202,11 +202,15 @@ struct RunEvidence {
     production:Option<graph_signals::ProductionReport>,
     signals:Option<graph_signals::ObservationReport>,
     execution:serde_json::Value,
+    graph_membership:Option<graph_liquidity::MembershipReport>,
 }
 impl RunEvidence {
     fn checks(&self,settings:RunSettings)->Vec<(&'static str,Result<()>)> {
         let mut checks=Vec::new();
         if settings.hydration_only {return checks;}
+        checks.push(("graph_membership",self.graph_membership.as_ref()
+            .context("missing final Registry/Graph membership comparison")
+            .and_then(|report|report.ensure_complete())));
         if settings.market {
             checks.push(("market_delivery",(||->Result<()> {
                 let source=self.market.as_ref().context("missing MarketState report")?;
@@ -261,9 +265,11 @@ pub async fn run()->Result<()> {
     report["orchestration_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_none());
     report["error"]=serde_json::json!(result.as_ref().err().or(acceptance).map(|e|format!("{e:#}")));
     for (check,field) in [("market_delivery","market_delivery_passed"),
-        ("signal_delivery","signal_delivery_passed"),("rewatch","rewatch_evidence_passed")] {
+        ("signal_delivery","signal_delivery_passed"),("rewatch","rewatch_evidence_passed"),
+        ("graph_membership","graph_membership_passed")] {
         report[field]=serde_json::json!(checks.iter().find(|(name,_)|*name==check).map(|(_,r)|r.is_ok()));
     }
+    report["graph_membership"]=serde_json::to_value(&evidence.graph_membership)?;
     report["candidate_delivery_passed"]=if settings.simulate {report["signal_delivery_passed"].clone()}
         else {serde_json::Value::Null};
     report["evidence_errors"]=serde_json::json!(checks.iter().filter_map(|(stage,check)|
@@ -350,11 +356,9 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     // Check the current signer before seeding the graph with persisted blocks.
     let completion_settings=completion_settings.context("missing enabled Completion settings")?;
     completion::validate_bootstrap(&completion_workers,&restored)?;
-    let graph_boot:Vec<PoolState>=restored.iter()
-        .filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();
     let registry=pool_registry::PoolRegistry::default();
     let count=registry.restore(restored)?;
-    crate::log_event!(Info,"runtime bootstrap restored={count} prepared={} lifecycle_executors=10 backpressure_unchanged=true",graph_boot.len());
+    crate::log_event!(Info,"runtime bootstrap restored={count} lifecycle_executors=10 backpressure_unchanged=true");
 
     let (stop_tx,stop_rx)=watch::channel(false);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(source_capacity);
@@ -362,11 +366,11 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     let (completions,completion_rx)=broadcast::channel::<Arc<CompletionResultBatch>>(256);
     let (source_done,_)=watch::channel(false);
     let (graph_tx,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
+    let final_graph=graph_rx.clone();
     let (catalog_tx,catalog_rx)=watch::channel(Arc::new(graph_watch_catalog::WatchCatalog::empty()));
     let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
+    let registry_qualified=qualified_rx.clone();
     let mut tasks=JoinSet::<Result<()>>::new();
-    critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
-        registry.clone(),updates.clone(),source_done,true,Some(qualified_rx.clone())));
     let (jupiter_out,_)=broadcast::channel::<Arc<DataBatch>>(256);
     let (onchain_tx,onchain_rx)=tokio::sync::mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
     let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
@@ -515,13 +519,11 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     critical(&mut tasks,"rpc_transport",async move{(&mut rpc_task.0).await?});
 
-    // Seed graph before completion can change a Prepared state.
-    if !graph_boot.is_empty(){
-        updates.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,
-            source:"persistence_restore",received_at_ms:0,
-            pools:graph_boot,persist_identity:Vec::new()}))
-            .map_err(|_|anyhow!("no graph bootstrap subscriber"))?;
-    }
+    // Connect every subscriber first. Publish the Registry's restored decisions
+    // before its writer can emit qualification/source/completion deltas.
+    registry.publish_bootstrap(&updates)?;
+    critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
+        registry.clone(),updates.clone(),source_done,true,Some(registry_qualified)));
     completion::start(&mut tasks,&registry,&updates,completions.clone(),
         (stop_tx.clone(),stop_rx.clone()),rpc.clone(),completion_workers,completion_settings,None)?;
     drop(completions);
@@ -609,6 +611,10 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         }
     }
     if let Some(error)=error{return Err(error);}
+    let graph=final_graph.borrow().clone();
+    let membership=graph_liquidity::compare_registry(&graph,&registry.snapshot())?;
+    evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
+        .graph_membership=Some(membership);
     crate::log_event!(Info,"runtime shutdown complete=true");
     Ok(())
 }

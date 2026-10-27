@@ -151,10 +151,10 @@ Histogrammobergrenzen. Graphbuild, Catalogbuild und Auswahlzeiten bleiben im Log
 und bei Audit in der Offline-Auswertung. Vergleiche benötigen ähnliche Last und
 Auswahlgröße; dieser Cleanup verspricht keinen vorab erfundenen Beschleunigungsfaktor.
 
-## Completion-Abschluss und 15-Minuten-Integration
+## Completion-Abschluss und 30-Minuten-Integration
 
 Der vollstaendige Aufruf mit allen laufenden Stufen und V10-Simulation steht in
-[COMPLETION.md](COMPLETION.md#closing-fix-and-complete-integration-run).
+[COMPLETION.md](COMPLETION.md#registry-bootstrap-correction-and-30-minute-integration).
 `CompletionRefreshSeconds` und `CompletionRecheckSeconds` sind optionale Overrides;
 0 bedeutet die bestehenden Einstellungen uebernehmen. Der Runtime-Starter setzt
 keinen Completion-Kohortenfilter. PumpSwap verwendet im Simulationslauf den aus
@@ -168,3 +168,19 @@ Die Zusammenfassung enthaelt zusaetzlich `completion_protocols`,
 Registry-Abhaengigkeitsupdates werden unveraendert veroeffentlicht, ohne
 Einzellogging unter Schreibsperren. Der optionale Graph-Audit behaelt seine
 Membership-Uebergaenge; normale Laeufe verwenden Zusammenfassungen.
+
+`SimulationLimit=0` ist der Standard und bedeutet kein Gesamtlimit. Die reale
+Parallelitaet bleibt bei einer Simulation plus einem wartenden Request. Positive
+Limits bleiben fuer gezielte Kurzlaeufe moeglich. Das begrenzte Eingangsangebot
+bleibt erhalten; ausgelastete Revisionen werden gezaehlt und uebersprungen.
+
+Registry publiziert den restaurierten Prepared-Anfangsbestand mit berechneter
+Admission vor den ersten Writer-Deltas. Nach dem Drain prueft `graph_membership`
+konkrete Pooladressen und Mintpaare gegen die finale Registry. Fehlende,
+unberechtigte oder falsch zugeordnete Graph-Pools verhindern die endliche Abnahme.
+Der Vergleich laeuft einmalig beim Abschluss und startet keinen Diagnosekonsumenten.
+
+MarketState unterscheidet im Abschlussbericht `selected_pools`, strukturell
+installierte `hydrated_pools`, nach Baseline betriebsbereite `ready_pools` und
+`priced_pools`. Der alte Final-Logname `prepared` fuer installierte Pools entfaellt;
+Completion-Prepared und Preisbereitschaft werden dadurch nicht verwechselt.

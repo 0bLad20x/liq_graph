@@ -21,7 +21,7 @@ param(
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
     [switch]$SimulateV10,
     [string]$WalletPath,
-    [ValidateRange(1,5000)][int]$SimulationLimit = 10,
+    [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
     [ValidateSet('All','Direct2','Direct3','Triangle3','Triangle4')][string]$RouteKind = 'All',
     [string]$ExecutionParametersPath
 )
@@ -162,6 +162,10 @@ try {
         Write-Host 'Plan only: no RPC connections, database reads or live acceptance.'
         return
     }
+    if ($SimulateV10) {
+        if ($SimulationLimit -eq 0) { Write-Host 'Simulation requests: no total cap; one executor and one queued request, broadcasts=false.' }
+        else { Write-Host "Simulation requests: total cap=$SimulationLimit, broadcasts=false." }
+    }
     if ($marketEnabled -and $plan.websocket_plan.account_capacity -le 0) { throw 'No WebSocket account capacity selected.' }
     Write-Host "Starting $DurationSeconds-second live run; full log: $log"
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -225,6 +229,8 @@ try {
         market_delivery_passed=$runtime.market_delivery_passed
         signal_delivery_passed=$runtime.signal_delivery_passed
         rewatch_evidence_passed=$runtime.rewatch_evidence_passed
+        graph_membership_passed=$runtime.graph_membership_passed
+        graph_membership=$runtime.graph_membership
         evidence_errors=$runtime.evidence_errors
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; completion_lifecycle_started=$lifecycleStarted
@@ -232,6 +238,8 @@ try {
         completion_protocol_evidence_passed=[bool]$protocolEvidence; completion_protocols=$protocols
         completion_issues=$issueRecords; discovery_records_by_source=$discovery
         log_bytes=(Get-Item -LiteralPath $log).Length; log_levels=$logLevels
+        selected_pools=$market.selected_pools; hydrated_pools=$market.hydrated_pools
+        ready_pools=$market.ready_pools; priced_pools=$market.priced_pools
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
         market_account_processing_ns=$market.metrics.processing

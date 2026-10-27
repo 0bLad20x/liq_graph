@@ -70,8 +70,9 @@ PumpSwap Prepared manifests require the same configured `PUMPSWAP_V10_WALLET` as
 the stored signer binding. Use the existing `--v10-wallet KEYPAIR.json` utility to
 resolve a public key if needed. The proof never broadcasts or simulates a transaction.
 
-The command prints per-protocol `dispatched`, `accepted`, `proofs` and `unchanged`
-`prepared`, `incomplete` and `retryable` counts. Zero accepted work in any requested protocol fails evidence. With
+The command prints per-protocol `dispatched`, `accepted`, `proofs`, `unchanged`,
+`prepared`, `incomplete` and `retryable` counts. Zero accepted work in any requested
+protocol fails evidence. With
 `--revalidate`, at least one accepted full proof per requested protocol is required.
 An Incomplete result is a valid checked result; these counters do not imply that
 every pool was Prepared or that a trade is executable. Shutdown drains protocol
@@ -118,45 +119,80 @@ consumers. Debug output now always requires an explicit `LIQ_GRAPH_LOG` setting,
 including the `--test` aliases. The runtime starter overrides inherited Debug filters,
 writes worker logs to a file and prints the final summary.
 
-For the requested 15-minute full-system run, use the existing starter:
+## Registry bootstrap correction and 30-minute integration
+
+The previous 900-second run on `983248a` completed with all ten Completion venues,
+117,676 accepted light Unchanged results, exact market/signal delivery and 100
+simulations covering Direct2, Direct3, Triangle3 and Triangle4. It exposed an
+independent start-state bug: the Runtime copied graph seed pools from Persistence
+before Registry restore computed their admission. Light Unchanged checks correctly
+do not rewrite Registry state and therefore cannot repair a missing graph seed.
+The last counts differed by 23 admitted Prepared pools; the WSOL/USDC counts were
+186 in Registry and 163 reconstructed from graph transitions. A reference comparison
+using only the graph's own input set did not detect the missing Registry membership.
+
+Registry now publishes its restored Prepared snapshot through the existing typed
+update contract, with its already computed admission decisions. All consumers are
+connected before publication, and the Registry writer starts only afterwards.
+There is no second seed built directly from database objects and no admission
+policy in orchestration. Qualification's watch receiver is connected before its
+producer starts. Light Unchanged semantics remain unchanged.
+
+After every normal Runtime shutdown, all tasks drain first. The Graph worker's
+one-shot comparison then checks concrete pool addresses and canonical mint pairs
+against the final Registry snapshot. `graph_membership_passed` is required for finite
+runtime acceptance. `graph_membership` reports both universe and WSOL/USDC counts,
+plus missing, unexpected and pair-mismatched addresses. This is a final comparison,
+not another live consumer, and it never repairs the graph to hide missing deltas.
+The existing independent topology/index reference audit remains available.
+
+For the requested half-hour run, use:
 
 ```powershell
 .\scripts\runtime_live.ps1 `
     -ExpectedBranch refactor-completion-boundaries `
-    -DurationSeconds 900 -Stage Signals `
+    -DurationSeconds 1800 -Stage Signals `
     -PoolLimit 15000 -AccountBudget 25000 `
-    -CompletionRefreshSeconds 120 -CompletionRecheckSeconds 120 `
-    -GraphAudit -Rewatch -SimulateV10 -SimulationLimit 100 -RouteKind All `
+    -CompletionRefreshSeconds 900 -CompletionRecheckSeconds 300 `
+    -GraphAudit -SimulateV10 -SimulationLimit 0 -RouteKind All `
     -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
 ```
 
-This uses the normal Discovery, enrichment, persistence and all ten Completion
-workers, then Graph, MarketState, signals, ExecutionCandidates and the V10 executor.
-Completion has no inspection cohort limit. The two 120-second overrides exercise
-repeat/light checks within 900 seconds; they are run configuration, not new defaults,
-and are restored with the other process variables. The independent one-shot full
-inventory RPC bootstrap remains excluded, as in the normal runtime: it is not a
-missing continuous Discovery source. Pump rolling Discovery requires a configured
-RPC V2 provider; disabled sources are explicitly logged. The starter resolves the
-simulation wallet's public key for PumpSwap, without printing or moving its secret
-key; the existing persisted signer compatibility guard still applies.
+`SimulationLimit=0` and `GRAPH_EXECUTION_MAX_REQUESTS=0` mean no total request cap;
+this is now the default. A positive value still permits a bounded operator run.
+There is still one executing simulation and at most one queued request. Busy
+revisions are counted and skipped rather than blocking signal calculation. Handoff
+and artifact matching index reports by request ID instead of repeatedly scanning
+the entire report list. Every accepted request must still have exactly one complete
+simulation report with matching packing; duplicate and missing IDs fail evidence.
+Original request, selection and simulation artifacts remain available for all jobs.
+Their total size grows with the number of accepted requests.
 
-`summary.json` adds all ten Completion protocol counters, aggregated diagnostic
-samples, actual Registry input counts by Discovery source, log size and level counts.
-`completion_protocol_evidence_passed` requires accepted work for every protocol;
-light refresh is proven only by positive `unchanged` counts. This is reported
-separately from market/signal delivery and V10 results. `RouteKind All` permits all
-four route forms; it does not guarantee that the bounded request sample contains
-each form. At most 100 real simulations are requested and no transaction is sent.
-A correct simulation handoff with on-chain errors does not prove successful swaps.
-The graph reference audit adds diagnostic work, so its timings represent this
-integration configuration rather than a clean production speed benchmark.
+This run uses the regular 900/300-second Completion intervals, with full refresh
+still at 3600 seconds, and no Completion inspection cohort. It leaves observations
+continuously enabled; Rewatch was already proven in the previous run. `-Rewatch`
+remains available for an explicit removal/reselection proof. Discovery, enrichment,
+persistence, all ten Completion workers, Graph, MarketState, signals and V10 all
+use the same normal runtime. A one-shot full inventory RPC bootstrap remains a
+separate operator mode. Pump rolling Discovery requires a configured RPC V2 provider;
+disabled sources are explicitly logged. The starter resolves only the simulation
+wallet's public key for PumpSwap and retains the persisted signer compatibility guard.
+No transaction is broadcast.
 
-The live run must execute on the operator's configured checkout. The implementation
-environment has no Rust/PowerShell, database, RPC or wallet configuration. CI checks
-the locked build and script syntax on the exact feature head; it cannot substitute
-for this live evidence. Keep the checkpoint open until the resulting artifact folder
-has been evaluated.
+`summary.json` includes Completion counters, bounded per-reason diagnostic samples,
+actual Registry input counts by Discovery source, log size/level counts and the new
+exact membership result. MarketState also reports `ready_pools` separately from
+structurally installed `hydrated_pools` and priceable `priced_pools`; pricing and
+hydration behavior are unchanged. `completion_protocol_evidence_passed` requires accepted work
+for every Completion venue; positive `unchanged` counts establish a light check.
+`RouteKind All` permits every route form but does not guarantee each has an opportunity.
+Successful handoff and successful on-chain simulation remain distinct outcomes.
+
+The graph audit adds diagnostic work, so the run measures this integration profile.
+The implementation environment has no local Rust/PowerShell or configured database,
+RPC or wallet. CI checks the exact feature-head locked build and existing utility
+syntax. The new 1800-second real-input run remains pending until its artifacts are
+available. Build success does not close the checkpoint.
 
 ## Remaining protocol verification
 

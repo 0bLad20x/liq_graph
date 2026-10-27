@@ -1,6 +1,6 @@
 //! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
-use std::{collections::HashSet, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc};
@@ -14,6 +14,7 @@ use super::pool_registry::PoolRegistry;
 pub struct Settings {
     pub wallet: Pubkey,
     pub parameters: ExecutionParameters,
+    /// Zero means no lifetime request cap; the output queue remains bounded.
     pub limit: usize,
     pub kind: Option<SignalRouteKind>,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
@@ -21,8 +22,7 @@ pub struct Settings {
 }
 impl Settings {
     pub fn from_env(wallet: Pubkey, capacity: fn(&ExecutionRequest)->Result<ExecutionMetrics>) -> Result<Self> {
-        let limit=env::var("GRAPH_EXECUTION_MAX_REQUESTS").unwrap_or_else(|_|"10".into()).parse()?;
-        ensure!((1..=5000).contains(&limit), "GRAPH_EXECUTION_MAX_REQUESTS must be 1..5000");
+        let limit=env::var("GRAPH_EXECUTION_MAX_REQUESTS").unwrap_or_else(|_|"0".into()).parse()?;
         let kind=match env::var("GRAPH_EXECUTION_ROUTE_KIND").unwrap_or_else(|_|"All".into()).to_ascii_lowercase().as_str() {
             "all"=>None, "direct2"=>Some(SignalRouteKind::Direct2), "direct3"=>Some(SignalRouteKind::Direct3),
             "triangle3"=>Some(SignalRouteKind::Triangle3), "triangle4"=>Some(SignalRouteKind::Triangle4),
@@ -81,10 +81,17 @@ impl Report {
         self.ensure_complete()?;
         ensure!(!self.requests.is_empty(), "no qualifying live request was produced; inspect coverage, threshold and candidate rejections");
         ensure!(self.requests.len()==reports.len(), "candidate/request report counts differ");
+        let mut by_id=HashMap::with_capacity(reports.len());
+        for report in reports {
+            ensure!(by_id.insert(report.id.as_str(),report).is_none(),
+                "duplicate execution report for {}",report.id);
+        }
+        let mut requested=HashSet::with_capacity(self.requests.len());
         for selection in &self.requests {
-            let matched=reports.iter().filter(|r|r.id==selection.request.id).collect::<Vec<_>>();
-            ensure!(matched.len()==1, "missing or duplicate execution report for {}",selection.request.id);
-            let report=matched[0];
+            ensure!(requested.insert(selection.request.id.as_str()),
+                "duplicate execution request {}",selection.request.id);
+            let report=by_id.get(selection.request.id.as_str())
+                .with_context(||format!("missing execution report for {}",selection.request.id))?;
             ensure!(report.error.is_none() && report.phase=="complete" && report.executor_invoked
                 && report.simulation.is_some(), "request {} did not reach an executor simulation",report.id);
             ensure!(serde_json::to_value(&selection.packing)?==serde_json::to_value(&report.metrics)?,
@@ -92,8 +99,8 @@ impl Report {
         }
         Ok(())
     }
-    pub fn ensure_live_evidence(&self, reports:&[ExecutionReport])->Result<()> {
-        self.ensure_handoff(reports)?;
+    /// Additional execution criterion, evaluated after ensure_handoff succeeds.
+    pub fn ensure_successful_simulation(&self, reports:&[ExecutionReport])->Result<()> {
         ensure!(reports.iter().any(|r|matches!(r.outcome,
             ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved)),
             "handoff observed, but no successful simulation; on-chain errors remain unclassified");
@@ -363,7 +370,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     ensure!(pending&&b.revision==state.revision&&b.graph_generation==state.generation,
                         "candidate batch references wrong state");
                     for candidate in &b.candidates {state.candidate(b,candidate)?;}
-                    if report.requests.len()>=cfg.limit
+                    if (cfg.limit>0 && report.requests.len()>=cfg.limit)
                         ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket,..})
                         ||!b.price_pipeline.is_some_and(|t|!t.initialization_replay){continue;}
                     for (index,candidate) in b.candidates.iter().enumerate(){

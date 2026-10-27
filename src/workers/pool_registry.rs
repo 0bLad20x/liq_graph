@@ -270,6 +270,31 @@ impl PoolRegistry {
         Ok(entries.len())
     }
 
+    /// Publish the restored owner state before starting the Registry writer.
+    /// Subscribers must be connected first. This is not a database write or a
+    /// second admission policy; restore() has already computed every decision.
+    pub fn publish_bootstrap(&self,output:&broadcast::Sender<Arc<PoolUpdateBatch>>)->Result<usize> {
+        let pools:Vec<_>={
+            let entries=self.entries.read().expect("pool registry lock poisoned");
+            entries.values().filter(|p|p.completion_state==CompletionState::Prepared)
+                .cloned().collect()
+        };
+        let prepared=pools.len();
+        let admitted=pools.iter().filter(|p|p.completion_admission.is_admitted()).count();
+        let references=reference_mints();
+        let conversion=pools.iter().filter(|p|p.completion_admission.is_admitted()
+            && matches!((p.mint_a,p.mint_b),(Some(a),Some(b))
+                if a!=b && references.contains(&a) && references.contains(&b))).count();
+        if !pools.is_empty() {
+            output.send(Arc::new(PoolUpdateBatch{kind:PoolUpdateKind::Source,
+                source:"registry_bootstrap",received_at_ms:now_unix_ms()?,pools,
+                persist_identity:Vec::new()}))
+                .map_err(|_|anyhow::anyhow!("Registry bootstrap has no subscriber"))?;
+        }
+        crate::log_event!(Info,"pool registry bootstrap prepared={prepared} admitted={admitted} conversion_pools={conversion} source=restored_registry");
+        Ok(prepared)
+    }
+
     /// Re-evaluate canonical TVL even when no new REST/DexScreener event arrives.
     /// Historical last_observation stays intact; expired quotes never masquerade
     /// as current liquidity. Called only by the Registry's single writer.

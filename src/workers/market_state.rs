@@ -1481,14 +1481,15 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     }
     // JoinSet drops/cancels the one preparation job. No detached HTTP initializer.
     drop(jobs);
-    crate::log_event!(Info,"market state hydration final selected={} prepared={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={} live_index_rebuilds={} structure_installs={} baseline_installs={} baseline_pools_installed={} watch_plans={}",
-        selected.len(),engine.pools.len(),engine.pools.iter().filter(|p|p.ready&&p.available).count(),
+    crate::log_event!(Info,"market state hydration final selected={} hydrated={} ready={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={} live_index_rebuilds={} structure_installs={} baseline_installs={} baseline_pools_installed={} watch_plans={}",
+        selected.len(),engine.pools.len(),engine.pools.iter().filter(|p|p.ready).count(),engine.pools.iter().filter(|p|p.ready&&p.available).count(),
         engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
         engine.metrics.max_hydration_in_flight,engine.metrics.hydration_failures,
         engine.metrics.index_rebuilds,engine.metrics.structure_installs,engine.metrics.baseline_installs,
         engine.metrics.baseline_pools_installed,engine.metrics.watch_plan.count);
     let selected_pools=selected.len();
     let hydrated_pools=engine.pools.len();
+    let ready_pools=engine.pools.iter().filter(|p|p.ready).count();
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
     for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true events={} observations={} websocket={} lost={}",
@@ -1497,7 +1498,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
         observations:engine.metrics.baseline_prices+engine.metrics.websocket_prices,
         websocket_observations:engine.metrics.websocket_prices,
         post_rewatch_websocket_observations:engine.metrics.post_rewatch_websocket_observations,
-        selected_pools,hydrated_pools,priced_pools,metrics:engine.metrics})
+        selected_pools,hydrated_pools,ready_pools,priced_pools,metrics:engine.metrics})
 }
 
 /// Counters and timings from the state owner; no diagnostic price mirror.
@@ -1505,7 +1506,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
 pub struct ProductionReport {
     pub events:u64,pub observations:u64,pub websocket_observations:u64,
     pub post_rewatch_websocket_observations:u64,
-    selected_pools:usize,hydrated_pools:usize,priced_pools:usize,metrics:Metrics,
+    selected_pools:usize,hydrated_pools:usize,ready_pools:usize,priced_pools:usize,metrics:Metrics,
 }
 impl ProductionReport {
     pub fn ensure_delivery_evidence(&self)->Result<()> {
