@@ -58,6 +58,60 @@ fn tvl(pool: &Value) -> Option<f64> {
     let v = raw.as_f64().or_else(||raw.as_str()?.parse::<f64>().ok())?;
     (v.is_finite() && v >= 0.0).then_some(v)
 }
+fn configuration(payload: &Value, venue: Venue) -> Option<crate::core::PoolConfigUpdate> {
+    let mapping: &[(&str, &str)] = match venue {
+        Venue::RaydiumAmmV4 => &[
+            ("/feeRate", "fee.rate_raw"),
+            ("/feeOn", "fee.on"),
+            ("/hasDynamicFee", "fee.dynamic_enabled"),
+            ("/marketId", "market_id"),
+        ],
+        Venue::RaydiumClmm => &[
+            ("/feeRate", "fee.rate_raw"),
+            ("/feeOn", "fee.on"),
+            ("/hasDynamicFee", "fee.dynamic_enabled"),
+            ("/config/id", "config_account"),
+            ("/config/tickSpacing", "tick_spacing"),
+            ("/config/tradeFeeRate", "fee.trade_rate_raw"),
+            ("/config/protocolFeeRate", "fee.protocol_rate_raw"),
+            ("/config/fundFeeRate", "fee.fund_rate_raw"),
+        ],
+        Venue::RaydiumCpmm => &[
+            ("/feeRate", "fee.rate_raw"),
+            ("/feeOn", "fee.on"),
+            ("/hasDynamicFee", "fee.dynamic_enabled"),
+            ("/config/id", "config_account"),
+            ("/config/tradeFeeRate", "fee.trade_rate_raw"),
+            ("/config/protocolFeeRate", "fee.protocol_rate_raw"),
+            ("/config/fundFeeRate", "fee.fund_rate_raw"),
+            ("/config/creatorFeeRate", "fee.creator_rate_raw"),
+        ],
+        Venue::RaydiumStable => &[
+            ("/feeRate", "fee.rate_raw"),
+            ("/feeOn", "fee.on"),
+            ("/hasDynamicFee", "fee.dynamic_enabled"),
+            ("/marketId", "market_id"),
+        ],
+        _ => return None,
+    };
+    let mut values = serde_json::Map::new();
+    for &(path, name) in mapping {
+        if let Some(value) = payload.pointer(path)
+            .filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
+            values.insert(name.to_owned(), value.clone());
+        }
+    }
+    if values.is_empty() { return None; }
+    let observation = values.keys().any(|k| k.starts_with("fee.snapshot_")).then_some(
+        crate::core::ConfigObservation { value_prefix: "fee.snapshot_", timestamp_key: "fee.snapshot_at_ms" });
+    Some(crate::core::PoolConfigUpdate {
+        values,
+        remove_prefixes: &[],
+        remove_keys: &[],
+        observation,
+    })
+}
+
 fn decode(payload: Value) -> Result<DataRecord> {
     let program = payload.get("programId").and_then(Value::as_str)
         .context("Raydium programId missing")?;
@@ -76,6 +130,7 @@ fn decode(payload: Value) -> Result<DataRecord> {
         identity: RecordIdentity::Pool { address, venue,
             mint_a: Some(mint_a), mint_b: Some(mint_b) },
         tvl_usd: tvl(&payload),
+        config: configuration(&payload, venue),
         payload,
     })
 }
@@ -323,26 +378,15 @@ async fn refresh_head(
     client: reqwest::Client, gate: Arc<Mutex<Instant>>, spacing: Duration,
     output: broadcast::Sender<Arc<DataBatch>>, interval: Duration,
     sort: &'static str, direction: &'static str,
-) {
+) -> Result<()> {
     loop {
         sleep(interval).await;
         let started = Instant::now();
-        match fetch_page(&client, &gate, spacing, sort, direction, None).await {
-            Ok(page) => match publish(&output, page.data, sort, direction) {
-                Ok(decoded) => crate::log_event!(Debug,
-                    "raydium head_refresh sort={sort} direction={direction} received={} accepted={} rejected={} elapsed_ms={}",
-                    decoded.received, decoded.accepted, decoded.rejected,
-                    started.elapsed().as_millis(),
-                ),
-                Err(error) => {
-                    crate::log_event!(Warn,"raydium head_refresh_stopped sort={sort} direction={direction} error={error:#}");
-                    return;
-                }
-            },
-            Err(error) => {
-                crate::log_event!(Warn,"raydium head_refresh_failed sort={sort} direction={direction} error={error:#}");
-            }
-        }
+        let page=fetch_page(&client,&gate,spacing,sort,direction,None).await?;
+        let decoded=publish(&output,page.data,sort,direction)?;
+        crate::log_event!(Debug,
+            "raydium head_refresh sort={sort} direction={direction} received={} accepted={} rejected={} elapsed_ms={}",
+            decoded.received,decoded.accepted,decoded.rejected,started.elapsed().as_millis());
     }
 }
 
@@ -363,7 +407,7 @@ pub async fn run(
     // Owned tasks: cancelling discovery must also stop every head refresh and
     // release its source sender so Registry and persistence can finish draining.
     let mut refresh_tasks = JoinSet::new();
-    for (sort, direction) in ROUTES {
+    for (sort, direction) in ROUTES.into_iter().filter(|_|!settings.once) {
         refresh_tasks.spawn(refresh_head(
             client.clone(), gate.clone(), spacing, output.clone(),
             Duration::from_secs(refresh_seconds), sort, direction,
@@ -375,39 +419,23 @@ pub async fn run(
         let client = client.clone();
         let gate = gate.clone();
         let output = output.clone();
-        tasks.spawn(async move {
-            let result = ordinary_lane(client, gate, spacing, output, settings, sort, direction).await;
-            if !settings.once {
-                if let Err(error) = &result {
-                    crate::log_event!(Warn,"raydium route_stopped sort={sort} direction={direction} error={error:#}");
-                }
-                Ok(())
-            } else { result }
-        });
+        tasks.spawn(ordinary_lane(client,gate,spacing,output,settings,sort,direction));
     }
-    tasks.spawn(async move {
-        let result = liquidity_pair(client, gate, spacing, output, settings).await;
-        if !settings.once {
-            if let Err(error) = &result {
-                crate::log_event!(Warn,"raydium liquidity_pair_stopped error={error:#}");
-            }
-            Ok(())
-        } else { result }
-    });
-    let mut first_error = None;
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(Ok(())) => {},
-            Ok(Err(error)) => { if first_error.is_none() { first_error = Some(error); } },
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(anyhow!("Raydium route task panicked: {error}"));
-                }
-            }
+    tasks.spawn(liquidity_pair(client,gate,spacing,output,settings));
+    while !tasks.is_empty() {
+        tokio::select! {
+            joined=tasks.join_next()=>{
+                joined.context("missing Raydium route task")?
+                    .context("Raydium route task panicked")??;
+            },
+            joined=refresh_tasks.join_next(),if !refresh_tasks.is_empty()=>{
+                joined.context("missing Raydium head task")?
+                    .context("Raydium head task panicked")??;
+                bail!("Raydium head refresh ended unexpectedly");
+            },
         }
     }
     refresh_tasks.shutdown().await;
-    if let Some(error) = first_error { return Err(error); }
     if !settings.once { bail!("all Raydium API routes stopped"); }
     Ok(())
 }

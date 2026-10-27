@@ -1,5 +1,5 @@
 //! Production task supervision and wiring. No DEX logic in the orchestrator.
-use crate::workers::discovery::{meteora_dlmm as discovery_meteora_dlmm, meteora_damm_v2 as discovery_meteora_damm_v2, raydium as discovery_raydium, orca_whirlpool as discovery_orca_whirlpool, pancakeswap_clmm as discovery_pancakeswap_clmm, byreal_clmm as discovery_byreal_clmm, manifest as discovery_manifest, pumpswap as discovery_pumpswap, rpc_full as discovery_rpc_full, identity_hydration as identity_hydration_venues};
+use crate::workers::discovery::identity_hydration as identity_hydration_venues;
 use std::{env, future::Future, io::{self, BufRead}, sync::{Arc,Mutex}, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
@@ -11,9 +11,9 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         completion_pumpswap, execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
         graph_signals, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint, execution_v10}};
-use super::{jupiter_settings,v10_simulation::ExecutionTasks};
+use super::{discovery,jupiter_settings,v10_simulation::ExecutionTasks};
 
-struct AbortOnDrop<T>(JoinHandle<T>);
+pub(super) struct AbortOnDrop<T>(pub(super) JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {fn drop(&mut self) {self.0.abort();}}
 
 fn number(key:&str,default:u64)->Result<u64>{
@@ -46,7 +46,7 @@ where F:Future<Output=Result<()>>+Send+'static {
         result
     });
 }
-async fn supervise<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
+pub(super) async fn supervise<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     let mut failures=0_u32;
     crate::log_event!(Info,"runtime worker={name} policy=restart started=true");
@@ -83,33 +83,6 @@ where F:Future<Output=Result<()>> {
         result=run=>result,
         _=stop.changed()=>Ok(()),
     }
-}
-async fn once<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factory:F)->Result<()>
-where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
-    crate::log_event!(Info,"runtime worker={name} policy=once started=true");
-    for attempt in 1..=3 {
-        let mut task=AbortOnDrop(tokio::spawn(factory()));
-        let result=tokio::select!{
-            result=&mut task.0=>result,
-            _=stop.changed()=>{task.0.abort();let _=(&mut task.0).await;return Ok(());}
-        };
-        match result{
-            Ok(Ok(()))=>{
-                crate::log_event!(Info,"runtime worker={name} complete=true attempts={attempt}");
-                let _=stop.changed().await;return Ok(());
-            }
-            other=>crate::log_event!(Warn,"runtime worker={name} attempt={attempt} error={other:?}"),
-        }
-        if attempt<3 {
-            tokio::select!{
-                _=tokio::time::sleep(Duration::from_secs(10*attempt))=>{},
-                _=stop.changed()=>return Ok(()),
-            }
-        }
-    }
-    crate::log_event!(Warn,"runtime worker={name} degraded=true");
-    let _=stop.changed().await;
-    Ok(())
 }
 /// Wiring shared by production, the finite protocol mode and the CP2 live run.
 /// Protocol code and scheduling stay in their respective workers.
@@ -286,74 +259,18 @@ pub async fn completion_lifecycle_live()->Result<()> {
                 jupiter_rx,qualified_tx,target_tx,None,None,None,None)));
         let _keep_jupiter_sender=jupiter_out;
     }
-    if configured.pumpswap.is_some() {
-        critical(&mut tasks,"discovery.pumpswap_rolling",until_stop(stop_rx.clone(),
-            discovery_pumpswap::run(rpc.clone(),sources.clone(),
-                discovery_pumpswap::Settings::from_env(false,None)?)));
-        crate::log_event!(Info,"lifecycle live enrichment=cp1 rolling_discovery=true wallet_bound=true");
-    }
-    if configured.manifest.is_some() {
-        let client=client.clone();let publisher=sources.clone();
-        tasks.spawn(supervise("discovery.manifest",stop_rx.clone(),move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_manifest::run(client,output,
-                discovery_manifest::Settings{once:false}).await}
-        }));
-    }
-    if configured.dlmm.is_some() {
-        let client=client.clone();let publisher=sources.clone();
-        tasks.spawn(supervise("discovery.meteora_dlmm",stop_rx.clone(),move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_meteora_dlmm::run(client,output,
-                discovery_meteora_dlmm::Settings{once:false,max_pages:None}).await}
-        }));
-    }
-    if configured.damm_v2.is_some() {
-        let client=client.clone();
-        let publisher=sources.clone();
-        tasks.spawn(supervise("discovery.meteora_damm_v2",stop_rx.clone(),move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_meteora_damm_v2::run(client,output,
-                discovery_meteora_damm_v2::Settings{once:false,max_pages:None}).await}
-        }));
-    }
-    if configured.orca.is_some() {
-        let client=client.clone();let publisher=sources.clone();
-        let rps=u32::try_from(number("ORCA_API_RPS",10)?)?;
-        tasks.spawn(supervise("discovery.orca_whirlpool",stop_rx.clone(),move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_orca_whirlpool::run(client,output,
-                discovery_orca_whirlpool::Settings{once:false,max_pages:None,rps}).await}
-        }));
-    }
-    if configured.pancakeswap_clmm.is_some() {
-        let client=client.clone();let publisher=sources.clone();
-        let rpm=u32::try_from(number("PANCAKESWAP_API_RPM",57)?)?;
-        tasks.spawn(supervise("discovery.pancakeswap_clmm",stop_rx.clone(),move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_pancakeswap_clmm::run(client,output,
-                discovery_pancakeswap_clmm::Settings{once:false,max_pages:None,rpm}).await}
-        }));
-    }
-    if configured.byreal_clmm.is_some() {
-        let client=client.clone();let publisher=sources.clone();
-        let rpm=u32::try_from(number("BYREAL_API_RPM",57)?)?;
-        tasks.spawn(supervise("discovery.byreal_clmm",stop_rx.clone(),move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_byreal_clmm::run(client,output,
-                discovery_byreal_clmm::Settings{once:false,max_pages:None,rpm}).await}
-        }));
-    }
-    if configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()
-        ||configured.raydium_clmm.is_some() {
-        let publisher=sources.clone();
-        let rps=u32::try_from(number("RAYDIUM_API_RPS",10)?)?;
-        tasks.spawn(supervise("discovery.raydium",stop_rx,move||{
-            let client=client.clone();let output=publisher.clone();
-            async move{discovery_raydium::run(client,output,
-                discovery_raydium::Settings{once:false,max_pages:None,rps}).await}
-        }));
-    }
+    let mut discovery_workers=Vec::new();
+    if configured.pumpswap.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::PumpSwap,false,None)?); }
+    if configured.manifest.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Manifest,false,None)?); }
+    if configured.dlmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Dlmm,false,None)?); }
+    if configured.damm_v2.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::DammV2,false,None)?); }
+    if configured.orca.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Orca,false,None)?); }
+    if configured.pancakeswap_clmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::PancakeSwap,false,None)?); }
+    if configured.byreal_clmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Byreal,false,None)?); }
+    if configured.raydium_amm_v4.is_some()||configured.raydium_cpmm.is_some()||configured.raydium_clmm.is_some() { discovery_workers.extend(discovery::configured(discovery::SourceSet::Raydium,false,None)?); }
+    discovery::spawn_continuous(&mut tasks,discovery_workers,discovery::Resources {
+        http:client,rpc:Some(rpc.clone()),output:sources.clone(),stop:stop_rx,
+    });
     drop(sources);
     critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
     drop(updates);drop(rpc);
@@ -619,7 +536,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         crate::log_event!(Info,
             "multi venue hydration standalone restored={} requested={}",
             restored_count,venue_hydration_seed.len());
-        let result=identity_hydration_venues::run(venue_hydration_seed,hydrate_rx,
+        let result=discovery::hydrate(venue_hydration_seed,hydrate_rx,
             rpc.clone(),source.clone(),venue_hydration_settings,true).await;
         drop(source);
         drop(updates);
@@ -826,85 +743,22 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
             raydium_clmm:Some(completion_raydium_clmm::Settings::from_env()?),
         },false,0)?;
     drop(completions);
-    // Single continuous hydration consumer for every venue, including PumpSwap.
-    let venue_hydrate_registry=registry.clone();
-    let venue_hydrate_updates=updates.clone();
-    let venue_hydrate_source=source.clone();
-    let venue_hydrate_rpc=rpc.clone();
-    let mut first_venue_seed=Some(venue_hydration_seed);
-    let mut first_venue_rx=Some(updates.subscribe());
-    tasks.spawn(supervise("identity_hydration.venues",stop_rx.clone(),move||{
-        let seed=first_venue_seed.take().unwrap_or_else(||{
-            venue_hydrate_registry.snapshot().into_iter()
-                .filter(|p|p.mint_a.is_none() || p.mint_b.is_none())
-                .map(|p|(p.address,p.venue)).collect()
-        });
-        let live=first_venue_rx.take()
-            .unwrap_or_else(||venue_hydrate_updates.subscribe());
-        let output=venue_hydrate_source.clone();
-        let rpc=venue_hydrate_rpc.clone();
-        async move{
-            identity_hydration_venues::run(seed,live,rpc,output,
-                venue_hydration_settings,false).await
-        }
-    }));
-    crate::log_event!(Info,"runtime ready=true workers_completion=10 v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
-
-    // Keep REST source ownership and retry entirely outside the protocol workers.
-    macro_rules! rest{
-        ($module:ident,$label:literal,$config:expr)=>{
-            {
-                let client=http.clone();let tx=source.clone();
-                tasks.spawn(supervise($label,stop_rx.clone(),move||{
-                    let settings=$config;let client=client.clone();let tx=tx.clone();
-                    async move{$module::run(client,tx,settings).await}
-                }));
-            }
-        };
-    }
-    let raydium_rps=u32::try_from(number("RAYDIUM_API_RPS",10)?)?;
-    let orca_rps=u32::try_from(number("ORCA_API_RPS",10)?)?;
-    let pancake_rpm=u32::try_from(number("PANCAKESWAP_API_RPM",57)?)?;
-    let byreal_rpm=u32::try_from(number("BYREAL_API_RPM",57)?)?;
-    rest!(discovery_meteora_dlmm,"discovery.meteora_dlmm",
-        discovery_meteora_dlmm::Settings{once:false,max_pages:None});
-    rest!(discovery_meteora_damm_v2,"discovery.meteora_damm_v2",
-        discovery_meteora_damm_v2::Settings{once:false,max_pages:None});
-    rest!(discovery_raydium,"discovery.raydium",
-        discovery_raydium::Settings{once:false,max_pages:None,rps:raydium_rps});
-    rest!(discovery_orca_whirlpool,"discovery.orca_whirlpool",
-        discovery_orca_whirlpool::Settings{once:false,max_pages:None,rps:orca_rps});
-    rest!(discovery_pancakeswap_clmm,"discovery.pancakeswap_clmm",
-        discovery_pancakeswap_clmm::Settings{once:false,max_pages:None,rpm:pancake_rpm});
-    rest!(discovery_byreal_clmm,"discovery.byreal_clmm",
-        discovery_byreal_clmm::Settings{once:false,max_pages:None,rpm:byreal_rpm});
-    rest!(discovery_manifest,"discovery.manifest",discovery_manifest::Settings{once:false});
-    let rolling=discovery_pumpswap::Settings::from_env(false,None)?;
-    use rpc_transport::{RpcOperation,AccountView};
-    // Check generic transport capabilities only. The PumpSwap worker itself
-    // owns the program ID, discriminator, slice and pagination contract.
-    let supported=rpc.supports(&RpcOperation::ProgramV2{
-        program:solana_pubkey::Pubkey::default(),filters:Vec::new(),
-        view:AccountView::Full,cursor:None,changed_since_slot:Some(1),limit:1
-    }) && rpc.supports(&RpcOperation::Slot{commitment:"finalized".into()});
-    if supported{
-        let client=rpc.clone();let tx=source.clone();
-        tasks.spawn(supervise("discovery.pumpswap_rolling",stop_rx.clone(),move||{
-            let client=client.clone();let tx=tx.clone();
-            let settings=rolling.clone();
-            async move{discovery_pumpswap::run(client,tx,settings).await}
-        }));
+    let discovery_resources=discovery::Resources {
+        http,rpc:Some(rpc.clone()),output:source.clone(),stop:stop_rx.clone(),
+    };
+    discovery::spawn_hydration(&mut tasks,registry.clone(),updates.clone(),
+        discovery_resources.clone(),venue_hydration_settings,venue_hydration_seed)?;
+    discovery::spawn_continuous(&mut tasks,
+        discovery::configured(discovery::SourceSet::All,false,None)?,discovery_resources.clone());
+    if discovery::pump_supported(&rpc) {
+        discovery::spawn_continuous(&mut tasks,
+            discovery::configured(discovery::SourceSet::PumpSwap,false,None)?,discovery_resources.clone());
     }else{
         crate::log_event!(Info,"runtime worker=discovery.pumpswap_rolling enabled=false missing_rpc_v2_or_slot=true");
     }
-    if full_scan{
-        let settings=discovery_rpc_full::Settings::from_env()?;
-        let tx=source.clone();
-        tasks.spawn(once("discovery.rpc_full",stop_rx.clone(),move||{
-            let tx=tx.clone();let settings=settings.clone();
-            async move{discovery_rpc_full::run(tx,settings).await}
-        }));
-    }
+    if full_scan {discovery::spawn_bootstrap(&mut tasks,discovery_resources.clone())?;}
+    drop(discovery_resources);
+    crate::log_event!(Info,"runtime ready=true workers_completion=10 v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
     drop(jupiter_out);drop(source);drop(updates);drop(rpc);
 
     // Operator termination uses q + Enter; finite RUN_DURATION_SECONDS supports

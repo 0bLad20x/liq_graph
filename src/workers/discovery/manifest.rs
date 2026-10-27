@@ -44,6 +44,7 @@ fn decode(payload: Value) -> Result<DataRecord> {
         // The orderbook protocol's reported liquidity_in_usd is always 0,
         // not a meaningful TVL measurement. Preserve it only in payload.
         tvl_usd: None,
+        config: None,
         payload,
     })
 }

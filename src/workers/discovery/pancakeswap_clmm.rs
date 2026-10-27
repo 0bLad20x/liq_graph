@@ -50,6 +50,36 @@ fn tvl(pool: &Value) -> Option<f64> {
     (value.is_finite() && value >= 0.0).then_some(value)
 }
 
+fn configuration(payload: &Value) -> Option<crate::core::PoolConfigUpdate> {
+    let mapping: &[(&str, &str)] = &[
+            ("/feeRate", "fee.rate_raw"),
+            ("/config/id", "config_account"),
+            ("/config/tickSpacing", "tick_spacing"),
+            ("/config/tradeFeeRate", "fee.trade_rate_raw"),
+            ("/config/protocolFeeRate", "fee.protocol_rate_raw"),
+            ("/config/fundFeeRate", "fee.fund_rate_raw"),
+            ("/vault/A", "vault_a"),
+            ("/vault/B", "vault_b"),
+            ("/alt", "address_lookup_table"),
+        ];
+    let mut values = serde_json::Map::new();
+    for &(path, name) in mapping {
+        if let Some(value) = payload.pointer(path)
+            .filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
+            values.insert(name.to_owned(), value.clone());
+        }
+    }
+    if values.is_empty() { return None; }
+    let observation = values.keys().any(|k| k.starts_with("fee.snapshot_")).then_some(
+        crate::core::ConfigObservation { value_prefix: "fee.snapshot_", timestamp_key: "fee.snapshot_at_ms" });
+    Some(crate::core::PoolConfigUpdate {
+        values,
+        remove_prefixes: &[],
+        remove_keys: &[],
+        observation,
+    })
+}
+
 fn decode(payload: Value) -> Result<DataRecord> {
     ensure!(payload.get("programId").and_then(Value::as_str) == Some(PROGRAM),
         "not a PancakeSwap Solana CLMM pool");
@@ -65,6 +95,7 @@ fn decode(payload: Value) -> Result<DataRecord> {
             mint_b: Some(mint_b),
         },
         tvl_usd: tvl(&payload),
+        config: configuration(&payload),
         payload,
     })
 }

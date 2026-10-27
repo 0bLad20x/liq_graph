@@ -5,6 +5,8 @@ Persistence, CompletionLifecycle, Graph, WatchCatalog, MarketState, Signal Engin
 optionale V10-Simulation. Endliche und dauerhafte Läufe verwenden dieselbe Verkabelung.
 `RUN_DURATION_SECONDS=0` bedeutet Dauerbetrieb; `q` plus Enter stoppt kontrolliert.
 Worker bleiben über ihre vorhandenen CLI-Einstiege eigenständig ausführbar.
+Discovery-Module, gemeinsame Startverkabelung und begrenzte Einzelaufrufe beschreibt
+[DISCOVERY.md](DISCOVERY.md).
 
 ## Werkzeuge
 

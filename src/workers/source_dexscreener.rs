@@ -528,6 +528,7 @@ pub async fn run_live(
                         address:pool.address,venue:pool.venue,mint_a:pool.mint_a,mint_b:pool.mint_b,
                     },
                     tvl_usd:Some(tvl),
+                    config:None,
                     payload:json!({"dexId":pair.dex_id,"liquidityUsd":tvl,
                         "requestedMint":batch.requested_mint.to_string()}),
                 });

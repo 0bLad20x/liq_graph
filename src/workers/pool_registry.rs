@@ -117,195 +117,38 @@ fn record_tvl(quotes:&mut HashMap<Pubkey,PoolQuotes>,address:Pubkey,
 
 /// Extract only protocol-specific, fee-relevant fields observed in the CP4
 /// Discovery payload audit. Keep the original scalar values and units; do not
-/// flatten the entire REST document or confuse fee revenue with swap fee rates.
-/// Dynamic API values are historical snapshots, never live execution quotes.
-fn pool_metadata(
-    payload: &Value, source: &str, venue: Venue, received_at_ms: u64,
-) -> Option<Arc<Value>> {
-    // A discovery source must match the decoded venue. Identity hydration,
-    // DexScreener and TVL refreshes must not overwrite protocol configuration.
-    let mapping: &[(&str, &str)] = match (source, venue) {
-        ("meteora_dlmm_api", Venue::MeteoraDlmm) => &[
-            ("/pool_config/bin_step", "bin_step"),
-            ("/pool_config/base_fee_pct", "fee.base_pct"),
-            ("/pool_config/max_fee_pct", "fee.max_pct"),
-            ("/pool_config/protocol_fee_pct", "fee.protocol_pct"),
-            ("/pool_config/collect_fee_mode", "fee.collect_mode"),
-            ("/reserve_x", "vault_x"),
-            ("/reserve_y", "vault_y"),
-            ("/dynamic_fee_pct", "fee.snapshot_dynamic_pct"),
-        ],
-        ("meteora_damm_v2_api", Venue::MeteoraDammV2) => &[
-            ("/pool_config/base_fee_pct", "fee.base_pct"),
-            ("/pool_config/base_fee_mode", "fee.base_mode"),
-            ("/pool_config/protocol_fee_pct", "fee.protocol_pct"),
-            ("/pool_config/partner_fee_pct", "fee.partner_pct"),
-            ("/pool_config/referral_fee_pct", "fee.referral_pct"),
-            ("/pool_config/compounding_fee_pct", "fee.compounding_pct"),
-            ("/pool_config/collect_fee_mode", "fee.collect_mode"),
-            ("/pool_config/dynamic_fee_initialized", "fee.dynamic_initialized"),
-            ("/pool_config/has_fee_scheduler", "fee.has_scheduler"),
-            ("/pool_config/is_fee_scheduler_active", "fee.snapshot_scheduler_active"),
-            ("/pool_config/pool_type", "pool_type"),
-            ("/pool_config/concentrated_liquidity", "concentrated_liquidity"),
-            ("/pool_config/min_price", "min_price"),
-            ("/pool_config/max_price", "max_price"),
-            ("/pool_config/activation_type", "activation_type"),
-            ("/pool_config/activation_point", "activation_point"),
-            ("/vault_x", "vault_x"),
-            ("/vault_y", "vault_y"),
-            ("/alpha_vault", "alpha_vault"),
-        ],
-        ("orca_whirlpool_api", Venue::OrcaWhirlpool) => &[
-            ("/feeRate", "fee.rate_raw"),
-            ("/protocolFeeRate", "fee.protocol_rate_raw"),
-            ("/tickSpacing", "tick_spacing"),
-            ("/feeTierIndex", "fee_tier_index"),
-            ("/whirlpoolsConfig", "config_account"),
-            ("/tokenVaultA", "vault_a"),
-            ("/tokenVaultB", "vault_b"),
-            ("/addressLookupTable", "address_lookup_table"),
-            ("/adaptiveFeeEnabled", "fee.adaptive_enabled"),
-            ("/adaptiveFee/constants/adaptiveFeeControlFactor", "fee.adaptive.control_factor"),
-            ("/adaptiveFee/constants/decayPeriod", "fee.adaptive.decay_period"),
-            ("/adaptiveFee/constants/filterPeriod", "fee.adaptive.filter_period"),
-            ("/adaptiveFee/constants/majorSwapThresholdTicks", "fee.adaptive.major_swap_threshold_ticks"),
-            ("/adaptiveFee/constants/maxVolatilityAccumulator", "fee.adaptive.max_volatility_accumulator"),
-            ("/adaptiveFee/constants/reductionFactor", "fee.adaptive.reduction_factor"),
-            ("/adaptiveFee/constants/tickGroupSize", "fee.adaptive.tick_group_size"),
-            ("/adaptiveFee/maxRate", "fee.adaptive.max_rate_raw"),
-            ("/adaptiveFee/currentRate", "fee.snapshot_adaptive_rate_raw"),
-            ("/adaptiveFee/variables/lastMajorSwapTimestamp", "fee.snapshot_adaptive_last_major_swap_timestamp"),
-            ("/adaptiveFee/variables/lastReferenceUpdateTimestamp", "fee.snapshot_adaptive_last_reference_update_timestamp"),
-            ("/adaptiveFee/variables/tickGroupIndexReference", "fee.snapshot_adaptive_tick_group_index_reference"),
-            ("/adaptiveFee/variables/volatilityAccumulator", "fee.snapshot_adaptive_volatility_accumulator"),
-            ("/adaptiveFee/variables/volatilityReference", "fee.snapshot_adaptive_volatility_reference"),
-        ],
-        ("raydium_api", Venue::RaydiumAmmV4) => &[
-            ("/feeRate", "fee.rate_raw"),
-            ("/feeOn", "fee.on"),
-            ("/hasDynamicFee", "fee.dynamic_enabled"),
-            ("/marketId", "market_id"),
-        ],
-        ("raydium_api", Venue::RaydiumClmm) => &[
-            ("/feeRate", "fee.rate_raw"),
-            ("/feeOn", "fee.on"),
-            ("/hasDynamicFee", "fee.dynamic_enabled"),
-            ("/config/id", "config_account"),
-            ("/config/tickSpacing", "tick_spacing"),
-            ("/config/tradeFeeRate", "fee.trade_rate_raw"),
-            ("/config/protocolFeeRate", "fee.protocol_rate_raw"),
-            ("/config/fundFeeRate", "fee.fund_rate_raw"),
-        ],
-        ("raydium_api", Venue::RaydiumCpmm) => &[
-            ("/feeRate", "fee.rate_raw"),
-            ("/feeOn", "fee.on"),
-            ("/hasDynamicFee", "fee.dynamic_enabled"),
-            ("/config/id", "config_account"),
-            ("/config/tradeFeeRate", "fee.trade_rate_raw"),
-            ("/config/protocolFeeRate", "fee.protocol_rate_raw"),
-            ("/config/fundFeeRate", "fee.fund_rate_raw"),
-            ("/config/creatorFeeRate", "fee.creator_rate_raw"),
-        ],
-        ("raydium_api", Venue::RaydiumStable) => &[
-            ("/feeRate", "fee.rate_raw"),
-            ("/feeOn", "fee.on"),
-            ("/hasDynamicFee", "fee.dynamic_enabled"),
-            ("/marketId", "market_id"),
-        ],
-        ("pancakeswap_api", Venue::PancakeSwapClmm) => &[
-            ("/feeRate", "fee.rate_raw"),
-            ("/config/id", "config_account"),
-            ("/config/tickSpacing", "tick_spacing"),
-            ("/config/tradeFeeRate", "fee.trade_rate_raw"),
-            ("/config/protocolFeeRate", "fee.protocol_rate_raw"),
-            ("/config/fundFeeRate", "fee.fund_rate_raw"),
-            ("/vault/A", "vault_a"),
-            ("/vault/B", "vault_b"),
-            ("/alt", "address_lookup_table"),
-        ],
-        ("byreal_api", Venue::ByrealClmm) => &[
-            ("/feeRate/fixFeeRate", "fee.fixed_rate_raw"),
-            ("/decayFeeFlag", "fee.decay_flag"),
-            ("/feeRate/decayFeeInitFeeRate", "fee.decay_initial_rate_raw"),
-            ("/feeRate/decayFeeDecreaseRate", "fee.decay_decrease_rate_raw"),
-            ("/feeRate/decayFeeDecreaseInterval", "fee.decay_decrease_interval_raw"),
-            ("/feeRate/decayFeeInUse", "fee.snapshot_decay_in_use_raw"),
-            ("/openTime", "open_time"),
-        ],
-        // Manifest tickers provide bid/ask prices but no pool fee config.
-        _ => return None,
-    };
-
-    let mut fields = serde_json::Map::new();
-    for &(path, name) in mapping {
-        if let Some(value) = payload.pointer(path)
-            .filter(|v| v.is_string() || v.is_number() || v.is_boolean())
-        {
-            fields.insert(name.to_owned(), value.clone());
+/// Merge a normalized source patch. The source owns field names and explicit
+/// removals; Registry owns ordering, provenance and persistence coalescing.
+fn combine_metadata(previous: Option<&Arc<Value>>, incoming: &crate::core::PoolConfigUpdate,
+    source: &str, received_at_ms: u64) -> Arc<Value> {
+    let old = previous.and_then(|v|v.as_object()).filter(|m|
+        m.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && m.get("source").and_then(Value::as_str) == Some(source));
+    let same_observation = incoming.observation.is_some_and(|group|old.is_some_and(|old|
+        incoming.values.iter().filter(|(k,_)|k.starts_with(group.value_prefix))
+            .all(|(k,v)|old.get(k)==Some(v))));
+    let recent_observation = incoming.observation.is_some_and(|group|old
+        .and_then(|m|m.get(group.timestamp_key)).and_then(Value::as_u64)
+        .is_some_and(|at|received_at_ms>=at && received_at_ms-at<TVL_PERSIST_INTERVAL_MS));
+    let removed = |key:&str|incoming.remove_keys.contains(&key)
+        || incoming.remove_prefixes.iter().any(|prefix|key.starts_with(prefix));
+    let removal_needed = old.is_some_and(|old|old.keys().any(|key|removed(key)));
+    if let Some(old) = old {
+        if !removal_needed && incoming.values.iter().all(|(k,v)|old.get(k)==Some(v))
+            && (incoming.observation.is_none() || same_observation && recent_observation) {
+            return Arc::clone(previous.expect("existing normalized configuration"));
         }
     }
-    if source == "orca_whirlpool_api" {
-        // Explicit null denotes absence of an adaptive fee state. A missing
-        // optional field on other venues must not clear a previously saved key.
-        if let Some(adaptive) = payload.get("adaptiveFee") {
-            fields.insert("fee.adaptive_available".into(), json!(adaptive.is_object()));
+    let mut merged = old.cloned().unwrap_or_default();
+    merged.retain(|key,_|!removed(key));
+    merged.extend(incoming.values.iter().map(|(k,v)|(k.clone(),v.clone())));
+    if let Some(group) = incoming.observation {
+        if !(same_observation && recent_observation) {
+            merged.insert(group.timestamp_key.into(),json!(received_at_ms));
         }
     }
-    if fields.is_empty() { return None; }
-    if fields.keys().any(|k| k.starts_with("fee.snapshot_")) {
-        fields.insert("fee.snapshot_at_ms".into(), json!(received_at_ms));
-    }
-    fields.insert("schema_version".into(), json!(1));
-    fields.insert("source".into(), json!(source));
-    Some(Arc::new(Value::Object(fields)))
-}
-
-/// A fresh partial REST response must not erase previously known optional
-/// fields. An old pre-CP5 config is replaced outright to remove bogus "fees"
-/// / unfiltered "config" objects from the previous generic extraction.
-/// Snapshot timestamps are refreshed at most once per TVL persistence interval
-/// for an unchanged observed value, avoiding a write on every poll.
-fn combine_metadata(
-    previous: Option<&Arc<Value>>, incoming: Arc<Value>, received_at_ms: u64,
-) -> Arc<Value> {
-    let Some(old) = previous.and_then(|v|v.as_object())
-        .filter(|m| m.get("schema_version").and_then(Value::as_u64) == Some(1))
-    else { return incoming; };
-    let Some(new) = incoming.as_object() else { return incoming; };
-    if old.get("source") != new.get("source") { return incoming; }
-
-    let same_snapshot = new.iter()
-        .filter(|(k,_)| k.starts_with("fee.snapshot_") && k.as_str() != "fee.snapshot_at_ms")
-        .all(|(k,v)| old.get(k) == Some(v));
-    let recent_snapshot = old.get("fee.snapshot_at_ms").and_then(Value::as_u64)
-        .is_some_and(|old_ms| received_at_ms >= old_ms
-            && received_at_ms - old_ms < TVL_PERSIST_INTERVAL_MS);
-    let clear_adaptive = new.get("fee.adaptive_available") == Some(&Value::Bool(false));
-    // The original merge removes these keys before inserting the incoming fields.
-    // Only reuse the old Arc when neither that removal nor any effective insert
-    // can alter the result (including the snapshot timestamp policy).
-    let removal_needed = clear_adaptive && old.keys().any(|k|
-        k.starts_with("fee.adaptive.") || k.starts_with("fee.snapshot_adaptive_")
-            || k == "fee.snapshot_at_ms");
-    if !removal_needed && new.iter().all(|(key,value)|
-        (key == "fee.snapshot_at_ms" && same_snapshot && recent_snapshot)
-            || old.get(key) == Some(value))
-    {
-        return Arc::clone(previous.expect("existing validated metadata"));
-    }
-
-    let mut merged = old.clone();
-    if clear_adaptive {
-        // Orca explicitly turned off / omitted the adaptive fee state.
-        merged.retain(|k,_| !k.starts_with("fee.adaptive.")
-            && !k.starts_with("fee.snapshot_adaptive_")
-            && k != "fee.snapshot_at_ms");
-    }
-    for (key, value) in new {
-        if key == "fee.snapshot_at_ms" && same_snapshot && recent_snapshot { continue; }
-        merged.insert(key.clone(), value.clone());
-    }
+    merged.insert("schema_version".into(),json!(1));
+    merged.insert("source".into(),json!(source));
     Arc::new(Value::Object(merged))
 }
 
@@ -536,7 +379,7 @@ impl PoolRegistry {
             let observed_tvl = record.tvl_usd.filter(|v|v.is_finite() && *v>=0.0);
             match entries.get_mut(address) {
                 None => {
-                    let metadata=pool_metadata(&record.payload,batch.source,*venue,batch.received_at_ms);
+                    let metadata=record.config.as_ref().filter(|_|native_source(*venue)==Some(batch.source));
                     admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
@@ -552,7 +395,7 @@ impl PoolRegistry {
                         tvl_usd: selected.map(|v|v.value),
                         completion_admission: CompletionAdmission::from_inputs(
                             *mint_a,*mint_b,None),
-                        pool_config: metadata.clone(),
+                        pool_config: metadata.map(|patch|combine_metadata(None,patch,batch.source,batch.received_at_ms)),
                         last_observation: selected.map(|v|Arc::new(json!({
                             "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,
                             "first_seen_ms":batch.received_at_ms
@@ -591,7 +434,7 @@ impl PoolRegistry {
                         crate::log_event!(Warn,"pool registry identity_conflict pool={address} source={}", batch.source);
                         continue;
                     }
-                    let metadata=pool_metadata(&record.payload,batch.source,*venue,batch.received_at_ms);
+                    let metadata=record.config.as_ref().filter(|_|native_source(*venue)==Some(batch.source));
                     admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
@@ -599,7 +442,7 @@ impl PoolRegistry {
                     let mut identity_changed = false;
                     let mut mint_identity_changed = false;
                     if let Some(config)=metadata {
-                        let config=combine_metadata(current.pool_config.as_ref(),config,batch.received_at_ms);
+                        let config=combine_metadata(current.pool_config.as_ref(),config,batch.source,batch.received_at_ms);
                         if current.pool_config.as_ref().is_some_and(|old|Arc::ptr_eq(old,&config)) {
                             stats.metadata_reused += 1;
                         }

@@ -77,7 +77,7 @@ fn decode(body: &[u8], requested: &[Pubkey]) -> Result<Decoded> {
         ensure!(allowed.contains(&mint),"Jupiter returned unrequested mint {mint}");
         if !seen.insert(mint) {continue;}
         records.push(DataRecord {
-            identity:RecordIdentity::Mint{address:mint},tvl_usd:None,payload,
+            identity:RecordIdentity::Mint{address:mint},tvl_usd:None,config:None,payload,
         });
     }
     let found=records.len();

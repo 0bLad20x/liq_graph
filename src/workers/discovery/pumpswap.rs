@@ -64,6 +64,7 @@ fn record(a:AccountData, program:Pubkey) -> Result<DataRecord> {
         identity:RecordIdentity::Pool {address:a.address,venue:Venue::PumpSwap,
             mint_a:Some(base),mint_b:Some(quote)},
         tvl_usd:None,
+        config: None,
         payload:json!({"kind":"pumpswap_pool_v1","base_mint":base.to_string(),
             "quote_mint":quote.to_string(),"data_offset":MINT_OFFSET,
             "data_bytes":MINT_LEN,"account_space":a.original_len}),
