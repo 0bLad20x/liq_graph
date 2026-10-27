@@ -10,7 +10,7 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         completion_pumpswap, discovery_meteora_dlmm, discovery_meteora_damm_v2,
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
-        diagnostic_source, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
+        execution_candidates, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
         identity_hydration_venues, graph_signals, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint, execution_v10}};
 use super::{jupiter_settings,v10_simulation::ExecutionTasks};
@@ -401,11 +401,8 @@ pub async fn cp1_live() -> Result<()> {
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx,
         None,None,None,None));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
-    // This isolated checkpoint must not start an unbounded full backfill.
-    let mut jupiter_settings=settings;
-    jupiter_settings.backfill_on_start=false;
     let jupiter=tokio::spawn(source_jupiter_mint::run_targeted(
-        core::http_client()?,jupiter_settings,target_rx,jupiter_out.clone()));
+        core::http_client()?,settings,target_rx,jupiter_out.clone()));
     let qualification_evidence=qualified_rx.clone();
     let dex=tokio::spawn(source_dexscreener::run_live(
         qualified_rx,registry.clone(),source.clone()));
@@ -444,7 +441,7 @@ fn ensure_duration(n:u64)->Result<()> {
 #[derive(Clone,Copy)]
 struct RunSettings {
     duration:u64,full_scan:bool,hydration_only:bool,
-    market:bool,signals:bool,simulate:bool,rewatch:bool,
+    market:bool,signals:bool,simulate:bool,rewatch:bool,signal_proof:bool,
 }
 impl RunSettings {
     fn from_env()->Result<Self> {
@@ -456,11 +453,16 @@ impl RunSettings {
             signals:enabled("GRAPH_SIGNALS_ENABLED")?,
             simulate:enabled("GRAPH_EXECUTION_SIMULATE")?,
             rewatch:enabled("RUN_REWATCH")?,
+            signal_proof:enabled("RUN_SIGNAL_PROOF")?,
         };
         anyhow::ensure!(!settings.signals || settings.market,
             "GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
         anyhow::ensure!(!settings.simulate || settings.signals,
             "GRAPH_EXECUTION_SIMULATE requires GRAPH_SIGNALS_ENABLED and MARKET_STATE_ENABLED");
+        anyhow::ensure!(!settings.signal_proof || (settings.signals && !settings.simulate),
+            "RUN_SIGNAL_PROOF requires signals without Execution; the actual Execution input validates simulation runs");
+        anyhow::ensure!(!settings.signals || settings.simulate || settings.signal_proof,
+            "signals require Execution or an explicitly enabled RUN_SIGNAL_PROOF consumer");
         anyhow::ensure!(!settings.rewatch || (settings.market && !settings.hydration_only
             && (30..=86400).contains(&settings.duration)),
             "RUN_REWATCH requires MarketState and a finite RUN_DURATION_SECONDS of 30..86400");
@@ -470,6 +472,8 @@ impl RunSettings {
         serde_json::json!({"pipeline":"runtime","duration_seconds":self.duration,
             "market_state_enabled":self.market,"signals_enabled":self.signals,
             "simulation_enabled":self.simulate,"rewatch":self.rewatch,
+            "signal_proof":self.signal_proof,
+            "diagnostic_consumers":usize::from(self.signal_proof || (self.market && !self.signals)),
             "completion_refresh_enabled":!self.hydration_only,"broadcasts":false})
     }
 }
@@ -487,7 +491,9 @@ pub fn plan()->Result<serde_json::Value> {
 // Completed worker outputs only. No second live state or processing algorithm.
 #[derive(Default)]
 struct RunEvidence {
-    market:Option<market_state::ObservationReport>,
+    market:Option<market_state::ProductionReport>,
+    market_consumer:Option<market_state::ObservationReport>,
+    candidates:Option<execution_candidates::Report>,
     production:Option<graph_signals::ProductionReport>,
     signals:Option<graph_signals::ObservationReport>,
     execution:serde_json::Value,
@@ -502,11 +508,21 @@ impl RunEvidence {
         if settings.signals {
             let market=self.market.as_ref().context("missing MarketState report")?;
             let production=self.production.as_ref().context("missing signal producer report")?;
-            let signals=self.signals.as_ref().context("missing signal consumer report")?;
-            production.ensure_input_delivery(market.observations,market.websocket_observations)?;
-            production.ensure_delivery(signals)?;
-            // Route readiness belongs to the optional graph/coverage proof.
-            // Correctly evaluating a live input with missing leg prices is valid dataflow.
+            production.ensure_input_delivery(market.events,market.observations,market.websocket_observations)?;
+            if settings.simulate {
+                let consumer=self.candidates.as_ref().context("missing actual ExecutionCandidates report")?;
+                consumer.ensure_complete()?;
+                production.ensure_execution_delivery(consumer.events,consumer.state_updates,
+                    consumer.candidate_batches,consumer.candidates,consumer.evaluations)?;
+            }else{
+                production.ensure_delivery(self.signals.as_ref().context("missing signal proof report")?)?;
+            }
+        }else if settings.market {
+            let source=self.market.as_ref().context("missing MarketState report")?;
+            let consumer=self.market_consumer.as_ref().context("missing standalone MarketState consumer report")?;
+            anyhow::ensure!((source.events,source.observations,source.websocket_observations)
+                ==(consumer.events,consumer.observations,consumer.websocket_observations),
+                "standalone MarketState output delivery counts differ");
         }
         if settings.simulate {
             anyhow::ensure!(self.execution["execution_handoff_observed"]==true,
@@ -612,8 +628,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
 
     let (stop_tx,stop_rx)=watch::channel(false);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(source_capacity);
-    let diagnostic_rx=source.subscribe();
-    let (updates,observe_rx)=broadcast::channel::<Arc<PoolUpdateBatch>>(registry_capacity);
+    let (updates,_)=broadcast::channel::<Arc<PoolUpdateBatch>>(registry_capacity);
     let (completions,completion_rx)=broadcast::channel::<Arc<CompletionResultBatch>>(256);
     let (source_done,done_rx)=watch::channel(false);
     let (graph_tx,graph_rx)=watch::channel(Arc::new(graph_liquidity::GraphSnapshot::default()));
@@ -622,7 +637,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     let mut tasks=JoinSet::<Result<()>>::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(completion_rx),
         registry.clone(),updates.clone(),source_done,true,Some(qualified_rx.clone())));
-    let (jupiter_out,jupiter_observer_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (jupiter_out,_)=broadcast::channel::<Arc<DataBatch>>(256);
     let (onchain_tx,onchain_rx)=tokio::sync::mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
     let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
     let (mint_revision_tx,mint_revision_rx)=watch::channel(0_u64);
@@ -645,7 +660,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
             if simulation_enabled {
                 let signer=execution_settings.context("missing validated V10 settings")?;
                 let mut execution=ExecutionTasks::start(
-                    signer,signals.subscribe(),registry.clone(),rpc.clone())?;
+                    signer,signal_rx,registry.clone(),rpc.clone())?;
                 let simulation_stop=stop_rx.clone();
                 let execution_evidence=evidence.clone();
                 critical(&mut tasks,"v10.simulation",async move {
@@ -664,11 +679,26 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
                         requests,evidence["simulation_successes"],evidence["simulation_failures"],
                         evidence["simulation_dex_calls_observed"],evidence["execution_handoff_observed"],
                         evidence["execution_integration_passed"]);
-                    execution_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.execution=evidence;
+                    let mut completed=execution_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?;
+                    completed.execution=evidence;
+                    completed.candidates=Some(result?);
+                    Ok(())
+                });
+            }
+            else if settings.signal_proof {
+                let consumer_evidence=evidence.clone();
+                critical(&mut tasks,"proof.graph_signals",async move {
+                    let report=graph_signals::observe(signal_rx,cfg).await?;
+                    if let Ok(path)=env::var("GRAPH_RUNTIME_SIGNAL_REPORT_PATH") {
+                        std::fs::write(path,serde_json::to_vec_pretty(&report)?)
+                            .context("write signal proof report")?;
+                    }
+                    let result=report.ensure_integrity();
+                    consumer_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.signals=Some(report);
                     result
                 });
             }
-            let signal_input=prices.subscribe(); let signal_catalog=graph_rx.clone();
+            let signal_input=price_rx;let signal_catalog=graph_rx.clone();
             let production_evidence=evidence.clone();
             critical(&mut tasks,"graph_signals",async move {
                 let report=crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?;
@@ -680,33 +710,26 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
                 production_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.production=Some(report);
                 result
             });
+        }else{
             let consumer_evidence=evidence.clone();
-            critical(&mut tasks,"graph_signals.consumer",async move {
-                let report=crate::workers::graph_signals::observe(signal_rx,cfg).await?;
-                if let Ok(path)=env::var("GRAPH_RUNTIME_SIGNAL_REPORT_PATH") {
-                    std::fs::write(path,serde_json::to_vec_pretty(&report)?)
-                        .context("write factorized consumer report")?;
-                }
-                if report.has_delivery_loss() {
-                    crate::log_event!(Warn,"runtime signal delivery_loss=true consumer_verification_incomplete=true calculation_not_invalidated=true");
-                }
-                let result=report.ensure_complete();
-                consumer_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.signals=Some(report);
-                result
+            critical(&mut tasks,"proof.market_state",async move {
+                let report=market_state::observe(price_rx).await?;
+                consumer_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.market_consumer=Some(report);
+                Ok(())
             });
         }
         let (account_control,account_events)=rpc.account_stream();
-        critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),
-            rpc.clone(),account_control,account_events,prices,market_settings,
-            catalog_rx.clone(),mint_reader,mint_revision_rx,selected_mints_tx,
-            stop_rx.clone(),enabled_rx));
-        let market_catalog=catalog_rx.clone();
         let market_evidence=evidence.clone();
-        critical(&mut tasks,"market_state.consumer",async move {
-            let report=market_state::observe(price_rx,market_catalog,market_settings.trace).await?;
+        let market_registry=registry.clone();let market_updates=updates.subscribe();
+        let market_rpc=rpc.clone();let market_catalog=catalog_rx.clone();let market_stop=stop_rx.clone();
+        critical(&mut tasks,"market_state",async move {
+            let report=market_state::run(market_registry,market_updates,
+                market_rpc,account_control,account_events,prices,market_settings,
+                market_catalog,mint_reader,mint_revision_rx,selected_mints_tx,
+                market_stop,enabled_rx).await?;
             if let Ok(path)=env::var("RUN_MARKET_REPORT_PATH") {
                 std::fs::write(path,serde_json::to_vec_pretty(&report)?)
-                    .context("write runtime MarketState report")?;
+                    .context("write MarketState owner report")?;
             }
             market_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.market=Some(report);
             Ok(())
@@ -731,11 +754,6 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         }));
     }
     let _market_control=market_control;
-    // Observers must not take down the state-owning runtime on diagnostic lag.
-    tasks.spawn(supervise("observer.graph_watch_catalog",stop_rx.clone(),move||{
-        let input=catalog_rx.clone();
-        async move{graph_watch_catalog::observe(input).await}
-    }));
     let cp1=enabled("CP1_MARKET_ENRICHMENT_ENABLED")?;
     // Economic Mint Registry owns qualification even without online Jupiter
     // credentials: bootstrapped persisted states still populate this channel.
@@ -744,13 +762,6 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),
         qualified_tx,target_tx,Some(onchain_rx),Some(onchain_persist),Some(mint_revision_tx),Some(stop_rx.clone())));
     if jupiter_settings()?.is_some() {
-        let observer_sender=jupiter_out.clone();
-        let mut first_jupiter_observer=Some(jupiter_observer_rx);
-        tasks.spawn(supervise("observer.source_jupiter_mint",stop_rx.clone(),move||{
-            let input=first_jupiter_observer.take()
-                .unwrap_or_else(||observer_sender.subscribe());
-            async move{diagnostic_source::run(input,true).await}
-        }));
         let client=http.clone();
         let jupiter_publisher=jupiter_out.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
@@ -772,20 +783,6 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
             async move{source_dexscreener::run_live(selection,reg,publisher).await}
         }));
     }
-    let diagnostic_sender=source.clone();
-    let mut first_discovery_observer=Some(diagnostic_rx);
-    tasks.spawn(supervise("observer.discovery_batches",stop_rx.clone(),move||{
-        let input=first_discovery_observer.take()
-            .unwrap_or_else(||diagnostic_sender.subscribe());
-        async move{diagnostic_source::run(input,true).await}
-    }));
-    let registry_observer_sender=updates.clone();
-    let mut first_registry_observer=Some(observe_rx);
-    tasks.spawn(supervise("observer.registry_updates",stop_rx.clone(),move||{
-        let input=first_registry_observer.take()
-            .unwrap_or_else(||registry_observer_sender.subscribe());
-        async move{pool_registry::observe_updates(input,true,true).await}
-    }));
     critical(&mut tasks,"rpc_transport",async move{(&mut rpc_task.0).await?});
 
     // Seed graph before completion can change a Prepared state.
