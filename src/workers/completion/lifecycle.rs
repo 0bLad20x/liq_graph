@@ -120,13 +120,14 @@ struct Scheduler {
     due:BTreeSet<(u64,Pubkey)>,
     selected:Vec<(Venue,HashSet<Pubkey>)>,
     refreshed:HashSet<Pubkey>,
+    revalidated:HashSet<Pubkey>,
     next_id:u64,
     counters:Counters,
 }
 impl Scheduler {
     fn new()->Self {
         Self{entries:HashMap::new(),due:BTreeSet::new(),selected:Vec::new(),
-            refreshed:HashSet::new(),next_id:0,counters:Counters::default()}
+            refreshed:HashSet::new(),revalidated:HashSet::new(),next_id:0,counters:Counters::default()}
     }
     fn recheckable(reason:Option<CompletionReason>,configuration_ready:bool)->bool {
         reason.is_none_or(|reason|match reason {
@@ -159,7 +160,7 @@ impl Scheduler {
         let key=pool.address;
         if !self.entries.contains_key(&key) {
             if !pool.completion_admission.is_admitted(){return;}
-            let force_once=managed && settings.revalidate_once;
+            let force_once=managed && settings.revalidate_once && !self.revalidated.contains(&key);
             if managed && settings.pool_limit>0 {
                 if !self.selected.iter().any(|(venue,_)|*venue==pool.venue) {
                     self.selected.push((pool.venue,HashSet::new()));
@@ -211,6 +212,7 @@ impl Scheduler {
             let counters=self.counters.venue(pool.venue);
             counters.accepted+=1;counters.proofs+=1;
             entry.force_once=false;
+            if settings.revalidate_once && flight.force_full {self.revalidated.insert(key);}
             match result.status {
                 CompletionStatus::Prepared=>{
                     self.counters.prepared+=1;

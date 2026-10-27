@@ -184,6 +184,10 @@ pub fn plan()->Result<serde_json::Value> {
     let settings=RunSettings::from_env()?;
     if settings.market {market_state::Settings::from_env()?;}
     if settings.signals {graph_signals::Settings::from_env()?;}
+    if !settings.hydration_only {
+        completion::configured("all")?;
+        crate::workers::completion::lifecycle::Settings::from_env()?;
+    }
     let mut plan=settings.describe();
     plan["websocket_plan"]=serde_json::to_value(rpc_transport::settings_from_env()?.websocket_plan()?)?;
     Ok(plan)
@@ -293,8 +297,10 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     anyhow::ensure!((32..=65536).contains(&source_capacity)
         && (32..=65536).contains(&registry_capacity),"broadcast capacity must be 32..=65536");
     let graph_settings=graph_liquidity::Settings::from_env()?;
-    let completion_workers=completion::configured("all")?;
-    let completion_settings=crate::workers::completion::lifecycle::Settings::from_env()?;
+    let completion_workers=if settings.hydration_only {Vec::new()}
+        else {completion::configured("all")?};
+    let completion_settings=if settings.hydration_only {None}
+        else {Some(crate::workers::completion::lifecycle::Settings::from_env()?)};
     let http=core::http_client()?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let mut rpc_task=AbortOnDrop(rpc_task);
@@ -342,6 +348,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     // Existing V10 PumpSwap Prepared manifests contain signer-specific PDAs.
     // Check the current signer before seeding the graph with persisted blocks.
+    let completion_settings=completion_settings.context("missing enabled Completion settings")?;
     completion::validate_bootstrap(&completion_workers,&restored)?;
     let graph_boot:Vec<PoolState>=restored.iter()
         .filter(|p|p.completion_state==CompletionState::Prepared).cloned().collect();

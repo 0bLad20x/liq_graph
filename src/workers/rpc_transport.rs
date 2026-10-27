@@ -21,7 +21,7 @@ use tokio::{
 use crate::core::now_unix_ms;
 
 use crate::core::rpc::{AccountData,AccountView,AccountFilter,RpcOperation,RpcAnswer,RpcResponse,RpcHandle,Call};
-use crate::core::account_stream::{AccountEvent,AccountStreamControl};
+use crate::core::account_stream::AccountStreamControl;
 
 impl RpcOperation {
     fn method(&self) -> &'static str {

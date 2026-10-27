@@ -9,7 +9,7 @@ use crate::{core::{self, DataBatch, PoolUpdateBatch, Venue},
         diagnostic_source, persistence, pool_registry, rpc_transport}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
+pub(super) enum SourceSet { Dlmm, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
 
 #[derive(Clone)]
 pub(super) enum Worker {
@@ -51,10 +51,10 @@ fn rate(name:&str,default:u32)->Result<u32> {
 /// All means the seven REST sources; rolling V2 and full bootstrap are explicit.
 pub(super) fn configured(set:SourceSet,once:bool,max_pages:Option<u32>)->Result<Vec<Worker>> {
     let mut out=Vec::new();
-    if matches!(set,SourceSet::Dlmm|SourceSet::DlmmDammV2|SourceSet::All) {
+    if matches!(set,SourceSet::Dlmm|SourceSet::All) {
         out.push(Worker::Dlmm(meteora_dlmm::Settings{once,max_pages}));
     }
-    if matches!(set,SourceSet::DammV2|SourceSet::DlmmDammV2|SourceSet::All) {
+    if matches!(set,SourceSet::DammV2|SourceSet::All) {
         out.push(Worker::Damm(meteora_damm_v2::Settings{once,max_pages}));
     }
     if matches!(set,SourceSet::Raydium|SourceSet::All) {
