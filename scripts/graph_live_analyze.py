@@ -342,7 +342,7 @@ def run(args):
         "delta_discovered_topologies":sum(as_int(row.get("discovered_topologies")) for row in rows),
         "delta_removed_topologies":sum(as_int(row.get("removed_topologies")) for row in rows),
     }
-    with (out/"summary.json").open("w",encoding="utf-8") as out_file:
+    with (out/args.summary_name).open("w",encoding="utf-8") as out_file:
         json.dump(stats,out_file,indent=2,ensure_ascii=False)
     print(json.dumps({k:stats[k] for k in (
         "runtime_completed","exit_code","graph_generations","transition_observed",
@@ -380,4 +380,5 @@ if __name__=="__main__":
     parser.add_argument("--exit-code",type=int,required=True)
     parser.add_argument("--min-duration",type=int,default=1790)
     parser.add_argument("--require-catalog-reconciliation",action="store_true")
+    parser.add_argument("--summary-name",default="summary.json")
     run(parser.parse_args())

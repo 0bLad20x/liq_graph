@@ -1,9 +1,9 @@
 //! File source -> typed channel -> execution worker -> JSON report. No route decisions.
-use std::path::Path;
-use anyhow::{Context, Result, ensure};
-use tokio::sync::mpsc;
-use crate::{core::execution::{ExecutionOutcome, ExecutionRequest},
-    workers::{execution_v10, rpc_transport}};
+use std::{env,path::Path,time::Duration};
+use anyhow::{Context, Result, bail, ensure};
+use tokio::{sync::{mpsc,watch},task::JoinHandle};
+use crate::{core::{execution::{ExecutionOutcome,ExecutionReport,ExecutionRequest},signals::SignalStream},
+    workers::{execution_candidates,execution_v10,pool_registry,rpc_transport}};
 
 pub async fn run(request_path: &Path, wallet_path: &Path) -> Result<()> {
     let bytes=std::fs::read(request_path).context("read V10 execution request")?;
@@ -27,4 +27,96 @@ pub async fn run(request_path: &Path, wallet_path: &Path) -> Result<()> {
         |ExecutionOutcome::SimulatedDexCallsObserved),
         "V10 request {:?} failed; inspect the JSON report",report.id);
     Ok(())
+}
+
+// Keep accepted execution jobs owned through shutdown; cancellation aborts their tasks.
+struct Task<T>(JoinHandle<T>);
+impl<T> Drop for Task<T> {fn drop(&mut self){self.0.abort();}}
+
+pub(super) struct ExecutionTasks {
+    candidates:Task<Result<execution_candidates::Report>>,
+    executor:Task<Result<()>>,
+    reports:Task<Vec<ExecutionReport>>,
+}
+impl ExecutionTasks {
+    pub(super) fn start(settings:execution_v10::Settings,input:SignalStream,
+        registry:pool_registry::PoolRegistry,rpc:rpc_transport::RpcHandle)->Result<Self> {
+        let cfg=execution_candidates::Settings::from_env(settings.wallet(),execution_v10::validate)?;
+        let (jobs,requests)=mpsc::channel(1);
+        let (output,mut responses)=mpsc::channel(1);
+        let reports=Task(tokio::spawn(async move {
+            let mut received=Vec::new();
+            while let Some(report)=responses.recv().await {received.push(report);}
+            received
+        }));
+        Ok(Self {
+            candidates:Task(tokio::spawn(execution_candidates::run(input,registry,jobs,cfg))),
+            executor:Task(tokio::spawn(execution_v10::run(settings,rpc,requests,output))),reports,
+        })
+    }
+    /// Production candidates are long-lived consumers. Only drain them after the
+    /// orchestration has stopped its upstream producers.
+    pub(super) async fn until_stop(&mut self,mut stop:watch::Receiver<bool>)->Result<()> {
+        if *stop.borrow() {return Ok(());}
+        tokio::select! {
+            changed=stop.changed()=>{
+                changed.context("runtime stop channel closed before shutdown")?;
+                ensure!(*stop.borrow(),"runtime stop channel changed without stopping");
+                Ok(())
+            },
+            result=&mut self.candidates.0=>{
+                match result {
+                    Ok(Ok(report))=>bail!("V10 candidate worker exited before runtime shutdown: requests={} error={:?}",report.requests.len(),report.error),
+                    Ok(Err(error))=>Err(error).context("V10 candidate worker exited before runtime shutdown"),
+                    Err(error)=>Err(error).context("V10 candidate worker task failed before shutdown"),
+                }
+            },
+            result=&mut self.executor.0=>{
+                match result {
+                    Ok(Ok(()))=>bail!("V10 executor exited before runtime shutdown"),
+                    Ok(Err(error))=>Err(error).context("V10 executor exited before runtime shutdown"),
+                    Err(error)=>Err(error).context("V10 executor task failed before shutdown"),
+                }
+            },
+            result=&mut self.reports.0=>{
+                match result {
+                    Ok(reports)=>bail!("V10 report collector exited before runtime shutdown after {} reports",reports.len()),
+                    Err(error)=>Err(error).context("V10 report collector task failed before shutdown"),
+                }
+            },
+        }
+    }
+    pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<()> {
+        let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
+            .context("candidate shutdown timeout")???;
+        // The candidate stream has closed. Let accepted jobs and reports drain
+        // while the shared RPC transport remains alive.
+        evidence["execution_candidates"]=serde_json::to_value(&candidates)?;
+        let executed=tokio::time::timeout(Duration::from_secs(300),&mut self.executor.0).await
+            .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r);
+        let reports=tokio::time::timeout(Duration::from_secs(10),&mut self.reports.0).await
+            .context("V10 report shutdown timeout")??;
+        evidence["execution_reports"]=serde_json::to_value(&reports)?;
+        evidence["simulation_successes"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,
+            ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved)).count());
+        evidence["simulation_failures"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,ExecutionOutcome::SimulationFailed)).count());
+        evidence["simulation_dex_calls_observed"]=serde_json::json!(reports.iter().filter(|r|!r.dex_invocations.is_empty()).count());
+        // All artifacts share the existing run directory; no additional code hierarchy.
+        if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
+            let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
+            for (i,selection) in candidates.requests.iter().enumerate() {
+                std::fs::write(folder.join(format!("request-{:02}.json",i+1)),serde_json::to_vec_pretty(&selection.request)?)?;
+                std::fs::write(folder.join(format!("selection-{:02}.json",i+1)),serde_json::to_vec_pretty(selection)?)?;
+                if let Some(report)=reports.iter().find(|r|r.id==selection.request.id) {
+                    std::fs::write(folder.join(format!("simulation-{:02}.json",i+1)),serde_json::to_vec_pretty(report)?)?;
+                }
+            }
+        }
+        executed?;
+        evidence["execution_handoff_observed"]=serde_json::json!(candidates.ensure_handoff(&reports).is_ok());
+        let acceptance=candidates.ensure_live_evidence(&reports);
+        evidence["execution_integration_passed"]=serde_json::json!(acceptance.is_ok());
+        evidence["execution_integration_error"]=serde_json::json!(acceptance.err().map(|e|format!("{e:#}")));
+        Ok(())
+    }
 }

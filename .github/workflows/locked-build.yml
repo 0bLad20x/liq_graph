@@ -37,7 +37,7 @@ jobs:
         run: |
           $tokens = $null
           $errors = $null
-          foreach ($path in @('scripts/graph_live.ps1', 'scripts/market_state_live.ps1', 'scripts/graph_signals_live.ps1')) {
+          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/full_runtime_v10_flashloan_hour.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)

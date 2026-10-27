@@ -1,3 +1,7 @@
+> Current entrypoint: CP7A uses one `--run` pipeline and `scripts/runtime_live.ps1`.
+> See [CP7A_RUNTIME.md](CP7A_RUNTIME.md). Earlier checkpoint measurements and output names
+> below describe their historical implementations; output loss now fails a finite proof.
+
 # Graph signals: compact candidate state
 
 ## CP7: catalog reconciliation (implementation; live acceptance pending)
@@ -46,7 +50,7 @@ git switch --track origin/cp7-graph-candidate-reconciliation
 git branch --show-current
 git rev-parse --short HEAD
 git status --short
-.\scripts\graph_live.ps1 -ExpectedBranch cp7-graph-candidate-reconciliation -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 -RequireCatalogReconciliation
+.\scripts\runtime_live.ps1 -GraphAudit -ExpectedBranch cp7a-unified-runtime -DurationSeconds 900 -PoolLimit 15000 -AccountBudget 25000 -RequireCatalogReconciliation
 ```
 
 For an already existing local branch, switch to it and update with `git pull
@@ -300,17 +304,17 @@ selection only as before. No wallet is needed.
 PowerShell:
 
     git fetch origin
-    git switch agent/factorized-route-state
+    git switch --track origin/cp7a-unified-runtime
     git pull --ff-only
-    .\scripts\graph_signals_live.ps1 -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals
+    .\scripts\runtime_live.ps1 -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals
 
 Use the normal error guards if running these commands in a block. The runner requires a clean
 tracked checkout and cargo build --locked --release before any live subscription. Keep
 TracePrices/TraceSignals off for the measurement. PoolLimit limits observation, not the full
 graph catalog's topology universe.
 
-The existing runner writes checkout.json, websocket_plan.json, report.json and worker.log
-under graph_signals_live/<timestamp>. Upload all four, including failed/partial runs.
+The common runner writes checkout.json, websocket_plan.json, runtime.json and runtime.log
+under runtime_live/<timestamp>. See [CP7A_RUNTIME.md](CP7A_RUNTIME.md) for the current artifact names and commands.
 Report startup, resynchronization, catalog pauses and steady-state values separately.
 One low-load measurement does not establish behavior at arbitrary fan-out or pool counts.
 
@@ -366,9 +370,10 @@ Every selected pool must still be admitted and Prepared in the Registry, have a 
 for the direction used, and supply matching manifests/mint proofs for the configured
 wallet. The resulting ExecutionRequest freezes those exact inputs. No mint-proof lookup,
 manifest repair, fee/depth/slippage model, amount optimization or send operation is added.
-The finite live harness continues to load persisted manifests and refresh TVL admission;
-it does **not** start completion refresh. `manifest_checked_at_ms` and
-`manifest_validated_slot` retain the actual proof ages; `manifest_refresh_performed=false`.
+CP7A uses the normal runtime for finite runs too: restore bootstraps the Registry,
+then the regular CompletionLifecycle refreshes manifests. The candidate worker itself
+still performs no refresh; `manifest_refresh_performed=false` refers to that worker.
+`manifest_checked_at_ms` and `manifest_validated_slot` retain actual proof ages.
 Fresh market prices must not be mistaken for a fresh execution manifest.
 
 The signal producer never awaits this consumer or the simulator. The candidate worker
@@ -382,7 +387,7 @@ There is no transport change, replay request, extra snapshot or generation optim
 Use the existing runner, existing provider configuration and the real wallet path:
 
 ```powershell
-.\scripts\graph_signals_live.ps1 `
+.\scripts\runtime_live.ps1 `
     -DurationSeconds 600 -PoolLimit 750 -ThresholdBps 0 -ProfileSignals `
     -SimulateV10 `
     -WalletPath (Join-Path $env:USERPROFILE ".solana\meteora-arb-test.json") `
@@ -396,20 +401,22 @@ forms: only fully priced, qualifying, packable live inputs can produce requests.
 otherwise the shared Rust defaults apply, including trade_size=0 and no_failure=false.
 No parameter is changed just to manufacture a successful simulation. `-SimulateV10` is
 explicit opt-in. Without it the runner sets GRAPH_EXECUTION_SIMULATE=false and neither
-loads a signer nor starts either execution worker. The production `--run` is unchanged.
+loads a signer nor starts either execution worker. Both settings use the same `--run`.
 
-Native configuration for the existing `--graph-signals-live` entry is:
+Native configuration for the common `--run` entry additionally requires
+MARKET_STATE_ENABLED=true, GRAPH_SIGNALS_ENABLED=true and the usual live admission settings:
+
 
 - GRAPH_EXECUTION_SIMULATE=true
 - GRAPH_EXECUTION_WALLET_PATH=<absolute keypair path>
-- GRAPH_EXECUTION_MAX_REQUESTS=10 (1..1000; successful queue submissions, not profitability)
+- GRAPH_EXECUTION_MAX_REQUESTS=10 (1..5000; successful queue submissions, not profitability)
 - GRAPH_EXECUTION_ROUTE_KIND=All
 - GRAPH_EXECUTION_PARAMETERS_PATH=<optional ExecutionParameters JSON path>
 
 The runner builds with --locked --release before opening connections and preserves the
 existing environment afterward. No private key bytes are logged or copied into artifacts.
 After the live duration it drains accepted simulations with RPC still available (up to
-300 seconds), then writes additional flat files beside checkout.json/report.json/worker.log:
+300 seconds), then writes additional flat files beside checkout.json/runtime.json/runtime.log:
 
 - request-NN.json: complete reusable ExecutionRequest;
 - selection-NN.json: trigger, generation/revision, direction, original indicative seed,
@@ -417,7 +424,7 @@ After the live duration it drains accepted simulations with RPC still available 
   counts and timings;
 - simulation-NN.json: actual existing executor report with the same request ID.
 
-report.json also retains execution_candidates, execution_reports, simulation_successes,
+execution.json retains execution_candidates, execution_reports, simulation_successes,
 simulation_failures and simulation_dex_calls_observed. Per request, selection_ns includes
 ranking and rejected seed attempts through construction; frame_to_request_us starts at
 local WebSocket frame read, signal_to_request_us at signal state readiness. The original

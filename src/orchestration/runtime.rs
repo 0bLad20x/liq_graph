@@ -1,5 +1,5 @@
 //! Production task supervision and wiring. No DEX logic in the orchestrator.
-use std::{env, future::Future, io::{self, BufRead}, sync::Arc, time::Duration};
+use std::{env, future::Future, io::{self, BufRead}, sync::{Arc,Mutex}, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::{broadcast, oneshot, watch}, task::{JoinHandle, JoinSet}, time::Instant};
 use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, PoolState,
@@ -11,9 +11,9 @@ use crate::{core::{self, CompletionState, DataBatch, CompletionResultBatch, Pool
         discovery_orca_whirlpool, discovery_raydium, discovery_pancakeswap_clmm,
         discovery_byreal_clmm, discovery_manifest, discovery_pumpswap, discovery_rpc_full,
         diagnostic_source, graph_liquidity, graph_watch_catalog, mint_qualification, source_dexscreener,
-        identity_hydration_venues, market_state, persistence, pool_registry,
+        identity_hydration_venues, graph_signals, market_state, persistence, pool_registry,
         rpc_transport, source_jupiter_mint, execution_v10}};
-use super::{jupiter_settings, market_state_live};
+use super::{jupiter_settings,v10_simulation::ExecutionTasks};
 
 struct AbortOnDrop<T>(JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {fn drop(&mut self) {self.0.abort();}}
@@ -55,10 +55,10 @@ where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     loop {
         if *stop.borrow(){return Ok(());}
         let started=Instant::now();
-        let mut worker=tokio::spawn(factory());
+        let mut worker=AbortOnDrop(tokio::spawn(factory()));
         let finished=tokio::select!{
-            result=&mut worker=>Some(result),
-            _=stop.changed()=>{worker.abort();let _=worker.await;None}
+            result=&mut worker.0=>Some(result),
+            _=stop.changed()=>{worker.0.abort();let _=(&mut worker.0).await;None}
         };
         let Some(finished)=finished else{return Ok(());};
         if *stop.borrow(){return Ok(());}
@@ -90,10 +90,10 @@ async fn once<F,Fut>(name:&'static str,mut stop:watch::Receiver<bool>,mut factor
 where F:FnMut()->Fut+Send+'static,Fut:Future<Output=Result<()>>+Send+'static {
     crate::log_event!(Info,"runtime worker={name} policy=once started=true");
     for attempt in 1..=3 {
-        let mut task=tokio::spawn(factory());
+        let mut task=AbortOnDrop(tokio::spawn(factory()));
         let result=tokio::select!{
-            result=&mut task=>result,
-            _=stop.changed()=>{task.abort();let _=task.await;return Ok(());}
+            result=&mut task.0=>result,
+            _=stop.changed()=>{task.0.abort();let _=(&mut task.0).await;return Ok(());}
         };
         match result{
             Ok(Ok(()))=>{
@@ -441,9 +441,114 @@ fn ensure_duration(n:u64)->Result<()> {
     Ok(())
 }
 
-pub async fn run()->Result<()>{
-    let duration=number("RUN_DURATION_SECONDS",0)?;
-    let full_scan=enabled("RUN_FULL_SCAN")?;
+#[derive(Clone,Copy)]
+struct RunSettings {
+    duration:u64,full_scan:bool,hydration_only:bool,
+    market:bool,signals:bool,simulate:bool,rewatch:bool,
+}
+impl RunSettings {
+    fn from_env()->Result<Self> {
+        let settings=Self {
+            duration:number("RUN_DURATION_SECONDS",0)?,
+            full_scan:enabled("RUN_FULL_SCAN")?,
+            hydration_only:enabled("IDENTITY_HYDRATION_ONLY")?,
+            market:enabled("MARKET_STATE_ENABLED")?,
+            signals:enabled("GRAPH_SIGNALS_ENABLED")?,
+            simulate:enabled("GRAPH_EXECUTION_SIMULATE")?,
+            rewatch:enabled("RUN_REWATCH")?,
+        };
+        anyhow::ensure!(!settings.signals || settings.market,
+            "GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
+        anyhow::ensure!(!settings.simulate || settings.signals,
+            "GRAPH_EXECUTION_SIMULATE requires GRAPH_SIGNALS_ENABLED and MARKET_STATE_ENABLED");
+        anyhow::ensure!(!settings.rewatch || (settings.market && !settings.hydration_only
+            && (30..=86400).contains(&settings.duration)),
+            "RUN_REWATCH requires MarketState and a finite RUN_DURATION_SECONDS of 30..86400");
+        Ok(settings)
+    }
+    fn describe(self)->serde_json::Value {
+        serde_json::json!({"pipeline":"runtime","duration_seconds":self.duration,
+            "market_state_enabled":self.market,"signals_enabled":self.signals,
+            "simulation_enabled":self.simulate,"rewatch":self.rewatch,
+            "completion_refresh_enabled":!self.hydration_only,"broadcasts":false})
+    }
+}
+
+/// Resolve the same settings as --run, without opening RPC or PostgreSQL.
+pub fn plan()->Result<serde_json::Value> {
+    let settings=RunSettings::from_env()?;
+    if settings.market {market_state::Settings::from_env()?;}
+    if settings.signals {graph_signals::Settings::from_env()?;}
+    let mut plan=settings.describe();
+    plan["websocket_plan"]=serde_json::to_value(rpc_transport::settings_from_env()?.websocket_plan()?)?;
+    Ok(plan)
+}
+
+// Completed worker outputs only. No second live state or processing algorithm.
+#[derive(Default)]
+struct RunEvidence {
+    market:Option<market_state::ObservationReport>,
+    production:Option<graph_signals::ProductionReport>,
+    signals:Option<graph_signals::ObservationReport>,
+    execution:serde_json::Value,
+}
+impl RunEvidence {
+    fn ensure_live(&self,settings:RunSettings)->Result<()> {
+        if settings.hydration_only {return Ok(());}
+        if settings.market {
+            self.market.as_ref().context("missing MarketState report")?
+                .ensure_live_evidence(settings.rewatch)?;
+        }
+        if settings.signals {
+            let market=self.market.as_ref().context("missing MarketState report")?;
+            let production=self.production.as_ref().context("missing signal producer report")?;
+            let signals=self.signals.as_ref().context("missing signal consumer report")?;
+            production.ensure_input_delivery(market.observations,market.websocket_observations)?;
+            production.ensure_delivery(signals)?;
+            signals.ensure_calculation_evidence()?;
+        }
+        if settings.simulate {
+            anyhow::ensure!(self.execution["execution_handoff_observed"]==true,
+                "no complete candidate -> request -> V10 simulation handoff; inspect execution.json");
+        }
+        Ok(())
+    }
+}
+
+pub async fn run()->Result<()> {
+    let settings=RunSettings::from_env()?;
+    let evidence=Arc::new(Mutex::new(RunEvidence::default()));
+    let result=run_pipeline(settings,evidence.clone()).await;
+    let evidence=evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?;
+    let acceptance=evidence.ensure_live(settings);
+    let mut report=settings.describe();
+    report["run_complete"]=serde_json::json!(result.is_ok());
+    report["live_evidence_passed"]=serde_json::json!(result.is_ok() && acceptance.is_ok());
+    report["error"]=serde_json::json!(result.as_ref().err().or(acceptance.as_ref().err()).map(|e|format!("{e:#}")));
+    report["execution_handoff_observed"]=evidence.execution["execution_handoff_observed"].clone();
+    report["execution_integration_passed"]=evidence.execution["execution_integration_passed"].clone();
+    if let Ok(path)=env::var("RUN_REPORT_PATH") {
+        std::fs::write(path,serde_json::to_vec_pretty(&report)?).context("write runtime report")?;
+    }
+    crate::log_event!(Info,"runtime evidence={report}");
+    result?;
+    // A finite live proof must not exit successfully with incomplete delivery.
+    // Continuous operation may be stopped before any market activity occurs.
+    if settings.duration>0 {acceptance?;}
+    Ok(())
+}
+
+async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Result<()>{
+    let duration=settings.duration;
+    let full_scan=settings.full_scan;
+    // Validate enabled worker settings before opening shared resources.
+    let market_settings=if settings.market {Some(market_state::Settings::from_env()?)}else{None};
+    let signal_settings=if settings.signals {Some(graph_signals::Settings::from_env()?)}else{None};
+    let execution_settings=if settings.simulate {
+        let path=env::var("GRAPH_EXECUTION_WALLET_PATH")
+            .context("GRAPH_EXECUTION_SIMULATE requires GRAPH_EXECUTION_WALLET_PATH")?;
+        Some(execution_v10::Settings::load(std::path::Path::new(&path))?)
+    }else{None};
     let source_capacity=usize::try_from(number("REST_BROADCAST_CAPACITY",256)?)?;
     let registry_capacity=usize::try_from(number("REGISTRY_BROADCAST_CAPACITY",256)?)?;
     anyhow::ensure!((32..=65536).contains(&source_capacity)
@@ -451,11 +556,12 @@ pub async fn run()->Result<()>{
     let graph_settings=graph_liquidity::Settings::from_env()?;
     let http=core::http_client()?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
+    let mut rpc_task=AbortOnDrop(rpc_task);
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
     let persisted_mints=database.restore_mints().await?;
     let mint_registry=mint_qualification::MintRegistry::restore(persisted_mints)?;
-    let hydration_only=enabled("IDENTITY_HYDRATION_ONLY")?;
+    let hydration_only=settings.hydration_only;
     let venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
     // Every unresolved pool, independent of venue, is assigned to one hydration worker.
     let venue_hydration_seed:Vec<(solana_pubkey::Pubkey,Venue)>=restored.iter()
@@ -485,7 +591,7 @@ pub async fn run()->Result<()>{
         // Preserve upstream errors and wait for the Registry/Persistence drain.
         let registry_result=registry_task.await.context("hydration Registry task panicked")?;
         let writer_result=writer_task.await.context("hydration Persistence task panicked")?;
-        let rpc_result=rpc_task.await.context("hydration RPC task panicked")?;
+        let rpc_result=(&mut rpc_task.0).await.context("hydration RPC task panicked")?;
         result?;
         registry_result?;
         writer_result?;
@@ -529,25 +635,18 @@ pub async fn run()->Result<()>{
         qualified_rx.clone(),selected_mints_rx,mint_reader.clone(),rpc.clone(),
         onchain_tx,stop_rx.clone()));
     // Price observations are optional. The Registry and graph retain their own eligibility rules.
-    let market_enabled=enabled("MARKET_STATE_ENABLED")?;
-    let signals_enabled=enabled("GRAPH_SIGNALS_ENABLED")?;
-    let simulation_enabled=enabled("GRAPH_EXECUTION_SIMULATE")?;
-    anyhow::ensure!(!signals_enabled || market_enabled,"GRAPH_SIGNALS_ENABLED requires MARKET_STATE_ENABLED");
-    anyhow::ensure!(!simulation_enabled || signals_enabled,"GRAPH_EXECUTION_SIMULATE requires GRAPH_SIGNALS_ENABLED and MARKET_STATE_ENABLED");
-    let market_control=if market_enabled {
-        let settings=market_state::Settings::from_env()?;
+    let simulation_enabled=settings.simulate;
+    let market_control=if let Some(market_settings)=market_settings {
         let (control,enabled_rx)=watch::channel(true);
         let (prices,price_rx)=broadcast::channel(16384);
-        if signals_enabled {
-            let cfg=crate::workers::graph_signals::Settings::from_env()?;
+        if let Some(cfg)=signal_settings {
             let (signals,signal_rx)=broadcast::channel(crate::workers::graph_signals::OUTPUT_CAPACITY);
             if simulation_enabled {
-                let path=env::var("GRAPH_EXECUTION_WALLET_PATH")
-                    .context("GRAPH_EXECUTION_SIMULATE requires GRAPH_EXECUTION_WALLET_PATH")?;
-                let signer=execution_v10::Settings::load(std::path::Path::new(&path))?;
-                let mut execution=market_state_live::ExecutionTasks::start(
+                let signer=execution_settings.context("missing validated V10 settings")?;
+                let mut execution=ExecutionTasks::start(
                     signer,signals.subscribe(),registry.clone(),rpc.clone())?;
                 let simulation_stop=stop_rx.clone();
+                let execution_evidence=evidence.clone();
                 critical(&mut tasks,"v10.simulation",async move {
                     // Never call finish() in steady state: it waits for the signal
                     // producer to close, which only happens during runtime shutdown.
@@ -564,18 +663,23 @@ pub async fn run()->Result<()>{
                         requests,evidence["simulation_successes"],evidence["simulation_failures"],
                         evidence["simulation_dex_calls_observed"],evidence["execution_handoff_observed"],
                         evidence["execution_integration_passed"]);
+                    execution_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.execution=evidence;
                     result
                 });
             }
             let signal_input=prices.subscribe(); let signal_catalog=graph_rx.clone();
+            let production_evidence=evidence.clone();
             critical(&mut tasks,"graph_signals",async move {
                 let report=crate::workers::graph_signals::run(signal_input,signal_catalog,signals,cfg).await?;
                 if let Ok(path)=env::var("GRAPH_RUNTIME_PRODUCTION_REPORT_PATH") {
                     std::fs::write(path,serde_json::to_vec_pretty(&report)?)
                         .context("write factorized production report")?;
                 }
-                report.ensure_complete()
+                let result=report.ensure_complete();
+                production_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.production=Some(report);
+                result
             });
+            let consumer_evidence=evidence.clone();
             critical(&mut tasks,"graph_signals.consumer",async move {
                 let report=crate::workers::graph_signals::observe(signal_rx,cfg).await?;
                 if let Ok(path)=env::var("GRAPH_RUNTIME_SIGNAL_REPORT_PATH") {
@@ -585,21 +689,46 @@ pub async fn run()->Result<()>{
                 if report.has_delivery_loss() {
                     crate::log_event!(Warn,"runtime signal delivery_loss=true consumer_verification_incomplete=true calculation_not_invalidated=true");
                 }
-                report.ensure_complete()
+                let result=report.ensure_complete();
+                consumer_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.signals=Some(report);
+                result
             });
         }
         let (account_control,account_events)=rpc.account_stream();
         critical(&mut tasks,"market_state",market_state::run(registry.clone(),updates.subscribe(),
-            rpc.clone(),account_control,account_events,prices,settings,
+            rpc.clone(),account_control,account_events,prices,market_settings,
             catalog_rx.clone(),mint_reader,mint_revision_rx,selected_mints_tx,
             stop_rx.clone(),enabled_rx));
         let market_catalog=catalog_rx.clone();
+        let market_evidence=evidence.clone();
         critical(&mut tasks,"market_state.consumer",async move {
-            market_state::observe(price_rx,market_catalog,settings.trace).await.map(|_|())
+            let report=market_state::observe(price_rx,market_catalog,market_settings.trace).await?;
+            if let Ok(path)=env::var("RUN_MARKET_REPORT_PATH") {
+                std::fs::write(path,serde_json::to_vec_pretty(&report)?)
+                    .context("write runtime MarketState report")?;
+            }
+            market_evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?.market=Some(report);
+            Ok(())
         });
         Some(control)
     } else {None};
     // Keep the observation-control sender alive for the worker lifetime.
+    let mut market_control=market_control;
+    if settings.rewatch {
+        let control=market_control.take().context("rewatch requires MarketState control")?;
+        let stop=stop_rx.clone();
+        critical(&mut tasks,"market_state.rewatch",until_stop(stop,async move {
+            tokio::time::sleep(Duration::from_secs(duration/2)).await;
+            crate::log_event!(Info,"runtime observation_control=false rewatch=true");
+            control.send(false).context("market rewatch control closed")?;
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            crate::log_event!(Info,"runtime observation_control=true rewatch=true");
+            control.send(true).context("market rewatch control closed")?;
+            // Keep the sender alive after resuming, until the common shutdown.
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+    }
     let _market_control=market_control;
     // Observers must not take down the state-owning runtime on diagnostic lag.
     tasks.spawn(supervise("observer.graph_watch_catalog",stop_rx.clone(),move||{
@@ -656,7 +785,7 @@ pub async fn run()->Result<()>{
             .unwrap_or_else(||registry_observer_sender.subscribe());
         async move{pool_registry::observe_updates(input,true,true).await}
     }));
-    critical(&mut tasks,"rpc_transport",async move{rpc_task.await?});
+    critical(&mut tasks,"rpc_transport",async move{(&mut rpc_task.0).await?});
 
     // Seed graph before completion can change a Prepared state.
     if !graph_boot.is_empty(){
@@ -821,7 +950,7 @@ pub async fn run()->Result<()>{
             tasks.abort_all();
             crate::log_event!(Warn,"runtime shutdown drain_timeout_s={shutdown_s}");
             if let Some(original)=error.take(){
-                return Err(original.context("shutdown drain exceeded 30 seconds"));
+                return Err(original.context(format!("shutdown drain exceeded {shutdown_s} seconds")));
             }
             bail!("runtime graceful shutdown exceeded {shutdown_s} seconds");
         }

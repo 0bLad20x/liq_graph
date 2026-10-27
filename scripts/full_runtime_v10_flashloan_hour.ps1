@@ -5,7 +5,7 @@ param(
     [ValidateRange(1,2147483647)][int]$PoolLimit = 10000,
     [ValidateRange(1,5000)][int]$SimulationLimit = 3000,
     [string]$WalletPath = (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json'),
-    [string]$ExpectedBranch = 'agent/v10-flashloan-hour-stress'
+    [string]$ExpectedBranch = 'cp7a-unified-runtime'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -105,6 +105,11 @@ try {
     Write-Host "Parameter file: $parameterPath"
 
     $runArguments = @{
+        SimulateV10 = $true
+        ExecutionParametersPath = $parameterPath
+        WsProviders = '1,2,5,6'
+        WsAccountBudget = 0
+        WsConnectionsPerProvider = 0
         ExpectedBranch = $ExpectedBranch
         DurationSeconds = $DurationSeconds
         PoolLimit = $PoolLimit
@@ -112,7 +117,7 @@ try {
         ThresholdBps = 0
         WalletPath = $WalletPath
     }
-    & (Join-Path $PSScriptRoot 'full_runtime_v10_live.ps1') @runArguments
+    & (Join-Path $PSScriptRoot 'runtime_live.ps1') @runArguments
     if (-not $?) { throw 'Full runtime audit did not complete successfully; inspect runtime_v10_live reports.' }
 }
 finally {
