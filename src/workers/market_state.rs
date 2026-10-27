@@ -353,6 +353,7 @@ struct Metrics {
     baseline_skipped:u64,stale:u64,bindings:u64,deleted:u64,gaps:u64,lost:u64,rejections:u64,
     baseline_prices:u64,websocket_prices:u64,no_receiver:u64,max_queue_depth:usize,
     selection_changes:u64,hydration_jobs:u64,discarded_results:u64,hydration_failures:u64,
+    index_rebuilds:u64,structure_installs:u64,baseline_installs:u64,baseline_pools_installed:u64,
     max_hydration_in_flight:usize,initial_hydration:Latency,baseline_hydration:Latency,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,venues:[VenueTiming;10],
 }
@@ -370,6 +371,8 @@ impl Metrics {
             "max_queue_depth":self.max_queue_depth,"selection_changes":self.selection_changes,"hydration_jobs":self.hydration_jobs,
             "discarded_preparation_pools":self.discarded_results,"hydration_failures":self.hydration_failures,
             "max_hydration_in_flight":self.max_hydration_in_flight,
+            "index_rebuilds":self.index_rebuilds,"structure_installs":self.structure_installs,
+            "baseline_installs":self.baseline_installs,"baseline_pools_installed":self.baseline_pools_installed,
             "initial_hydration":self.initial_hydration.report(),"baseline_hydration":self.baseline_hydration.report(),
             "account_processing":self.processing.report(),"transport_to_market":self.queue.report(),
             "preparation_install":self.install.report(),"watch_reconcile":self.watch_plan.report(),"by_venue":venues})
@@ -380,13 +383,16 @@ struct Engine {
     events: broadcast::Sender<Arc<MarketStateEvent>>, sequence: u64,
     account_ranges:HashMap<Pubkey,std::ops::Range<usize>>, account_bindings:Vec<usize>,
     pool_subs:Vec<Vec<usize>>,
+    pool_index:HashMap<Pubkey,usize>,
 }
 impl Engine{
     fn empty(events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Self {
         Self{pools:Vec::new(),subs:Vec::new(),metrics:Metrics::default(),events,sequence,
-            account_ranges:HashMap::new(),account_bindings:Vec::new(),pool_subs:Vec::new()}
+            account_ranges:HashMap::new(),account_bindings:Vec::new(),pool_subs:Vec::new(),pool_index:HashMap::new()}
     }
     fn index(&mut self) {
+        self.metrics.index_rebuilds+=1;
+        self.pool_index=self.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
         let mut by_account=HashMap::<Pubkey,Vec<usize>>::new();
         self.pool_subs=vec![Vec::new();self.pools.len()];
         for (i,s) in self.subs.iter().enumerate() {
@@ -399,25 +405,27 @@ impl Engine{
         }
     }
     fn retain(&mut self,keep:&HashSet<Pubkey>) {
+        if self.retain_unindexed(keep) {self.index();}
+    }
+    // Structural installation will rebuild once, after removals and additions.
+    fn retain_unindexed(&mut self,keep:&HashSet<Pubkey>)->bool {
+        if self.pools.iter().all(|p|keep.contains(&p.key)) {return false;}
         let mut remap=vec![None;self.pools.len()];let mut next=0;
         for (i,p) in self.pools.iter().enumerate(){if keep.contains(&p.key){remap[i]=Some(next);next+=1;}}
         self.pools.retain(|p|keep.contains(&p.key));
         self.subs.retain_mut(|s|match remap[s.pool]{Some(pi)=>{s.pool=pi;true},None=>false});
-        self.index();
+        true
     }
     // Copy only selected Prepared pools and their existing static account descriptors.
     // The baseline phase must not re-read mint metadata or re-decode pool identities.
     fn subset(&self,selected:&HashSet<Pubkey>)->Engine {
         let mut part=Engine::empty(self.events.clone(),0);
-        let mut remap=HashMap::<usize,usize>::new();
-        for (i,p) in self.pools.iter().enumerate() {
-            if selected.contains(&p.key) {
-                remap.insert(i,part.pools.len());part.pools.push(p.clone());
-            }
-        }
-        for sub in &self.subs {
-            if let Some(&pi)=remap.get(&sub.pool) {
-                let mut next=sub.clone();next.pool=pi;part.subs.push(next);
+        let mut indices:Vec<_>=selected.iter().filter_map(|key|self.pool_index.get(key).copied()).collect();
+        indices.sort_unstable();
+        for i in indices {
+            let pi=part.pools.len();part.pools.push(self.pools[i].clone());
+            for &binding in &self.pool_subs[i] {
+                let mut next=self.subs[binding].clone();next.pool=pi;part.subs.push(next);
             }
         }
         part.index();part
@@ -449,12 +457,52 @@ impl Engine{
         }
         Ok(())
     }
-    fn install(&mut self,mut part:Engine) {
+    fn install_structure(&mut self,mut part:Engine)->bool {
+        if part.pools.is_empty() {return false;}
         let replaced:HashSet<_>=part.pools.iter().map(|p|p.key).collect();
         let keep=self.pools.iter().filter(|p|!replaced.contains(&p.key)).map(|p|p.key).collect();
-        self.retain(&keep);
+        self.retain_unindexed(&keep);
         let offset=self.pools.len();for sub in &mut part.subs{sub.pool+=offset;}
         self.pools.extend(part.pools);self.subs.extend(part.subs);self.index();
+        self.metrics.structure_installs+=1;
+        true
+    }
+    // A validated baseline changes dynamic state only. Validate the whole batch
+    // before writing, then keep every live pool position and account binding.
+    fn install_baseline(&mut self,part:Engine)->Result<Vec<usize>> {
+        let mut positions=Vec::with_capacity(part.pools.len());
+        for (source,pool) in part.pools.iter().enumerate() {
+            let pi=*self.pool_index.get(&pool.key).context("baseline pool no longer installed")?;
+            let old=&self.pools[pi];
+            ensure!(!old.ready,"baseline would overwrite a ready pool {}",pool.id);
+            ensure!(old.venue==pool.venue && old.a==pool.a && old.b==pool.b
+                && old.da==pool.da && old.db==pool.db
+                && old.canon_base==pool.canon_base && old.canon_quote==pool.canon_quote,
+                "baseline pool identity changed {}",pool.id);
+            let before=&self.pool_subs[pi];let after=&part.pool_subs[source];
+            ensure!(before.len()==after.len(),"baseline binding count changed {}",pool.id);
+            for (&target,&incoming) in before.iter().zip(after) {
+                let a=&self.subs[target];let b=&part.subs[incoming];
+                ensure!(a.key==b.key && a.field==b.field && a.owner==b.owner && a.address==b.address,
+                    "baseline account binding changed {}",pool.id);
+            }
+            positions.push(pi);
+        }
+        for (source,(pool,&pi)) in part.pools.into_iter().zip(&positions).enumerate() {
+            let old=&mut self.pools[pi];
+            old.ready=pool.ready;old.state=pool.state;old.price=pool.price;
+            old.available=pool.available;old.slot=pool.slot;
+            old.received_us=pool.received_us;old.updates=pool.updates;
+            for (&target,&incoming) in self.pool_subs[pi].iter().zip(&part.pool_subs[source]) {
+                let a=&mut self.subs[target];let b=&part.subs[incoming];
+                a.slot=b.slot;a.received_us=b.received_us;a.floor=b.floor;a.valid=b.valid;
+            }
+        }
+        if !positions.is_empty() {
+            self.metrics.baseline_installs+=1;
+            self.metrics.baseline_pools_installed+=positions.len() as u64;
+        }
+        Ok(positions)
     }
     async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,prices:bool,mints:&dyn MintReader)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
@@ -1240,7 +1288,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
         }
         if replan {
             let started=Instant::now();
-            let failed:Vec<_>=retry.keys().copied().filter(|key|!engine.pools.iter().any(|p|p.key==*key)).collect();
+            let failed:Vec<_>=retry.keys().copied().filter(|key|!engine.pool_index.contains_key(key)).collect();
             let next=watches(&engine,&failed)?;
             ensure!(next.len()<=selection_capacity,"market state selected {} pools require {} accounts; CP5 WS budget={} configured WS capacity={}",
                 selected.len(),next.len(),selection_capacity,control.capacity());
@@ -1258,7 +1306,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             schedule=false;
             while jobs.len()<concurrency {
                 let now=time::Instant::now();
-                let present:HashMap<_,_>=engine.pools.iter().enumerate().map(|(i,p)|(p.key,i)).collect();
+                let present=&engine.pool_index;
                 let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address)
                     .is_some_and(|&pi|!engine.pools[pi].ready && complete(&engine,pi,&active))
                     && !in_flight.contains(&p.address)
@@ -1351,22 +1399,28 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     .map(|(p,_)|p.address).collect();
                 engine.metrics.discarded_results+=(part.pools.len()-part.pools.iter().filter(|p|valid.contains(&p.key)).count()) as u64;
                 part.retain(&valid);
+                let mut failed_watch_changed=false;
                 for (p,reason) in failures {if valid.contains(&p.address) {
                     retry.insert(p.address,time::Instant::now()+Duration::from_secs(30));engine.metrics.hydration_failures+=1;
+                    // First-hydration failures need a root watch; baseline failures keep their watches.
+                    failed_watch_changed|=!baseline;
                     engine.sequence+=1;send(&out,MarketStateEvent::Unavailable{pool:p.address.to_string(),venue:Venue::from_core(p.venue).map_or("unsupported",Venue::label),slot:0,received_at_us:timestamp_us(),sequence:engine.sequence,reason});
                 }}
                 let keys:HashSet<_>=part.pools.iter().map(|p|p.key).collect();
                 for p in &mut part.pools {p.ready=baseline;retry.remove(&p.key);}
-                engine.install(part);replan=true;
                 if baseline {
-                    for pi in 0..engine.pools.len() {if keys.contains(&engine.pools[pi].key) {
+                    let positions=engine.install_baseline(part)?;
+                    for &pi in &positions {
                         if engine.pools[pi].available {engine.publish_price(pi,PriceOrigin::Baseline,None,None,None);}
                         else{engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),"baseline has no valid indicative price".into());}
-                    }}
-                    let replay_keys:HashSet<_>=engine.subs.iter().filter(|sub|keys.contains(&engine.pools[sub.pool].key)).map(|sub|sub.key).collect();
+                    }
+                    let replay_keys:HashSet<_>=positions.iter().flat_map(|&pi|engine.pool_subs[pi].iter()
+                        .map(|&i|engine.subs[i].key)).collect();
                     for key in replay_keys {if let Some((event,received))=cached.remove(&key) {
                         if engine.account(&event,&active,received,true,Some(&keys)){cached.insert(key,(event,received));}
                     }}
+                }else{
+                    replan|=engine.install_structure(part) || failed_watch_changed;
                 }
                 engine.metrics.install.add(nanos(started));
             },
@@ -1414,13 +1468,15 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     let ready=engine.pools.iter().filter(|p|p.ready).count();
                     let available=engine.pools.iter().filter(|p|p.ready && p.available).count();
                     crate::log_event!(Info,
-                        "market state hydration progress selected={} hydrated={} ready={} priced={} in_flight={} init_jobs={} baseline_jobs={} initial_mean_ms={} baseline_mean_ms={} mint_verified_pools={}",
+                        "market state hydration progress selected={} hydrated={} ready={} priced={} in_flight={} init_jobs={} baseline_jobs={} initial_mean_ms={} baseline_mean_ms={} mint_verified_pools={} live_index_rebuilds={} structure_installs={} baseline_installs={} baseline_pools_installed={} watch_plans={}",
                         selected.len(),hydrated,ready,available,in_flight.len(),
                         engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
                         if engine.metrics.initial_hydration.count>0 {engine.metrics.initial_hydration.total/engine.metrics.initial_hydration.count as u128/1_000_000}else{0},
                         if engine.metrics.baseline_hydration.count>0 {engine.metrics.baseline_hydration.total/engine.metrics.baseline_hydration.count as u128/1_000_000}else{0},
                         selected.iter().filter(|p|[p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
-                            .and_then(|r|r.onchain).is_some())).count());
+                            .and_then(|r|r.onchain).is_some())).count(),
+                        engine.metrics.index_rebuilds,engine.metrics.structure_installs,engine.metrics.baseline_installs,
+                        engine.metrics.baseline_pools_installed,engine.metrics.watch_plan.count);
                     for p in &selected {if !persisted{rebuild|=reconcile(&registry,&mut candidates,p.address);}}
                     let (ws_messages,ws_text_bytes)=control.stream_counts();engine.sequence+=1;
                     send(&out,MarketStateEvent::Stats{pools:selected.len(),ready:engine.pools.iter().filter(|p|p.ready).count(),
@@ -1432,10 +1488,12 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     // JoinSet drops/cancels the one preparation job. No detached HTTP initializer.
     drop(jobs);
     let report=engine.metrics.report();
-    crate::log_event!(Info,"market state hydration final selected={} prepared={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={}",
+    crate::log_event!(Info,"market state hydration final selected={} prepared={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={} live_index_rebuilds={} structure_installs={} baseline_installs={} baseline_pools_installed={} watch_plans={}",
         selected.len(),engine.pools.len(),engine.pools.iter().filter(|p|p.ready&&p.available).count(),
         engine.metrics.initial_hydration.count,engine.metrics.baseline_hydration.count,
-        engine.metrics.max_hydration_in_flight,engine.metrics.hydration_failures);
+        engine.metrics.max_hydration_in_flight,engine.metrics.hydration_failures,
+        engine.metrics.index_rebuilds,engine.metrics.structure_installs,engine.metrics.baseline_installs,
+        engine.metrics.baseline_pools_installed,engine.metrics.watch_plan.count);
     for p in &selected {engine.sequence+=1;send(&out,MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true");
     Ok(report)
