@@ -115,8 +115,6 @@ fn record_tvl(quotes:&mut HashMap<Pubkey,PoolQuotes>,address:Pubkey,
     select_tvl(state,at)
 }
 
-/// Extract only protocol-specific, fee-relevant fields observed in the CP4
-/// Discovery payload audit. Keep the original scalar values and units; do not
 /// Merge a normalized source patch. The source owns field names and explicit
 /// removals; Registry owns ordering, provenance and persistence coalescing.
 fn combine_metadata(previous: Option<&Arc<Value>>, incoming: &crate::core::PoolConfigUpdate,

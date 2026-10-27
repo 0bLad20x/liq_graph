@@ -152,7 +152,8 @@ pub(super) async fn live(args:&[String])->Result<()> {
     ensure!(pages.is_none_or(|n|n>0),"max-pages must be positive");
     ensure!(duration.is_none_or(|n|(1..=86400).contains(&n)),"duration must be 1..=86400 seconds");
     ensure!(name!="rpc_full"||pages.is_none(),"full RPC scan has no pages; use duration for cancellation proof");
-    ensure!(name!="manifest"||pages.is_none(),"Manifest inventory has no pages");
+    ensure!(!matches!(name.as_str(),"manifest"|"identity_hydration")||pages.is_none(),
+        "this discovery source has no pages");
     let set=match name.as_str() {
         "meteora_dlmm"=>Some(SourceSet::Dlmm),"meteora_damm_v2"=>Some(SourceSet::DammV2),
         "raydium"=>Some(SourceSet::Raydium),"orca_whirlpool"=>Some(SourceSet::Orca),

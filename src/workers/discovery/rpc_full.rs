@@ -162,7 +162,7 @@ impl Collector {
             identity: RecordIdentity::Pool { address, venue: self.venue, mint_a: None, mint_b: None },
             tvl_usd: None,
             config: None,
-        payload: json!({"kind": "rpc_full_scan_address_v1"}),
+            payload: json!({"kind": "rpc_full_scan_address_v1"}),
         });
         self.accepted += 1;
         if self.pending.len() == BATCH { self.flush()?; }
