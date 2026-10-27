@@ -184,6 +184,7 @@ pub fn plan()->Result<serde_json::Value> {
     let settings=RunSettings::from_env()?;
     if settings.market {market_state::Settings::from_env()?;}
     if settings.signals {graph_signals::Settings::from_env()?;}
+    if !settings.hydration_only {graph_liquidity::Settings::from_env()?;}
     if !settings.hydration_only {
         completion::configured("all")?;
         crate::workers::completion::lifecycle::Settings::from_env()?;
@@ -303,6 +304,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     anyhow::ensure!((32..=65536).contains(&source_capacity)
         && (32..=65536).contains(&registry_capacity),"broadcast capacity must be 32..=65536");
     let graph_settings=graph_liquidity::Settings::from_env()?;
+    let graph_audit_settings=graph_settings.clone();
     let completion_workers=if settings.hydration_only {Vec::new()}
         else {completion::configured("all")?};
     let completion_settings=if settings.hydration_only {None}
@@ -612,7 +614,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     if let Some(error)=error{return Err(error);}
     let graph=final_graph.borrow().clone();
-    let membership=graph_liquidity::compare_registry(&graph,&registry.snapshot())?;
+    let membership=graph_liquidity::compare_registry(&graph,&registry.snapshot(),&graph_audit_settings)?;
     evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
         .graph_membership=Some(membership);
     crate::log_event!(Info,"runtime shutdown complete=true");
