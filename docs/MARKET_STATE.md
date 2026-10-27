@@ -27,6 +27,11 @@ The consumer joins prices to the existing generational `WatchCatalog` and report
 - The initial RPC 5/6 setup uses 24 account subscriptions per provider, 48 total. Use `-PoolLimit 16` for that acceptance run. Raising only the pool limit to 10,000 does not expand provider account capacity. Increase observation scope only with matching configured and provider-permitted capacity.
 - A manifest refresh with unchanged pool identity does not rebuild subscriptions. A changed selection does re-establish a fresh baseline.
 
+CP7B separates structural installation from dynamic baselines. A baseline keeps live
+pool positions, static account bindings and the desired watches; it does not rebuild
+the global indices or request watch planning. See [CP7B_MARKET_STATE.md](CP7B_MARKET_STATE.md)
+for the preserved version/floor/replay guards and the short real acceptance run.
+
 ## Output contract
 
 `Price` includes pool/venue, on-chain mint order, normalized base/quote order, price, origin, price kind, consistency, component-slot range, component receipt-time range, receipt timestamp and sequence. Prices use human quote-token units per one human base-token unit. Quote preference is USDC, then WSOL, then the lexicographically larger mint address. The inverse is used when on-chain orientation differs. Thus prices of the same pair are comparable across venues.
