@@ -7,7 +7,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::broadcast, time::{sleep_until, Instant}};
 use crate::{
     core::{DataBatch, DataRecord, RecordIdentity, Venue},
-    workers::rpc_transport::{AccountData, AccountFilter, AccountView, RpcAnswer, RpcHandle, RpcOperation},
+    core::rpc::{AccountData, AccountFilter, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";

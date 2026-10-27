@@ -8,7 +8,7 @@ use crate::{core::{self, DataBatch, PoolUpdateBatch, Venue},
         pancakeswap_clmm, byreal_clmm, manifest, pumpswap, rpc_full, identity_hydration},
         diagnostic_source, persistence, pool_registry, rpc_transport}};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SourceSet { Dlmm, DlmmDammV2, Raydium, PancakeSwap, Byreal, Manifest, PumpSwap, Orca, DammV2, All }
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub(super) enum Worker {
 #[derive(Clone)]
 pub(super) struct Resources {
     pub http:reqwest::Client,
-    pub rpc:Option<rpc_transport::RpcHandle>,
+    pub rpc:Option<crate::core::rpc::RpcHandle>,
     pub output:broadcast::Sender<Arc<DataBatch>>,
     pub stop:watch::Receiver<bool>,
 }
@@ -77,8 +77,8 @@ pub(super) fn configured(set:SourceSet,once:bool,max_pages:Option<u32>)->Result<
     }
     Ok(out)
 }
-pub(super) fn pump_supported(rpc:&rpc_transport::RpcHandle)->bool {
-    use rpc_transport::RpcOperation;
+pub(super) fn pump_supported(rpc:&crate::core::rpc::RpcHandle)->bool {
+    use crate::core::rpc::RpcOperation;
     rpc.supports(&RpcOperation::ProgramV2{
         program:solana_pubkey::Pubkey::default(),filters:Vec::new(),
         view:core::account_stream::AccountView::Full,cursor:None,changed_since_slot:Some(1),limit:1,
@@ -113,7 +113,7 @@ pub(super) fn spawn_bootstrap(tasks:&mut JoinSet<Result<()>>,r:Resources)->Resul
 }
 
 pub(super) async fn hydrate(initial:Vec<(solana_pubkey::Pubkey,Venue)>,
-    live:broadcast::Receiver<Arc<PoolUpdateBatch>>,rpc:rpc_transport::RpcHandle,
+    live:broadcast::Receiver<Arc<PoolUpdateBatch>>,rpc:crate::core::rpc::RpcHandle,
     output:broadcast::Sender<Arc<DataBatch>>,settings:identity_hydration::Settings,finite:bool)->Result<()> {
     identity_hydration::run(initial,live,rpc,output,settings,finite).await
 }

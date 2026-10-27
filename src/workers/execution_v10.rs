@@ -8,7 +8,7 @@ use solana_pubkey::Pubkey;
 use tokio::sync::mpsc;
 use crate::core::{AccountMeta, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionPool, ExecutionPoolUse, ExecutionReport, ExecutionRequest}};
-use super::rpc_transport::{AccountView, RpcAnswer, RpcHandle, RpcOperation};
+use crate::core::rpc::{AccountView, RpcAnswer, RpcHandle, RpcOperation};
 
 const EXECUTOR: &str = "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz";
 const SOL: &str = "So11111111111111111111111111111111111111112";

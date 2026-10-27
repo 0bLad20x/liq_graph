@@ -25,14 +25,12 @@ pub struct Settings {
     refresh_ms: u64,
     recheck_ms: u64,
     full_refresh_ms: u64,
-    recheck_paused_once: bool,
+    /// Explicit bounded operator revalidation; never enabled by production defaults.
+    pub revalidate_once: bool,
     retry_ms: u64,
     retry_max_ms: u64,
     acknowledgement_ms: u64,
     attempt_timeout: Duration,
-    /// A finite standalone pass stops after source drain or this attempt limit.
-    pub finite: bool,
-    pub attempt_limit: usize,
     /// Optional fixed real-pool cohort per executor for live inspection. Zero: all.
     pub pool_limit: usize,
 }
@@ -43,7 +41,7 @@ fn seconds(key:&str,default:u64)->Result<u64> {
     Ok(value*1000)
 }
 impl Settings {
-    pub fn from_env(finite:bool,attempt_limit:usize)->Result<Self> {
+    pub fn from_env()->Result<Self> {
         let retry_ms=seconds("COMPLETION_LIFECYCLE_RETRY_SECONDS",60)?;
         let retry_max_ms=seconds("COMPLETION_LIFECYCLE_RETRY_MAX_SECONDS",900)?;
         ensure!(retry_max_ms>=retry_ms,"lifecycle retry maximum is below initial retry");
@@ -51,25 +49,15 @@ impl Settings {
             .unwrap_or_else(|_|"0".into()).parse::<usize>()
             .context("invalid COMPLETION_LIFECYCLE_POOL_LIMIT")?;
         ensure!(pool_limit<=100000,"lifecycle pool limit must be 0..100000");
-        let recheck_paused_once=match env::var("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE") {
-            Err(env::VarError::NotPresent)=>false,
-            Ok(v) if v=="true"||v=="1"=>true,
-            Ok(v) if v=="false"||v=="0"=>false,
-            _=>bail!("COMPLETION_LIFECYCLE_RECHECK_PAUSED_ONCE must be true or false"),
-        };
-        if recheck_paused_once {
-            ensure!(pool_limit>0 && env::var("COMPLETION_LIFECYCLE_LIVE_VENUE").ok().as_deref()==Some("byreal"),
-                "paused legacy Byreal recheck is allowed only in bounded Byreal live mode");
-        }
         Ok(Self {
-            recheck_paused_once,
+            revalidate_once:false,
             refresh_ms:seconds("COMPLETION_LIFECYCLE_REFRESH_SECONDS",900)?,
             recheck_ms:seconds("COMPLETION_LIFECYCLE_RECHECK_SECONDS",300)?,
             full_refresh_ms:seconds("COMPLETION_LIFECYCLE_FULL_REFRESH_SECONDS",3600)?,
             retry_ms,retry_max_ms,
             acknowledgement_ms:seconds("COMPLETION_LIFECYCLE_ACK_SECONDS",120)?,
             attempt_timeout:Duration::from_millis(seconds("COMPLETION_LIFECYCLE_ATTEMPT_SECONDS",180)?),
-            finite,attempt_limit,pool_limit,
+            pool_limit,
         })
     }
 }
@@ -93,9 +81,20 @@ struct Entry {
     // Most recent timed-out request for this pool; older executor replies must not overwrite proofs.
     last_expired:Option<u64>,
     last_light_checked_at_ms:Option<u64>,
+    force_once:bool,
 }
+/// Completed processing counters, not a second pool/manifest state.
+pub struct ProtocolReport {
+    pub venue:Venue,
+    pub dispatched:u64,
+    pub accepted:u64,
+    pub proofs:u64,
+    pub unchanged:u64,
+}
+pub struct Report {pub protocols:Vec<ProtocolReport>}
 #[derive(Default)]
 struct Counters {
+    protocols:Vec<ProtocolReport>,
     dispatched:u64,
     accepted:u64,
     prepared:u64,
@@ -111,6 +110,11 @@ struct Counters {
     timeouts:u64,
     late_responses:u64,
 }
+impl Counters {
+    fn venue(&mut self,venue:Venue)->&mut ProtocolReport {
+        self.protocols.iter_mut().find(|p|p.venue==venue).expect("registered Completion venue")
+    }
+}
 struct Scheduler {
     entries:HashMap<Pubkey,Entry>,
     due:BTreeSet<(u64,Pubkey)>,
@@ -125,8 +129,11 @@ impl Scheduler {
             refreshed:HashSet::new(),next_id:0,counters:Counters::default()}
     }
     fn recheckable(reason:Option<CompletionReason>,configuration_ready:bool)->bool {
-        reason.is_none_or(|reason|reason.recheckable()
-            || (reason==CompletionReason::ConfigurationRequired && configuration_ready))
+        reason.is_none_or(|reason|match reason {
+            CompletionReason::UnsupportedConfiguration=>false,
+            CompletionReason::ConfigurationRequired=>configuration_ready,
+            _=>true,
+        })
     }
     fn plan(pool:&PoolState,configuration_ready:bool,settings:Settings,now:u64)->(CompletionWork,Option<u64>) {
         if !pool.completion_admission.is_admitted() {
@@ -152,9 +159,7 @@ impl Scheduler {
         let key=pool.address;
         if !self.entries.contains_key(&key) {
             if !pool.completion_admission.is_admitted(){return;}
-            let legacy_byreal=settings.recheck_paused_once && pool.venue==Venue::ByrealClmm
-                && pool.completion_state==CompletionState::Incomplete
-                && pool.completion_reason_code==Some(CompletionReason::UnsupportedConfiguration);
+            let force_once=managed && settings.revalidate_once;
             if managed && settings.pool_limit>0 {
                 if !self.selected.iter().any(|(venue,_)|*venue==pool.venue) {
                     self.selected.push((pool.venue,HashSet::new()));
@@ -163,15 +168,15 @@ impl Scheduler {
                     .find(|(venue,_)|*venue==pool.venue).expect("registered cohort").1;
                 // A paused unsupported pool must not consume the finite cohort.
                 if !selected.contains(&key) {
-                    if (!legacy_byreal && !Self::recheckable(pool.completion_reason_code,configuration_ready))
+                    if (!force_once && !Self::recheckable(pool.completion_reason_code,configuration_ready))
                         || selected.len()>=settings.pool_limit{return;}
                     selected.insert(key);
                 }
             }
-            let (work,due)=if legacy_byreal{(CompletionWork::Recheck,Some(now))}
-                else{Self::plan(pool,configuration_ready,settings,now)};
+            let (work,mut due)=Self::plan(pool,configuration_ready,settings,now);
+            if force_once {due=Some(now);}
             crate::log_event!(Debug,"lifecycle plan pool={} venue={:?} executing={managed} work={work:?} due_at_ms={due:?}",key,pool.venue);
-            self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None,last_expired:None,last_light_checked_at_ms:None});
+            self.entries.insert(key,Entry{pool:pool.clone(),due,work,failures:0,flight:None,last_expired:None,last_light_checked_at_ms:None,force_once});
             if managed {if let Some(at)=due{self.due.insert((at,key));}}
             return;
         }
@@ -203,6 +208,9 @@ impl Scheduler {
             let flight=entry.flight.take().expect("acknowledged flight");
             let result=flight.terminal.expect("acknowledged result");
             self.counters.accepted+=1;
+            let counters=self.counters.venue(pool.venue);
+            counters.accepted+=1;counters.proofs+=1;
+            entry.force_once=false;
             match result.status {
                 CompletionStatus::Prepared=>{
                     self.counters.prepared+=1;
@@ -214,7 +222,7 @@ impl Scheduler {
                 CompletionStatus::Incomplete=>self.counters.incomplete+=1,
                 CompletionStatus::Retryable=>unreachable!(),
             }
-            crate::log_event!(Info,
+            crate::log_event!(Debug,
                 "lifecycle accepted request_id={} pool={} pool_hex={} venue={:?} work={:?} status={:?} previous_checked_at_ms={:?} checked_at_ms={:?} previous_slot={:?} slot={:?} admission={:?}",
                 flight.id,key,key.to_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>(),
                 pool.venue,flight.work,result.status,flight.previous_checked,
@@ -306,6 +314,8 @@ impl Scheduler {
                 entry.failures=0;
                 entry.last_light_checked_at_ms=Some(check.checked_at_ms);
                 self.counters.accepted+=1;
+                let counters=self.counters.venue(entry.pool.venue);
+                counters.accepted+=1;counters.unchanged+=1;
                 match check.baseline_state {
                     CompletionState::Prepared=>{
                         self.counters.unchanged_prepared+=1;
@@ -322,7 +332,7 @@ impl Scheduler {
                 let interval=if check.baseline_state==CompletionState::Prepared {settings.refresh_ms}else{settings.recheck_ms};
                 entry.due=normal_due.map(|due|due.max(check.checked_at_ms.saturating_add(interval)));
                 if let Some(at)=entry.due{self.due.insert((at,pool));}
-                crate::log_event!(Info,"lifecycle unchanged request_id={} pool={} venue={:?} work={:?} state={:?} baseline_slot={} observed_slot={} checked_at_ms={} next_due_ms={:?} db_write=false",
+                crate::log_event!(Debug,"lifecycle unchanged request_id={} pool={} venue={:?} work={:?} state={:?} baseline_slot={} observed_slot={} checked_at_ms={} next_due_ms={:?} db_write=false",
                     response.id,pool,entry.pool.venue,work,check.baseline_state,
                     check.baseline_validated_slot,check.observed_slot,check.checked_at_ms,entry.due);
                 continue;
@@ -334,7 +344,7 @@ impl Scheduler {
                     "invalid transient lifecycle response");
                 self.counters.retryable+=1;
                 Self::retry(entry,settings,now);
-                crate::log_event!(Info,"lifecycle retry request_id={} pool={} next_due_ms={:?} failures={} proof_retained=true",
+                crate::log_event!(Debug,"lifecycle retry request_id={} pool={} next_due_ms={:?} failures={} proof_retained=true",
                     response.id,pool,entry.due,entry.failures);
                 if let Some(at)=entry.due{self.due.insert((at,pool));}
             } else if result.validated_slot.is_some_and(|slot|
@@ -361,9 +371,7 @@ impl Scheduler {
             loop {
                 let active=self.entries.values().filter(|e|
                     e.pool.venue==executor.venue && e.flight.is_some()).count();
-                let remaining=if settings.attempt_limit==0 {usize::MAX}
-                    else {settings.attempt_limit.saturating_sub(self.counters.dispatched as usize)};
-                let capacity=executor.batch_size.min(executor.max_in_flight.saturating_sub(active)).min(remaining);
+                let capacity=executor.batch_size.min(executor.max_in_flight.saturating_sub(active));
                 if capacity==0{break;}
                 let keys=self.due.iter().take_while(|(at,_)|*at<=now)
                     .filter_map(|(_,key)|self.entries.get(key)
@@ -383,7 +391,7 @@ impl Scheduler {
                     if let Some(at)=entry.due.take(){self.due.remove(&(at,key));}
                     self.next_id=self.next_id.checked_add(1).context("lifecycle request id overflow")?;
                     let id=self.next_id;
-                    let force_full=entry.pool.completion_state==CompletionState::Unknown
+                    let force_full=entry.force_once || entry.pool.completion_state==CompletionState::Unknown
                         || entry.pool.completion_validated_slot.is_none()
                         || entry.pool.completion_checked_at_ms.is_none_or(|at|
                             now.saturating_sub(at)>=settings.full_refresh_ms);
@@ -395,6 +403,7 @@ impl Scheduler {
                     requests.push(CompletionRequest{id,work:entry.work,force_full,pool:entry.pool.clone()});
                 }
                 self.counters.dispatched+=requests.len() as u64;
+                self.counters.venue(executor.venue).dispatched+=requests.len() as u64;
                 permit.send(CompletionRequestBatch{requests,timeout:settings.attempt_timeout});
             }
         }
@@ -428,24 +437,30 @@ impl Scheduler {
 /// unchanged proof never postpones a due refresh or resets transient backoff.
 pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     mut responses:mpsc::Receiver<CompletionResponseBatch>,executors:Vec<Executor>,
-    output:broadcast::Sender<Arc<CompletionResultBatch>>,source_done:watch::Receiver<bool>,
-    mut stop:watch::Receiver<bool>,settings:Settings)->Result<()> {
+    output:broadcast::Sender<Arc<CompletionResultBatch>>,
+    mut stop:watch::Receiver<bool>,settings:Settings)->Result<Report> {
     ensure!(!executors.is_empty(),"lifecycle requires at least one executor");
     ensure!(executors.iter().all(|e|e.batch_size>0&&e.max_in_flight>0),"invalid lifecycle capacity");
     let mut registered=Vec::new();
     for e in &executors {
         ensure!(!registered.contains(&e.venue),"duplicate lifecycle venue");registered.push(e.venue);
     }
+    ensure!(!settings.revalidate_once || settings.pool_limit>0,
+        "explicit Completion revalidation requires a bounded pool cohort");
     let mut scheduler=Scheduler::new();
+    for executor in &executors {
+        scheduler.counters.protocols.push(ProtocolReport{venue:executor.venue,
+            dispatched:0,accepted:0,proofs:0,unchanged:0});
+    }
     let now=now_unix_ms()?;
     for pool in seed {
         scheduler.observe(&pool,executors.iter().find(|e|e.venue==pool.venue),settings,now);
     }
     let configuration_ready=executors.iter().filter(|e|e.configuration_ready)
         .map(|e|e.venue).collect::<Vec<_>>();
-    crate::log_event!(Info,"lifecycle started managed={registered:?} configuration_ready={configuration_ready:?} refresh_ms={} recheck_ms={} retry_ms={} retry_max_ms={} full_refresh_ms={} pool_limit={} attempt_limit={} finite={} max_age_enforced=false",
+    crate::log_event!(Info,"lifecycle started managed={registered:?} configuration_ready={configuration_ready:?} refresh_ms={} recheck_ms={} retry_ms={} retry_max_ms={} full_refresh_ms={} pool_limit={} revalidate_once={} max_age_enforced=false",
         settings.refresh_ms,settings.recheck_ms,settings.retry_ms,settings.retry_max_ms,
-        settings.full_refresh_ms,settings.pool_limit,settings.attempt_limit,settings.finite);
+        settings.full_refresh_ms,settings.pool_limit,settings.revalidate_once);
     let mut input_open=true;
     let mut stopping=*stop.borrow();
     let mut pulse=tokio::time::interval(Duration::from_millis(250));
@@ -457,10 +472,7 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         stopping|=*stop.borrow();
         if !stopping {scheduler.dispatch(&executors,settings,now)?;}
         let active=scheduler.entries.values().filter(|e|e.flight.is_some()).count();
-        let limit=settings.attempt_limit>0 && scheduler.counters.dispatched>=settings.attempt_limit as u64;
-        let finite_drained=settings.finite && (*source_done.borrow()||!input_open) && input.is_empty()
-            && scheduler.due.first().is_none_or(|(at,_)|*at>now);
-        if active==0 && (stopping||limit||finite_drained){break;}
+        if active==0 && stopping {break;}
         // A single slow executor or Registry acknowledgement is a pool-local
         // failure, not a reason to kill discovery, pricing, graph and execution.
         // Preserve the last accepted proof and use the existing bounded backoff.
@@ -524,5 +536,9 @@ pub async fn run(seed:Vec<PoolState>,mut input:broadcast::Receiver<Arc<PoolUpdat
         +scheduler.counters.timeouts+scheduler.counters.withdrawn_in_flight,
         "lifecycle final accounting has unacknowledged requests");
     scheduler.report(&executors,now_unix_ms()?,true);
-    Ok(())
+    for p in &scheduler.counters.protocols {
+        crate::log_event!(Info,"lifecycle protocol_summary venue={:?} dispatched={} accepted={} proofs={} unchanged={}",
+            p.venue,p.dispatched,p.accepted,p.proofs,p.unchanged);
+    }
+    Ok(Report{protocols:scheduler.counters.protocols})
 }

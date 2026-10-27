@@ -93,8 +93,15 @@ impl AdmissionIndex {
             .any(|mint| !references.contains(&mint) && self.qualified.contains(&mint));
         let native_below_minimum=native_source(pool.venue).is_some()
             && self.native_tvl.get(&pool.address).is_some_and(|v|*v<MIN_NATIVE_TVL_USD);
-        CompletionAdmission::from_qualification(
-            pool.mint_a,pool.mint_b,mint_qualified,native_below_minimum)
+        let (Some(a),Some(b))=(pool.mint_a,pool.mint_b) else {
+            return CompletionAdmission::MissingIdentity;
+        };
+        if a==b || a==Pubkey::default() || b==Pubkey::default() {
+            return CompletionAdmission::MissingIdentity;
+        }
+        if !mint_qualified {return CompletionAdmission::MintNotQualified;}
+        if native_below_minimum {return CompletionAdmission::NativeTvlBelowMinimum;}
+        CompletionAdmission::Admitted
     }
 }
 
@@ -391,8 +398,7 @@ impl PoolRegistry {
                         last_seen_ms: batch.received_at_ms,
                         last_changed_ms: batch.received_at_ms,
                         tvl_usd: selected.map(|v|v.value),
-                        completion_admission: CompletionAdmission::from_inputs(
-                            *mint_a,*mint_b,None),
+                        completion_admission: CompletionAdmission::MissingIdentity,
                         pool_config: metadata.map(|patch|combine_metadata(None,patch,batch.source,batch.received_at_ms)),
                         last_observation: selected.map(|v|Arc::new(json!({
                             "tvl_usd":v.value,"source":v.source,"observed_at_ms":v.at,

@@ -5,13 +5,13 @@ use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_pubkey::Pubkey;
 use serde_json::json;
-use tokio::{sync::{broadcast,mpsc}, task::JoinSet};
+use tokio::{sync::mpsc, task::JoinSet};
 
 use crate::{
     core::{CompletionReason, Venue, AccountMeta, ExecutionManifest, CompletionEvidence, MintProof,
-        CompletionStatus, CompletionResult, CompletionResultBatch,
+        CompletionStatus, CompletionResult,
         CompletionOutcome, CompletionRequest, CompletionUnchanged, CompletionRequestBatch, CompletionResponse, CompletionResponseBatch, PoolState},
-    workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
+    core::rpc::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
@@ -86,12 +86,19 @@ impl Settings {
             .unwrap_or_else(|_| "2".to_owned()).parse::<usize>()
             .context("invalid DLMM_EXECUTION_ABOVE")?;
         ensure!(1 + below + above <= 6, "DLMM V10 supports at most six BinArrays");
+        ensure!(account_batch_size >= 3 + below + above,
+            "DLMM account batch must fit pool, bitmap and the configured BinArray window");
         let parallel_batches = env::var("DLMM_COMPLETION_PARALLEL_BATCHES")
             .unwrap_or_else(|_| "32".to_owned()).parse::<usize>()
             .context("invalid DLMM_COMPLETION_PARALLEL_BATCHES")?;
         ensure!((1..=64).contains(&parallel_batches),
             "DLMM_COMPLETION_PARALLEL_BATCHES must be 1..=64");
         Ok(Self { account_batch_size, below, above, parallel_batches })
+    }
+    /// Worst case per pool: LbPair + bitmap + active array + configured neighbors.
+    /// Batch capacity follows the same account budget as protocol validation.
+    pub fn pools_per_batch(self) -> usize {
+        self.account_batch_size / (3 + self.below + self.above)
     }
 }
 
@@ -758,7 +765,8 @@ pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
             batch=input.recv(), if open && tasks.len()<settings.parallel_batches => {
                 match batch {
                     Some(batch)=>{
-                        ensure!(!batch.requests.is_empty(),"empty DLMM request batch");
+                        ensure!(!batch.requests.is_empty() && batch.requests.len()<=settings.pools_per_batch(),
+                            "invalid DLMM request batch size");
                         ensure!(batch.requests.iter().all(|r|
                             r.pool.venue==Venue::MeteoraDlmm
                             && r.pool.completion_admission.is_admitted()),
@@ -808,54 +816,3 @@ pub async fn run(mut input: mpsc::Receiver<CompletionRequestBatch>,
     Ok(())
 }
 
-pub async fn observe(mut input: broadcast::Receiver<Arc<CompletionResultBatch>>) -> Result<()> {
-    let mut batches = 0_u64;
-    let mut results = 0_usize;
-    let mut manifests = 0_usize;
-    loop {
-        match input.recv().await {
-            Ok(batch) => {
-                batches += 1;
-                for result in &batch.results {
-                    results += 1;
-                    if let Some(evidence) = &result.evidence {
-                        crate::log_event!(Debug,"execution evidence pool={} kind={} version={} payload={}",
-                            result.pool, evidence.kind, evidence.version, evidence.payload);
-                    }
-                    if let Some(mints) = &result.mints {
-                        for mint in mints {
-                            crate::log_event!(Warn,"execution mint pool={} mint={} token_2022={} extensions={:?} unsupported={:?}",
-                                result.pool, mint.address, mint.token_2022, mint.extensions, mint.unsupported);
-                        }
-                    }
-                    if let Some(manifest) = &result.manifest {
-                        manifests += 1;
-                        crate::log_event!(Debug,
-                            "execution manifest pool={} status={:?} slot={} mint_a={} mint_b={} \
-                             base_a_accounts={:?} base_b_accounts={:?}",
-                            manifest.pool, result.status, manifest.validated_slot,
-                            manifest.mint_a, manifest.mint_b,
-                            manifest.base_a.iter().map(|account|
-                                format!("{}:{}", account.address, if account.writable {"rw"} else {"ro"}))
-                                .collect::<Vec<_>>(),
-                            manifest.base_b.iter().map(|account|
-                                format!("{}:{}", account.address, if account.writable {"rw"} else {"ro"}))
-                                .collect::<Vec<_>>(),
-                        );
-                    } else {
-                        crate::log_event!(Debug,"execution result pool={} status={:?} slot={:?} reason={}",
-                            result.pool, result.status, result.validated_slot,
-                            result.reason.as_deref().unwrap_or("-"));
-                    }
-                }
-                crate::log_event!(Debug,"execution completion consumer source={} batches={} results={}",
-                    batch.source, batches, results);
-            }
-            Err(broadcast::error::RecvError::Lagged(count)) =>
-                bail!("execution completion output consumer lagged {count} batches"),
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
-    crate::log_event!(Info,"execution completion consumer complete batches={batches} results={results} validated_manifests={manifests}");
-    Ok(())
-}

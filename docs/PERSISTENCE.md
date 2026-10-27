@@ -21,7 +21,7 @@ comparison against an imaginary inner slot cannot establish proof agreement.
 Full validation establishes the persisted proof. A lightweight Unchanged refresh
 does not extend that full proof's timestamp or rewrite it. Ongoing refresh remains
 active in the shared runtime. Live Completion may be exercised independently with
-`--completion-lifecycle-live`; venue and limits use its existing environment settings.
+`--completion-live PROTOCOL --revalidate`; protocol and cohort are explicit CLI settings.
 Isolated real Jupiter/DexScreener enrichment remains available via `--cp1-live`.
 Historical shell/SQL acceptance and reset tools are removed; there is no parallel
 SQL-derived admission or manual manifest producer in the runtime.

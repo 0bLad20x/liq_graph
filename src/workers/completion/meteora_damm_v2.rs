@@ -17,7 +17,7 @@ use crate::{
         CompletionResponse, CompletionResponseBatch, CompletionStatus, ExecutionManifest,
         MintProof, PoolState, Venue,
     },
-    workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
+    core::rpc::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const SOURCE: &str = "meteora_damm_v2_execution_completion";

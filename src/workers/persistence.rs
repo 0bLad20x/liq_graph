@@ -555,7 +555,9 @@ impl Persistence {
                 pools.push(PoolState{
                     address,venue,mint_a:a,mint_b:b,source:"persistence_restore",
                     first_seen_ms:0,last_seen_ms:0,last_changed_ms:0,tvl_usd:None,
-                    completion_admission:CompletionAdmission::from_inputs(a,b,None),
+                    // Provisional, never admitted. Registry restore derives the
+                    // actual decision from its qualified-mint and native-TVL state.
+                    completion_admission:CompletionAdmission::MissingIdentity,
                     pool_config,last_observation,
                     completion_state:status,completion_validated_slot:slot,
                     execution_manifest:manifest,completion_evidence:evidence,

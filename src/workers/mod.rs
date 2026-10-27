@@ -1,3 +1,4 @@
+pub mod completion;
 pub mod discovery;
 pub mod source_jupiter_mint;
 pub mod mint_qualification;
@@ -8,21 +9,10 @@ pub mod pool_registry;
 pub mod rpc_transport;
 pub mod execution_v10;
 pub mod http_transport;
-pub mod completion_meteora_dlmm;
-pub mod completion_lifecycle;
-pub mod completion_meteora_damm_v2;
-pub mod completion_orca_whirlpool;
-pub mod completion_raydium_amm_v4;
-pub mod completion_raydium_cpmm;
-pub mod completion_raydium_clmm;
-pub mod completion_pancakeswap_clmm;
-pub mod completion_byreal_clmm;
-pub mod completion_manifest;
 
 pub mod graph_liquidity;
 pub mod graph_watch_catalog;
 pub mod persistence;
-pub mod completion_pumpswap;
 pub mod market_state;
 pub mod graph_signals;
 pub mod execution_candidates;

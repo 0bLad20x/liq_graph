@@ -111,7 +111,8 @@ try {
         LIQ_GRAPH_LOG = (@(
             'warn','liq_graph::orchestration::runtime=info',
             'liq_graph::workers::persistence=info','liq_graph::workers::pool_registry=info',
-            'liq_graph::workers::completion_lifecycle=info','liq_graph::workers::graph_liquidity=info',
+            'liq_graph::workers::completion::lifecycle=info','liq_graph::orchestration::completion=info',
+            'liq_graph::workers::graph_liquidity=info',
             'liq_graph::workers::graph_watch_catalog=info','liq_graph::workers::market_state=info',
             'liq_graph::workers::mint_extensions=info','liq_graph::workers::mint_qualification=info',
             'liq_graph::workers::graph_signals=info','liq_graph::workers::execution_candidates=info',
@@ -162,7 +163,8 @@ try {
     $market = Read-OptionalJson $marketPath
     $execution = Read-OptionalJson $executionPath
     $production = Read-OptionalJson $producerPath
-    $refreshes = @(Select-String -LiteralPath $log -Pattern 'lifecycle (unchanged request_id=.* work=Refresh state=Prepared|accepted request_id=.* work=Refresh status=Prepared)').Count
+    $refreshRecord = Select-String -LiteralPath $log -Pattern 'lifecycle stats final=true .*? prepared_refreshes=(\d+)' | Select-Object -Last 1
+    $refreshes = if ($null -ne $refreshRecord) { [long]$refreshRecord.Matches[0].Groups[1].Value } else { 0 }
     $lifecycleStarted = [bool](Select-String -LiteralPath $log -Pattern 'lifecycle started' -Quiet)
     $candidateDelivery = $runtime.candidate_delivery_passed
     $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and

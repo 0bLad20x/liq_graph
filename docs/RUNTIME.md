@@ -7,6 +7,7 @@ optionale V10-Simulation. Endliche und dauerhafte Läufe verwenden dieselbe Verk
 Worker bleiben über ihre vorhandenen CLI-Einstiege eigenständig ausführbar.
 Discovery-Module, gemeinsame Startverkabelung und begrenzte Einzelaufrufe beschreibt
 [DISCOVERY.md](DISCOVERY.md).
+Completion-Module und der gemeinsame Einzelstart sind in [COMPLETION.md](COMPLETION.md) beschrieben.
 
 ## Werkzeuge
 
@@ -20,7 +21,7 @@ Unter `scripts/` bleiben genau drei wiederverwendbare Dateien:
 
 Historische Checkpoint-Starter, Flashloan-Presets, DB-Wrapper, SQL-Vergleiche,
 Migration und Reset-Werkzeuge sind entfernt. Benötigte Workerfunktionen bleiben
-erhalten, darunter `--cp1-live`, `--completion-lifecycle-live` und
+erhalten, darunter `--cp1-live`, `--completion-live PROTOCOL` und
 `--jupiter-mint-backfill`. Schema und Completion-Serialisierung beschreibt
 [PERSISTENCE.md](PERSISTENCE.md). Es wird keine Datenbankmigration oder Löschung durch
 diesen Cleanup ausgeführt.

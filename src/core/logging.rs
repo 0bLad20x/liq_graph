@@ -1,5 +1,5 @@
 //! Minimal, dependency-free, worker-scoped log filtering.
-//! LIQ_GRAPH_LOG=info,source_jupiter_mint=debug,completion_manifest=debug
+//! LIQ_GRAPH_LOG=info,source_jupiter_mint=debug,liq_graph::workers::completion::manifest=debug
 use std::{env, fmt, sync::OnceLock, time::{SystemTime, UNIX_EPOCH}};
 use anyhow::{bail, Result};
 

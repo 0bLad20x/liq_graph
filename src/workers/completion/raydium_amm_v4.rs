@@ -17,7 +17,7 @@ use crate::{
         CompletionStatus, ExecutionManifest, MintProof, PoolState,
         Venue,
     },
-    workers::rpc_transport::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
+    core::rpc::{AccountData, AccountView, RpcAnswer, RpcHandle, RpcOperation},
 };
 
 const SOURCE: &str = "raydium_amm_v4_execution_completion";

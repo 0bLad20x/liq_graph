@@ -40,7 +40,7 @@ pub(super) struct ExecutionTasks {
 }
 impl ExecutionTasks {
     pub(super) fn start(settings:execution_v10::Settings,input:SignalStream,
-        registry:pool_registry::PoolRegistry,rpc:rpc_transport::RpcHandle)->Result<Self> {
+        registry:pool_registry::PoolRegistry,rpc:crate::core::rpc::RpcHandle)->Result<Self> {
         let cfg=execution_candidates::Settings::from_env(settings.wallet(),execution_v10::validate)?;
         let (jobs,requests)=mpsc::channel(1);
         let (output,mut responses)=mpsc::channel(1);
