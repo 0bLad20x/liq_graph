@@ -8,7 +8,7 @@ use crate::core::{CompletionState, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionParameters, ExecutionPool, ExecutionReport, ExecutionRequest}, market_state::{PriceOrigin,PricePipelineTiming},
     signals::{SignalCandidate, SignalCandidateBatch, SignalEvent, SignalPlan, SignalPool, SignalPoolPrice, SignalTopology,SignalWitness,
         SignalRangeChange, SignalRouteKind, SignalStateUpdate,
-        SignalStream, SignalTrigger, SIGNAL_LOG_SCALE}};
+        SignalStream, SignalTrigger, SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
 use super::pool_registry::PoolRegistry;
 
 pub struct Settings {
@@ -40,6 +40,24 @@ fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
     .as_micros().min(u128::from(u64::MAX)) as u64}
 fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 
+#[derive(Clone,Default,serde::Serialize)]
+struct RegistryReads {
+    calls:u64,wait_ns:u64,hold_ns:u64,max_wait_ns:u64,max_hold_ns:u64,
+}
+impl RegistryReads {
+    fn record(&mut self,wait:u64,hold:u64) {
+        self.calls+=1;self.wait_ns=self.wait_ns.saturating_add(wait);
+        self.hold_ns=self.hold_ns.saturating_add(hold);
+        self.max_wait_ns=self.max_wait_ns.max(wait);self.max_hold_ns=self.max_hold_ns.max(hold);
+    }
+    fn merge(&mut self,other:&Self) {
+        self.calls+=other.calls;self.wait_ns=self.wait_ns.saturating_add(other.wait_ns);
+        self.hold_ns=self.hold_ns.saturating_add(other.hold_ns);
+        self.max_wait_ns=self.max_wait_ns.max(other.max_wait_ns);
+        self.max_hold_ns=self.max_hold_ns.max(other.max_hold_ns);
+    }
+}
+
 #[derive(serde::Serialize)]
 struct PoolEvidence {
     pool: String, role: &'static str, slot: usize, log_weight_units: i64,
@@ -51,28 +69,32 @@ pub struct Selection {
     pub request: ExecutionRequest,
     graph_generation: u64, revision: u64, topology_id: Option<usize>, route_kind: SignalRouteKind,
     reverse: bool, trigger: Arc<SignalTrigger>, candidate: Option<SignalCandidate>,
-    threshold_units: i64, indicative_return_bps: Option<f64>,
+    threshold_units: i64, estimated_net_return_bps:Option<f64>,
     pools: Vec<PoolEvidence>, packing: ExecutionMetrics,
     signal_ready_at_us: u64, candidate_received_at_us: u64, request_ready_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
     frame_to_request_us: Option<u64>, signal_to_request_us: u64,
     selection_ns: u64, alternatives_considered: u64, packing_rejections: u64,
+    registry_reads:RegistryReads,
     unavailable_alternatives: u64, last_alternative_rejection: Option<String>,
     alternative_pools_added: usize,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
     pub error: Option<String>, pub requests: Vec<Selection>,
+    score_basis:&'static str,
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
     lost_events: u64, resynchronizations: u64, skipped_busy_revisions: u64,
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
     catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
+    registry_reads:RegistryReads,
 }
 impl Report {
     pub fn ensure_complete(&self)->Result<()> {
         ensure!(self.error.is_none(), "execution candidate worker failed: {}", self.error.as_deref().unwrap_or(""));
+        ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
         Ok(())
@@ -115,7 +137,7 @@ struct State {
     prices: Vec<Option<Arc<SignalPoolPrice>>>, revision: u64, generation: u64,
     ready_at_us: u64, received_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
-    threshold:i64, active:HashSet<(usize,bool)>,
+    threshold:i64, active:HashSet<(usize,bool)>,prepared_logarithms:u64,
 }
 impl State {
     fn apply(&mut self, s:&SignalStateUpdate, recovering:bool)->Result<()> {
@@ -124,6 +146,7 @@ impl State {
         if let Some(snapshot)=&s.snapshot {
             ensure!(snapshot.plan.graph_generation==s.graph_generation
                 && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE
+                && snapshot.plan.score_basis==SIGNAL_SCORE_BASIS
                 && snapshot.pools.len()==snapshot.prices.len(), "invalid candidate snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
             self.generation=s.graph_generation;
@@ -142,6 +165,10 @@ impl State {
             self.prices[change.pool_id]=change.price.clone();
         }
         self.revision=s.revision; self.ready_at_us=s.ready_at_us; self.price_pipeline=s.price_pipeline;
+        self.prepared_logarithms=if matches!(s.trigger.as_ref(),SignalTrigger::Price{..}) {
+            s.changes.iter().filter_map(|c|c.price.as_ref())
+                .map(|p|p.log_weight_units.iter().flatten().count() as u64).sum()
+        }else{0};
         Ok(())
     }
     fn weight(&self, slot:usize)->Option<i64> {
@@ -186,11 +213,13 @@ impl State {
         }
         Ok(())
     }
-    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey)
+    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey,reads:&mut RegistryReads)
         ->Result<(ExecutionPool,PoolEvidence)> {
         let identity=self.pools.get(slot/2).context("candidate slot identity missing")?;
         let price=self.prices.get(slot/2).and_then(|p|p.as_ref()).context("candidate price unavailable")?;
-        let state=registry.get(identity.address).context("candidate missing from Registry")?;
+        let (state,wait,hold)=registry.measured_get(identity.address);
+        reads.record(wait,hold);
+        let state=state.context("candidate missing from Registry")?;
         ensure!(state.completion_admission.is_admitted() && state.completion_state==CompletionState::Prepared,
             "candidate {} no longer admitted Prepared",identity.address);
         let manifest=state.execution_manifest.context("Prepared manifest missing")?;
@@ -209,7 +238,7 @@ impl State {
     /// Pack an exact CP6A best-witness without rebuilding any route product.
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
-        registry:&PoolRegistry,cfg:&Settings,number:usize)->Result<Selection>{
+        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads)->Result<Selection>{
         let started=Instant::now();
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
@@ -247,7 +276,7 @@ impl State {
             parameters:cfg.parameters.clone()};
         let mut pools=Vec::new();
         for &(slot,r) in &slots{
-            pools.push(self.pool(slot,r,registry,cfg.wallet)?);
+            pools.push(self.pool(slot,r,registry,cfg.wallet,reads)?);
         }
         install_compact(&mut request,top,&pools);
         let mut packing=(cfg.capacity)(&request).context("compact seed does not fit V10")?;
@@ -276,7 +305,7 @@ impl State {
         for (_,slot,role_name,_) in options{
             if used.contains(&(slot/2)){continue;}
             considered+=1;
-            let pool=match self.pool(slot,role_name,registry,cfg.wallet){
+            let pool=match self.pool(slot,role_name,registry,cfg.wallet,reads){
                 Ok(pool)=>pool,Err(error)=>{
                     unavailable+=1;last_rejection=Some(format!("{error:#}"));continue;
                 }
@@ -295,12 +324,13 @@ impl State {
         Ok(Selection{request,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
-            indicative_return_bps:witness.indicative_return_bps,
+            estimated_net_return_bps:witness.estimated_net_return_bps,
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
             signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
             frame_to_request_us:frame.and_then(|at|ready.checked_sub(at)),
             signal_to_request_us:ready.saturating_sub(self.ready_at_us),selection_ns:elapsed_ns(started),
+            registry_reads:reads.clone(),
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added})
@@ -331,7 +361,7 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
 }
 
 pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>, cfg:Settings)->Result<Report> {
-    let mut report=Report::default(); let mut state=State::default(); let mut sequence=0;
+    let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
     let mut pending=false;
@@ -371,8 +401,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         "candidate batch references wrong state");
                     for candidate in &b.candidates {state.candidate(b,candidate)?;}
                     if (cfg.limit>0 && report.requests.len()>=cfg.limit)
-                        ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket,..})
-                        ||!b.price_pipeline.is_some_and(|t|!t.initialization_replay){continue;}
+                        ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket|PriceOrigin::Revaluation,..})
+                        ||b.price_pipeline.is_some_and(|t|t.initialization_replay){continue;}
                     for (index,candidate) in b.candidates.iter().enumerate(){
                         if candidate.change==SignalRangeChange::Exited{continue;}
                         let top=state.plan.as_ref()
@@ -381,7 +411,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         if cfg.kind.is_some_and(|kind|kind!=top.kind){continue;}
                         if let Some(w)=candidate.witness.as_ref(){
                             ensure!(w.log_sum_units<b.threshold_units,
-                                "best candidate does not satisfy threshold");
+                                "best candidate does not satisfy net threshold");
                             report.qualifying_ranges+=1;
                             ranked.push((w.log_sum_units,event.clone(),index));
                         }
@@ -390,6 +420,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                 SignalEvent::Evaluated(e)=>{
                     report.evaluations+=1;
                     ensure!(pending && e.revision==state.revision && e.graph_generation==state.generation,"candidate completion references wrong state");
+                    ensure!(e.logarithms_prepared==state.prepared_logarithms,"candidate directed net logarithm accounting mismatch");
                     pending=false;
                     if let Some(c)=&e.catalog {
                         ensure!(matches!(e.trigger.as_ref(),SignalTrigger::Catalog{..})
@@ -409,13 +440,14 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
                     };
                     let started=Instant::now();
+                    let mut reads=RegistryReads::default();
                     ranked.sort_unstable_by_key(|entry|entry.0);
                     let mut chosen=None;
                     for (_,event,index) in &ranked {
                         let selected=match event.as_ref(){
                             SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
                                 block.threshold_units,block.trigger.clone(),&registry,&cfg,
-                                report.requests.len()+1),
+                                report.requests.len()+1,&mut reads),
                             _=>bail!("ranked event is not a compact candidate"),
                         };
                         match selected {
@@ -424,10 +456,12 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         }
                     }
                     ranked.clear();
+                    report.registry_reads.merge(&reads);
                     if let Some(selection)=chosen {
-                        crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} broadcasts=false",
+                        crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} registry_reads={} registry_wait_ns={} registry_hold_ns={} broadcasts=false",
                             selection.request.id,state.generation,state.revision,selection.route_kind,selection.reverse,
-                            selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us);
+                            selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us,
+                            selection.registry_reads.calls,selection.registry_reads.wait_ns,selection.registry_reads.hold_ns);
                         permit.send(selection.request.clone());report.requests.push(selection);
                     } else {
                         crate::log_event!(Warn,"execution candidates no_packable_seed=true generation={} revision={} last_rejection={:?}",

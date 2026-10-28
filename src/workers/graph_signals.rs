@@ -1,19 +1,19 @@
 //! CP6A: factorized canonical topologies, directed-price ranking and one
-//! best executable witness per changed topology. Never enumerate route products.
+//! best marginal DEX-net witness per changed topology. Never enumerate route products.
 use std::{collections::{BTreeMap,BTreeSet,HashMap,HashSet},env,sync::Arc,
     time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 use anyhow::{Context,Result,bail,ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast,watch};
 use crate::core::{
-    market_state::{MarketStateEvent,PoolPriceObservation,PriceEventStream,PriceOrigin,PricePipelineTiming},
+    market_state::{MarketStateEvent,PoolPriceObservation,PriceEventStream,PriceOrigin,PricePipelineTiming,PoolRemovalReason},
     signals::{SignalActiveCandidate,SignalCatalogReconciliation,SignalCandidate,SignalCandidateBatch,SignalEvaluation,SignalEvent,SignalLeg,
         SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,
         SignalRangeChange,SignalRouteKind,SignalSnapshot,SignalStateUpdate,SignalStream,
-        SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE}};
+        SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
 use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
-const OUTPUT_LAYOUT:&str="versioned_candidate_state_cp7";
+const OUTPUT_LAYOUT:&str="versioned_net_candidate_state_cp8a2";
 pub const OUTPUT_CAPACITY:usize=16384;
 
 #[derive(Clone,Copy)]
@@ -78,15 +78,18 @@ impl Prices {
         let forward = if &p.base_mint == a && &p.quote_mint == b { 0 }
             else if &p.base_mint == b && &p.quote_mint == a { 1 }
             else { bail!("price orientation mismatch"); };
-        let price = p.price_quote_per_base;
-        ensure!(price.is_finite() && price > 0.0, "invalid indicative price");
-        let logarithm = price.ln();
-        let mut weights = [None; 2];
-        let units = (-logarithm * SIGNAL_LOG_SCALE as f64).round() as i64;
-        weights[forward] = logarithm.is_finite().then_some(units);
-        weights[forward ^ 1] = (logarithm.is_finite() && (1.0 / price).is_finite()).then_some(-units);
+        let mut weights=[None;2];
+        if let Some(v)=&p.valuation {
+            for (direction,rate) in v.estimated_net_rates.iter().enumerate(){
+                if let Some(rate)=rate.filter(|r|r.is_finite()&&*r>0.0) {
+                    let n=(-rate.ln()*SIGNAL_LOG_SCALE as f64).round();
+                    ensure!(n.is_finite()&&n>=i64::MIN as f64&&n<i64::MAX as f64,"net weight overflow");
+                    weights[forward^direction]=Some(n as i64);
+                }
+            }
+        }
         let old = self.values[id].replace(Arc::new(SignalPoolPrice {
-            log_weight_units: weights, observation: Arc::new(p.clone()),
+            log_weight_units:weights, observation:Arc::new(p.clone()),
         }));
         Ok((address, Previous { pool: id, price: old }))
     }
@@ -107,6 +110,8 @@ fn key(weight: i64, slot: usize) -> Key { Key { weight, slot } }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 struct Winner{slots:[usize;4],length:usize,total:i64}
+#[derive(Clone,Copy)]
+struct ActiveCandidate { winner:Winner, entered:Instant }
 fn first_two(set:Option<&BTreeSet<Key>>)->[Option<Key>;2]{
     let mut values=set.into_iter().flat_map(|v|v.iter());
     [values.next().copied(),values.next().copied()]
@@ -116,7 +121,8 @@ fn pair(a:Pubkey,b:Pubkey)->(Pubkey,Pubkey){(a.min(b),a.max(b))}
 struct CompactIndex {
     graph:Arc<GraphSnapshot>,
     ranked:HashMap<(Pubkey,Pubkey),BTreeSet<Key>>,
-    qualifying:HashMap<(u32,bool),Winner>,
+    qualifying:HashMap<(u32,bool),ActiveCandidate>,
+    windows:CandidateWindows,
 }
 struct CatalogInstall {
     affected:Vec<u32>,
@@ -164,11 +170,13 @@ impl CompactIndex {
             previous_generation:self.graph.generation,changed_pairs:dirty.len(),
             ..Default::default()};
         let mut matched=0;
+        let mut preserved=HashSet::new();
         for (id,t) in graph.topologies.iter().enumerate(){
             let prior=old_ids.get(&(t.kind,t.settlement,t.target,t.bridge)).copied()
                 .filter(|&old|self.graph.topologies[old as usize].directed_roles()==t.directed_roles());
             if let Some(old)=prior {
                 matched+=1;
+                preserved.insert(old);
                 for reverse in [false,true]{
                     if let Some(w)=previous.get(&(old,reverse)){
                         self.qualifying.insert((id as u32,reverse),*w);
@@ -184,12 +192,30 @@ impl CompactIndex {
         summary.reused_topologies=graph.topologies.len()-affected.len();
         summary.reevaluated_topologies=affected.len();
         summary.exited_candidates=previous.len()-self.qualifying.len();
+        if !self.windows.ended {
+            for (&(id,_),candidate) in &previous {
+                if !preserved.contains(&id){self.windows.catalog_exit_ns.add(nanos(candidate.entered));}
+            }
+        }
         self.graph=graph;
         CatalogInstall{affected,previous_candidates:previous.len(),summary}
     }
     fn clear_prices(&mut self){
         self.ranked.clear();
+        if !self.windows.ended {
+            for candidate in self.qualifying.values(){self.windows.gap_exit_ns.add(nanos(candidate.entered));}
+        }
         self.qualifying.clear();
+    }
+    fn censor_windows(&mut self,error:bool){
+        if self.windows.ended{return;}
+        let at=Instant::now();
+        for candidate in self.qualifying.values(){
+            let duration=at.duration_since(candidate.entered).as_nanos().min(u128::from(u64::MAX)) as u64;
+            if error{self.windows.right_censored_at_error_ns.add(duration);}
+            else{self.windows.right_censored_at_end_ns.add(duration);}
+        }
+        self.windows.ended=true;
     }
     /// True only when a directed pair's best or runner-up has changed.
     /// The second-best is required to preserve direct-2 same-pool exclusion.
@@ -269,11 +295,11 @@ impl CompactIndex {
             ==i128::from(winner.total),"CP6A candidate score mismatch");
         let sum=winner.total as f64/SIGNAL_LOG_SCALE as f64;
         let bps=(-sum).exp_m1()*10_000.0;
-        Ok(SignalWitness{legs,log_sum_units:winner.total,negative_log_sum:sum,
-            indicative_return_bps:bps.is_finite().then_some(bps)})
+        Ok(SignalWitness{legs,log_sum_units:winner.total,
+            estimated_net_return_bps:bps.is_finite().then_some(bps)})
     }
     fn reconcile(&mut self,ids:&[u32],prices:&Prices,threshold:i64,
-        stats:&mut SignalEvaluation,publish_changes:bool)->Result<(Vec<SignalCandidate>,[usize;3])>{
+        stats:&mut SignalEvaluation,publish_changes:bool,force_updates:bool)->Result<(Vec<SignalCandidate>,[usize;3])>{
         let mut out=Vec::new();
         let mut transitions=[0;3];
         for &id in ids {
@@ -296,16 +322,32 @@ impl CompactIndex {
                 if best.is_some(){stats.ready_anchors[kind_id(kind)]+=1;}
                 let selected=best.filter(|b|b.total<threshold);
                 let key=(id,reverse);
-                let previous=self.qualifying.get(&key).copied();
-                if previous==selected{continue;}
+                let prior=self.qualifying.get(&key).copied();
+                let previous=prior.map(|p|p.winner);
+                if previous==selected && !(force_updates && selected.is_some()){continue;}
                 let change=match(previous,selected){
                     (None,Some(_))=>SignalRangeChange::Entered,
                     (Some(_),None)=>SignalRangeChange::Exited,
                     (Some(_),Some(_))=>SignalRangeChange::Updated,
                     (None,None)=>continue,
                 };
-                if let Some(w)=selected{self.qualifying.insert(key,w);}
-                else{self.qualifying.remove(&key);}
+                if let Some(winner)=selected {
+                    let entered=prior.map_or_else(Instant::now,|p|p.entered);
+                    if prior.is_none(){self.windows.entered+=u64::from(!self.windows.ended);}
+                    self.qualifying.insert(key,ActiveCandidate{winner,entered});
+                    if !self.windows.ended {
+                        self.windows.peak_active_candidates=self.windows.peak_active_candidates.max(self.qualifying.len());
+                    }
+                } else if let Some(prior)=self.qualifying.remove(&key) {
+                    if !self.windows.ended {
+                        let duration=nanos(prior.entered);
+                        match stats.trigger.as_ref() {
+                            SignalTrigger::Price{..} if best.is_some()=>self.windows.threshold_exit_ns.add(duration),
+                            SignalTrigger::Catalog{..}=>self.windows.catalog_exit_ns.add(duration),
+                            _=>self.windows.unavailable_exit_ns.add(duration),
+                        }
+                    }
+                }
                 transitions[change_id(change)]+=1;
                 let witness=if publish_changes {
                     stats.ranges[change_id(change)]+=1;
@@ -319,9 +361,9 @@ impl CompactIndex {
         Ok((out,transitions))
     }
     fn candidates(&mut self,address:Pubkey,prices:&Prices,threshold:i64,
-        stats:&mut SignalEvaluation)->Result<Vec<SignalCandidate>>{
+        stats:&mut SignalEvaluation,force_updates:bool)->Result<Vec<SignalCandidate>>{
         let graph=self.graph.clone();
-        self.reconcile(graph.topologies_for_pool(address),prices,threshold,stats,true)
+        self.reconcile(graph.topologies_for_pool(address),prices,threshold,stats,true,force_updates)
             .map(|(changes,_)|changes)
     }
     fn snapshot_candidates(&self,plan:&SignalPlan,prices:&Prices)->Result<Vec<SignalActiveCandidate>>{
@@ -329,7 +371,7 @@ impl CompactIndex {
         keys.sort_unstable();
         keys.into_iter().map(|(id,reverse)|{
             let top=plan.compact_topologies.get(id as usize).context("snapshot topology absent")?;
-            let winner=self.qualifying[&(id,reverse)];
+            let winner=self.qualifying[&(id,reverse)].winner;
             Ok(SignalActiveCandidate{topology_id:id as usize,reverse,
                 witness:self.witness(top,winner,reverse,prices)?})
         }).collect()
@@ -382,10 +424,10 @@ impl Engine {
         work.stats.publication_ns+=nanos(started);
         Ok(())
     }
-    fn candidates(&mut self,work:&mut Work,address:Pubkey)->Result<()>{
+    fn candidates(&mut self,work:&mut Work,address:Pubkey,force_updates:bool)->Result<()>{
         let started=Instant::now();
-        let candidates=self.index.candidates(address,&self.prices,self.threshold,&mut work.stats)?;
-        work.stats.query_ns=nanos(started);
+        let candidates=self.index.candidates(address,&self.prices,self.threshold,&mut work.stats,force_updates)?;
+        work.stats.query_ns+=nanos(started);
         if candidates.is_empty(){return Ok(());}
         let t=Instant::now();
         let block=SignalCandidateBatch{sequence:self.next_sequence(),revision:self.revision,
@@ -397,7 +439,7 @@ impl Engine {
         self.emit(SignalEvent::Candidates(block))?;
         work.stats.publication_ns+=nanos(started);
         let end=nanos(work.started);
-        work.stats.first_range_ns=Some(end);work.stats.last_range_ns=Some(end);
+        work.stats.first_range_ns.get_or_insert(end);work.stats.last_range_ns=Some(end);
         Ok(())
     }
     fn evaluate(&mut self,mut work:Work)->Result<()>{
@@ -418,7 +460,7 @@ impl Engine {
         let installed=self.index.install(graph.clone(),&self.prices);
         crate::log_event!(Info,"graph signals cp6b rankings generation={} changed_pairs={} directed_roles={} old_groups_compiled=0",
             graph.generation,installed.summary.changed_pairs,self.index.ranked.len());
-        let plan=Arc::new(SignalPlan{graph_generation:graph.generation,
+        let plan=Arc::new(SignalPlan{score_basis:SIGNAL_SCORE_BASIS,graph_generation:graph.generation,
             log_weight_scale:SIGNAL_LOG_SCALE,
             compact_topologies:compact.into(),route_options:graph.route_options});
         let old=std::mem::replace(&mut self.plan,plan);
@@ -428,7 +470,7 @@ impl Engine {
     fn reconcile_catalog(&mut self,work:&mut Work,mut installed:CatalogInstall,sample_limit:usize)->Result<()>{
         let started=Instant::now();
         let (changes,transitions)=self.index.reconcile(&installed.affected,&self.prices,
-            self.threshold,&mut work.stats,false)?;
+            self.threshold,&mut work.stats,false,false)?;
         work.stats.query_ns=nanos(started);
         let summary=&mut installed.summary;
         summary.entered_candidates=transitions[0];
@@ -445,7 +487,7 @@ impl Engine {
             .take(sample_limit.saturating_sub(self.production.catalog_examples.len())) {
             let top=&self.plan.compact_topologies[candidate.topology_id];
             if let Some(&winner)=self.index.qualifying.get(&(candidate.topology_id as u32,candidate.reverse)) {
-                candidate.witness=Some(self.index.witness(top,winner,candidate.reverse,&self.prices)?);
+                candidate.witness=Some(self.index.witness(top,winner.winner,candidate.reverse,&self.prices)?);
             }
             self.production.catalog_examples.push(serde_json::json!({
                 "graph_generation":self.plan.graph_generation,"previous_generation":summary.previous_generation,
@@ -463,18 +505,18 @@ impl Engine {
 }
 pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<GraphSnapshot>>,
     output:broadcast::Sender<Arc<SignalEvent>>,settings:Settings)->Result<ProductionReport>{
-    let initial=Arc::new(SignalPlan{graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
+    let initial=Arc::new(SignalPlan{score_basis:SIGNAL_SCORE_BASIS,graph_generation:0,log_weight_scale:SIGNAL_LOG_SCALE,
         compact_topologies:Arc::from([]),route_options:0});
     let mut e=Engine{prices:Prices::default(),plan:initial,index:CompactIndex::default(),
         output,sequence:0,revision:0,
         threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,
-        production:ProductionReport::default()};
+        production:ProductionReport{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}};
     let outcome:Result<()>=async{
         let started=Instant::now();let received=now_us();
         let mut work=e.begin(SignalTrigger::Catalog{generation:0},started,received,None,input.len());
         e.state(&mut work,true,false,Vec::new())?;e.evaluate(work)?;
         let mut graph_open=true;
-        crate::log_event!(Info,"graph signals cp6a started=true output_layout={} compact=true",OUTPUT_LAYOUT);
+        crate::log_event!(Info,"graph signals cp8a2 started=true output_layout={} score_basis={} threshold_bps={} compact=true",OUTPUT_LAYOUT,SIGNAL_SCORE_BASIS,settings.threshold_bps);
         loop{tokio::select!{
             change=graphs.changed(),if graph_open=>{
                 if change.is_err(){graph_open=false;continue;}
@@ -504,21 +546,30 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                     MarketStateEvent::Price(p)=>{
                         let started=Instant::now();let received=now_us();let preparing=Instant::now();
                         let (address,old)=e.prices.observe(p)?;
+                        let known=e.prices.values[old.pool].as_ref().unwrap().log_weight_units.iter().flatten().count();
+                        e.production.observations_by_known_net_directions[known]+=1;
                         let preparation_ns=nanos(preparing);
                         let index_start=Instant::now();
+                        let previous_fee=old.price.as_ref().and_then(|v|v.observation.valuation.as_ref())
+                            .map(|v|(&v.dex_fee_rates,&v.fees_on_input,&v.token_fee_status,&v.unknown_reason));
+                        let current_fee=p.valuation.as_ref().map(|v|(&v.dex_fee_rates,&v.fees_on_input,&v.token_fee_status,&v.unknown_reason));
+                        let fee_changed=previous_fee!=current_fee;
                         let change=e.index.refresh(address,&old,&e.prices)?;
                         let index_ns=nanos(index_start);
                         let mut work=e.begin(SignalTrigger::Price{pool:address,
                             sequence:p.sequence,origin:p.origin,received_at_us:p.received_at_us},
                             started,received,p.pipeline,input.len());
                         work.stats.price_preparation_ns=preparation_ns;
-                        work.stats.index_update_ns=index_ns;work.stats.logarithms_prepared=1;
+                        work.stats.index_update_ns=index_ns;work.stats.logarithms_prepared=known as u64;
                         e.state(&mut work,false,false,vec![e.prices.change(old.pool)])?;
-                        if change{e.candidates(&mut work,address)?;}
+                        if change||fee_changed{e.candidates(&mut work,address,fee_changed)?;}
                         e.evaluate(work)?;
                     },
-                    MarketStateEvent::Unavailable{pool,sequence,..}|MarketStateEvent::Removed{pool,sequence}=>{
+                    MarketStateEvent::Unavailable{pool,sequence,..}|MarketStateEvent::Removed{pool,sequence,..}=>{
                         let started=Instant::now();let received=now_us();
+                        if matches!(event.as_ref(),MarketStateEvent::Removed{reason:PoolRemovalReason::Shutdown,..}) {
+                            e.index.censor_windows(false);
+                        }
                         let address:Pubkey=pool.parse().context("unavailable pool key")?;
                         let id=e.prices.index.get(&address).copied();
                         let mut changed=false;
@@ -530,7 +581,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                             reason:"pool unavailable or removed".into()},started,received,None,input.len());
                         let changes=id.map(|i|e.prices.change(i)).into_iter().collect();
                         e.state(&mut work,false,false,changes)?;
-                        if changed{e.candidates(&mut work,address)?;}
+                        if changed{e.candidates(&mut work,address,false)?;}
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Gap{sequence,reason}=>{
@@ -558,7 +609,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,
                             reason:"observation selection reconciled".into()},started,received,None,input.len());
                         e.state(&mut work,false,false,changes)?;
-                        for address in affected{e.candidates(&mut work,address)?;}
+                        for address in affected{e.candidates(&mut work,address,false)?;}
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Stats{..}=>{},
@@ -580,6 +631,8 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
         Ok(())
     }.await;
     e.production.error=outcome.err().map(|e|format!("{e:#}"));
+    e.index.censor_windows(e.production.error.is_some());
+    e.production.candidate_windows=std::mem::take(&mut e.index.windows);
     e.production.final_price_pools=e.prices.values.iter().filter(|p|p.is_some()).count();
     e.production.final_available_directions=e.prices.values.iter().flatten()
         .map(|p|p.log_weight_units.iter().filter(|w|w.is_some()).count()).sum();
@@ -631,6 +684,25 @@ impl serde::Serialize for Histogram {
 pub struct Timing { count: u64, min: Option<u64>, max: Option<u64>, mean: Option<f64>,
     p50_upper_bound: Option<u64>, p95_upper_bound: Option<u64>, p99_upper_bound: Option<u64> }
 
+/// Local net-qualifying topology/direction membership, not executable profit lifetime.
+/// Histograms are bounded; shutdown/error censoring never counts as an economic exit.
+#[derive(Default,serde::Serialize)]
+struct CandidateWindows {
+    entered:u64,peak_active_candidates:usize,
+    threshold_exit_ns:Histogram,unavailable_exit_ns:Histogram,
+    catalog_exit_ns:Histogram,gap_exit_ns:Histogram,
+    right_censored_at_end_ns:Histogram,right_censored_at_error_ns:Histogram,
+    #[serde(skip)] ended:bool,
+}
+impl CandidateWindows {
+    fn ensure_complete(&self)->Result<()> {
+        let accounted=self.threshold_exit_ns.count+self.unavailable_exit_ns.count
+            +self.catalog_exit_ns.count+self.gap_exit_ns.count
+            +self.right_censored_at_end_ns.count+self.right_censored_at_error_ns.count;
+        ensure!(self.entered==accounted,"net candidate window accounting mismatch: entered={} accounted={accounted}",self.entered);
+        Ok(())
+    }
+}
 
 #[derive(Default, PartialEq, Eq, serde::Serialize)]
 struct Counts {
@@ -703,6 +775,7 @@ struct ProductionTimings {
     first_range_ns: Histogram, last_range_ns: Histogram,
     transport_decode_us: Histogram, transport_to_market_us: Histogram, market_processing_us: Histogram,
     price_queue_us: Histogram, frame_to_worker_us: Histogram, frame_to_state_ready_us: Histogram,
+    frame_to_evaluation_complete_us:Histogram,
 }
 impl ProductionTimings {
     fn record(&mut self, e: &SignalEvaluation) {
@@ -722,15 +795,19 @@ impl ProductionTimings {
             ] { if let Some(us)=end.checked_sub(start) { hist.add(us); } }
             if let Some(us)=e.worker_received_at_us.checked_sub(t.frame_received_at_us) {
                 self.frame_to_state_ready_us.add(us.saturating_add(e.state_ready_ns.div_ceil(1000)));
+                self.frame_to_evaluation_complete_us.add(us.saturating_add(e.processing_ns.div_ceil(1000)));
             }
         }
     }
 }
 #[derive(Default, serde::Serialize)]
 pub struct ProductionReport {
+    score_basis:&'static str,
     error: Option<String>, counts: Counts,pub input_events:u64,
+    observations_by_known_net_directions:[u64;3],candidate_windows:CandidateWindows,
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
     steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
+    revaluation_inputs:ProductionTimings,
     catalog_plan_build_ns: Histogram, last_plan: Option<serde_json::Value>,
     catalog_examples:Vec<serde_json::Value>,
     final_price_pools: usize, final_available_directions: usize,
@@ -740,6 +817,7 @@ impl ProductionReport {
     fn plan(&mut self,p:&Arc<SignalPlan>,index:&CompactIndex,prices:&Prices,ns:u64){
         self.catalog_plan_build_ns.add(ns);
         self.last_plan=Some(serde_json::json!({
+            "score_basis":p.score_basis,
             "generation":p.graph_generation,"pools":prices.pools.len(),
             "compact_topologies":p.compact_topologies.len(),
             "logical_routes":p.route_options,
@@ -756,12 +834,16 @@ impl ProductionReport {
             self.websocket_inputs.record(e);
             if e.price_pipeline.is_some_and(|t|!t.initialization_replay) { self.steady_state_inputs.record(e); }
             else { self.initialization_inputs.record(e); }
+        } else if matches!(e.trigger.as_ref(),SignalTrigger::Price {origin:PriceOrigin::Revaluation,..}) {
+            self.revaluation_inputs.record(e);
         } else if matches!(e.trigger.as_ref(),SignalTrigger::Price { .. }) {
             self.initialization_inputs.record(e);
         }
     }
     pub fn ensure_complete(&self) -> Result<()> {
         ensure!(self.error.is_none(),"signal producer failed: {}",self.error.as_deref().unwrap_or(""));
+        ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"signal score basis differs from net contract");
+        self.candidate_windows.ensure_complete()?;
         Ok(())
     }
     pub fn ensure_delivery(&self, r: &ObservationReport) -> Result<()> {
@@ -826,7 +908,7 @@ impl Mirror {
         ensure!(s.revision==self.revision+1,"state revision gap");
         if let Some(snapshot)=&s.snapshot {
             ensure!(snapshot.plan.graph_generation==s.graph_generation
-                && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE && snapshot.pools.len()==snapshot.prices.len(),"invalid state snapshot");
+                && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE && snapshot.plan.score_basis==SIGNAL_SCORE_BASIS && snapshot.pools.len()==snapshot.prices.len(),"invalid state snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
             self.generation=s.graph_generation;
             self.threshold=snapshot.threshold_units;
@@ -894,13 +976,14 @@ impl Mirror {
         ensure!(witness.legs.last().is_some_and(|l|l.output_mint==witness.legs[0].input_mint)
             &&sum==i128::from(witness.log_sum_units)
             &&witness.log_sum_units<self.threshold,
-            "candidate is not a profitable closed route");
+            "candidate is not a net-qualifying closed route");
         Ok(())
     }
 }
 pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
     let mut report=ObservationReport::default();
     let mut mirror=Mirror::default(); let mut pending=false; let mut ranges=[0_u64;3];
+    let mut prepared_logarithms=0_u64;
     let mut sample_baseline=[0_usize;4]; let mut sample_ws=[0_usize;4];
     let mut ticker=tokio::time::interval(Duration::from_secs(5));
     let outcome: Result<()> = async {
@@ -940,6 +1023,10 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 ensure!(!pending,"state replaced before previous evaluation completed");
                                 if recovering {mirror.revision=s.revision.checked_sub(1).context("invalid snapshot revision")?;}
                                 mirror.state(s)?; pending=true; ranges=[0;3]; report.last_revision=s.revision;
+                                prepared_logarithms=if matches!(s.trigger.as_ref(),SignalTrigger::Price{..}) {
+                                    s.changes.iter().filter_map(|c|c.price.as_ref())
+                                        .map(|p|p.log_weight_units.iter().flatten().count() as u64).sum()
+                                }else{0};
                                 if recovering {
                                     report.awaiting_snapshot=false; report.resynchronizations+=1;
                                     crate::log_event!(Warn,"graph signals receiver snapshot_applied=true sequence={sequence} revision={} generation={} resynchronizations={} lost_total={} delivery_valid=false",
@@ -992,6 +1079,8 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 ensure!(pending && e.revision==mirror.revision && e.graph_generation==mirror.generation,
                                     "completion references wrong state");
                                 ensure!(ranges==e.ranges,"range/completion counts differ");
+                                ensure!(e.logarithms_prepared==prepared_logarithms,
+                                    "directed net logarithm accounting mismatch");
                                 if let Some(c)=&e.catalog {
                                     ensure!(matches!(e.trigger.as_ref(),SignalTrigger::Catalog{..})
                                         && ranges==[0;3] && mirror.active.len()==c.active_candidates,
@@ -1001,8 +1090,8 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             }
                             ensure!(e.ranges.iter().sum::<u64>()==e.ranges_by_kind.iter().sum::<u64>(),
                                 "range/completion counts differ");
-                            ensure!(e.logarithms_prepared==u64::from(matches!(e.trigger.as_ref(),SignalTrigger::Price {..})),
-                                "price logarithm accounting mismatch");
+                            ensure!(e.logarithms_prepared<=2*u64::from(matches!(e.trigger.as_ref(),SignalTrigger::Price {..})),
+                                "directed net logarithm count exceeds price directions");
                             report.counts.evaluation(e); pending=false;
                             if let Some(us)=at.checked_sub(e.completed_at_us) {report.completion_to_consumer_us.add(us);}
                             if live(&e.trigger) {

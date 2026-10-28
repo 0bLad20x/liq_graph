@@ -80,3 +80,5 @@ CP8 separately addresses the private alternative-pair index, repeated message bu
 redundant fast-mode signing and unused execution fields. Its functional proof must
 report packing/rejection/simulation/DEX results per Direct2, Direct3, Triangle3 and
 Triangle4, with account counts, CU, error codes and costs. Nothing is broadcast.
+
+CP8A.2 preserves V10 automatic sizing. Witness selection, candidate ranking and parallel alternatives use marginal DEX-net weights only; the configured signal threshold applies to that net return. Requests record the selected witness estimate and each pool's fee provenance. Missing net rates have no gross fallback. Estimated net return is not a guaranteed trade profit. See [CP8A](CP8A.md).

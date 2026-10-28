@@ -5,6 +5,7 @@ use super::market_state::{PoolPriceObservation, PriceOrigin, PricePipelineTiming
 
 /// Canonical log-weight unit for the wire contract (Q48).
 pub const SIGNAL_LOG_SCALE: i64 = 1_i64 << 48;
+pub const SIGNAL_SCORE_BASIS: &str = "marginal_dex_net";
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -27,9 +28,10 @@ pub struct SignalPool {
     pub mint_b: Pubkey,
 }
 /// Canonical slots 2*pool_id and 2*pool_id+1 mean A->B and B->A.
-/// None means that direction is not numerically available.
+/// None means that direction has no usable marginal DEX-net estimate.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SignalPoolPrice {
+    /// Independent directed marginal DEX-net weights. No gross fallback.
     pub log_weight_units: [Option<i64>; 2],
     pub observation: Arc<PoolPriceObservation>,
 }
@@ -62,7 +64,7 @@ pub struct SignalCandidate {
     pub topology_id: usize,
     pub reverse: bool,
     pub change: SignalRangeChange,
-    /// Only present for entering/updating profitable candidates.
+    /// Only present for entering/updating net-qualifying candidates.
     pub witness: Option<SignalWitness>,
 }
 /// Current membership, not an Entered event or an instruction to execute.
@@ -97,6 +99,7 @@ pub struct SignalCandidateBatch {
 }
 #[derive(Debug, serde::Serialize)]
 pub struct SignalPlan {
+    pub score_basis: &'static str,
     pub graph_generation: u64,
     pub log_weight_scale: i64,
     pub compact_topologies: Arc<[SignalTopology]>,
@@ -143,8 +146,9 @@ pub struct SignalLeg {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SignalWitness {
     pub legs: Vec<SignalLeg>,
-    /// Current score for Entered/Updated; prior score for Exited.
-    pub log_sum_units: i64, pub negative_log_sum: f64, pub indicative_return_bps: Option<f64>,
+    /// Sum of the directed marginal DEX-net Q48 weights.
+    pub log_sum_units: i64,
+    pub estimated_net_return_bps: Option<f64>,
 }
 #[derive(Debug, serde::Serialize)]
 pub struct SignalEvaluation {

@@ -15,10 +15,13 @@ param(
     [switch]$TracePrices,
     [switch]$TraceSignals,
     [switch]$ProfileSignals,
+    # Required marginal DEX-net advantage; network/rent costs are separate.
     [ValidateRange(0,1000000)][double]$ThresholdBps = 0,
     [string]$WsProviders = 'Configured',
     [ValidateRange(0,2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
+    [switch]$RequireFeeEvidence,
+    [string]$EnabledVenues = '',
     [switch]$SimulateV10,
     [string]$WalletPath,
     [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
@@ -33,6 +36,7 @@ if (($SimulateV10 -or $RequireCatalogReconciliation -or $TraceSignals -or $Profi
 }
 if (($Rewatch -or $TracePrices) -and -not $marketEnabled) { throw 'Rewatch and TracePrices require MarketState.' }
 if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires GraphAudit for actual graph/reference evidence.' }
+if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage Signals.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -40,6 +44,20 @@ if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10
 function Read-OptionalJson([string]$Path) {
     if (Test-Path -LiteralPath $Path) { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) }
     return $null
+}
+function Measure-Durations($Values) {
+    # Exact post-run request samples; signal-owner percentiles remain histogram bounds.
+    $sorted = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [long]$_ } | Sort-Object)
+    $n = $sorted.Count
+    if ($n -eq 0) { return [ordered]@{count=0; min=$null; median=$null; mean=$null; p95=$null; p99=$null; max=$null} }
+    $middle = [int][Math]::Floor($n / 2)
+    $median = if ($n % 2 -eq 0) { ([double]$sorted[$middle - 1] + [double]$sorted[$middle]) / 2 } else { $sorted[$middle] }
+    return [ordered]@{
+        count=$n; min=$sorted[0]; median=$median
+        mean=($sorted | Measure-Object -Average).Average
+        p95=$sorted[[int][Math]::Ceiling($n * 0.95) - 1]
+        p99=$sorted[[int][Math]::Ceiling($n * 0.99) - 1]; max=$sorted[$n - 1]
+    }
 }
 $repo = Split-Path -Parent $PSScriptRoot
 $previous = @{}
@@ -123,6 +141,7 @@ try {
             'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info'
         ) -join ',')
     }
+    if ($EnabledVenues) { $values.GRAPH_ENABLED_VENUES = $EnabledVenues }
     if ($CompletionRefreshSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_REFRESH_SECONDS = "$CompletionRefreshSeconds" }
     if ($CompletionRecheckSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_RECHECK_SECONDS = "$CompletionRecheckSeconds" }
     if ($SimulateV10 -and -not $PlanOnly) {
@@ -145,6 +164,9 @@ try {
         branch=$branch; head=$head; start_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         duration_seconds=$DurationSeconds; pool_limit=$PoolLimit; ws_account_budget=$AccountBudget
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
+        signal_score_basis='marginal_dex_net'; signal_net_threshold_bps=$ThresholdBps
+        profile_signals=[bool]$ProfileSignals
+        require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=$EnabledVenues
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -155,6 +177,7 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
+    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
     Write-Host "WS accounts=$($plan.websocket_plan.account_capacity) sockets=$($plan.websocket_plan.socket_count)"
     if ($PlanOnly) {
         @{ plan_only=$true; runtime_started=$false; orchestration_evidence_passed=$false } |
@@ -221,6 +244,41 @@ try {
     }
     $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
+    $netViolations = @($requests | Where-Object { $_.candidate.witness.log_sum_units -ge $_.threshold_units } | ForEach-Object { $_.request.id })
+    $netPassed = $null
+    if ($signals) {
+        $netPassed = $null -ne $production -and $production.score_basis -eq 'marginal_dex_net' -and
+            $production.last_plan.score_basis -eq 'marginal_dex_net' -and
+            ([long]$production.observations_by_known_net_directions[1] + [long]$production.observations_by_known_net_directions[2]) -gt 0 -and
+            $netViolations.Count -eq 0 -and
+            (-not $SimulateV10 -or $execution.execution_candidates.score_basis -eq 'marginal_dex_net')
+    }
+    $feeEvidence = $market.metrics.fee_valuation
+    $feePassed = $null
+    if ($RequireFeeEvidence) {
+        $feePassed = $null -ne $feeEvidence -and
+            [long]$feeEvidence.known_dex_fees_by_model.dlmm -gt 0 -and
+            [long]$feeEvidence.known_dex_fees_by_model.pumpswap -gt 0 -and
+            [long]$feeEvidence.asymmetric_rates -gt 0
+    }
+    # Owner measurements only; no extra observer or per-pool timing logs.
+    $registryCycles = @(Select-String -LiteralPath $log -Pattern 'pool registry tvl_refresh=(\{.*\})$' | ForEach-Object {
+        $_.Matches[0].Groups[1].Value | ConvertFrom-Json
+    })
+    $registryMaintenance = [ordered]@{
+        cycles=$registryCycles.Count
+        scanned=[long](($registryCycles | Measure-Object -Property scanned -Sum).Sum)
+        changed=[long](($registryCycles | Measure-Object -Property changed -Sum).Sum)
+        persisted=[long](($registryCycles | Measure-Object -Property persisted -Sum).Sum)
+        write_batches=[long](($registryCycles | Measure-Object -Property write_batches -Sum).Sum)
+        max_write_batch_pools=[long](($registryCycles | Measure-Object -Property max_write_batch_pools -Maximum).Maximum)
+        max_prepare_ns=[long](($registryCycles | Measure-Object -Property prepare_ns -Maximum).Maximum)
+        write_lock_wait_ns=[long](($registryCycles | Measure-Object -Property write_lock_wait_ns -Sum).Sum)
+        write_lock_hold_ns=[long](($registryCycles | Measure-Object -Property write_lock_hold_ns -Sum).Sum)
+        max_write_lock_hold_ns=[long](($registryCycles | Measure-Object -Property max_write_lock_hold_ns -Maximum).Maximum)
+        max_elapsed_ns=[long](($registryCycles | Measure-Object -Property elapsed_ns -Maximum).Maximum)
+    }
+    $registryReads = $execution.execution_candidates.registry_reads
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
@@ -242,10 +300,30 @@ try {
         ready_pools=$market.ready_pools; priced_pools=$market.priced_pools
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
+        fee_evidence_passed=$feePassed; fee_valuation=$feeEvidence
+        signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
+        net_evidence_passed=$netPassed; net_witness_violations=$netViolations
+        observations_by_known_net_directions=$production.observations_by_known_net_directions
+        net_candidate_windows=$production.candidate_windows
         market_account_processing_ns=$market.metrics.processing
         market_queue_ns=$market.metrics.queue
         signal_steady_state_processing_ns=$production.steady_state_inputs.processing_ns
+        signal_preparation_ns=$production.steady_state_inputs.preparation_ns
+        signal_index_update_ns=$production.steady_state_inputs.index_update_ns
+        signal_state_ready_ns=$production.steady_state_inputs.state_ready_ns
+        signal_query_ns=$production.steady_state_inputs.query_ns
+        signal_event_build_ns=$production.steady_state_inputs.event_build_ns
+        signal_publication_ns=$production.steady_state_inputs.publication_ns
+        signal_revaluation_processing_ns=$production.revaluation_inputs.processing_ns
         frame_to_signal_state_us=$production.steady_state_inputs.frame_to_state_ready_us
+        frame_to_signal_complete_us=$production.steady_state_inputs.frame_to_evaluation_complete_us
+        execution_selection_ns=(Measure-Durations @($requests | ForEach-Object { $_.selection_ns }))
+        signal_to_request_us=(Measure-Durations @($requests | ForEach-Object { $_.signal_to_request_us }))
+        frame_to_request_us=(Measure-Durations @($requests | ForEach-Object { $_.frame_to_request_us }))
+        registry_maintenance=$registryMaintenance
+        execution_registry_reads=$registryReads
+        registry_timing_observed=($registryCycles.Count -ge 2 -and [long]$registryReads.calls -gt 0)
+        execution_skipped_busy_revisions=$execution.execution_candidates.skipped_busy_revisions
         candidate_delivery_passed=$candidateDelivery
         v10_requests=$requests.Count; v10_reports=$reports.Count
         v10_simulation_successes=$execution.simulation_successes
@@ -256,6 +334,8 @@ try {
     }
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
+    if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
+    if ($signals -and -not $netPassed) { throw "Net signal evidence incomplete; inspect $folder." }
     if (-not $protocolEvidence) { Write-Warning 'Nicht fuer jedes Completion-Protokoll angenommene Arbeit nachgewiesen; protocol_summary pruefen.' }
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
     Write-Host "Orchestrierungsnachweis bestanden. Artefakte: $folder"

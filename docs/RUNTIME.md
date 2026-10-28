@@ -5,6 +5,9 @@ Persistence, CompletionLifecycle, Graph, WatchCatalog, MarketState, Signal Engin
 optionale V10-Simulation. Endliche und dauerhafte Läufe verwenden dieselbe Verkabelung.
 `RUN_DURATION_SECONDS=0` bedeutet Dauerbetrieb; `q` plus Enter stoppt kontrolliert.
 Worker bleiben über ihre vorhandenen CLI-Einstiege eigenständig ausführbar.
+Der Registry-Nachlauf zu CP8A misst Request-Lesewartezeiten und entfernt den
+langen TVL-Wartungsschreiblock; Messfelder und der 600-Sekunden-Nachweis stehen
+in [CP8A.md](CP8A.md#cp8a1-registry-maintenance-and-request-read-timing).
 Discovery-Module, gemeinsame Startverkabelung und begrenzte Einzelaufrufe beschreibt
 [DISCOVERY.md](DISCOVERY.md).
 Completion-Module und der gemeinsame Einzelstart sind in [COMPLETION.md](COMPLETION.md) beschrieben.
@@ -184,3 +187,25 @@ MarketState unterscheidet im Abschlussbericht `selected_pools`, strukturell
 installierte `hydrated_pools`, nach Baseline betriebsbereite `ready_pools` und
 `priced_pools`. Der alte Final-Logname `prepared` fuer installierte Pools entfaellt;
 Completion-Prepared und Preisbereitschaft werden dadurch nicht verwechselt.
+
+For the two-protocol 30-minute fee checkpoint, use the existing starter with
+`-EnabledVenues meteora_dlmm,pumpswap -RequireFeeEvidence`; the exact PowerShell
+command and acceptance limits are in [CP8A](CP8A.md).
+
+
+## CP8A.2: reine Netto-Pruefung
+
+Signalindex, Kandidaten und Poolalternativen verwenden ausschliesslich die
+bekannten gerichteten DEX-Nettoraten. `ThresholdBps` bzw.
+`GRAPH_SIGNALS_THRESHOLD_BPS` bezeichnet jetzt den geschaetzten Vorteil nach
+DEX-Gebuehren; Standard 0 verlangt einen positiven Wert. Fehlende Nettoraten
+haben keinen Bruttofallback. Fuer diesen Checkpoint werden DLMM/PumpSwap aktiviert.
+Netzwerkgebuehren, Liquiditaetstiefe und Mengenwirkung bleiben gesondert.
+
+Der einzelne 1800-Sekunden-Lauf und die Abnahmekriterien stehen in
+[CP8A.md](CP8A.md#cp8a2-net-only-selection-and-duration-telemetry).
+`summary.json` enthaelt `net_evidence_passed`, `signal_score_basis`, die Nettoschwelle,
+`observations_by_known_net_directions`, `net_candidate_windows`, getrennte
+Signalstufen und Revaluation-Zeiten sowie Request-Aufbauzeiten. Signalfenster am
+Laufende sind rechtszensiert und keine gemessenen wirtschaftlichen Abbrueche.
+Die Telemetrie benoetigt keinen zusaetzlichen Diagnosekonsumenten.

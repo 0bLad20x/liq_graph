@@ -11,7 +11,7 @@ pub enum Consistency {
     OrderbookBboIndicative,
 }
 #[derive(Clone, Copy, Debug, serde::Serialize)]
-pub enum PriceOrigin { Baseline, Websocket }
+pub enum PriceOrigin { Baseline, Websocket, Revaluation }
 /// Local pipeline boundaries, starting when a text frame is read from the socket.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct PricePipelineTiming {
@@ -21,6 +21,23 @@ pub struct PricePipelineTiming {
     pub market_decode_ns:u64, pub market_compute_ns:u64,
     /// Catch-up after initialization/resync; excluded from steady-state latency.
     pub initialization_replay:bool,
+}
+/// CP8A estimates in human units, in canonical base->quote / quote->base order.
+/// Gross screening remains optimistic; net estimates never prove exclusion.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct FeeValuation {
+    pub model: &'static str,
+    pub estimated_net_rates: [Option<f64>;2],
+    pub dex_fee_rates: [Option<f64>;2],
+    pub fees_on_input: [bool;2],
+    pub base_fee_rate: Option<f64>, pub variable_fee_rate: Option<f64>,
+    pub lp_fee_bps: Option<u64>, pub protocol_fee_bps: Option<u64>, pub creator_fee_bps: Option<u64>,
+    pub fee_schedule: Option<&'static str>, pub market_cap_raw: Option<String>,
+    pub chain_timestamp: i64, pub chain_epoch:u64,
+    pub token_fee_status: [&'static str;2],
+    pub unknown_reason: Option<String>,
+    /// Host rebates, integer rounding and price impact are not estimated here.
+    pub scope: &'static str,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PoolPriceObservation {
@@ -32,6 +49,7 @@ pub struct PoolPriceObservation {
     pub base_mint: String,
     pub quote_mint: String,
     pub price_quote_per_base: f64,
+    pub valuation: Option<FeeValuation>,
     pub previous_price: Option<f64>,
     pub delta_bps: Option<f64>,
     pub price_kind: PriceKind,
@@ -48,13 +66,15 @@ pub struct PoolPriceObservation {
     pub trigger_field: Option<&'static str>,
     pub pipeline: Option<PricePipelineTiming>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum PoolRemovalReason { Selection, Shutdown }
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum MarketStateEvent {
     Price(PoolPriceObservation),
     Unavailable {pool:String, venue:&'static str, slot:u64,
         received_at_us:u64, sequence:u64, reason:String},
     Gap {reason:String, sequence:u64},
-    Removed {pool:String, sequence:u64},
+    Removed {pool:String, sequence:u64, reason:PoolRemovalReason},
     Selection {prepared:usize, selected:Vec<String>, accounts:usize, sequence:u64},
     Stats {pools:usize, ready:usize, available:usize, accounts:usize, active:usize,
         ws_messages:u64, ws_text_bytes:u64, sequence:u64},
