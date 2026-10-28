@@ -357,7 +357,6 @@ try {
     $amountViolations = @($requests | ForEach-Object {
         $r = $_; $a = $r.amount_assessment
         if ($null -eq $a -or $a.decision -ne 'possible' -or $a.reason -eq 'not_evaluated') { $r.request.id; return }
-        if ($a.decision -ne 'possible') { return }
         $estimate = $a.estimate; $legs = @($estimate.legs)
         $invalid = $null -eq $estimate -or $legs.Count -lt 2 -or
             [decimal]$estimate.input_raw -le 0 -or [decimal]$estimate.output_raw -le [decimal]$estimate.input_raw -or

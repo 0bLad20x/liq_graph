@@ -47,6 +47,7 @@ pub(super) fn compare(s:&Selection,r:&ExecutionReport)->Value{
         }
     }
     let mut actual=Vec::<Value>::new();let mut current=None::<(String,Vec<&Value>)>;
+    let mut outside_swap_outflows=Vec::new();
     let flush=|pool:String,transfers:Vec<&Value>,actual:&mut Vec<Value>|{
         let mut debits=BTreeMap::<String,u64>::new();let mut credits=BTreeMap::<String,u64>::new();let mut unresolved=false;
         for x in transfers {let info=&x["parsed"]["info"];let Some(n)=amount(info)else{unresolved=true;continue;};
@@ -86,6 +87,13 @@ pub(super) fn compare(s:&Selection,r:&ExecutionReport)->Value{
         }
         if matches!(x["parsed"]["type"].as_str(),Some("transfer"|"transferChecked")){
             if let Some((_,transfers))=current.as_mut(){transfers.push(x);}
+            else if x["parsed"]["info"]["authority"]==wallet {
+                let info=&x["parsed"]["info"];
+                let mint=info["mint"].as_str().or_else(||info["source"].as_str()
+                    .and_then(|a|account_mints.get(a)).map(String::as_str));
+                outside_swap_outflows.push(json!({"mint":mint,"amount_raw":amount(info),
+                    "source":info["source"],"destination":info["destination"]}));
+            }
         }
     }
     if let Some((pool,transfers))=current{flush(pool,transfers,&mut actual);}
@@ -94,7 +102,8 @@ pub(super) fn compare(s:&Selection,r:&ExecutionReport)->Value{
     let liquid=native_delta.filter(|_|native_settlement).map(|n|n+settlement_delta);
     json!({"id":r.id,"simulation_success":sim["err"].is_null(),"simulation_error":sim["err"],
         "expected_primary":s.amount_assessment.estimate,"expected_cost_assumptions":s.cost_assumptions,
-        "actual_legs":actual,"actual_fee_lamports":fee,"wallet_token_delta_raw":delta,
+        "actual_legs":actual,"wallet_token_outflows_outside_swaps":outside_swap_outflows,
+        "actual_fee_lamports":fee,"wallet_token_delta_raw":delta,
         "settlement_delta_raw":settlement_delta,"other_inventory_consumed":other_inventory_consumed,
         "native_delta_lamports":native_delta,"wallet_owned_account_deposits_lamports":deposits,
         "native_settlement_profit_after_network_raw":after_network,

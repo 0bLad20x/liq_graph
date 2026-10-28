@@ -46,9 +46,13 @@ impl Report {
         self.processing_ns_histogram[bin]+=1;*self.reasons.entry(a.reason).or_default()+=1;
         match a.decision{Decision::Possible=>self.possible+=1,Decision::Unknown=>self.unknown+=1,Decision::Excluded=>self.excluded+=1}
     }
+    pub fn wants_sample(&self,decision:Decision)->bool {
+        let label=match decision{Decision::Possible=>"qualified",Decision::Unknown=>"unknown",Decision::Excluded=>"excluded"};
+        self.samples.iter().filter(|s|s["kind"]==label).count()<2
+    }
     pub fn sample(&mut self,a:&Assessment,inputs:&[Input],context:serde_json::Value) {
         let label=match a.decision{Decision::Possible=>"qualified",Decision::Unknown=>"unknown",Decision::Excluded=>"excluded"};
-        if self.samples.iter().filter(|s|s["kind"]==label).count()<2 {
+        if self.wants_sample(a.decision) {
             self.samples.push(serde_json::json!({"kind":label,"context":context,"assessment":a,
                 "models":inputs.iter().map(|i|serde_json::json!({"slot":i.slot,"manifest_matches":i.manifest_matches,
                     "observation":i.observation,"complete_levels":i.observation.liquidity.as_ref()
@@ -335,9 +339,13 @@ pub(super) fn assess(inputs:&[Input],pairs:&[(String,String)],cost_guard:u64,min
         if let Some(n)=minimum_economic_input(rates,required){start=n;}
         else{result.reason="economic_input_not_representable";return finish(result);}
     }
-    let mut probes=BTreeSet::from([start]);let mut n=start;
-    while let Some(next)=n.checked_mul(2){probes.insert(next);n=next;}
-    probes.insert(u64::MAX);
+    // A full-fee, no-rebate estimate cannot return more than a proved gross
+    // output cap. Amounts above cap-required cannot qualify this estimate.
+    // This narrows search only; unsuccessful search still remains unknown.
+    let limit=result.gross_output_upper_bound_raw.map_or(u64::MAX,|n|n.saturating_sub(required).saturating_sub(1));
+    if start>limit{result.reason="no_economic_probe_in_observed_bound";return finish(result);}
+    let mut probes=BTreeSet::from([start,limit]);let mut n=start;
+    while let Some(next)=n.checked_mul(2){if next>limit{break;}probes.insert(next);n=next;}
     // Include all known level input boundaries from every alternative, projected
     // through the prefix domains. This is search coverage, not an exclusion rule.
     for (i,domain) in choices.iter().enumerate(){for e in domain {if let Ok(p)=profile(&inputs[e.pool]){
@@ -345,7 +353,7 @@ pub(super) fn assess(inputs:&[Input],pairs:&[(String,String)],cost_guard:u64,min
         for l in &p.directions[e.direction].levels {
             let Some(v)=l.input_raw.and_then(|v|total.checked_add(v))else{break;};total=v;
             let q=if i==0{Some(total)}else{minimum_path(&choices[..i],inputs,total).ok().map(|p|p.0)};
-            if let Some(q)=q.filter(|q|*q>=start){probes.insert(q);if q>start{probes.insert(q-1);}if let Some(q)=q.checked_add(1){probes.insert(q);}}
+            if let Some(q)=q.filter(|q|*q>=start&&*q<=limit){probes.insert(q);if q>start{probes.insert(q-1);}if q<limit{probes.insert(q+1);}}
         }
     }}}
     result.first_probe_raw=probes.first().copied();result.last_probe_raw=probes.last().copied();

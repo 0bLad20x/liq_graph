@@ -8,6 +8,16 @@ simulations, no observed profit above network fees, and zero final amount vetoes
 The PowerShell postprocessor exhausted memory on a 244 MB combined report.
 This checkpoint does not call that baseline economically accepted.
 
+Manual inspection of those real records gives two useful anchors. Recorded primary
+637 has one USDC atom at its bottleneck; even its fee-free final Pump conversion
+can return at most 10 lamports, below the 5,000-lamport guard before input cost.
+This is a bound on that recorded primary, not all omitted conversion alternatives.
+In record 2139 the actual 359,976-lamport first input produces about 8,335,703 token
+atoms under the saved first-level model; the second pool's first level accepts
+8,335,729. Larger first inputs cross that boundary. This helps explain the chosen
+size; summarized first-level data cannot establish profit over all later levels.
+Neither observation is a live acceptance of the new implementation.
+
 ## One decision path
 
 GraphSignals remains the fast marginal DEX-net candidate producer. Its output is
@@ -21,6 +31,8 @@ pool alternatives. Forward output envelopes and optimistic inverse paths avoid
 enumerating Cartesian pool products. The best positive sampled absolute gain is
 retained, rather than the first positive atom-sized result. Every recorded
 primary is a closed, positive, full-fill integer chain over named pools.
+Search is shortened by proved gross output bounds: a no-rebate estimate cannot
+gain more than its output cap minus input. This is not a configurable work budget.
 
 All representable doublings from the cost-derived lower input bound and observed
 level input boundaries (also their adjacent integers) are considered. Boundaries
@@ -102,6 +114,8 @@ unchanged states and processing times. `economic_comparison.json` records expect
 primary flow, actual declared pools from inner CPI account lists, generic parsed
 token transfers, the frozen model evaluated at actual observed leg inputs when
 resolvable, wallet token deltas, actual network fee and native balance changes.
+Wallet token outflows outside declared swaps are retained without assuming their
+purpose, so contract payouts can be separated from DEX output differences.
 Ambiguous legacy transfers remain unresolved. No protocol instruction decoder is
 duplicated. Fees/host rebates and different bank states can explain differences;
 this comparison is not a same-state mathematical proof.

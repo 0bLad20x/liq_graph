@@ -254,9 +254,10 @@ impl State {
         let assessment=if cfg.parameters.trade_size!=0||cfg.parameters.constant_conversion||cfg.parameters.no_failure||cfg.parameters.additional_fee_bp!=0 {
             amounts::Assessment::unknown("nondefault_execution_mode_unmodelled")
         }else{amounts::assess(&inputs,&pairs,cost.cost_guard_raw,cost.minimum_net_profit_raw)};
-        report.record(&assessment);report.sample(&assessment,&inputs,serde_json::json!({
+        report.record(&assessment);
+        if report.wants_sample(assessment.decision){report.sample(&assessment,&inputs,serde_json::json!({
             "generation":self.generation,"revision":self.revision,"topology_id":c.topology_id,"reverse":c.reverse,
-            "source_witness":c.witness,"cost_assumptions":cost}));
+            "source_witness":c.witness,"cost_assumptions":cost}));}
         self.economic_cache.insert(key,CachedAssessment{fingerprint,assessment:assessment.clone(),sent:false});
         Ok((assessment.decision==amounts::Decision::Possible).then_some((assessment,cost,inputs)))
     }
