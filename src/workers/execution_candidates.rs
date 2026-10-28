@@ -137,7 +137,7 @@ struct State {
     prices: Vec<Option<Arc<SignalPoolPrice>>>, revision: u64, generation: u64,
     ready_at_us: u64, received_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
-    threshold:i64, active:HashSet<(usize,bool)>,
+    threshold:i64, active:HashSet<(usize,bool)>,prepared_logarithms:u64,
 }
 impl State {
     fn apply(&mut self, s:&SignalStateUpdate, recovering:bool)->Result<()> {
@@ -165,6 +165,10 @@ impl State {
             self.prices[change.pool_id]=change.price.clone();
         }
         self.revision=s.revision; self.ready_at_us=s.ready_at_us; self.price_pipeline=s.price_pipeline;
+        self.prepared_logarithms=if matches!(s.trigger.as_ref(),SignalTrigger::Price{..}) {
+            s.changes.iter().filter_map(|c|c.price.as_ref())
+                .map(|p|p.log_weight_units.iter().flatten().count() as u64).sum()
+        }else{0};
         Ok(())
     }
     fn weight(&self, slot:usize)->Option<i64> {
@@ -416,6 +420,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                 SignalEvent::Evaluated(e)=>{
                     report.evaluations+=1;
                     ensure!(pending && e.revision==state.revision && e.graph_generation==state.generation,"candidate completion references wrong state");
+                    ensure!(e.logarithms_prepared==state.prepared_logarithms,"candidate directed net logarithm accounting mismatch");
                     pending=false;
                     if let Some(c)=&e.catalog {
                         ensure!(matches!(e.trigger.as_ref(),SignalTrigger::Catalog{..})

@@ -983,6 +983,7 @@ impl Mirror {
 pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<ObservationReport> {
     let mut report=ObservationReport::default();
     let mut mirror=Mirror::default(); let mut pending=false; let mut ranges=[0_u64;3];
+    let mut prepared_logarithms=0_u64;
     let mut sample_baseline=[0_usize;4]; let mut sample_ws=[0_usize;4];
     let mut ticker=tokio::time::interval(Duration::from_secs(5));
     let outcome: Result<()> = async {
@@ -1022,6 +1023,10 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 ensure!(!pending,"state replaced before previous evaluation completed");
                                 if recovering {mirror.revision=s.revision.checked_sub(1).context("invalid snapshot revision")?;}
                                 mirror.state(s)?; pending=true; ranges=[0;3]; report.last_revision=s.revision;
+                                prepared_logarithms=if matches!(s.trigger.as_ref(),SignalTrigger::Price{..}) {
+                                    s.changes.iter().filter_map(|c|c.price.as_ref())
+                                        .map(|p|p.log_weight_units.iter().flatten().count() as u64).sum()
+                                }else{0};
                                 if recovering {
                                     report.awaiting_snapshot=false; report.resynchronizations+=1;
                                     crate::log_event!(Warn,"graph signals receiver snapshot_applied=true sequence={sequence} revision={} generation={} resynchronizations={} lost_total={} delivery_valid=false",
@@ -1074,6 +1079,8 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                                 ensure!(pending && e.revision==mirror.revision && e.graph_generation==mirror.generation,
                                     "completion references wrong state");
                                 ensure!(ranges==e.ranges,"range/completion counts differ");
+                                ensure!(e.logarithms_prepared==prepared_logarithms,
+                                    "directed net logarithm accounting mismatch");
                                 if let Some(c)=&e.catalog {
                                     ensure!(matches!(e.trigger.as_ref(),SignalTrigger::Catalog{..})
                                         && ranges==[0;3] && mirror.active.len()==c.active_candidates,
@@ -1083,8 +1090,8 @@ pub async fn observe(mut input: SignalStream, settings: Settings) -> Result<Obse
                             }
                             ensure!(e.ranges.iter().sum::<u64>()==e.ranges_by_kind.iter().sum::<u64>(),
                                 "range/completion counts differ");
-                            ensure!(e.logarithms_prepared==u64::from(matches!(e.trigger.as_ref(),SignalTrigger::Price {..})),
-                                "price logarithm accounting mismatch");
+                            ensure!(e.logarithms_prepared<=2*u64::from(matches!(e.trigger.as_ref(),SignalTrigger::Price {..})),
+                                "directed net logarithm count exceeds price directions");
                             report.counts.evaluation(e); pending=false;
                             if let Some(us)=at.checked_sub(e.completed_at_us) {report.completion_to_consumer_us.add(us);}
                             if live(&e.trigger) {
