@@ -536,7 +536,7 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
 fn material_fingerprint(inputs:&[amounts::Input],cost:&CostContext)->[u8;32] {
     let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
     hash.update(&cost.cost_guard_raw.to_le_bytes());hash.update(&cost.minimum_net_profit_raw.to_le_bytes());
-    for i in &inputs {
+    for i in inputs {
         hash.update(&(i.slot as u64).to_le_bytes());
         if let Some(p)=&i.observation.liquidity{hash.update(&p.content_digest);hash.update(&p.account_set_digest);}
         if let Some(v)=&i.observation.valuation{for t in &v.token_fee_status{hash.update(t.as_bytes());}}
@@ -561,7 +561,7 @@ struct Work {
     cancel:Arc<AtomicBool>,progress:Arc<Mutex<WorkProgress>>,
 }
 impl Drop for Work {fn drop(&mut self){self.cancel.store(true,Ordering::Relaxed);self.updates.close();self.task.abort();}}
-fn start_work(mut state:State,mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>,registry:PoolRegistry,cfg:Arc<Settings>)->Work {
+fn start_work(mut state:State,mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>,registry:PoolRegistry,cfg:Arc<Settings>,mut sample_limits:[usize;3])->Work {
     // This orders work only. Every candidate is visited; the economic gate still
     // decides every proposal. A slow later candidate cannot hold an earlier one.
     ranked.sort_unstable_by_key(|r|r.0);
@@ -579,7 +579,7 @@ fn start_work(mut state:State,mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>,regis
             let c=&block.candidates[*index];
             {let mut p=live.lock().map_err(|_|anyhow::anyhow!("economic progress poisoned"))?;
                 p.topology_id=Some(c.topology_id);p.phase=if source_only{"source_witness"}else{"pair_alternatives"};p.candidate_started_at_us=now_us();}
-            let started=Instant::now();let mut amounts=amounts::Report::default();let mut reads=RegistryReads::default();
+            let started=Instant::now();let mut amounts=amounts::Report{sample_limits,..Default::default()};let mut reads=RegistryReads::default();
             let key=c.witness.as_ref().context("economic witness absent")?.legs.iter()
                 .map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
             let qualified=state.qualify(c,&cfg,&mut amounts,&stop,&mut curves,source_only)?;
@@ -591,6 +591,8 @@ fn start_work(mut state:State,mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>,regis
                 }
             }else{None};
             if stop.load(Ordering::Relaxed){break;}
+            for sample in &amounts.samples{let i=match sample["kind"].as_str(){Some("qualified")=>0,Some("unknown")=>1,_=>2};
+                sample_limits[i]=sample_limits[i].saturating_sub(1);}
             let update=WorkUpdate{key:key.clone(),cache:state.economic_cache.get(&key).cloned(),
                 amounts,selection,reads,rejection,generation:state.generation};
             if tx.blocking_send(update).is_err(){return Ok(());}
@@ -754,7 +756,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         Err(mpsc::error::TrySendError::Full(_))=>{report.skipped_busy_revisions+=1;ranked.clear();continue;},
                         Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),}
                     report.evaluated_revisions+=1;report.economic_jobs_started+=1;
-                    work=Some(start_work(state.clone(),std::mem::take(&mut ranked),registry.clone(),cfg.clone()));
+                    work=Some(start_work(state.clone(),std::mem::take(&mut ranked),registry.clone(),cfg.clone(),report.amounts.sample_allowance()));
                 },
             }
         }

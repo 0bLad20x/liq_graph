@@ -36,6 +36,7 @@ pub(super) struct Report {
     pub cache_hits:u64,pub observations_reused:u64,pub unchanged_states:u64,
     pub processing_ns_total:u64,pub processing_ns_max:u64,pub processing_ns_histogram:Vec<u64>,
     pub reasons:BTreeMap<&'static str,u64>,#[serde(skip_serializing)] pub samples:Vec<serde_json::Value>,
+    #[serde(skip_serializing)] pub sample_limits:[usize;3],
 }
 impl Report {
     pub fn record(&mut self,a:&Assessment) {
@@ -59,7 +60,11 @@ impl Report {
     }
     pub fn wants_sample(&self,decision:Decision)->bool {
         let label=match decision{Decision::Possible=>"qualified",Decision::Unknown=>"unknown",Decision::Excluded=>"excluded"};
-        self.samples.iter().filter(|s|s["kind"]==label).count()<2
+        let index=match decision{Decision::Possible=>0,Decision::Unknown=>1,Decision::Excluded=>2};
+        self.samples.iter().filter(|s|s["kind"]==label).count()<self.sample_limits[index]
+    }
+    pub fn sample_allowance(&self)->[usize;3] {
+        ["qualified","unknown","excluded"].map(|kind|2_usize.saturating_sub(self.samples.iter().filter(|s|s["kind"]==kind).count()))
     }
     pub fn sample(&mut self,a:&Assessment,inputs:&[Input],context:serde_json::Value) {
         let label=match a.decision{Decision::Possible=>"qualified",Decision::Unknown=>"unknown",Decision::Excluded=>"excluded"};
