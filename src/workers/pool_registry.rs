@@ -900,14 +900,15 @@ pub async fn run(
             },
             _=freshness.tick()=>{
                 let maintenance=registry.clone();
-                let now=now_unix_ms()?;
                 // This is still the single writer: await completion before any
                 // apply/apply_completion/qualification input can mutate state.
                 // CPU maintenance and synchronous locks must not occupy Tokio.
-                let (invalidated,persist)=tokio::task::spawn_blocking(move || {
+                let (invalidated,persist)=tokio::task::spawn_blocking(move || -> Result<_> {
                     maintenance.report_conversion_admission();
-                    maintenance.refresh_tvl(now)
-                }).await.map_err(|e|anyhow::anyhow!("Registry maintenance task failed: {e}"))?;
+                    // Preserve the original expiry reference: actual scan time,
+                    // after diagnostics and any blocking-pool scheduling delay.
+                    Ok(maintenance.refresh_tvl(now_unix_ms()?))
+                }).await.map_err(|e|anyhow::anyhow!("Registry maintenance task failed: {e}"))??;
                 if !invalidated.is_empty() {
                     let count=invalidated.len();
                     output.send(Arc::new(PoolUpdateBatch {
