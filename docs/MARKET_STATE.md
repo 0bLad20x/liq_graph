@@ -1,5 +1,10 @@
 # MarketState
 
+[CP8C](CP8C.md) extends the same liquidity contract with exact level fractions,
+ordered raw components and PumpSwap reserve curves. Physical quote liquidity
+excludes accrued fee buckets; effective pricing reserves keep the signed virtual
+adjustment. Same-rate reserve changes update the existing signal consumers.
+
 The worker owns selected pool identities, account bindings and indicative prices.
 Registry is the sole owner of admission and Completion; `rpc_transport` owns HTTP,
 subscriptions, ACKs and reconnections. MarketState never modifies manifests or SQL.

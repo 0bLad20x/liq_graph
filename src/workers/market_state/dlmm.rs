@@ -119,7 +119,7 @@ impl Book {
         let (input,output,di,do_) = if forward {(a,b,da,db)}else{(b,a,db,da)};
         let mut out=DirectedLiquidity{input_mint:input.into(),output_mint:output.into(),input_decimals:di,output_decimals:do_,
             status:"unknown",coverage:"invalid",next_required_account:None,first_source_position:None,
-            marginal_net_rate:None,input_capacity_raw:None,output_capacity_raw:"0".into(),levels:Vec::new(),reason:None};
+            marginal_net_rate:None,monotone_rate_tail:true,input_capacity_raw:None,output_capacity_raw:"0".into(),levels:Vec::new(),reason:None};
         let calculated=(||->Result<()>{
             let mut initialized=self.initialized()?;
             let orders=self.limit_orders()?;
@@ -157,11 +157,9 @@ impl Book {
                     let full_input=u64::try_from(input).ok();
                     let included=if fees_on_input {full_input.and_then(|n|included_fee(n,fee_units))}else{full_input};
                     let output_raw=if fees_on_input{total}else{total-excluded_fee(total,fee_units)};
-                    if output_raw==0{continue;}
                     let fee_raw=if fees_on_input{included.zip(full_input).map(|(a,b)|a-b)}else{Some(total-output_raw)};
                     let needed_output=if fees_on_input {1}else {included_fee(1,fee_units).context("DLMM minimum output fee overflow")?};
-                    let minimum=minimum_cost(&parts,needed_output,bin.price,forward)?;
-                    let minimum=u64::try_from(minimum).ok();
+                    let minimum=if output_raw==0{None}else{u64::try_from(minimum_cost(&parts,needed_output,bin.price,forward)?).ok()};
                     let minimum=if fees_on_input {minimum.and_then(|n|included_fee(n,fee_units))}else{minimum};
                     let native=bin.price as f64/Q64;
                     let gross=if forward{native}else{1.0/native};
@@ -170,16 +168,20 @@ impl Book {
                     let full_level_net_rate=included.filter(|n|*n>0).map(|n|
                         output_raw as f64/n as f64*10_f64.powi(i32::from(di)-i32::from(do_)));
                     ensure!(net.is_finite()&&net>0.0,"DLMM reachable net price invalid");
-                    if minimum.is_none(){out.coverage="amount_unrepresentable";break;}
+                    if output_raw>0 && minimum.is_none(){out.coverage="amount_unrepresentable";break;}
                     input_total=input_total.zip(included).and_then(|(n,v)|n.checked_add(u128::from(v)));
                     output_total=output_total.checked_add(u128::from(output_raw)).context("DLMM output capacity overflow")?;
                     out.levels.push(LiquidityLevel{source_position:bin.id,gross_rate:gross,net_rate:net,fee_rate:rate,
+                        rate_numerator:if forward{bin.price}else{1_u128<<64},
+                        rate_denominator:if forward{1_u128<<64}else{bin.price},
+                        output_parts_raw:parts,fee_numerator:fee_units,fee_denominator:PRECISION as u64,
+                        maximum_rebate_bps:if parts[1]==0&&parts[2]==0{super::u16_le(&self.raw_pair,32)?.min(10000)}else{10000},
                         fees_on_input,full_level_net_rate,input_raw:included,output_raw,minimum_input_raw:minimum,fee_raw});
                 }
                 if out.coverage=="amount_unrepresentable"{break;}
             }
             out.input_capacity_raw=input_total.map(|n|n.to_string());out.output_capacity_raw=output_total.to_string();
-            if let Some(first)=out.levels.first() {
+            if let Some(first)=out.levels.iter().find(|l|l.output_raw>0) {
                 out.status="available";out.first_source_position=Some(first.source_position);out.marginal_net_rate=Some(first.net_rate);
             }else{
                 out.status=if out.coverage=="exhausted_bitmap"{"empty"}else{"uncovered"};
@@ -200,10 +202,10 @@ impl Book {
         let mut directions=[self.direction(active,step,fee,clock,a,b,da,db,true),
             self.direction(active,step,fee,clock,a,b,da,db,false)];
         if a!=canonical_base {directions.swap(0,1);}
-        let mut next=PoolLiquidity{model:"dlmm_execution_window_v1",revision:0,content_digest:[0;32],
+        let mut next=PoolLiquidity{model:"dlmm_execution_window_v2",revision:0,content_digest:[0;32],
             account_set_digest:self.dependencies.digest,
-            execution_accounts:self.dependencies.addresses().iter().map(ToString::to_string).collect(),directions};
-        next.content_digest=profile_digest(&next);
+            execution_accounts:self.dependencies.addresses().iter().map(ToString::to_string).collect(),reserve_curve:None,directions};
+        next.content_digest=super::liquidity_digest(&next);
         if let Some(previous)=&self.profile {
             next.revision=previous.revision;
             if previous.content_digest==next.content_digest{return false;}
@@ -221,30 +223,6 @@ impl Book {
             "bitmap_extension_base64":self.extension.as_ref().map(|v|encode(v)),"profile":self.profile,
             "complete_levels":self.profile.as_ref().map(|p|p.directions.iter().map(|d|&d.levels).collect::<Vec<_>>())})
     }
-}
-
-fn profile_digest(profile:&PoolLiquidity)->[u8;32] {
-    let mut digest=ring::digest::Context::new(&ring::digest::SHA256);
-    digest.update(b"dlmm_liquidity_profile_v1");digest.update(&profile.account_set_digest);
-    let mut string=|value:&str|{digest.update(&(value.len() as u64).to_le_bytes());digest.update(value.as_bytes());};
-    for direction in &profile.directions {
-        let text:[&str;6]=[&direction.input_mint,&direction.output_mint,direction.status,direction.coverage,
-            direction.next_required_account.as_deref().unwrap_or(""),direction.reason.as_deref().unwrap_or("")];
-        for value in text {string(value);}
-    }
-    for direction in &profile.directions {
-        digest.update(&[direction.input_decimals,direction.output_decimals]);
-        digest.update(&(direction.levels.len() as u64).to_le_bytes());
-        for level in &direction.levels {
-            digest.update(&level.source_position.to_le_bytes());
-            for rate in [level.gross_rate,level.net_rate,level.fee_rate]{digest.update(&rate.to_bits().to_le_bytes());}
-            digest.update(&[u8::from(level.fees_on_input)]);digest.update(&level.output_raw.to_le_bytes());
-            for raw in [level.input_raw,level.minimum_input_raw,level.fee_raw] {
-                digest.update(&[u8::from(raw.is_some())]);digest.update(&raw.unwrap_or(0).to_le_bytes());
-            }
-        }
-    }
-    digest.finish().as_ref().try_into().expect("SHA256 length")
 }
 
 // Q64 multiply/divide without a new bigint crate. u64 * u128 is decomposed

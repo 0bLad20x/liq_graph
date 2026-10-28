@@ -9,7 +9,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue, MintReader,
-    market_state::{FeeValuation,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
+    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, 
     graph_watch_catalog::WatchCatalog};
 use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
@@ -92,7 +92,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
     }
     Ok(records)
 }
-#[derive(Clone)]struct Watch {address:String,venue:Venue,dlmm:Option<dlmm::Dependencies>}
+#[derive(Clone)]struct Watch {address:String,venue:Venue,dlmm:Option<dlmm::Dependencies>,manifest_digest:[u8;32]}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
 impl Venue {
@@ -238,11 +238,47 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
     ensure!(p.is_finite()&&p>0.0,"invalid PumpSwap spot");Ok(p)
 }
 
+fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
+    let mut digest=ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"liquidity_amount_profile_v2");digest.update(&profile.account_set_digest);
+    let mut string=|value:&str|{digest.update(&(value.len() as u64).to_le_bytes());digest.update(value.as_bytes());};
+    for direction in &profile.directions {
+        let text:[&str;6]=[&direction.input_mint,&direction.output_mint,direction.status,direction.coverage,
+            direction.next_required_account.as_deref().unwrap_or(""),direction.reason.as_deref().unwrap_or("")];
+        for value in text {string(value);}
+    }
+    for direction in &profile.directions {
+        digest.update(&[direction.input_decimals,direction.output_decimals,u8::from(direction.monotone_rate_tail)]);
+        digest.update(&(direction.levels.len() as u64).to_le_bytes());
+        for level in &direction.levels {
+            digest.update(&level.source_position.to_le_bytes());
+            for rate in [level.gross_rate,level.net_rate,level.fee_rate]{digest.update(&rate.to_bits().to_le_bytes());}
+            digest.update(&[u8::from(level.fees_on_input)]);digest.update(&level.output_raw.to_le_bytes());
+            digest.update(&level.rate_numerator.to_le_bytes());digest.update(&level.rate_denominator.to_le_bytes());
+            for n in level.output_parts_raw{digest.update(&n.to_le_bytes());}
+            digest.update(&level.fee_numerator.to_le_bytes());digest.update(&level.fee_denominator.to_le_bytes());
+            digest.update(&level.maximum_rebate_bps.to_le_bytes());
+            for raw in [level.input_raw,level.minimum_input_raw,level.fee_raw] {
+                digest.update(&[u8::from(raw.is_some())]);digest.update(&raw.unwrap_or(0).to_le_bytes());
+            }
+        }
+    }
+    if let Some(curve)=&profile.reserve_curve {
+        digest.update(&[1]);digest.update(curve.base_mint.as_bytes());
+        for n in [curve.base_reserve_raw,curve.effective_quote_reserve_raw,curve.spendable_quote_reserve_raw] {
+            digest.update(&n.to_le_bytes());
+        }
+        for n in curve.fee_bps{digest.update(&n.to_le_bytes());}
+        digest.update(&curve.buy_input_padding_raw.to_le_bytes());
+    }else{digest.update(&[0]);}
+    digest.finish().as_ref().try_into().expect("SHA256 length")
+}
+
 #[derive(Clone)]enum State{
     Dlmm{active:i32,step:u16,fee:fees::Dlmm,book:Box<dlmm::Book>},
     Pump{vquote:i128,base:u64,quote:u64,base_vault:String,quote_vault:String,
          pool_slot:u64,base_slot:u64,quote_slot:u64,fee_pool:fees::PumpPool,
-         global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>},
+         global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>,liquidity:Option<Arc<PoolLiquidity>>},
     DammV2{sqrt:u128},
     RaydiumClmm{sqrt:u128},
     OrcaWhirlpool{sqrt:u128},
@@ -262,9 +298,43 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
     price:f64,available:bool,slot:u64,received_us:u64,updates:u64,
     clock:i64,epoch:u64,mint_states:[Option<Arc<crate::core::MintOnchainState>>;2],
     last_valuation:Option<FeeValuation>,
+    manifest_digest:[u8;32],
 }
 impl Pool{
+    fn reserve_profile(&self)->Option<PoolLiquidity> {
+        let State::Pump{base,quote,vquote,fee_pool,..}=&self.state else{return None;};
+        let value=self.valuation()?;
+        let fee_bps=[value.lp_fee_bps?,value.protocol_fee_bps?,value.creator_fee_bps?];
+        let effective=u64::try_from(i128::from(*quote).checked_add(*vquote)?).ok()?;
+        let spendable=quote.checked_sub(fee_pool.protocol_fees.checked_add(fee_pool.creator_fees)?)?;
+        let mut directions=std::array::from_fn(|i| {
+            let forward=i==0;
+            let input=if forward{&self.canon_base}else{&self.canon_quote};
+            let output=if forward{&self.canon_quote}else{&self.canon_base};
+            let input_is_base=input==&self.a;
+            DirectedLiquidity{input_mint:input.clone(),output_mint:output.clone(),
+                input_decimals:if input_is_base{self.da}else{self.db},
+                output_decimals:if input_is_base{self.db}else{self.da},
+                status:if value.estimated_net_rates[i].is_some(){"available"}else{"empty"},coverage:"reserve_curve",
+                next_required_account:None,first_source_position:None,marginal_net_rate:value.estimated_net_rates[i],monotone_rate_tail:true,
+                input_capacity_raw:None,output_capacity_raw:if input_is_base{spendable}else{*base}.to_string(),
+                levels:Vec::new(),reason:None}
+        });
+        for d in &mut directions {if d.status=="empty"{d.reason=Some("trade direction disabled".into());}}
+        Some(PoolLiquidity{model:"constant_product_quote_fees_v1",revision:0,content_digest:[0;32],
+            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
+            reserve_curve:Some(ReserveCurve{base_mint:self.a.clone(),base_reserve_raw:*base,
+                effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps,buy_input_padding_raw:1}),directions})
+    }
     fn refresh_liquidity(&mut self)->bool {
+        if self.venue==Venue::Pump {
+            let mut next=self.reserve_profile();
+            if let Some(p)=next.as_mut(){p.content_digest=liquidity_digest(p);}
+            let State::Pump{liquidity,..}=&mut self.state else{unreachable!()};
+            if liquidity.as_ref().map(|p|p.content_digest)==next.as_ref().map(|p|p.content_digest){return false;}
+            if let Some(p)=next.as_mut(){p.revision=liquidity.as_ref().map_or(1,|old|old.revision.saturating_add(1));}
+            *liquidity=next.map(Arc::new);return true;
+        }
         match &mut self.state {
             State::Dlmm{active,step,fee,book}=>book.rebuild(*active,*step,fee,self.clock,
                 &self.a,&self.b,self.da,self.db,&self.canon_base),
@@ -272,7 +342,7 @@ impl Pool{
         }
     }
     fn liquidity(&self)->Option<Arc<crate::core::market_state::PoolLiquidity>> {
-        match &self.state{State::Dlmm{book,..}=>book.profile.clone(),_=>None}
+        match &self.state{State::Dlmm{book,..}=>book.profile.clone(),State::Pump{liquidity,..}=>liquidity.clone(),_=>None}
     }
     fn valuation(&self)->Option<FeeValuation> {
         if !matches!(self.venue,Venue::Dlmm|Venue::Pump){return None;}
@@ -306,8 +376,8 @@ impl Pool{
                         let direction=native^usize::from(self.a!=self.canon_base);
                         let value=&profile.directions[direction];
                         rates[native]=value.marginal_net_rate.unwrap_or(0.0);
-                        v.dex_fee_rates[native]=value.levels.first().map(|l|l.fee_rate);
-                        v.fees_on_input[native]=value.levels.first().map_or(on_input[native],|l|l.fees_on_input);
+                        v.dex_fee_rates[native]=value.levels.iter().find(|l|l.output_raw>0).map(|l|l.fee_rate);
+                        v.fees_on_input[native]=value.levels.iter().find(|l|l.output_raw>0).map_or(on_input[native],|l|l.fees_on_input);
                     }
                     if rates.contains(&0.0){v.unknown_reason=Some("DLMM direction empty or outside observed execution window; inspect liquidity".into());}
                     rates
@@ -447,6 +517,7 @@ struct Metrics {
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,decode_errors:u64,
     post_rewatch_websocket_observations:u64,removals:u64,
     fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
+    reserve_curve_observations:u64,reserve_curve_build:Latency,
     #[serde(skip)] cleared:bool,#[serde(skip)] rewatching:bool,
 }
 #[derive(serde::Serialize)]
@@ -572,6 +643,7 @@ impl Engine{
             let old=&self.pools[pi];
             ensure!(!old.ready,"baseline would overwrite a ready pool {}",pool.id);
             ensure!(old.venue==pool.venue && old.a==pool.a && old.b==pool.b
+                && old.manifest_digest==pool.manifest_digest
                 && old.da==pool.da && old.db==pool.db
                 && old.canon_base==pool.canon_base && old.canon_quote==pool.canon_quote,
                 "baseline pool identity changed {}",pool.id);
@@ -625,7 +697,7 @@ impl Engine{
                     let vquote=if acc.data.len()>=261{i128_le(&acc.data,245)?}else{0};
                     (a,b,State::Pump{vquote,base:0,quote:0,base_vault,quote_vault,
                         pool_slot,base_slot:pool_slot,quote_slot:pool_slot,
-                        fee_pool:fees::PumpPool::decode(&acc.data)?,global:None,config:None,supply:None})
+                        fee_pool:fees::PumpPool::decode(&acc.data)?,global:None,config:None,supply:None,liquidity:None})
                 },
                 Venue::DammV2=>{
                     ensure!(acc.owner==DAMM_V2_PROGRAM&&acc.data.starts_with(&POOL_DISC),"{} not a DAMM V2 Pool",watch.address);
@@ -803,7 +875,8 @@ impl Engine{
             let mint_states=[mints.mint(a.parse()?).and_then(|m|m.onchain),mints.mint(b.parse()?).and_then(|m|m.onchain)];
             let mut pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
-                clock,epoch,mint_states,last_valuation:None,price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,
+                clock,epoch,mint_states,last_valuation:None,manifest_digest:watch.manifest_digest,
+                price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,
             };
             pool.refresh_liquidity();
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
@@ -844,6 +917,10 @@ impl Engine{
         self.sequence
     }
     fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>,mut pipeline:Option<PricePipelineTiming>) {
+        if self.pools[pi].venue==Venue::Pump {
+            let started=Instant::now();self.pools[pi].refresh_liquidity();
+            self.metrics.reserve_curve_build.add(nanos(started));
+        }
         let sequence=self.next_sequence();
         let fees_started=Instant::now();
         let valuation=self.pools[pi].valuation();
@@ -880,7 +957,8 @@ impl Engine{
         let mut event=event;
         if let Some(t)=pipeline.as_mut(){t.price_published_at_us=timestamp_us();}
         event.pipeline=pipeline;
-        if let Some(profile)=&event.liquidity {
+        self.metrics.reserve_curve_observations+=u64::from(event.liquidity.as_ref().is_some_and(|p|p.reserve_curve.is_some()));
+        if let Some(profile)=event.liquidity.as_ref().filter(|_|pool.venue==Venue::Dlmm) {
             let evidence=&mut self.metrics.liquidity;
             evidence.profile_observations+=1;
             for direction in &profile.directions {
@@ -1099,14 +1177,17 @@ impl Settings {
 // Only the price worker's identity index is retained; manifests and canonical pool
 // lifecycle remain in the Registry. Notifications reconcile against the current owner.
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>}
+struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,manifest_digest:[u8;32]}
 impl PoolInput {
     fn of(p:&PoolState)->Option<Self> {
         if !p.completion_admission.is_admitted() || p.completion_state!=CompletionState::Prepared{return None;}
         let dlmm=if p.venue==CoreVenue::MeteoraDlmm {
             p.execution_manifest.as_ref().and_then(|m|dlmm::Dependencies::from_manifest(m).ok())
         }else{None};
-        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm})
+        let manifest_digest=if matches!(p.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap) {
+            p.execution_manifest.as_ref()?.account_set_digest()
+        }else{[0;32]};
+        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm,manifest_digest})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
@@ -1362,7 +1443,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
-            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,dlmm:p.dlmm}))
+            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,dlmm:p.dlmm,manifest_digest:p.manifest_digest}))
             .collect::<Result<Vec<_>>>()?})})();
         let result=match (baseline_source,config) {
             (Some(source),_)=>{

@@ -63,7 +63,8 @@ pub(super) struct PumpPool {
     #[serde(with="crate::core::execution::pubkey_json")]
     pub creator:Pubkey,
     #[serde(with="crate::core::execution::pubkey_json")]
-    pub coin_creator:Pubkey,pub mayhem:bool,pub override_bps:u64,pub canonical:bool}
+    pub coin_creator:Pubkey,pub mayhem:bool,pub override_bps:u64,pub canonical:bool,
+    pub protocol_fees:u64,pub creator_fees:u64}
 impl PumpPool {
     pub fn decode(d:&[u8])->Result<Self> {
         ensure!(d.len()>=243 && d.starts_with(&super::POOL_DISC),"unsupported Pump pool layout");
@@ -74,6 +75,8 @@ impl PumpPool {
         Ok(Self{creator,canonical,
             coin_creator:Pubkey::new_from_array(bytes(d,211,32)?.try_into()?),
             mayhem:d.get(243).copied().unwrap_or(0)!=0,
+            protocol_fees:if d.len()>=279{u64_le(d,271)?}else{0},
+            creator_fees:if d.len()>=287{u64_le(d,279)?}else{0},
             override_bps:if d.len()>=269{u64_le(d,261)?}else{0}})
     }
 }

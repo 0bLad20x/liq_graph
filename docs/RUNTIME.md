@@ -1,5 +1,10 @@
 # Gemeinsame Runtime und Live-Nachweis
 
+Der aktuelle Mengencheckpoint [CP8C.md](CP8C.md) verwendet denselben Starter mit
+`RequireAmountEvidence` fuer einen einzelnen 1800-Sekunden-Simulationslauf.
+`amount_evidence.json` enthaelt Mengenentscheidungen, begruendete Ausschluesse,
+positive Modellmengen und neue Zeitmessungen. V10 waehlt die Handelsgroesse weiterhin.
+
 Der aktuelle DLMM-Liquiditaetscheckpoint und sein einzelner 600-Sekunden-Lauf
 stehen in [CP8B.md](CP8B.md). `RequireLiquidityEvidence` verlangt echte BinArray-
 WS-Eingaben, Signalverbrauch und konsistente Request-Fenster. Optionale

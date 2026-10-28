@@ -13,7 +13,7 @@ use crate::core::{
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
 use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
-const OUTPUT_LAYOUT:&str="versioned_net_liquidity_state_cp8b";
+const OUTPUT_LAYOUT:&str="versioned_net_amount_state_cp8c";
 pub const OUTPUT_CAPACITY:usize=16384;
 
 #[derive(Clone,Copy)]
@@ -516,7 +516,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
         let mut work=e.begin(SignalTrigger::Catalog{generation:0},started,received,None,input.len());
         e.state(&mut work,true,false,Vec::new())?;e.evaluate(work)?;
         let mut graph_open=true;
-        crate::log_event!(Info,"graph signals cp8a2 started=true output_layout={} score_basis={} threshold_bps={} compact=true",OUTPUT_LAYOUT,SIGNAL_SCORE_BASIS,settings.threshold_bps);
+        crate::log_event!(Info,"graph signals started=true output_layout={} score_basis={} threshold_bps={} compact=true",OUTPUT_LAYOUT,SIGNAL_SCORE_BASIS,settings.threshold_bps);
         loop{tokio::select!{
             change=graphs.changed(),if graph_open=>{
                 if change.is_err(){graph_open=false;continue;}
@@ -559,6 +559,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         let current_liquidity=p.liquidity.as_ref().map(|v|(v.account_set_digest,v.content_digest));
                         let liquidity_changed=previous_liquidity!=current_liquidity;
                         e.production.liquidity_inputs+=u64::from(p.liquidity.is_some());
+                        e.production.reserve_curve_inputs+=u64::from(p.liquidity.as_ref().is_some_and(|v|v.reserve_curve.is_some()));
                         e.production.liquidity_only_updates+=u64::from(liquidity_changed&&!fee_changed
                             &&old.price.as_ref().is_some_and(|v|v.log_weight_units==e.prices.values[old.pool].as_ref().unwrap().log_weight_units));
                         let change=e.index.refresh(address,&old,&e.prices)?;
@@ -812,7 +813,7 @@ pub struct ProductionReport {
     score_basis:&'static str,
     error: Option<String>, counts: Counts,pub input_events:u64,
     observations_by_known_net_directions:[u64;3],candidate_windows:CandidateWindows,
-    liquidity_inputs:u64,liquidity_only_updates:u64,
+    liquidity_inputs:u64,liquidity_only_updates:u64,reserve_curve_inputs:u64,
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
     steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
     revaluation_inputs:ProductionTimings,
