@@ -47,8 +47,8 @@ impl Report {
         self.processing_ns_histogram[bin]+=1;*self.reasons.entry(a.reason).or_default()+=1;
         match a.decision{Decision::Possible=>self.possible+=1,Decision::Unknown=>self.unknown+=1,Decision::Excluded=>self.excluded+=1}
     }
-    pub fn retain_exclusion(&mut self,a:Assessment,inputs:&[Input]) {
-        if self.excluded_samples.len()<4 {self.excluded_samples.push(serde_json::json!({"assessment":a,
+    pub fn retain_exclusion(&mut self,a:Assessment,inputs:&[Input],context:serde_json::Value) {
+        if self.excluded_samples.len()<4 {self.excluded_samples.push(serde_json::json!({"context":context,"assessment":a,
             "models":inputs.iter().map(|i|serde_json::json!({"slot":i.slot,"manifest_matches":i.manifest_matches,
                 "observation":i.observation,"complete_levels":i.observation.liquidity.as_ref()
                     .map(|p|p.directions.iter().map(|d|&d.levels).collect::<Vec<_>>())})).collect::<Vec<_>>()}));}

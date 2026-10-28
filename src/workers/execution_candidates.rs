@@ -187,7 +187,12 @@ impl State {
             let mut global=amounts::assess(&universe,&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
             global.scope="current_prepared_candidate_mint_universe_dex_only";report.global_proofs+=1;
             if global.decision==amounts::Decision::Excluded {
-                global.elapsed_ns=elapsed_ns(started);report.record(&global);report.retain_exclusion(global,&universe);return Ok(None);
+                global.elapsed_ns=elapsed_ns(started);report.record(&global);
+                report.retain_exclusion(global,&universe,serde_json::json!({
+                    "graph_generation":self.generation,"signal_revision":self.revision,
+                    "topology_id":candidate.topology_id,"reverse":candidate.reverse,
+                    "trigger":selection.trigger,"source_witness":candidate.witness
+                }));return Ok(None);
             }
             let witness=candidate.witness.as_ref().context("quantity witness missing")?;
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();

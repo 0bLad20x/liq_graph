@@ -164,14 +164,15 @@ if ($LASTEXITCODE -ne 0) { throw 'Branchwechsel fehlgeschlagen.' }
     -PoolLimit 0 -AccountBudget 25000 `
     -ProfileSignals -ThresholdBps 0 `
     -RequireFeeEvidence -RequireLiquidityEvidence -RequireAmountEvidence `
-    -LiquidityEvidencePools '3w6Bk1xj4wAVG7ZPHRgpT5SW77hB2ofs3iYYvE5gezLN,2D6YWhkKLVUaJMhmyYQUS5z54ZwpqcxE9SmGJTXJmq2G' `
     -SimulateV10 -SimulationLimit 0 `
     -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
 ```
 
 If the local feature branch already exists, switch to it and use a guarded
-`git pull --ff-only origin cp8c-route-amount-compatibility`. The focus only records
-raw evidence; it does not pin pool selection. A missing pool is reported honestly.
+`git pull --ff-only origin cp8c-route-amount-compatibility`. Optional
+`LiquidityEvidencePools` records raw evidence without pinning selection. The default
+run has no dependency on an old diagnostic pool still being selected; actual
+exclusion examples retain their full models and source revision/witness.
 No forced Rewatch or graph audit adds load to this quantity/timing measurement.
 
 `-RequireAmountEvidence` additionally requires a real exclusion, a positive amount
