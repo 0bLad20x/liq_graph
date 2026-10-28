@@ -1,5 +1,10 @@
 # V10 simulation
 
+[CP8C](CP8C.md) composes typed amount models in ExecutionCandidates before
+dispatch, preserves unknown cases and checks broader pool alternatives before
+any veto. `amount_assessment` records possible/unknown and concrete estimated
+raw flows. The V10 request parameters and automatic sizing remain unchanged.
+
 The common runtime connects Graph -> Signal Engine -> ExecutionCandidates -> V10.
 See [RUNTIME.md](RUNTIME.md) for launch and dataflow acceptance.
 ExecutionCandidates freezes current Prepared proofs and price observations into

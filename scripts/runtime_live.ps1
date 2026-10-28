@@ -22,6 +22,7 @@ param(
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
     [switch]$RequireFeeEvidence,
     [switch]$RequireLiquidityEvidence,
+    [switch]$RequireAmountEvidence,
     # Diagnostic raw snapshots only. This does not pin or filter pool selection.
     [string]$LiquidityEvidencePools = '',
     [string]$EnabledVenues = '',
@@ -41,6 +42,7 @@ if (($Rewatch -or $TracePrices) -and -not $marketEnabled) { throw 'Rewatch and T
 if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires GraphAudit for actual graph/reference evidence.' }
 if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage Signals.' }
 if (($RequireLiquidityEvidence -or $LiquidityEvidencePools) -and -not $signals) { throw 'Liquidity evidence requires Stage Signals.' }
+if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw 'Amount evidence requires Stage Signals and SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -62,6 +64,18 @@ function Measure-Durations($Values) {
         p95=$sorted[[int][Math]::Ceiling($n * 0.95) - 1]
         p99=$sorted[[int][Math]::Ceiling($n * 0.99) - 1]; max=$sorted[$n - 1]
     }
+}
+function Measure-AmountStage($Report) {
+    $n = [long]$Report.attempts
+    if ($n -eq 0) { return [ordered]@{count=0; mean_ns=$null; p95_upper_ns=$null; p99_upper_ns=$null; max_ns=$null} }
+    $p95 = $null; $p99 = $null; $seen = 0L
+    for ($i = 0; $i -lt $Report.processing_ns_histogram.Count; $i++) {
+        $seen += [long]$Report.processing_ns_histogram[$i]
+        $upper = [Math]::Min([Math]::Pow(2,$i+1)-1,[double]$Report.processing_ns_max)
+        if ($null -eq $p95 -and $seen -ge [Math]::Ceiling($n*0.95)) { $p95 = [long]$upper }
+        if ($null -eq $p99 -and $seen -ge [Math]::Ceiling($n*0.99)) { $p99 = [long]$upper; break }
+    }
+    return [ordered]@{count=$n; mean_ns=([double]$Report.processing_ns_total/$n); p95_upper_ns=$p95; p99_upper_ns=$p99; max_ns=$Report.processing_ns_max}
 }
 $repo = Split-Path -Parent $PSScriptRoot
 $previous = @{}
@@ -173,7 +187,8 @@ try {
         profile_signals=[bool]$ProfileSignals
         require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=$EnabledVenues
         require_liquidity_evidence=[bool]$RequireLiquidityEvidence
-        liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v1'
+        liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v2'
+        require_amount_evidence=[bool]$RequireAmountEvidence; amount_check='observed_simple_cycles_dex_only'
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -251,7 +266,7 @@ try {
     }
     $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
-    $netViolations = @($requests | Where-Object { $_.candidate.witness.log_sum_units -ge $_.threshold_units } | ForEach-Object { $_.request.id })
+    $netViolations = @($requests | Where-Object { $_.candidate.witness.log_sum_units -ge $_.threshold_units -or $_.packing_seed_log_sum_units -ge $_.threshold_units } | ForEach-Object { $_.request.id })
     $netPassed = $null
     if ($signals) {
         $netPassed = $null -ne $production -and $production.score_basis -eq 'marginal_dex_net' -and
@@ -307,6 +322,47 @@ try {
         signal_liquidity_only_updates=$production.liquidity_only_updates
         focused_requested=$focusRequested; focused_observed=$focusObserved; focused_missing=$focusMissing
         request_window_violations=$liquidityViolations
+    } }
+    $amount = $execution.execution_candidates.amounts
+    $amountViolations = @($requests | ForEach-Object {
+        $r = $_; $a = $r.amount_assessment
+        if ($null -eq $a -or $a.decision -eq 'excluded' -or $a.reason -eq 'not_evaluated') { $r.request.id; return }
+        if ($a.decision -ne 'possible') { return }
+        $estimate = $a.estimate; $legs = @($estimate.legs)
+        $invalid = $null -eq $estimate -or $legs.Count -lt 2 -or
+            [decimal]$estimate.input_raw -le 0 -or [decimal]$estimate.output_raw -le [decimal]$estimate.input_raw -or
+            [decimal]$estimate.profit_raw -ne ([decimal]$estimate.output_raw-[decimal]$estimate.input_raw)
+        if ($legs.Count -ge 2) {
+            $invalid = $invalid -or $legs[0].input_mint -ne $r.request.settlement -or
+                $legs[-1].output_mint -ne $r.request.settlement -or
+                [decimal]$legs[0].input_raw -ne [decimal]$estimate.input_raw -or
+                [decimal]$legs[-1].output_raw -ne [decimal]$estimate.output_raw
+            for ($i = 0; $i -lt $legs.Count; $i++) {
+                $invalid = $invalid -or $legs[$i].pool -notin @($r.pools.pool)
+                if ($i -gt 0) { $invalid = $invalid -or $legs[$i].input_mint -ne $legs[$i-1].output_mint -or
+                    [decimal]$legs[$i].input_raw -ne [decimal]$legs[$i-1].output_raw }
+            }
+        }
+        if ($invalid) { $r.request.id }
+    } | Sort-Object -Unique)
+    if ($null -ne $amount) {
+        $amount | ConvertTo-Json -Depth 60 | Set-Content -LiteralPath (Join-Path $folder 'amount_evidence.json') -Encoding UTF8
+    }
+    $amountPassed = $null
+    if ($RequireAmountEvidence) {
+        $amountPassed = $null -ne $amount -and [long]$amount.possible -gt 0 -and [long]$amount.excluded -gt 0 -and
+            ([long]$amount.possible+[long]$amount.unknown) -eq $requests.Count -and
+            [long]$amount.attempts -eq ([long]$amount.possible+[long]$amount.unknown+[long]$amount.excluded) -and
+            [long]$market.metrics.reserve_curve_observations -gt 0 -and
+            [long]$market.metrics.reserve_curve_observations -eq [long]$production.reserve_curve_inputs -and
+            [long]$liquidityEvidence.array_websocket_updates -gt 0 -and $amountViolations.Count -eq 0
+    }
+    $amountSummary = if ($null -eq $amount) { $null } else { [ordered]@{
+        attempts=$amount.attempts; possible=$amount.possible; unknown=$amount.unknown; excluded=$amount.excluded
+        seed_repaired=$amount.seed_repaired; global_proofs=$amount.global_proofs; probes=$amount.probes
+        reasons=$amount.reasons; processing_ns=(Measure-AmountStage $amount)
+        violations=$amountViolations; reserve_curve_observations=$market.metrics.reserve_curve_observations
+        reserve_curve_inputs=$production.reserve_curve_inputs; reserve_curve_build_ns=$market.metrics.reserve_curve_build
     } }
     # Owner measurements only; no extra observer or per-pool timing logs.
     $registryCycles = @(Select-String -LiteralPath $log -Pattern 'pool registry tvl_refresh=(\{.*\})$' | ForEach-Object {
@@ -369,6 +425,7 @@ try {
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
         fee_evidence_passed=$feePassed; fee_valuation=$feeEvidence
         liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
+        amount_evidence_passed=$amountPassed; amount_evaluation=$amountSummary
         request_payload_repetition=$requestRepetition
         signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
         net_evidence_passed=$netPassed; net_witness_violations=$netViolations
@@ -405,6 +462,7 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Write-Host
     if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
     if ($RequireLiquidityEvidence -and -not $liquidityPassed) { throw "CP8B liquidity evidence incomplete; inspect liquidity_evidence.json in $folder." }
+    if ($RequireAmountEvidence -and -not $amountPassed) { throw "CP8C amount evidence incomplete; inspect amount_evidence.json in $folder. A real exclusion and a positive amount estimate are required." }
     if ($signals -and -not $netPassed) { throw "Net signal evidence incomplete; inspect $folder." }
     if (-not $protocolEvidence) { Write-Warning 'Nicht fuer jedes Completion-Protokoll angenommene Arbeit nachgewiesen; protocol_summary pruefen.' }
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }

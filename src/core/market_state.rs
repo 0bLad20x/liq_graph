@@ -51,6 +51,17 @@ pub struct LiquidityLevel {
     pub net_rate:f64,
     pub fee_rate:f64,
     pub fees_on_input:bool,
+    /// Exact atom-output / atom-input ratio; integers serialize as decimal text.
+    #[serde(serialize_with="decimal_u128")]
+    pub rate_numerator:u128,
+    #[serde(serialize_with="decimal_u128")]
+    pub rate_denominator:u128,
+    /// Ordered output components; rounding applies to each component separately.
+    pub output_parts_raw:[u64;3],
+    pub fee_numerator:u64,pub fee_denominator:u64,
+    /// Upper bound on the refundable part of an input fee. Bounds may assume
+    /// this entire fraction is returned; estimates omit rebates.
+    pub maximum_rebate_bps:u16,
     /// Full-level output/input after integer rounding, unlike marginal net_rate.
     pub full_level_net_rate:Option<f64>,
     /// Cost/output of filling this level, including integer fee rounding.
@@ -72,6 +83,8 @@ pub struct DirectedLiquidity {
     pub next_required_account:Option<String>,
     pub first_source_position:Option<i32>,
     pub marginal_net_rate:Option<f64>,
+    /// Whether unobserved later levels can only worsen the raw exchange rate.
+    pub monotone_rate_tail:bool,
     pub input_capacity_raw:Option<String>,pub output_capacity_raw:String,
     /// Complete live calculation data. Ordinary JSON evidence records count and
     /// first level; explicit raw-account evidence can include the full vector.
@@ -82,7 +95,17 @@ pub struct DirectedLiquidity {
 fn level_summary<S:serde::Serializer>(levels:&[LiquidityLevel],serializer:S)->Result<S::Ok,S::Error> {
     #[derive(serde::Serialize)]
     struct Summary<'a>{count:usize,first:Option<&'a LiquidityLevel>}
-    serde::Serialize::serialize(&Summary{count:levels.len(),first:levels.first()},serializer)
+    serde::Serialize::serialize(&Summary{count:levels.len(),first:levels.iter().find(|l|l.output_raw>0)},serializer)
+}
+fn decimal_u128<S:serde::Serializer>(value:&u128,serializer:S)->Result<S::Ok,S::Error> {
+    serializer.serialize_str(&value.to_string())
+}
+/// Reserve curve facts, not a protocol decoder or quoting implementation.
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct ReserveCurve {
+    pub base_mint:String,pub base_reserve_raw:u64,
+    pub effective_quote_reserve_raw:u64,pub spendable_quote_reserve_raw:u64,
+    pub fee_bps:[u64;3],
 }
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct PoolLiquidity {
@@ -91,6 +114,8 @@ pub struct PoolLiquidity {
     pub content_digest:[u8;32],
     pub account_set_digest:[u8;32],
     pub execution_accounts:Vec<String>,
+    /// None uses the exact directed levels; Some describes a reserve curve.
+    pub reserve_curve:Option<ReserveCurve>,
     /// Canonical base->quote / quote->base, like FeeValuation.
     pub directions:[DirectedLiquidity;2],
 }
