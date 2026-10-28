@@ -2,7 +2,7 @@
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
 mod comparison;
-use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap,HashSet}, env, sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}, time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc};
@@ -13,6 +13,7 @@ use crate::core::{CompletionState, execution::{ExecutionGroup, ExecutionMetrics,
         SignalStream, SignalTrigger, SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
 use super::pool_registry::PoolRegistry;
 
+#[derive(Clone)]
 pub struct Settings {
     pub wallet: Pubkey,
     pub parameters: ExecutionParameters,
@@ -57,6 +58,7 @@ struct CostContext {
     settlement:String,reference_pool:Option<String>,reference_observed_at_us:Option<u64>,
     scope:&'static str,
 }
+#[derive(Clone)]
 struct CachedAssessment {fingerprint:[u8;32],assessment:amounts::Assessment,sent:bool}
 fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
     .as_micros().min(u128::from(u64::MAX)) as u64}
@@ -111,6 +113,8 @@ pub struct Report {
     pub error: Option<String>, #[serde(skip_serializing)] pub requests: Vec<Selection>,
     request_count:usize,pub economic_qualified_requests:u64,
     pub evaluated_revisions:u64,
+    economic_jobs_started:u64,economic_jobs_completed:u64,economic_jobs_cancelled:u64,
+    economic_stale_results:u64,economic_busy_results:u64,
     score_basis:&'static str,
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
@@ -127,6 +131,7 @@ impl Report {
         ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
+        ensure!(self.economic_jobs_started==self.economic_jobs_completed,"economic job did not drain");
         ensure!(self.amounts.attempts==self.amounts.possible+self.amounts.unknown+self.amounts.excluded,
             "economic decision accounting mismatch");
         ensure!(self.request_count==self.requests.len() && self.economic_qualified_requests==self.requests.len() as u64,
@@ -177,7 +182,7 @@ impl Report {
 }
 
 /// A consumer-owned view of the published contract, not another route engine.
-#[derive(Default)]
+#[derive(Clone,Default)]
 struct State {
     plan: Option<Arc<SignalPlan>>, pools: Vec<SignalPool>,
     prices: Vec<Option<Arc<SignalPoolPrice>>>, revision: u64, generation: u64,
@@ -228,7 +233,7 @@ impl State {
         ensure!(out.cost_guard_raw>0,"zero settlement cost reference");
         self.cost_contexts.insert(settlement,(self.revision,out.clone()));Ok(out)
     }
-    fn qualify(&mut self,c:&SignalCandidate,cfg:&Settings,report:&mut amounts::Report)
+    fn qualify(&mut self,c:&SignalCandidate,cfg:&Settings,report:&mut amounts::Report,cancel:&AtomicBool,curves:&mut amounts::CurveCache,source_only:bool)
         ->Result<Option<(amounts::Assessment,CostContext,Vec<amounts::Input>)>>{
         let top=&self.plan.as_ref().context("economic plan absent")?.compact_topologies[c.topology_id];
         let inputs=self.economic_inputs(top);let settlement=top.settlement;
@@ -237,27 +242,27 @@ impl State {
         }};
         let pairs=c.witness.as_ref().context("economic source witness absent")?.legs.iter()
             .map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
-        let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
-        hash.update(&cost.cost_guard_raw.to_le_bytes());hash.update(&cost.minimum_net_profit_raw.to_le_bytes());
-        for i in &inputs {
-            hash.update(&(i.slot as u64).to_le_bytes());
-            if let Some(p)=&i.observation.liquidity{hash.update(&p.content_digest);hash.update(&p.account_set_digest);}
-            if let Some(v)=&i.observation.valuation{for t in &v.token_fee_status{hash.update(t.as_bytes());}}
-        }
-        let fingerprint:[u8;32]=hash.finish().as_ref().try_into().expect("SHA256 length");
+        let fingerprint=material_fingerprint(&inputs,&cost);
         let key=pairs.clone();
         if let Some(cached)=self.economic_cache.get(&key).filter(|e|e.fingerprint==fingerprint){
             report.cache_hits+=1;report.observations_reused+=inputs.len() as u64;
             if cached.sent{report.unchanged_states+=1;return Ok(None);}
             return Ok((cached.assessment.decision==amounts::Decision::Possible).then(||(cached.assessment.clone(),cost,inputs)));
         }
-        let assessment=if cfg.parameters.trade_size!=0||cfg.parameters.constant_conversion||cfg.parameters.no_failure||cfg.parameters.additional_fee_bp!=0 {
+        let source_inputs=if source_only{inputs.iter().filter(|i|c.witness.as_ref().unwrap().legs.iter()
+            .any(|l|l.slot/2==i.slot/2)).cloned().collect::<Vec<_>>()}else{Vec::new()};
+        let evaluated=if source_only{&source_inputs[..]}else{&inputs[..]};
+        let mut assessment=if cfg.parameters.trade_size!=0||cfg.parameters.constant_conversion||cfg.parameters.no_failure||cfg.parameters.additional_fee_bp!=0 {
             amounts::Assessment::unknown("nondefault_execution_mode_unmodelled")
-        }else{amounts::assess(&inputs,&pairs,cost.cost_guard_raw,cost.minimum_net_profit_raw)};
+        }else{amounts::assess(evaluated,&pairs,cost.cost_guard_raw,cost.minimum_net_profit_raw,cancel,curves)};
+        if cancel.load(Ordering::Relaxed){return Ok(None);}
+        if source_only{assessment.scope="frozen_source_witness_route";}
         report.record(&assessment);
-        if report.wants_sample(assessment.decision){report.sample(&assessment,&inputs,serde_json::json!({
+        if report.wants_sample(assessment.decision){report.sample(&assessment,evaluated,serde_json::json!({
             "generation":self.generation,"revision":self.revision,"topology_id":c.topology_id,"reverse":c.reverse,
             "source_witness":c.witness,"cost_assumptions":cost}));}
+        // A failed source witness says nothing about other pools for these roles.
+        if source_only&&assessment.decision!=amounts::Decision::Possible{return Ok(None);}
         self.economic_cache.insert(key,CachedAssessment{fingerprint,assessment:assessment.clone(),sent:false});
         Ok((assessment.decision==amounts::Decision::Possible).then_some((assessment,cost,inputs)))
     }
@@ -377,7 +382,7 @@ impl State {
     /// Pack an exact CP6A best-witness without rebuilding any route product.
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
-        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,assessment:amounts::Assessment,cost:CostContext,inputs:&[amounts::Input])->Result<Selection>{
+        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,assessment:amounts::Assessment,cost:CostContext,inputs:&[amounts::Input],cancel:&AtomicBool,curves:&mut amounts::CurveCache)->Result<Selection>{
         let started=Instant::now();
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
@@ -440,6 +445,7 @@ impl State {
         let mut options=Vec::new();
         let primary=assessment.estimate.as_ref().context("primary estimate absent")?;
         let pairs=primary.legs.iter().map(|l|(l.input_mint.clone(),l.output_mint.clone())).collect::<Vec<_>>();
+        let quotes=amounts::Quotes::new(inputs,cancel,curves);
         // Only direct/partner roles accept parallel alternatives in the current
         // V10 group contract. Intermediate/conversion remain the best chosen pool.
         for (i,&(selected,role_name)) in slots.iter().enumerate(){
@@ -447,14 +453,15 @@ impl State {
             let target=self.pools.get(selected/2).context("candidate identity missing")?;
             let (a,b)=(target.mint_a,target.mint_b);
             let original=self.weight(selected).context("seed weight missing")?;
-            for (id,p) in self.pools.iter().enumerate(){
-                if p.mint_a!=a||p.mint_b!=b||used.contains(&id){continue;}
+            for &id in self.pair_index.get(&(a,b)).into_iter().flatten(){
+                ensure!(!cancel.load(Ordering::Relaxed),"economic calculation cancelled");
+                if used.contains(&id){continue;}
                 let slot=2*id+selected%2;
                 if let Some(w)=self.weight(slot){
                     let new_sum=i128::from(seed_sum)-i128::from(original)+i128::from(w);
                     if new_sum<i128::from(threshold){
                         let mut alternative=preferred.clone();alternative[i]=slot;
-                        if let Some(e)=amounts::evaluate_slots(inputs,&pairs,&alternative,primary.input_raw) {
+                        if let Some(e)=quotes.evaluate_slots(&pairs,&alternative,primary.input_raw) {
                             if e.profit_raw>assessment.required_profit_raw {options.push((std::cmp::Reverse(e.profit_raw),slot,role_name,e));}
                         }
                     }
@@ -466,6 +473,7 @@ impl State {
         let mut considered=0;let mut rejected=0;let mut unavailable=0;
         let mut last_rejection=None;
         for (_,slot,role_name,estimate) in options{
+            ensure!(!cancel.load(Ordering::Relaxed),"economic calculation cancelled");
             if used.contains(&(slot/2)){continue;}
             considered+=1;
             let pool=match self.pool(slot,role_name,registry,cfg.wallet,reads){
@@ -525,18 +533,161 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
     }];
 }
 
+fn material_fingerprint(inputs:&[amounts::Input],cost:&CostContext)->[u8;32] {
+    let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(&cost.cost_guard_raw.to_le_bytes());hash.update(&cost.minimum_net_profit_raw.to_le_bytes());
+    for i in &inputs {
+        hash.update(&(i.slot as u64).to_le_bytes());
+        if let Some(p)=&i.observation.liquidity{hash.update(&p.content_digest);hash.update(&p.account_set_digest);}
+        if let Some(v)=&i.observation.valuation{for t in &v.token_fee_status{hash.update(t.as_bytes());}}
+    }
+    hash.finish().as_ref().try_into().expect("SHA256 length")
+}
+
+// One private CPU task; the typed input consumer remains responsive. Cancellation
+// is cooperative inside the search, including when its owning async task drops.
+#[derive(Default,Clone,serde::Serialize)]
+struct WorkProgress {
+    generation:u64,revision:u64,candidates:usize,completed:usize,
+    topology_id:Option<usize>,phase:&'static str,started_at_us:u64,candidate_started_at_us:u64,
+}
+struct WorkUpdate {
+    key:Vec<(String,String)>,cache:Option<CachedAssessment>,
+    amounts:amounts::Report,selection:Option<Selection>,reads:RegistryReads,
+    rejection:Option<String>,generation:u64,
+}
+struct Work {
+    task:tokio::task::JoinHandle<Result<()>>,updates:mpsc::Receiver<WorkUpdate>,
+    cancel:Arc<AtomicBool>,progress:Arc<Mutex<WorkProgress>>,
+}
+impl Drop for Work {fn drop(&mut self){self.cancel.store(true,Ordering::Relaxed);self.updates.close();self.task.abort();}}
+fn start_work(mut state:State,mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>,registry:PoolRegistry,cfg:Arc<Settings>)->Work {
+    // This orders work only. Every candidate is visited; the economic gate still
+    // decides every proposal. A slow later candidate cannot hold an earlier one.
+    ranked.sort_unstable_by_key(|r|r.0);
+    let cancel=Arc::new(AtomicBool::new(false));let stop=cancel.clone();
+    let progress=Arc::new(Mutex::new(WorkProgress{generation:state.generation,revision:state.revision,
+        candidates:ranked.len(),started_at_us:now_us(),..Default::default()}));let live=progress.clone();
+    let (tx,updates)=mpsc::channel(1);
+    let task=tokio::task::spawn_blocking(move||->Result<()> {
+        let mut curves=amounts::CurveCache::default();
+        // Source witnesses first: a large alternative domain must not hold up
+        // independent, already concrete opportunities. Then examine all domains.
+        for source_only in [true,false] {for (_,event,index) in &ranked {
+            if stop.load(Ordering::Relaxed){break;}
+            let SignalEvent::Candidates(block)=event.as_ref()else{bail!("ranked event is not a candidate")};
+            let c=&block.candidates[*index];
+            {let mut p=live.lock().map_err(|_|anyhow::anyhow!("economic progress poisoned"))?;
+                p.topology_id=Some(c.topology_id);p.phase=if source_only{"source_witness"}else{"pair_alternatives"};p.candidate_started_at_us=now_us();}
+            let started=Instant::now();let mut amounts=amounts::Report::default();let mut reads=RegistryReads::default();
+            let key=c.witness.as_ref().context("economic witness absent")?.legs.iter()
+                .map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
+            let qualified=state.qualify(c,&cfg,&mut amounts,&stop,&mut curves,source_only)?;
+            let mut rejection=None;
+            let selection=if let Some((assessment,cost,inputs))=qualified {
+                match state.build_compact(c,block.threshold_units,block.trigger.clone(),&registry,&cfg,0,&mut reads,assessment,cost,&inputs,&stop,&mut curves){
+                    Ok(mut s)=>{s.selection_ns=elapsed_ns(started);Some(s)},
+                    Err(e)=>{rejection=Some(format!("{e:#}"));None},
+                }
+            }else{None};
+            if stop.load(Ordering::Relaxed){break;}
+            let update=WorkUpdate{key:key.clone(),cache:state.economic_cache.get(&key).cloned(),
+                amounts,selection,reads,rejection,generation:state.generation};
+            if tx.blocking_send(update).is_err(){return Ok(());}
+            // Suppress duplicate proposals within this frozen job. The live owner
+            // independently marks sent only after accepting a current proposal.
+            if let Some(cache)=state.economic_cache.get_mut(&key){if cache.assessment.decision==amounts::Decision::Possible{cache.sent=true;}}
+            live.lock().map_err(|_|anyhow::anyhow!("economic progress poisoned"))?.completed+=1;
+        }}
+        Ok(())
+    });
+    Work{task,updates,cancel,progress}
+}
+fn checkpoint(report:&Report,work:Option<&Work>,complete:bool)->Result<()> {
+    if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
+        let folder=std::path::Path::new(&path).parent().context("execution report directory")?;
+        let progress=work.map(|w|w.progress.lock().map(|p|p.clone())
+            .map_err(|_|anyhow::anyhow!("economic progress poisoned"))).transpose()?;
+        let value=serde_json::json!({"complete":complete,"updated_at_us":now_us(),"in_flight":progress,"report":report});
+        let temp=folder.join("execution_candidates_progress.tmp");
+        std::fs::write(&temp,serde_json::to_vec_pretty(&value)?)?;
+        // rename on Windows cannot replace an existing file; the final report is
+        // authoritative and is written separately after successful drain.
+        let dest=folder.join("execution_candidates_progress.json");
+        if dest.exists(){std::fs::remove_file(&dest)?;}std::fs::rename(temp,dest)?;
+    }
+    Ok(())
+}
+fn accept_work(update:WorkUpdate,state:&mut State,report:&mut Report,cfg:&Settings,
+    registry:&PoolRegistry,output:&mpsc::Sender<ExecutionRequest>,dispatch:bool)->Result<()> {
+    report.amounts.merge(update.amounts);report.registry_reads.merge(&update.reads);
+    if let Some(rejection)=update.rejection{report.skipped_invalid_seed+=1;report.last_rejection=Some(rejection);}
+    if let Some(cache)=update.cache {
+        let sent=state.economic_cache.get(&update.key).is_some_and(|old|old.fingerprint==cache.fingerprint&&old.sent);
+        if dispatch&&update.generation==state.generation {
+            state.economic_cache.insert(update.key.clone(),CachedAssessment{sent,..cache});
+        }
+    }
+    let Some(mut s)=update.selection else{return Ok(());};
+    if !dispatch{return Ok(());}
+    // Validate material pool state, live membership and the current cost reference,
+    // rather than accepting or rejecting solely on an unrelated price revision.
+    let current=(||->Result<bool>{
+        let id=s.topology_id.context("economic topology missing")?;
+        if s.graph_generation!=state.generation||!state.active.contains(&(id,s.reverse)){return Ok(false);}
+        let top=state.plan.as_ref().context("economic current plan missing")?.compact_topologies[id].clone();
+        let cost=state.cost_context(top.settlement,cfg)?;
+        let fingerprint=material_fingerprint(&state.economic_inputs(&top),&cost);
+        let Some(cache)=state.economic_cache.get(&update.key)else{return Ok(false);};
+        if cache.sent||cache.fingerprint!=fingerprint{return Ok(false);}
+        state.witness(id,s.reverse,s.candidate.as_ref().and_then(|c|c.witness.as_ref()).context("economic candidate missing")?)?;
+        let mut reads=RegistryReads::default();
+        for p in &s.pools{state.pool(p.slot,p.role,registry,cfg.wallet,&mut reads)?;}
+        report.registry_reads.merge(&reads);s.registry_reads.merge(&reads);
+        Ok(true)
+    })();
+    if !matches!(current,Ok(true)){report.economic_stale_results+=1;return Ok(());}
+    if cfg.limit>0&&report.requests.len()>=cfg.limit{return Ok(());}
+    let permit=match output.try_reserve(){Ok(p)=>p,Err(mpsc::error::TrySendError::Full(_))=>{
+        report.economic_busy_results+=1;return Ok(());},Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped")};
+    s.request.id=format!("graph-{}-{}-{}",s.graph_generation,s.revision,report.requests.len()+1);
+    s.request_ready_at_us=now_us();s.frame_to_request_us=s.price_pipeline.and_then(|t|s.request_ready_at_us.checked_sub(t.frame_received_at_us));
+    s.signal_to_request_us=s.request_ready_at_us.saturating_sub(s.signal_ready_at_us);
+    crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} pools={} selection_ns={} frame_to_request_us={:?} broadcasts=false",
+        s.request.id,s.graph_generation,s.revision,s.packing.pool_declarations,s.selection_ns,s.frame_to_request_us);
+    if let Some(cache)=state.economic_cache.get_mut(&update.key){cache.sent=true;}
+    permit.send(s.request.clone());report.requests.push(s);report.request_count=report.requests.len();report.economic_qualified_requests+=1;
+    Ok(())
+}
+
 pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>, cfg:Settings)->Result<Report> {
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
-    let mut pending=false;
+    let mut pending=false;let cfg=Arc::new(cfg);let mut work=None::<Work>;
+    let mut tick=tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let outcome:Result<()>=async {
         loop {
-            let event=match input.recv().await {
+            enum Next {Event(std::result::Result<Arc<SignalEvent>,broadcast::error::RecvError>),Work(Option<WorkUpdate>),Tick}
+            let next=tokio::select! {
+                e=input.recv()=>Next::Event(e),
+                r=async{work.as_mut().unwrap().updates.recv().await},if work.is_some()&&!pending=>Next::Work(r),
+                _=tick.tick()=>Next::Tick,
+            };
+            let received=match next {
+                Next::Tick=>{checkpoint(&report,work.as_ref(),false)?;continue;},
+                Next::Work(Some(update))=>{accept_work(update,&mut state,&mut report,&cfg,&registry,&output,true)?;continue;},
+                Next::Work(None)=>{let mut done=work.take().unwrap();(&mut done.task).await.context("economic calculation task")??;
+                    report.economic_jobs_completed+=1;continue;},
+                Next::Event(e)=>e,
+            };
+            let event=match received {
                 Ok(event)=>event,
                 Err(broadcast::error::RecvError::Closed)=>break,
                 Err(broadcast::error::RecvError::Lagged(n))=>{
                     report.lost_events+=n;report.awaiting_snapshot=true;state=State::default();ranked.clear();pending=false;
+                    if let Some(w)=&work{w.cancel.store(true,Ordering::Relaxed);}
                     crate::log_event!(Warn,"execution candidates lost={n} awaiting_snapshot=true requests_paused=true");
                     continue;
                 },
@@ -598,68 +749,29 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         if e.price_pipeline.is_some_and(|t|t.initialization_replay) {report.initialization_revisions+=1;}
                     }
                     if ranked.is_empty() {continue;}
-                    // Never await simulation capacity or propagate backpressure to calculation.
-                    let permit=match output.try_reserve() {
-                        Ok(permit)=>permit,
-                        Err(mpsc::error::TrySendError::Full(_))=>{report.skipped_busy_revisions+=1;continue;},
-                        Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
-                    };
-                    let started=Instant::now();
-                    let mut reads=RegistryReads::default();
-                    report.evaluated_revisions+=1;
-                    let mut qualified=Vec::new();
-                    for (_,event,index) in &ranked {
-                        let SignalEvent::Candidates(block)=event.as_ref() else{bail!("ranked event is not a candidate")};
-                        if let Some((assessment,cost,inputs))=state.qualify(&block.candidates[*index],&cfg,&mut report.amounts)? {
-                            qualified.push((event.clone(),*index,assessment,cost,inputs));
-                        }
-                    }
-                    // Compare absolute gains on a common cost-normalized currency
-                    // basis, not marginal BPS. The same configured lamport guard
-                    // is converted for USDC settlements using the recorded reference.
-                    qualified.sort_unstable_by(|a,b|{
-                        let ag=a.2.estimate.as_ref().unwrap().profit_raw-a.2.cost_guard_raw;
-                        let bg=b.2.estimate.as_ref().unwrap().profit_raw-b.2.cost_guard_raw;
-                        (u128::from(bg)*u128::from(a.2.cost_guard_raw)).cmp(&(u128::from(ag)*u128::from(b.2.cost_guard_raw)))
-                    });
-                    let mut chosen=None;let mut invalid_seed=false;
-                    for (event,index,assessment,cost,inputs) in qualified {
-                        let SignalEvent::Candidates(block)=event.as_ref() else{bail!("qualified event is not a candidate")};
-                        match state.build_compact(&block.candidates[index],block.threshold_units,block.trigger.clone(),
-                            &registry,&cfg,report.requests.len()+1,&mut reads,assessment,cost,&inputs) {
-                            Ok(mut selection)=>{
-                                selection.selection_ns=elapsed_ns(started);selection.registry_reads=reads.clone();
-                                selection.request_ready_at_us=now_us();
-                                selection.frame_to_request_us=selection.price_pipeline.and_then(|t|selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
-                                selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
-                                chosen=Some(selection);break;
-                            },
-                            Err(error)=>{invalid_seed=true;report.skipped_invalid_seed+=1;report.last_rejection=Some(format!("{error:#}"));},
-                        }
-                    }
-                    ranked.clear();
-                    report.registry_reads.merge(&reads);
-                    if let Some(selection)=chosen {
-                        crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} registry_reads={} registry_wait_ns={} registry_hold_ns={} broadcasts=false",
-                            selection.request.id,state.generation,state.revision,selection.route_kind,selection.reverse,
-                            selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us,
-                            selection.registry_reads.calls,selection.registry_reads.wait_ns,selection.registry_reads.hold_ns);
-                        let key=selection.amount_assessment.estimate.as_ref().unwrap().legs.iter()
-                            .map(|l|(l.input_mint.clone(),l.output_mint.clone())).collect::<Vec<_>>();
-                        if let Some(entry)=state.economic_cache.get_mut(&key){entry.sent=true;}
-                        permit.send(selection.request.clone());report.requests.push(selection);
-                        report.request_count=report.requests.len();report.economic_qualified_requests+=1;
-                    } else if invalid_seed {
-                        crate::log_event!(Warn,"execution candidates no_packable_seed=true generation={} revision={} last_rejection={:?}",
-                            state.generation,state.revision,report.last_rejection);
-                    }
+                    if work.is_some(){report.skipped_busy_revisions+=1;ranked.clear();continue;}
+                    match output.try_reserve(){Ok(p)=>drop(p),
+                        Err(mpsc::error::TrySendError::Full(_))=>{report.skipped_busy_revisions+=1;ranked.clear();continue;},
+                        Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),}
+                    report.evaluated_revisions+=1;report.economic_jobs_started+=1;
+                    work=Some(start_work(state.clone(),std::mem::take(&mut ranked),registry.clone(),cfg.clone()));
                 },
             }
         }
         ensure!(!pending,"candidate stream closed during evaluation");
         Ok(())
     }.await;
+    let mut outcome=outcome;
+    if let Some(mut done)=work.take(){
+        done.cancel.store(true,Ordering::Relaxed);done.updates.close();
+        while let Some(update)=done.updates.recv().await{
+            if let Err(e)=accept_work(update,&mut state,&mut report,&cfg,&registry,&output,false){if outcome.is_ok(){outcome=Err(e);}}
+        }
+        if let Err(e)=(&mut done.task).await.context("economic cancellation join").and_then(|r|r){if outcome.is_ok(){outcome=Err(e);}}
+        report.economic_jobs_completed+=1;report.economic_jobs_cancelled+=1;
+    }
     report.error=outcome.err().map(|e|format!("{e:#}"));
+    checkpoint(&report,None,true)?;
     crate::log_event!(Info,"execution candidates complete=true requests={} lost={} error={:?}",report.requests.len(),report.lost_events,report.error);
     Ok(report)
 }

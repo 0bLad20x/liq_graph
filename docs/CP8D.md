@@ -72,8 +72,13 @@ neither fresh global/Clock frames nor unchanged digests prove fresh pool account
 
 ## Packing and repeated state
 
-Current event candidates are economically assessed before sorting/packing. Gains
-are compared on their recorded common cost-normalized basis across settlements.
+Current event candidates are economically assessed before packing. The bounded
+CPU task first evaluates each concrete source witness, then explores pair-domain
+alternatives for unresolved candidates. A positive source witness is sufficient;
+a failed source witness is not a verdict on other pools. Ready economic proposals
+can be dispatched before the remaining candidates finish. Marginal scores order
+work only; they do not replace the amount/cost gate. No global best-across-candidates
+ranking is claimed.
 The chosen primary must satisfy the existing net contract, unique-pool rules,
 current Prepared proofs/account digest/signer, and V10 capacity. An unfit primary
 is not replaced by the old unqualified witness.
@@ -93,6 +98,23 @@ these identities. An unchanged already-dispatched state is not a new opportunity
 There is no failure blacklist or cooldown. Cache entries are pruned with catalog
 membership, and gaps clear them.
 
+One private blocking CPU task and one result slot keep calculation separate from
+the existing typed input consumer. That consumer continues applying/validating the
+complete stream. Prefix sums preserve exact full-bin fees/component rounding;
+queries binary-search complete bins and calculate one partial bin. Compiled curves
+are reused by material pool identity throughout a job, including packing. Integer
+overflow falls back to the original incremental arithmetic rather than invalidating
+otherwise representable small fills. There is no new runtime, worker, RPC or work
+budget. The amount search checks cancellation between probes/levels; dropping its
+owner also cancels it. Closing the input stops new dispatches and cancels unfinished
+search while accepted simulations retain their normal drain.
+
+Each completed proposal is rechecked against live candidate membership, the material
+profile/fee fingerprint, cost reference and Prepared manifests before enqueueing.
+Unrelated revisions do not by themselves invalidate it; changed relevant inputs do.
+Generation changes conservatively discard old proposals. Busy revisions/results and
+stale results are counted separately; they are not delivery losses.
+
 Simulation backpressure behavior remains bounded: busy input revisions are counted
 and skipped, not queued for complete later service. Economic statistics describe
 the assessed live candidate revisions, **not every route or every market state**.
@@ -108,6 +130,14 @@ simulation bodies. Existing `selection-NN.json`, `request-NN.json`, and
 reads one selection at a time and keeps a small projection. Full diagnostic models
 are bounded to two examples per decision in `economic_models.json`, including exact
 level vectors; the starter never parses this large raw-model file.
+
+`execution_candidates_progress.json` is refreshed every five seconds with compact
+completed counters and the current job/topology/phase/time. The final version marks
+`complete=true`. A candidate drain failure retains this partial report in the
+execution summary; missing request counts remain null, never a fabricated zero.
+Job started/completed/cancelled counters distinguish shutdown cancellation from a
+completed economic assessment. Source-witness and pair-domain decisions carry
+different explicit scopes; one candidate can therefore have two assessments.
 
 `economic_evidence.json` counts real decisions, bounds, probes, cache reuse,
 unchanged states and processing times. `economic_comparison.json` records expected
@@ -155,3 +185,17 @@ Current expected signal sizes are hypotheses; actual V10 size/pool differences
 remain evidence. Check model bounds against complete saved observations, verify
 qualified primary inclusion, quantify same-size leg differences, fee-assumption
 errors, processing latency and actual after-cost results before any merge decision.
+
+## First real CP8D run and correction
+
+Run `20261028T223232895Z` on `027b0f7` stopped its producer window at 600.001
+seconds but failed candidate drain at 630.008 seconds. ExecutionCandidates logged
+45,014 missed broadcast events; its final report was absent (`execution.json={}`).
+MarketState produced 28,604 observations and GraphSignals completed 41,959
+evaluations. The old synchronous all-candidate search blocked its own consumer.
+No economic acceptance or zero-opportunity conclusion follows from that run.
+The changes above address CPU isolation, indexed curve queries, incremental result
+delivery, cooperative cancellation and retained partial evidence. Re-run the same
+600-second command; compare event loss, job drain, proposal staleness, economic
+processing times and actual fee-adjusted simulation results. Live acceptance of
+this correction remains pending.

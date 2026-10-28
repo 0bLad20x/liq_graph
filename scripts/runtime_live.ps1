@@ -479,6 +479,11 @@ try {
         execution_registry_reads=$registryReads
         registry_timing_observed=($registryCycles.Count -ge 2 -and [long]$registryReads.calls -gt 0)
         execution_skipped_busy_revisions=$execution.execution_candidates.skipped_busy_revisions
+        economic_jobs_started=$execution.execution_candidates.economic_jobs_started
+        economic_jobs_completed=$execution.execution_candidates.economic_jobs_completed
+        economic_jobs_cancelled=$execution.execution_candidates.economic_jobs_cancelled
+        economic_stale_results=$execution.execution_candidates.economic_stale_results
+        economic_busy_results=$execution.execution_candidates.economic_busy_results
         candidate_delivery_passed=$candidateDelivery
         v10_requests=$requests.Count; v10_reports=$reports.Count
         v10_simulation_successes=$execution.simulation_successes

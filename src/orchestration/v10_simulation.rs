@@ -87,8 +87,21 @@ impl ExecutionTasks {
         }
     }
     pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<execution_candidates::Report> {
-        let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
-            .context("candidate shutdown timeout")???;
+        evidence["state"]=serde_json::json!("draining");
+        evidence["request_count"]=serde_json::Value::Null;
+        let result=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
+            .context("candidate shutdown timeout").and_then(|r|r.context("candidate worker panicked")).and_then(|r|r);
+        let candidates=match result {Ok(report)=>report,Err(error)=>{
+            evidence["error"]=serde_json::json!(format!("{error:#}"));
+            if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
+                if let Some(folder)=std::path::Path::new(&path).parent(){
+                    if let Ok(bytes)=std::fs::read(folder.join("execution_candidates_progress.json")){
+                        if let Ok(partial)=serde_json::from_slice::<serde_json::Value>(&bytes){evidence["execution_candidates_partial"]=partial;}
+                    }
+                }
+            }
+            return Err(error);
+        }};
         // The candidate stream has closed. Let accepted jobs and reports drain
         // while the shared RPC transport remains alive.
         evidence["execution_candidates"]=serde_json::to_value(&candidates)?;
@@ -133,6 +146,7 @@ impl ExecutionTasks {
         evidence["execution_integration_passed"]=serde_json::json!(acceptance.is_ok());
         evidence["execution_integration_error"]=serde_json::json!(acceptance.err().map(|e|format!("{e:#}")));
         candidates.ensure_complete()?;
+        evidence["state"]=serde_json::json!("complete");
         Ok(candidates)
     }
 }
