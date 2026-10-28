@@ -8,7 +8,7 @@ use crate::core::{CompletionState, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionParameters, ExecutionPool, ExecutionReport, ExecutionRequest}, market_state::{PriceOrigin,PricePipelineTiming},
     signals::{SignalCandidate, SignalCandidateBatch, SignalEvent, SignalPlan, SignalPool, SignalPoolPrice, SignalTopology,SignalWitness,
         SignalRangeChange, SignalRouteKind, SignalStateUpdate,
-        SignalStream, SignalTrigger, SIGNAL_LOG_SCALE}};
+        SignalStream, SignalTrigger, SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
 use super::pool_registry::PoolRegistry;
 
 pub struct Settings {
@@ -69,7 +69,7 @@ pub struct Selection {
     pub request: ExecutionRequest,
     graph_generation: u64, revision: u64, topology_id: Option<usize>, route_kind: SignalRouteKind,
     reverse: bool, trigger: Arc<SignalTrigger>, candidate: Option<SignalCandidate>,
-    threshold_units: i64, indicative_return_bps: Option<f64>, estimated_net_return_bps:Option<f64>,
+    threshold_units: i64, estimated_net_return_bps:Option<f64>,
     pools: Vec<PoolEvidence>, packing: ExecutionMetrics,
     signal_ready_at_us: u64, candidate_received_at_us: u64, request_ready_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
@@ -82,6 +82,7 @@ pub struct Selection {
 #[derive(Default, serde::Serialize)]
 pub struct Report {
     pub error: Option<String>, pub requests: Vec<Selection>,
+    score_basis:&'static str,
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
     lost_events: u64, resynchronizations: u64, skipped_busy_revisions: u64,
@@ -93,6 +94,7 @@ pub struct Report {
 impl Report {
     pub fn ensure_complete(&self)->Result<()> {
         ensure!(self.error.is_none(), "execution candidate worker failed: {}", self.error.as_deref().unwrap_or(""));
+        ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
         Ok(())
@@ -144,6 +146,7 @@ impl State {
         if let Some(snapshot)=&s.snapshot {
             ensure!(snapshot.plan.graph_generation==s.graph_generation
                 && snapshot.plan.log_weight_scale==SIGNAL_LOG_SCALE
+                && snapshot.plan.score_basis==SIGNAL_SCORE_BASIS
                 && snapshot.pools.len()==snapshot.prices.len(), "invalid candidate snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
             self.generation=s.graph_generation;
@@ -172,7 +175,7 @@ impl State {
             .context("candidate state topology absent")?;
         ensure!(witness.legs.len()==top.length && (2..=4).contains(&top.length)
             && !(top.kind==SignalRouteKind::Direct2&&reverse),"candidate state length/direction invalid");
-        let mut unique=HashSet::new();let mut sum=0_i128;let mut net_sum=Some(0_i128);
+        let mut unique=HashSet::new();let mut sum=0_i128;
         for (i,leg) in witness.legs.iter().enumerate(){
             let j=if reverse{top.length-1-i}else{i};
             let (a,b)=top.roles[j];let (input,output)=if reverse{(b,a)}else{(a,b)};
@@ -183,12 +186,7 @@ impl State {
                 && unique.insert(leg.slot/2),"candidate state pool/direction invalid");
             ensure!(self.weight(leg.slot)==Some(leg.log_weight_units),"candidate state weight mismatch");
             sum+=i128::from(leg.log_weight_units);
-            net_sum=net_sum.zip(self.prices.get(leg.slot/2).and_then(|p|p.as_ref())
-                .and_then(|p|p.estimated_net_weight_units[leg.slot%2]))
-                .map(|(sum,n)|sum+i128::from(n));
         }
-        ensure!(net_sum.and_then(|n|i64::try_from(n).ok())==witness.estimated_net_log_sum_units,
-            "candidate net estimate revision mismatch");
         ensure!(witness.legs[0].input_mint==top.settlement
             && witness.legs.last().is_some_and(|l|l.output_mint==top.settlement)
             && witness.legs.windows(2).all(|l|l[0].output_mint==l[1].input_mint)
@@ -322,7 +320,7 @@ impl State {
         Ok(Selection{request,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
-            indicative_return_bps:witness.indicative_return_bps,estimated_net_return_bps:witness.estimated_net_return_bps,
+            estimated_net_return_bps:witness.estimated_net_return_bps,
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
             signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
@@ -359,7 +357,7 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
 }
 
 pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>, cfg:Settings)->Result<Report> {
-    let mut report=Report::default(); let mut state=State::default(); let mut sequence=0;
+    let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
     let mut pending=false;
@@ -409,9 +407,9 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         if cfg.kind.is_some_and(|kind|kind!=top.kind){continue;}
                         if let Some(w)=candidate.witness.as_ref(){
                             ensure!(w.log_sum_units<b.threshold_units,
-                                "best candidate does not satisfy threshold");
+                                "best candidate does not satisfy net threshold");
                             report.qualifying_ranges+=1;
-                            ranked.push((w.estimated_net_log_sum_units.unwrap_or(w.log_sum_units),event.clone(),index));
+                            ranked.push((w.log_sum_units,event.clone(),index));
                         }
                     }
                 },

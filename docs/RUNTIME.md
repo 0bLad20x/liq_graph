@@ -191,3 +191,21 @@ Completion-Prepared und Preisbereitschaft werden dadurch nicht verwechselt.
 For the two-protocol 30-minute fee checkpoint, use the existing starter with
 `-EnabledVenues meteora_dlmm,pumpswap -RequireFeeEvidence`; the exact PowerShell
 command and acceptance limits are in [CP8A](CP8A.md).
+
+
+## CP8A.2: reine Netto-Pruefung
+
+Signalindex, Kandidaten und Poolalternativen verwenden ausschliesslich die
+bekannten gerichteten DEX-Nettoraten. `ThresholdBps` bzw.
+`GRAPH_SIGNALS_THRESHOLD_BPS` bezeichnet jetzt den geschaetzten Vorteil nach
+DEX-Gebuehren; Standard 0 verlangt einen positiven Wert. Fehlende Nettoraten
+haben keinen Bruttofallback. Fuer diesen Checkpoint werden DLMM/PumpSwap aktiviert.
+Netzwerkgebuehren, Liquiditaetstiefe und Mengenwirkung bleiben gesondert.
+
+Der einzelne 1800-Sekunden-Lauf und die Abnahmekriterien stehen in
+[CP8A.md](CP8A.md#cp8a2-net-only-selection-and-duration-telemetry).
+`summary.json` enthaelt `net_evidence_passed`, `signal_score_basis`, die Nettoschwelle,
+`observations_by_known_net_directions`, `net_candidate_windows`, getrennte
+Signalstufen und Revaluation-Zeiten sowie Request-Aufbauzeiten. Signalfenster am
+Laufende sind rechtszensiert und keine gemessenen wirtschaftlichen Abbrueche.
+Die Telemetrie benoetigt keinen zusaetzlichen Diagnosekonsumenten.

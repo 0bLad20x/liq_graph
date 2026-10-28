@@ -8,7 +8,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
 use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue, MintReader,
-    market_state::{FeeValuation,Consistency, MarketStateEvent, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
+    market_state::{FeeValuation,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, 
     graph_watch_catalog::WatchCatalog};
 use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
@@ -434,7 +434,7 @@ struct FeeEvidence {
     known_dex_fees_by_model:BTreeMap<&'static str,u64>,
     unknown_by_reason:BTreeMap<String,u64>,
     updates_by_field:BTreeMap<&'static str,u64>,
-    unchanged_gross_price_updates:u64,revaluations:u64,asymmetric_rates:u64,
+    unchanged_net_rate_updates:u64,revaluations:u64,asymmetric_rates:u64,
     calculation:Latency,samples:Vec<FeeSample>,
 }
 struct Engine {
@@ -793,6 +793,9 @@ impl Engine{
         let fees_started=Instant::now();
         let valuation=self.pools[pi].valuation();
         if valuation.is_some(){self.metrics.fee_valuation.calculation.add(nanos(fees_started));}
+        let unchanged_net_rates=valuation.as_ref().is_some_and(|next|
+            self.pools[pi].last_valuation.as_ref().is_some_and(|previous|
+                previous.estimated_net_rates==next.estimated_net_rates));
         self.pools[pi].last_valuation=valuation.clone();
         let pool=&self.pools[pi];
         let (best_bid,best_ask)=pool.manifest_quotes().map_or((None,None),|(bid,ask)|(Some(bid),Some(ask)));
@@ -827,7 +830,7 @@ impl Engine{
             if let Some(reason)=&v.unknown_reason{*evidence.unknown_by_reason.entry(reason.clone()).or_default()+=1;}
             *evidence.updates_by_field.entry(event.trigger_field.unwrap_or("baseline_or_mint")).or_default()+=1;
             evidence.revaluations+=u64::from(matches!(origin,PriceOrigin::Revaluation));
-            evidence.unchanged_gross_price_updates+=u64::from(previous==Some(event.price_quote_per_base));
+            evidence.unchanged_net_rate_updates+=u64::from(unchanged_net_rates);
             evidence.asymmetric_rates+=u64::from(v.estimated_net_rates.iter().all(Option::is_some)
                 && (v.estimated_net_rates[0].unwrap()*v.estimated_net_rates[1].unwrap()-1.0).abs()>1e-12);
             if evidence.samples.iter().filter(|p|p.observation.venue==event.venue).count()<8 {
@@ -1422,7 +1425,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             if next!=selected {
                 let next_map:HashMap<_,_>=next.iter().map(|p|(p.address,*p)).collect();
                 let keep:HashSet<_>=selected.iter().filter(|p|next_map.get(&p.address)==Some(*p)).map(|p|p.address).collect();
-                for p in &selected {if !keep.contains(&p.address){engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}}
+                for p in &selected {if !keep.contains(&p.address){engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence,reason:PoolRemovalReason::Selection});}}
                 engine.retain(&keep);cached.retain(|key,_|engine.account_ranges.contains_key(key));
                 versions.retain(|key,_|keep.contains(key));retry.retain(|key,_|keep.contains(key));
                 for p in &next {if !keep.contains(&p.address){revision+=1;versions.insert(p.address,revision);}}
@@ -1659,7 +1662,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let hydrated_pools=engine.pools.len();
     let ready_pools=engine.pools.iter().filter(|p|p.ready).count();
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
-    for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
+    for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence,reason:PoolRemovalReason::Shutdown});}
     crate::log_event!(Info,"market state stopped=true events={} observations={} websocket={} lost={}",
         engine.sequence,engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,engine.metrics.websocket_prices,engine.metrics.lost);
     Ok(ProductionReport{events:engine.sequence,

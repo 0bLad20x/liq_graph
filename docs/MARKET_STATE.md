@@ -32,7 +32,7 @@ stale initializer results. A manifest-only refresh does not change the static wa
 Selection and Stats. Price carries mint orientation, indicative price, origin,
 consistency, component slots, receipt times and pipeline timing. The canonical quote
 preference is USDC, then WSOL, then the lexicographically larger mint address.
-Recovery after unavailability starts without an adjacent previous price.
+Recovery after unavailability starts without an adjacent previous price. Removed events distinguish selection changes from shutdown for downstream duration censoring.
 
 MarketState reports counters and bounded timing histograms directly from its owner.
 `market_state.json` records published event/price/WS totals, post-rewatch WS prices,
@@ -100,3 +100,9 @@ MARKET_STATE_TRACE=0
 
 
 CP8A watches full DLMM/PumpSwap pool accounts plus shared chain Clock, Pump GlobalConfig/FeeConfig and Pump base Mint supply. Shared addresses are deduplicated; see [CP8A](CP8A.md) for fee-only revaluation, unknown token-transfer costs and live acceptance.
+
+CP8A.2 Signal Engine consumes the directed fee-adjusted rates exclusively. Raw
+indicative prices remain protocol evidence; they are not a fallback selection
+score. Other venues retain their raw indicators, but require a fee model before
+participating in net signal evaluation. Rate-equality telemetry is
+`fee_valuation.unchanged_net_rate_updates`; it does not suppress observations.

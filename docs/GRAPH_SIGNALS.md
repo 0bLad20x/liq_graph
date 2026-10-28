@@ -30,11 +30,12 @@ Signal Engine owns stable pool identities, current prices, ordered directed weig
 compact topology rankings and qualifying candidates. Weights use integer Q48
 negative logarithms. A candidate is the best closed-route witness for a topology and
 direction below the configured threshold; it is not a swap quote or profit guarantee.
-The optimistic gross screening score remains unchanged. CP8A additionally carries
-current directed DLMM/PumpSwap marginal DEX-fee estimates in each price and witness;
-ExecutionCandidates uses the estimated net score for prioritization without a new
-exclusion threshold. Amount, depth, exact transfer-fee effects, slippage and execution
-costs are not included. See [CP8A](CP8A.md).
+CP8A.2 uses directed DLMM/PumpSwap marginal DEX-net weights as its sole
+selection/admission score. The default zero threshold requires strictly positive
+estimated DEX-net return. Missing net rates make that direction unavailable;
+there is no gross fallback. The existing factorized index and all topologies stay.
+Amount, depth, exact transfer-fee effects, slippage and execution costs are outside
+this estimate. See [CP8A](CP8A.md).
 
 On graph replacement, the worker compares the two actually installed generations.
 It remaps winners by topology identity and directed roles. New topologies and those
@@ -59,7 +60,7 @@ rejects sequence/revision errors, inconsistent witnesses and incomplete evaluati
 Lag invalidates consumer state; recovery requires a complete later snapshot. A finite
 proof with loss remains incomplete even if a subsequent snapshot restores state.
 
-Only non-initialization WebSocket Price revisions may enqueue V10 jobs. Baseline,
+Only non-initialization WebSocket Price or fee/clock Revaluation revisions may enqueue V10 jobs. Baseline,
 catalog reconciliation and coverage changes update candidate state without triggering
 execution. The actual ExecutionCandidates worker validates the contract at its input.
 The independent executor request validator remains necessary for manual requests.
@@ -86,3 +87,10 @@ Simulation rejects that proof setting, so the second mirror cannot be enabled th
 `RequireCatalogReconciliation` is an optional strict event-specific proof. It requires
 real candidate visibility, withdrawal, reuse and a catalog witness. Absence of such
 market events is incomplete evidence, never an invented success.
+
+CP8A.2 adds local monotonic net-candidate window durations inside the owner state,
+with threshold, availability, catalog, gap and right-censor outcomes separated.
+Winner changes and catalog ID remapping preserve continuous qualification time.
+These are estimate-membership windows, not guaranteed executable profit windows.
+Fee revaluations have a separate timing population; frame-to-evaluation completion
+complements frame-to-state readiness. See CP8A.md for units and run comparison.

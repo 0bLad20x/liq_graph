@@ -5,32 +5,38 @@ one Graph/CompactIndex and one V10 simulation path. No broadcasts.
 
 ## Contract and selection
 
-MarketState publishes `valuation` alongside the unchanged indicative gross price.
-The two `estimated_net_rates` are canonical **base -> quote / quote -> base**,
-expressed in human token units. GraphSignals maps them to the existing canonical
-Pubkey slots. They are marginal DEX-fee assessments, not amount quotes or a
-prediction of wallet profit. `scope` states this explicitly. Token-2022 transfer
-fees/caps or unresolved transfer behavior remain visible in `token_fee_status`
-and `unknown_reason`; they are not silently modelled as free transfers.
+MarketState publishes directed marginal DEX-net rates for DLMM and PumpSwap.
+`estimated_net_rates` are canonical **base -> quote / quote -> base**, in human
+token units. Raw pool prices remain protocol inputs and evidence, not a second
+signal-selection score. Amount, depth, host rebates, exact transfer-fee effects,
+network fees and account deposits are outside this estimate. Token-2022 costs
+that need an amount remain explicitly labelled; known DEX-net rates may still
+be used with that limitation.
 
-The existing optimistic gross index remains the candidate admission screen.
-There is no extra net threshold, pool cut, combination budget or second graph.
-A witness additionally carries its current estimated net log sum and return.
-ExecutionCandidates prioritizes candidate witnesses by that estimate when known,
-with the gross score as an explicit fallback when unknown. It does not reject a
-candidate merely because its marginal net estimate is negative. Alternatives
-continue to be packed under the existing V10/account constraints. The best gross
-witness is not claimed to be the globally best net or amount-dependent witness.
-Quantity/depth-aware alternatives and busy-request retry remain CP8B/CP8C.
+CP8A.2 replaces the gross admission/selection path completely. The existing
+CompactIndex orders independent directed net weights, finds the best net witness
+per topology/direction, and applies `GRAPH_SIGNALS_THRESHOLD_BPS` to that net
+return. Default zero means **strictly positive estimated DEX-net return**. This
+is an intentional admission change: old gross-positive/net-negative requests
+are no longer admitted through that witness. It is not a network-cost or final
+wallet-profit threshold. Q48 rounding remains part of the contract.
 
-A fee-only change recalculates affected topology witnesses even when gross
-weights stay equal. A relevant fee change also republishes active affected candidates when the
-best gross witness is unchanged, so a fee change on a parallel alternative
-can reach V10. This does not require that alternative to win the gross index.
-Catalog reconciliation remains state maintenance, not an execution trigger.
-Clock/mint revaluation has its own PriceOrigin and can trigger a new request;
-initialization replay and baseline-only observations do not request execution.
-V10 `trade_size=0`, profit parameters, signer and simulation logic are unchanged.
+`SignalPoolPrice.log_weight_units`, leg weights and witness `log_sum_units` now
+all mean marginal DEX-net weights. `SignalPlan.score_basis` and both owner reports
+identify `marginal_dex_net`; consumers reject a mismatched snapshot. The duplicate
+net weight/log-sum fields, gross-return aliases and gross fallback are removed.
+Unknown/nonpositive/nonfinite net rates leave that direction unavailable. A
+missing fee model does not mean zero fees, and does not remove graph topologies.
+Other venues need their own fee model before they can contribute net weights.
+
+ExecutionCandidates ranks those net witnesses and tests/ranks parallel pool
+alternatives with the same net weights and threshold. Existing V10/account limits,
+all route kinds, pool alternatives and V10 automatic sizing remain. Fee-only
+changes update the ordered net index. Relevant fee changes on parallel alternatives
+still republish affected candidates even when the best witness stays unchanged.
+Catalog reconciliation updates current membership without requesting execution.
+Clock/mint revaluation can request execution; baseline and initialization replay
+cannot. There is one index and one runtime, no legacy switch or comparison engine.
 
 ## Protocol references and rules
 
@@ -99,8 +105,8 @@ bps; buyback was part of protocol fee. Its positive virtual reserves materially
 changed the price. Its DLMM host fee was credited to the wallet. Historical
 DLMM pre-state is absent, so no full historical signal reproduction is claimed.
 
-After the locked feature build, run one short smoke check, then the requested
-1800 seconds in the configured Windows environment (no transaction broadcast):
+After the locked feature build, run the requested single
+1800-second measurement in the configured Windows environment (no transaction broadcast):
 
 ```powershell
 git switch cp8a-directed-fee-signals
@@ -115,6 +121,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Synchronisierung fehlgeschlagen.' }
     -PoolLimit 0 `
     -AccountBudget 25000 `
     -ProfileSignals `
+    -ThresholdBps 0 `
     -RequireFeeEvidence `
     -SimulateV10 `
     -SimulationLimit 0 `
@@ -181,7 +188,13 @@ scan needed no installation; that run cannot prove mass-expiry installation.
 Large expiry batches require real observations of such expiry, not synthetic
 inputs or a claim inferred from the configured duration. Other source/completion
 write sections are not refactored by this checkpoint; measured waits include them.
-The new head still requires its own real-input live acceptance.
+The real 600-second run `20261028T095251967Z` on `f560b01` verified concurrent
+execution reads during long scans: 11 maintenance cycles, up to 413.157 ms
+preparation, 10,040 measured reads and at most 16.918 ms individual read wait.
+Three requests overlapped scans with 0.6--2.2 us total read waits. All cycles
+had zero changes/write batches, so the changed-patch install remains unproven.
+The 802 requests and reports matched, with 23 successful simulations. CP8A.2
+changes net selection and requires its own live evidence.
 
 ### Deferred candidate/swap analysis
 
@@ -201,3 +214,68 @@ available liquidity matter. Complete historical DLMM BinArray pre-states are
 absent from the current evidence. Request route labels also do not prove the
 executed hop count: successful Direct3/Triangle4 requests in the second run
 executed two swaps. Real four-swap execution remains unproven.
+
+
+## CP8A.2: net-only selection and duration telemetry
+
+Scope is the current DLMM/PumpSwap branch, building on `f560b01`. Registry
+maintenance, Discovery, Completion, GraphLiquidity and the executor retain their
+existing responsibilities. No new worker, observer, script, crate or dependency.
+The existing starter command above runs 1800 seconds with unlimited total request
+count, no pool-count cap, the same account budget and no broadcasts.
+
+The implementation must pass the exact-head locked build before handoff. Real
+1800-second acceptance remains pending until that run's artifacts are inspected.
+No successful simulations or improved speed are promised by the net threshold;
+our previous successes sometimes used another supplied pool or a different
+number of hops. An estimated DEX-net edge is not a quantity-dependent quote.
+
+The existing owner histograms still separate ordinary WebSocket processing from
+initialization. New `revaluation_inputs` separates fee/clock-only processing.
+`frame_to_evaluation_complete_us` includes state/index work, candidate queries
+and state/candidate publication up to evaluation completion; it starts at local
+socket-frame receipt, not validator execution. Signal histograms report percentile
+upper bounds, not exact percentiles. `logarithms_prepared` now counts actual
+available directed net logarithms, rather than one gross logarithm per price.
+The preparation timer includes net-rate availability counting.
+
+`candidate_windows` is bounded telemetry within the actual active-candidate map:
+- One window is continuous net qualification for one topology and direction.
+  Changing the winning pool/weight while remaining qualified does not restart it.
+- Catalog remapping preserves the original monotonic entry time. Removed shapes
+  end in `catalog_exit_ns`; source/selection unavailability ends in
+  `unavailable_exit_ns`; stream gaps end in `gap_exit_ns`.
+- `threshold_exit_ns` records a complete priced evaluation falling below the
+  configured net advantage. These are the observed threshold-window durations.
+- Windows still open at shutdown go to `right_censored_at_end_ns`, separately
+  from economic exits. A typed MarketState removal reason identifies shutdown
+  before per-pool withdrawal. Abnormal stream completion has a separate
+  `right_censored_at_error_ns`. All durations use monotonic nanoseconds.
+- Entry and all exit/censor counts must balance. `peak_active_candidates` is
+  recorded before shutdown. The windows describe local estimate validity,
+  not guaranteed executable opportunity lifetime or the lifetime of a frozen job.
+  Baseline/catalog-created memberships can be included without dispatching them.
+
+`summary.json` exposes the score basis, net threshold, known-direction counts,
+net witness violations, all window histograms, steady-state preparation/index/
+query/publication/processing timings, fee-revaluation timing, frame-to-state and
+frame-to-completion timings, and exact post-run request selection/frame/request
+sample statistics. Existing Registry wait and simulation results remain separate.
+No per-pool duration log or second price/candidate state is created.
+MarketState's old unchanged-gross counter is replaced by
+`unchanged_net_rate_updates`; this measures rate equality, not deduplication.
+
+Compare the new run to the `f560b01` 600-second baseline by event type and workload:
+62,475 steady-state samples, mean processing 49.189 us, request selection median
+0.29865 ms/P95 5.0457 ms/max 45.1736 ms, frame-to-request median 0.5695 ms/max
+49.242 ms. Account for changed event mix, queries and candidate counts before
+attributing changes to code. Duration telemetry has no comparable historical
+window baseline. A longer run alone does not establish statistical significance.
+
+The live review must check net-only pool ordering, both directions, fee-only
+updates, unavailable-rate withdrawal/recovery, candidate/window accounting,
+complete delivery, actual accepted request/report IDs and timing tails. Inspect
+raw fee samples and selected net witnesses; `net_evidence_passed` is a necessary
+structural check, not a proof of exact math, liquidity depth, all configuration
+changes or profitability. Busy retry/coalescing and directed liquidity remain
+separate work; skipped revision identities are still not retained.

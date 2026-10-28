@@ -66,13 +66,15 @@ pub struct PoolPriceObservation {
     pub trigger_field: Option<&'static str>,
     pub pipeline: Option<PricePipelineTiming>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum PoolRemovalReason { Selection, Shutdown }
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum MarketStateEvent {
     Price(PoolPriceObservation),
     Unavailable {pool:String, venue:&'static str, slot:u64,
         received_at_us:u64, sequence:u64, reason:String},
     Gap {reason:String, sequence:u64},
-    Removed {pool:String, sequence:u64},
+    Removed {pool:String, sequence:u64, reason:PoolRemovalReason},
     Selection {prepared:usize, selected:Vec<String>, accounts:usize, sequence:u64},
     Stats {pools:usize, ready:usize, available:usize, accounts:usize, active:usize,
         ws_messages:u64, ws_text_bytes:u64, sequence:u64},
