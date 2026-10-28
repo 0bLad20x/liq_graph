@@ -1,6 +1,7 @@
 //! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
+mod comparison;
 use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
@@ -15,6 +16,7 @@ use super::pool_registry::PoolRegistry;
 pub struct Settings {
     pub wallet: Pubkey,
     pub parameters: ExecutionParameters,
+    economics:EconomicPolicy,
     /// Zero means no lifetime request cap; the output queue remains bounded.
     pub limit: usize,
     pub kind: Option<SignalRouteKind>,
@@ -34,9 +36,28 @@ impl Settings {
                 .context("read execution parameters")?).context("decode ExecutionParameters")?,
             _=>ExecutionParameters::default(),
         };
-        Ok(Self {wallet,parameters,limit,kind,capacity})
+        let economics=EconomicPolicy::from_env()?;
+        Ok(Self {wallet,parameters,economics,limit,kind,capacity})
     }
 }
+/// Internal assumptions, never copied into ExecutionParameters or CPI data.
+#[derive(Clone,serde::Serialize)]
+struct EconomicPolicy {network_fee_lamports:u64,additional_cost_reserve_lamports:u64,minimum_net_profit_lamports:u64}
+impl EconomicPolicy {
+    fn from_env()->Result<Self>{
+        let number=|name:&str,default:&str|->Result<u64>{env::var(name).unwrap_or_else(|_|default.into()).parse().with_context(||format!("invalid {name}"))};
+        Ok(Self{network_fee_lamports:number("GRAPH_ECONOMIC_NETWORK_FEE_LAMPORTS","5000")?,
+            additional_cost_reserve_lamports:number("GRAPH_ECONOMIC_COST_RESERVE_LAMPORTS","0")?,
+            minimum_net_profit_lamports:number("GRAPH_ECONOMIC_MIN_NET_PROFIT_LAMPORTS","0")?})
+    }
+}
+#[derive(Clone,serde::Serialize)]
+struct CostContext {
+    policy:EconomicPolicy,priority_fee_lamports:u64,cost_guard_raw:u64,minimum_net_profit_raw:u64,
+    settlement:String,reference_pool:Option<String>,reference_observed_at_us:Option<u64>,
+    scope:&'static str,
+}
+struct CachedAssessment {fingerprint:[u8;32],assessment:amounts::Assessment,sent:bool}
 fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
     .as_micros().min(u128::from(u64::MAX)) as u64}
 fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
@@ -82,11 +103,14 @@ pub struct Selection {
     alternative_pools_added: usize,
     /// May differ from the source SignalCandidate after quantity seed repair.
     packing_seed_log_sum_units:i64,
-    amount_assessment:amounts::Assessment,amount_seed_changed:bool,
+    amount_assessment:amounts::Assessment,economic_primary_changed:bool,
+    cost_assumptions:CostContext,alternative_estimates:Vec<amounts::Estimate>,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
-    pub error: Option<String>, pub requests: Vec<Selection>,
+    pub error: Option<String>, #[serde(skip_serializing)] pub requests: Vec<Selection>,
+    request_count:usize,pub economic_qualified_requests:u64,
+    pub evaluated_revisions:u64,
     score_basis:&'static str,
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
@@ -103,15 +127,21 @@ impl Report {
         ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
-        ensure!(self.amounts.attempts==self.amounts.possible+self.amounts.unknown+self.amounts.excluded
-            &&self.amounts.possible+self.amounts.unknown==self.requests.len() as u64,
-            "quantity decision accounting mismatch");
-        ensure!(self.requests.iter().all(|r|r.amount_assessment.decision!=amounts::Decision::Excluded),"excluded quantity request dispatched");
+        ensure!(self.amounts.attempts==self.amounts.possible+self.amounts.unknown+self.amounts.excluded,
+            "economic decision accounting mismatch");
+        ensure!(self.request_count==self.requests.len() && self.economic_qualified_requests==self.requests.len() as u64,
+            "economic request accounting mismatch");
+        for r in &self.requests {
+            let a=&r.amount_assessment;
+            ensure!(a.decision==amounts::Decision::Possible && a.estimate.as_ref().is_some_and(|e|e.profit_raw>a.required_profit_raw),
+                "unqualified economic request dispatched");
+            ensure!(a.estimate.as_ref().is_some_and(|e|e.legs.iter().all(|l|r.pools.iter().any(|p|p.pool==l.pool))),
+                "economic primary was not packed");
+        }
         Ok(())
     }
     pub fn ensure_handoff(&self, reports:&[ExecutionReport])->Result<()> {
         self.ensure_complete()?;
-        ensure!(!self.requests.is_empty(), "no qualifying live request was produced; inspect coverage, threshold and candidate rejections");
         ensure!(self.requests.len()==reports.len(), "candidate/request report counts differ");
         let mut by_id=HashMap::with_capacity(reports.len());
         for report in reports {
@@ -131,6 +161,12 @@ impl Report {
         }
         Ok(())
     }
+    pub fn compare_simulations(&self,reports:&[ExecutionReport])->Vec<serde_json::Value>{
+        let by_id=reports.iter().map(|r|(r.id.as_str(),r)).collect::<HashMap<_,_>>();
+        self.requests.iter().filter_map(|s|by_id.get(s.request.id.as_str()).map(|r|comparison::compare(s,r))).collect()
+    }
+    pub fn request_count(&self)->usize{self.requests.len()}
+    pub fn economic_samples(&self)->&[serde_json::Value]{&self.amounts.samples}
     /// Additional execution criterion, evaluated after ensure_handoff succeeds.
     pub fn ensure_successful_simulation(&self, reports:&[ExecutionReport])->Result<()> {
         ensure!(reports.iter().any(|r|matches!(r.outcome,
@@ -148,6 +184,8 @@ struct State {
     ready_at_us: u64, received_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
     threshold:i64, active:HashSet<(usize,bool)>,prepared_logarithms:u64,
+    pair_index:HashMap<(Pubkey,Pubkey),Vec<usize>>,economic_cache:HashMap<Vec<(String,String)>,CachedAssessment>,
+    cost_contexts:HashMap<Pubkey,(u64,CostContext)>,
 }
 impl State {
     fn amount_input(&self,id:usize,manifest_matches:bool)->Option<amounts::Input> {
@@ -155,61 +193,72 @@ impl State {
         Some(amounts::Input{slot:2*id+usize::from(identity.mint_a.to_string()!=price.observation.base_mint),
             observation:price.observation.clone(),manifest_matches})
     }
-    fn amount_universe(&self,top:&SignalTopology,registry:&PoolRegistry,wallet:Pubkey,reads:&mut RegistryReads)->Vec<amounts::Input> {
-        let mints=top.roles[..top.length].iter().flat_map(|&(a,b)|[a,b]).collect::<HashSet<_>>();
-        self.pools.iter().enumerate().filter_map(|(id,p)|{
-            if !mints.contains(&p.mint_a)||!mints.contains(&p.mint_b){return None;}
-            let mut input=self.amount_input(id,false)?;
-            let (state,wait,hold)=registry.measured_get(p.address);reads.record(wait,hold);
-            let state=state?;
-            if !state.completion_admission.is_admitted()||state.completion_state!=CompletionState::Prepared{return None;}
-            input.manifest_matches=state.execution_manifest.as_ref().is_some_and(|m|
-                m.bound_signer.is_none_or(|w|w==wallet)&&input.observation.liquidity.as_ref()
-                    .is_some_and(|q|q.account_set_digest==m.account_set_digest()));
-            Some(input)
-        }).collect()
+    fn economic_inputs(&self,top:&SignalTopology)->Vec<amounts::Input> {
+        let mut ids=top.roles[..top.length].iter().flat_map(|&(a,b)|self.pair_index.get(&(a.min(b),a.max(b))).into_iter().flatten().copied()).collect::<Vec<_>>();
+        ids.sort_unstable();ids.dedup();ids.into_iter().filter_map(|id|self.amount_input(id,true)).collect()
     }
-    fn packed_amount_inputs(&self,s:&Selection)->Vec<amounts::Input> {
-        s.pools.iter().filter_map(|p|self.amount_input(p.slot/2,p.liquidity_window_checked)).collect()
-    }
-    fn assess_selection(&self,mut selection:Selection,registry:&PoolRegistry,cfg:&Settings,
-        reads:&mut RegistryReads,report:&mut amounts::Report)->Result<Option<Selection>> {
-        let started=Instant::now();
-        let conversion_other=selection.request.conversion.as_ref().map(|p|
-            if p.manifest.mint_a==selection.request.settlement{p.manifest.mint_b}else{p.manifest.mint_a}.to_string());
-        let mut assessment=if cfg.parameters.trade_size!=0||cfg.parameters.constant_conversion||cfg.parameters.no_failure {
-            amounts::Assessment::unknown("nondefault_execution_mode")
-        }else{amounts::assess(&self.packed_amount_inputs(&selection),&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref())};
-        if assessment.decision==amounts::Decision::Excluded {
-            let candidate=selection.candidate.as_ref().context("quantity candidate missing")?;
-            let top=&self.plan.as_ref().context("quantity plan missing")?.compact_topologies[candidate.topology_id];
-            let universe=self.amount_universe(top,registry,cfg.wallet,reads);
-            let mut global=amounts::assess(&universe,&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
-            global.scope="current_prepared_candidate_mint_universe_dex_only";report.global_proofs+=1;
-            if global.decision==amounts::Decision::Excluded {
-                global.elapsed_ns=elapsed_ns(started);report.record(&global);
-                report.retain_exclusion(global,&universe,serde_json::json!({
-                    "graph_generation":self.generation,"signal_revision":self.revision,
-                    "topology_id":candidate.topology_id,"reverse":candidate.reverse,
-                    "trigger":selection.trigger,"source_witness":candidate.witness
-                }));return Ok(None);
+    fn cost_context(&mut self,settlement:Pubkey,cfg:&Settings)->Result<CostContext>{
+        if let Some((revision,cost))=self.cost_contexts.get(&settlement).filter(|(r,_)|*r==self.revision){let _=revision;return Ok(cost.clone());}
+        let total=cfg.economics.network_fee_lamports.checked_add(cfg.parameters.priority_fee_lamports)
+            .and_then(|n|n.checked_add(cfg.economics.additional_cost_reserve_lamports)).context("economic costs overflow")?;
+        ensure!(total>0,"internal economic cost guard must be positive");
+        let mut out=CostContext{policy:cfg.economics.clone(),priority_fee_lamports:cfg.parameters.priority_fee_lamports,
+            cost_guard_raw:total,minimum_net_profit_raw:cfg.economics.minimum_net_profit_lamports,
+            settlement:settlement.to_string(),reference_pool:None,reference_observed_at_us:None,
+            scope:"DEX_net_minus_configured_cost_guard_not_verified_contract_costs"};
+        if settlement.to_string()=="So11111111111111111111111111111111111111112"{self.cost_contexts.insert(settlement,(self.revision,out.clone()));return Ok(out);}
+        // Value lamport costs through the deepest complete observed SOL/settlement
+        // reference, never an arbitrary first pool or a hard-coded dollar peg.
+        let mut reference=None;
+        for id in 0..self.pools.len(){if let Some(i)=self.amount_input(id,true){
+            if let Some(p)=&i.observation.liquidity {
+                for direction in 0..2 {let d=&p.directions[direction];
+                    if d.input_mint!="So11111111111111111111111111111111111111112"||d.output_mint!=out.settlement{continue;}
+                    let capacity=amounts::output_bound(&i,1-direction).ok();
+                    if let Some(capacity)=capacity.filter(|n|*n>0){if let Ok(rate)=amounts::upper_rate(&i,direction){
+                        if reference.as_ref().is_none_or(|(old,_,_):&(u64,amounts::Rate,amounts::Input)|capacity>*old){reference=Some((capacity,rate,i.clone()));}
+                    }}
+                }
             }
-            let witness=candidate.witness.as_ref().context("quantity witness missing")?;
-            let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
-            if let Some(preferred)=amounts::seed(&universe,&pairs) {
-                if let Ok(mut repaired)=self.build_compact(candidate,selection.threshold_units,selection.trigger.clone(),
-                    registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,Some(&preferred)) {
-                    if repaired.amount_seed_changed {
-                        let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
-                        if next.decision!=amounts::Decision::Excluded {
-                            assessment=next;repaired.amount_seed_changed=true;report.seed_repaired+=1;selection=repaired;
-                        }else{assessment=amounts::Assessment::unknown("unpacked_or_untested_alternative");}
-                    }else{assessment=amounts::Assessment::unknown("unpacked_or_untested_alternative");}
-                }else{assessment=amounts::Assessment::unknown("quantity_seed_does_not_fit");}
-            }else{assessment=amounts::Assessment::unknown("alternative_quantity_unknown");}
+        }}
+        let (_,rate,input)=reference.context("settlement cost reference unavailable")?;
+        out.cost_guard_raw=u64::try_from(amounts::mul_div(total,rate.0,rate.1,true).map_err(|_|anyhow::anyhow!("reference cost overflow"))?)?;
+        out.minimum_net_profit_raw=u64::try_from(amounts::mul_div(cfg.economics.minimum_net_profit_lamports,rate.0,rate.1,true).map_err(|_|anyhow::anyhow!("reference profit overflow"))?)?;
+        out.reference_pool=Some(input.observation.pool.clone());out.reference_observed_at_us=Some(input.observation.received_at_us);
+        ensure!(out.cost_guard_raw>0,"zero settlement cost reference");
+        self.cost_contexts.insert(settlement,(self.revision,out.clone()));Ok(out)
+    }
+    fn qualify(&mut self,c:&SignalCandidate,cfg:&Settings,report:&mut amounts::Report)
+        ->Result<Option<(amounts::Assessment,CostContext,Vec<amounts::Input>)>>{
+        let top=&self.plan.as_ref().context("economic plan absent")?.compact_topologies[c.topology_id];
+        let inputs=self.economic_inputs(top);let settlement=top.settlement;
+        let cost=match self.cost_context(settlement,cfg){Ok(v)=>v,Err(_)=>{
+            let a=amounts::Assessment::unknown("settlement_cost_reference_unavailable");report.record(&a);return Ok(None);
+        }};
+        let pairs=c.witness.as_ref().context("economic source witness absent")?.legs.iter()
+            .map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
+        let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(&cost.cost_guard_raw.to_le_bytes());hash.update(&cost.minimum_net_profit_raw.to_le_bytes());
+        for i in &inputs {
+            hash.update(&(i.slot as u64).to_le_bytes());
+            if let Some(p)=&i.observation.liquidity{hash.update(&p.content_digest);hash.update(&p.account_set_digest);}
+            if let Some(v)=&i.observation.valuation{for t in &v.token_fee_status{hash.update(t.as_bytes());}}
         }
-        assessment.elapsed_ns=elapsed_ns(started);report.record(&assessment);
-        selection.amount_assessment=assessment;Ok(Some(selection))
+        let fingerprint:[u8;32]=hash.finish().as_ref().try_into().expect("SHA256 length");
+        let key=pairs.clone();
+        if let Some(cached)=self.economic_cache.get(&key).filter(|e|e.fingerprint==fingerprint){
+            report.cache_hits+=1;report.observations_reused+=inputs.len() as u64;
+            if cached.sent{report.unchanged_states+=1;return Ok(None);}
+            return Ok((cached.assessment.decision==amounts::Decision::Possible).then(||(cached.assessment.clone(),cost,inputs)));
+        }
+        let assessment=if cfg.parameters.trade_size!=0||cfg.parameters.constant_conversion||cfg.parameters.no_failure||cfg.parameters.additional_fee_bp!=0 {
+            amounts::Assessment::unknown("nondefault_execution_mode_unmodelled")
+        }else{amounts::assess(&inputs,&pairs,cost.cost_guard_raw,cost.minimum_net_profit_raw)};
+        report.record(&assessment);report.sample(&assessment,&inputs,serde_json::json!({
+            "generation":self.generation,"revision":self.revision,"topology_id":c.topology_id,"reverse":c.reverse,
+            "source_witness":c.witness,"cost_assumptions":cost}));
+        self.economic_cache.insert(key,CachedAssessment{fingerprint,assessment:assessment.clone(),sent:false});
+        Ok((assessment.decision==amounts::Decision::Possible).then_some((assessment,cost,inputs)))
     }
     fn apply(&mut self, s:&SignalStateUpdate, recovering:bool)->Result<()> {
         self.received_at_us=now_us();
@@ -220,6 +269,13 @@ impl State {
                 && snapshot.plan.score_basis==SIGNAL_SCORE_BASIS
                 && snapshot.pools.len()==snapshot.prices.len(), "invalid candidate snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
+            self.pair_index.clear();
+            let alive=snapshot.plan.compact_topologies.iter().flat_map(|t|[false,true].into_iter().map(move|reverse|{
+                (0..t.length).map(|i|{let (a,b)=t.roles[if reverse{t.length-1-i}else{i}];
+                    if reverse{(b.to_string(),a.to_string())}else{(a.to_string(),b.to_string())}}).collect::<Vec<_>>()
+            })).collect::<HashSet<_>>();
+            self.economic_cache.retain(|key,_|alive.contains(key));
+            for (id,p) in self.pools.iter().enumerate(){self.pair_index.entry((p.mint_a,p.mint_b)).or_default().push(id);}
             self.generation=s.graph_generation;
             self.threshold=snapshot.threshold_units;
             self.active.clear();
@@ -229,9 +285,9 @@ impl State {
                     "duplicate execution candidate snapshot key");
             }
         } else {ensure!(self.plan.is_some() && s.graph_generation==self.generation, "candidate delta without snapshot");}
-        if s.clear {self.prices.fill(None);self.active.clear();}
+        if s.clear {self.prices.fill(None);self.active.clear();self.economic_cache.clear();}
         for change in &s.changes {
-            if change.pool_id==self.pools.len() {self.pools.push(change.identity.clone()); self.prices.push(None);}
+            if change.pool_id==self.pools.len() {self.pair_index.entry((change.identity.mint_a,change.identity.mint_b)).or_default().push(change.pool_id);self.pools.push(change.identity.clone()); self.prices.push(None);}
             ensure!(self.pools.get(change.pool_id)==Some(&change.identity), "candidate pool identity mismatch");
             self.prices[change.pool_id]=change.price.clone();
         }
@@ -273,8 +329,8 @@ impl State {
         ensure!(b.threshold_units==self.threshold,"candidate threshold changed without snapshot");
         let key=(c.topology_id,c.reverse);
         match c.change {
-            SignalRangeChange::Exited=>ensure!(c.witness.is_none()&&self.active.remove(&key),
-                "execution candidate exit missing or carries witness"),
+            SignalRangeChange::Exited=>{ensure!(c.witness.is_none()&&self.active.remove(&key),
+                "execution candidate exit missing or carries witness");},
             SignalRangeChange::Entered|SignalRangeChange::Updated=>{
                 self.witness(c.topology_id,c.reverse,c.witness.as_ref().context("candidate witness absent")?)?;
                 if c.change==SignalRangeChange::Entered {
@@ -320,7 +376,7 @@ impl State {
     /// Pack an exact CP6A best-witness without rebuilding any route product.
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
-        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,preferred:Option<&[usize]>)->Result<Selection>{
+        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,assessment:amounts::Assessment,cost:CostContext,inputs:&[amounts::Input])->Result<Selection>{
         let started=Instant::now();
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
@@ -353,8 +409,9 @@ impl State {
         ensure!(witness.legs.last().is_some_and(|l|l.output_mint==top.settlement)
             &&witness.legs[0].input_mint==top.settlement,
             "compact route does not settle");
-        let mut amount_seed_changed=false;
-        if let Some(preferred)=preferred.filter(|s|s.len()==slots.len()) {
+        let preferred=assessment.estimate.as_ref().context("economic primary absent")?.legs.iter().map(|l|l.slot).collect::<Vec<_>>();
+        let mut economic_primary_changed=false;
+        {
             let mut seen=HashSet::new();let mut total=0_i128;let mut valid=true;
             for (i,&slot) in preferred.iter().enumerate() {
                 let Some(identity)=self.pools.get(slot/2)else{valid=false;break;};
@@ -363,10 +420,9 @@ impl State {
                 let Some(w)=self.weight(slot)else{valid=false;break;};
                 valid&=pair==(leg.input_mint,leg.output_mint)&&seen.insert(slot/2);total+=i128::from(w);
             }
-            if valid&&total<i128::from(threshold) {
-                for (entry,&slot) in slots.iter_mut().zip(preferred){amount_seed_changed|=entry.0!=slot;entry.0=slot;}
-                used=seen;
-            }
+            ensure!(valid && total<i128::from(threshold),"economic primary does not satisfy directed net contract");
+            for (entry,&slot) in slots.iter_mut().zip(&preferred){economic_primary_changed|=entry.0!=slot;entry.0=slot;}
+            used=seen;
         }
         let seed_sum=slots.iter().try_fold(0_i128,|sum,(slot,_)|Ok::<_,anyhow::Error>(sum+i128::from(self.weight(*slot).context("seed net weight unavailable")?)))?;
         let seed_sum=i64::try_from(seed_sum).context("seed net sum overflow")?;
@@ -381,6 +437,8 @@ impl State {
         install_compact(&mut request,top,&pools);
         let mut packing=(cfg.capacity)(&request).context("compact seed does not fit V10")?;
         let mut options=Vec::new();
+        let primary=assessment.estimate.as_ref().context("primary estimate absent")?;
+        let pairs=primary.legs.iter().map(|l|(l.input_mint.clone(),l.output_mint.clone())).collect::<Vec<_>>();
         // Only direct/partner roles accept parallel alternatives in the current
         // V10 group contract. Intermediate/conversion remain the best chosen pool.
         for (i,&(selected,role_name)) in slots.iter().enumerate(){
@@ -394,15 +452,19 @@ impl State {
                 if let Some(w)=self.weight(slot){
                     let new_sum=i128::from(seed_sum)-i128::from(original)+i128::from(w);
                     if new_sum<i128::from(threshold){
-                        options.push((new_sum,slot,role_name,i));
+                        let mut alternative=preferred.clone();alternative[i]=slot;
+                        if let Some(e)=amounts::evaluate_slots(inputs,&pairs,&alternative,primary.input_raw) {
+                            if e.profit_raw>assessment.required_profit_raw {options.push((std::cmp::Reverse(e.profit_raw),slot,role_name,e));}
+                        }
                     }
                 }
             }
         }
         options.sort_unstable_by_key(|(score,slot,_,_)|(*score,*slot));
+        let mut alternative_estimates=Vec::new();
         let mut considered=0;let mut rejected=0;let mut unavailable=0;
         let mut last_rejection=None;
-        for (_,slot,role_name,_) in options{
+        for (_,slot,role_name,estimate) in options{
             if used.contains(&(slot/2)){continue;}
             considered+=1;
             let pool=match self.pool(slot,role_name,registry,cfg.wallet,reads){
@@ -413,7 +475,7 @@ impl State {
             pools.push(pool);
             install_compact(&mut request,top,&pools);
             match (cfg.capacity)(&request){
-                Ok(metrics)=>{packing=metrics;used.insert(slot/2);},
+                Ok(metrics)=>{packing=metrics;used.insert(slot/2);alternative_estimates.push(estimate);},
                 Err(error)=>{pools.pop();rejected+=1;last_rejection=Some(format!("{error:#}"));}
             }
         }
@@ -435,7 +497,7 @@ impl State {
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added,packing_seed_log_sum_units:seed_sum,
-            amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed})
+            amount_assessment:assessment,economic_primary_changed,cost_assumptions:cost,alternative_estimates})
     }
 
 }
@@ -543,25 +605,33 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     };
                     let started=Instant::now();
                     let mut reads=RegistryReads::default();
-                    ranked.sort_unstable_by_key(|entry|entry.0);
-                    let mut chosen=None;
-                    let mut invalid_seed=false;
+                    report.evaluated_revisions+=1;
+                    let mut qualified=Vec::new();
                     for (_,event,index) in &ranked {
-                        let selected=match event.as_ref(){
-                            SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
-                                block.threshold_units,block.trigger.clone(),&registry,&cfg,
-                                report.requests.len()+1,&mut reads,None),
-                            _=>bail!("ranked event is not a compact candidate"),
-                        };
-                        match selected {
-                            Ok(selection)=>{
-                                if let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,&mut report.amounts)? {
-                                    selection.selection_ns=elapsed_ns(started);selection.registry_reads=reads.clone();
-                                    selection.request_ready_at_us=now_us();
-                                    selection.frame_to_request_us=selection.price_pipeline.and_then(|t|selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
-                                    selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
-                                    chosen=Some(selection);break;
-                                }
+                        let SignalEvent::Candidates(block)=event.as_ref() else{bail!("ranked event is not a candidate")};
+                        if let Some((assessment,cost,inputs))=state.qualify(&block.candidates[*index],&cfg,&mut report.amounts)? {
+                            qualified.push((event.clone(),*index,assessment,cost,inputs));
+                        }
+                    }
+                    // Compare absolute gains on a common cost-normalized currency
+                    // basis, not marginal BPS. The same configured lamport guard
+                    // is converted for USDC settlements using the recorded reference.
+                    qualified.sort_unstable_by(|a,b|{
+                        let ag=a.2.estimate.as_ref().unwrap().profit_raw-a.2.cost_guard_raw;
+                        let bg=b.2.estimate.as_ref().unwrap().profit_raw-b.2.cost_guard_raw;
+                        (u128::from(bg)*u128::from(a.2.cost_guard_raw)).cmp(&(u128::from(ag)*u128::from(b.2.cost_guard_raw)))
+                    });
+                    let mut chosen=None;let mut invalid_seed=false;
+                    for (event,index,assessment,cost,inputs) in qualified {
+                        let SignalEvent::Candidates(block)=event.as_ref() else{bail!("qualified event is not a candidate")};
+                        match state.build_compact(&block.candidates[index],block.threshold_units,block.trigger.clone(),
+                            &registry,&cfg,report.requests.len()+1,&mut reads,assessment,cost,&inputs) {
+                            Ok(mut selection)=>{
+                                selection.selection_ns=elapsed_ns(started);selection.registry_reads=reads.clone();
+                                selection.request_ready_at_us=now_us();
+                                selection.frame_to_request_us=selection.price_pipeline.and_then(|t|selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
+                                selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
+                                chosen=Some(selection);break;
                             },
                             Err(error)=>{invalid_seed=true;report.skipped_invalid_seed+=1;report.last_rejection=Some(format!("{error:#}"));},
                         }
@@ -573,7 +643,11 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             selection.request.id,state.generation,state.revision,selection.route_kind,selection.reverse,
                             selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us,
                             selection.registry_reads.calls,selection.registry_reads.wait_ns,selection.registry_reads.hold_ns);
+                        let key=selection.amount_assessment.estimate.as_ref().unwrap().legs.iter()
+                            .map(|l|(l.input_mint.clone(),l.output_mint.clone())).collect::<Vec<_>>();
+                        if let Some(entry)=state.economic_cache.get_mut(&key){entry.sent=true;}
                         permit.send(selection.request.clone());report.requests.push(selection);
+                        report.request_count=report.requests.len();report.economic_qualified_requests+=1;
                     } else if invalid_seed {
                         crate::log_event!(Warn,"execution candidates no_packable_seed=true generation={} revision={} last_rejection={:?}",
                             state.generation,state.revision,report.last_rejection);

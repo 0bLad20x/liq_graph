@@ -1,6 +1,6 @@
 //! Private quantity analysis of typed, frozen observations. No RPC or worker calls.
-//! Proofs use optimistic costs (maximum possible fee rebates); estimates use full
-//! DEX fees. Failed probes are never an exclusion proof. See docs/CP8C.md.
+//! CP8D: primary-route qualification before packing. Bounds overstate profit;
+//! estimates use full DEX fees. Failed probes never prove absence. See docs/CP8D.md.
 use std::{collections::{BTreeMap,BTreeSet},sync::Arc,time::Instant};
 use crate::core::market_state::{PoolPriceObservation,PoolLiquidity,LiquidityLevel};
 
@@ -12,31 +12,30 @@ type Calc<T>=Result<T,Issue>;
 #[derive(Clone,Copy,Debug,PartialEq,Eq,serde::Serialize)]
 #[serde(rename_all="snake_case")]
 pub(super) enum Decision {Possible,Unknown,Excluded}
-#[derive(serde::Serialize)]
-pub(super) struct Leg {pub pool:String,pub input_mint:String,pub output_mint:String,pub input_raw:u64,pub output_raw:u64}
-#[derive(serde::Serialize)]
+#[derive(Clone,serde::Serialize)]
+pub(super) struct Leg {pub pool:String,pub slot:usize,pub input_mint:String,pub output_mint:String,pub input_raw:u64,pub output_raw:u64}
+#[derive(Clone,serde::Serialize)]
 pub(super) struct Estimate {pub input_raw:u64,pub output_raw:u64,pub profit_raw:u64,pub legs:Vec<Leg>}
-#[derive(serde::Serialize)]
-pub(super) struct Cycle {
-    pub mints:Vec<String>,pub status:&'static str,pub reason:&'static str,
-    pub minimum_input_lower_bound_raw:Option<u64>,
-}
-#[derive(serde::Serialize)]
+#[derive(Clone,serde::Serialize)]
 pub(super) struct Assessment {
     pub decision:Decision,pub scope:&'static str,pub reason:&'static str,
-    pub pool_count:usize,pub cycles:Vec<Cycle>,pub probes:u64,pub elapsed_ns:u64,
-    pub estimate:Option<Estimate>,
+    pub pool_count:usize,pub probes:u64,pub elapsed_ns:u64,
+    pub cost_guard_raw:u64,pub required_profit_raw:u64,
+    pub first_probe_raw:Option<u64>,pub last_probe_raw:Option<u64>,
+    pub estimate:Option<Estimate>,pub best_below_guard:Option<Estimate>,
+    pub gross_output_upper_bound_raw:Option<u64>,
 }
 impl Assessment {
-    pub fn unknown(reason:&'static str)->Self {Self{decision:Decision::Unknown,scope:"current_observed_simple_cycles_dex_only",
-        reason,pool_count:0,cycles:Vec::new(),probes:0,elapsed_ns:0,estimate:None}}
+    pub fn unknown(reason:&'static str)->Self {Self{decision:Decision::Unknown,scope:"frozen_observed_primary_route",
+        reason,pool_count:0,probes:0,elapsed_ns:0,cost_guard_raw:0,required_profit_raw:0,
+        first_probe_raw:None,last_probe_raw:None,estimate:None,best_below_guard:None,gross_output_upper_bound_raw:None}}
 }
 #[derive(Default,serde::Serialize)]
 pub(super) struct Report {
-    pub attempts:u64,pub possible:u64,pub unknown:u64,pub excluded:u64,pub seed_repaired:u64,
-    pub global_proofs:u64,pub probes:u64,pub processing_ns_total:u64,pub processing_ns_max:u64,
-    pub processing_ns_histogram:Vec<u64>,pub reasons:BTreeMap<&'static str,u64>,
-    pub excluded_samples:Vec<serde_json::Value>,
+    pub attempts:u64,pub possible:u64,pub unknown:u64,pub excluded:u64,pub probes:u64,
+    pub cache_hits:u64,pub observations_reused:u64,pub unchanged_states:u64,
+    pub processing_ns_total:u64,pub processing_ns_max:u64,pub processing_ns_histogram:Vec<u64>,
+    pub reasons:BTreeMap<&'static str,u64>,#[serde(skip_serializing)] pub samples:Vec<serde_json::Value>,
 }
 impl Report {
     pub fn record(&mut self,a:&Assessment) {
@@ -47,17 +46,19 @@ impl Report {
         self.processing_ns_histogram[bin]+=1;*self.reasons.entry(a.reason).or_default()+=1;
         match a.decision{Decision::Possible=>self.possible+=1,Decision::Unknown=>self.unknown+=1,Decision::Excluded=>self.excluded+=1}
     }
-    pub fn retain_exclusion(&mut self,a:Assessment,inputs:&[Input],context:serde_json::Value) {
-        if self.excluded_samples.len()<4 {self.excluded_samples.push(serde_json::json!({"context":context,"assessment":a,
-            "models":inputs.iter().map(|i|serde_json::json!({"slot":i.slot,"manifest_matches":i.manifest_matches,
-                "observation":i.observation,"complete_levels":i.observation.liquidity.as_ref()
-                    .map(|p|p.directions.iter().map(|d|&d.levels).collect::<Vec<_>>())})).collect::<Vec<_>>()}));}
+    pub fn sample(&mut self,a:&Assessment,inputs:&[Input],context:serde_json::Value) {
+        let label=match a.decision{Decision::Possible=>"qualified",Decision::Unknown=>"unknown",Decision::Excluded=>"excluded"};
+        if self.samples.iter().filter(|s|s["kind"]==label).count()<2 {
+            self.samples.push(serde_json::json!({"kind":label,"context":context,"assessment":a,
+                "models":inputs.iter().map(|i|serde_json::json!({"slot":i.slot,"manifest_matches":i.manifest_matches,
+                    "observation":i.observation,"complete_levels":i.observation.liquidity.as_ref()
+                        .map(|p|p.directions.iter().map(|d|&d.levels).collect::<Vec<_>>())})).collect::<Vec<_>>()}));
+        }
     }
 }
 
 #[derive(Clone,Copy)]
 struct Edge {pool:usize,direction:usize}
-type Domains=BTreeMap<(String,String),Vec<Edge>>;
 fn profile(input:&Input)->Calc<&PoolLiquidity> {
     if !input.manifest_matches{return Err(Issue::Unknown("manifest_window_changed"));}
     if !input.observation.valuation.as_ref().is_some_and(|v|v.token_fee_status.iter().all(|s|*s=="verified_no_standard_transfer_fee")) {
@@ -78,7 +79,7 @@ fn included(amount:u128,level:&LiquidityLevel,optimistic:bool)->Calc<u128> {
 
 // Exact 64*128 /128 math, with the common u128 product as a fast path.
 // The long division fallback has a fixed integer bit width, not a search budget.
-fn mul_div(a:u64,b:u128,d:u128,up:bool)->Calc<u128> {
+pub(super) fn mul_div(a:u64,b:u128,d:u128,up:bool)->Calc<u128> {
     if d==0{return Err(Issue::Unknown("zero_price_denominator"));}
     if let Some(n)=u128::from(a).checked_mul(b){return Ok(if up{n.div_ceil(d)}else{n/d});}
     let low=u128::from(a)*u128::from(b as u64);let high=u128::from(a)*(b>>64);
@@ -145,7 +146,7 @@ pub(super) fn minimum_input(input:&Input,direction:usize,mut output:u64)->Calc<u
     else{Err(Issue::Unknown("liquidity_window_incomplete"))}
 }
 
-fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
+pub(super) fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
     let p=profile(input)?;let dir=&p.directions[direction];
     if dir.status!="available"{return Err(Issue::Unknown("direction_unavailable_for_estimate"));}
     if let Some(c)=&p.reserve_curve {
@@ -190,7 +191,7 @@ fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
 }
 
 #[derive(Clone,Copy)]
-struct Rate(u128,u128);
+pub(super) struct Rate(pub u128,pub u128);
 // Exact rational products, avoiding overflow and floating-point vetoes.
 fn product(values:impl Iterator<Item=u128>)->Vec<u32> {
     let mut out=vec![1_u32];
@@ -209,7 +210,7 @@ fn compare_products(a:impl Iterator<Item=u128>,b:impl Iterator<Item=u128>)->std:
 fn no_gross_gain(rates:&[Rate])->bool {
     compare_products(rates.iter().map(|r|r.0),rates.iter().map(|r|r.1))!=std::cmp::Ordering::Greater
 }
-fn upper_rate(input:&Input,direction:usize)->Calc<Rate> {
+pub(super) fn upper_rate(input:&Input,direction:usize)->Calc<Rate> {
     let p=profile(input)?;let d=&p.directions[direction];
     if let Some(c)=&p.reserve_curve {
         if d.status=="empty"{return Ok(Rate(0,1));}
@@ -228,119 +229,145 @@ fn upper_rate(input:&Input,direction:usize)->Calc<Rate> {
     }Ok(best)
 }
 
-fn cycles(node:&str,settlement:&str,domains:&Domains,path:&mut Vec<String>,out:&mut Vec<Vec<String>>) {
-    for (_,b) in domains.keys().filter(|pair|pair.0.as_str()==node) {
-        if b==settlement {if path.len()>=2 {let mut p=path.clone();p.push(b.clone());out.push(p);}continue;}
-        if path.contains(b){continue;}
-        path.push(b.clone());cycles(b,settlement,domains,path,out);path.pop();
-    }
+fn domains(inputs:&[Input],pairs:&[(String,String)])->Vec<Vec<Edge>> {
+    pairs.iter().map(|(a,b)|inputs.iter().enumerate().filter_map(|(pool,input)|{
+        let o=&input.observation;
+        if &o.base_mint==a&&&o.quote_mint==b{Some(Edge{pool,direction:0})}
+        else if &o.quote_mint==a&&&o.base_mint==b{Some(Edge{pool,direction:1})}else{None}
+    }).collect()).collect()
 }
-fn minimum_path(domains:&[Vec<Edge>],inputs:&[Input],mut need:u64,allow_unknown_options:bool)->Calc<(u64,Vec<Edge>)> {
-    let mut chosen=Vec::new();let mut uncertain=None;
+fn minimum_path(domains:&[Vec<Edge>],inputs:&[Input],mut need:u64)->Calc<(u64,Vec<Edge>)> {
+    let mut chosen=Vec::new();
     for domain in domains.iter().rev() {
         let mut best=None::<(u64,Edge)>;
-        for &e in domain {match minimum_input(&inputs[e.pool],e.direction,need) {
-            Ok(n)=>if best.is_none_or(|(old,_)|n<old){best=Some((n,e));},
-            Err(Issue::Unknown(reason))=>uncertain=Some(reason),Err(Issue::Insufficient(_))=>{},
+        for &e in domain {if let Ok(n)=minimum_input(&inputs[e.pool],e.direction,need) {
+            if best.is_none_or(|(old,_)|n<old){best=Some((n,e));}
         }}
-        let Some((n,e))=best else{return Err(if let Some(reason)=uncertain{Issue::Unknown(reason)}else{Issue::Insufficient("no_compatible_integer_flow")});};
+        let Some((n,e))=best else{return Err(Issue::Unknown("inverse_path_unresolved"));};
         need=n;chosen.push(e);
     }
     chosen.reverse();
     if chosen.iter().enumerate().any(|(i,e)|chosen[..i].iter().any(|p|p.pool==e.pool)) {
         return Err(Issue::Unknown("duplicate_pool_relaxation"));
     }
-    // A lower bound based on a known option is unsafe if another option is unknown.
-    if !allow_unknown_options {if let Some(reason)=uncertain{return Err(Issue::Unknown(reason));}}
     Ok((need,chosen))
 }
-fn estimate(path:&[Edge],inputs:&[Input],initial:u64,minimum_profit:u64)->Option<Estimate> {
+fn estimate(path:&[Edge],inputs:&[Input],initial:u64)->Option<Estimate> {
     let mut amount=initial;let mut legs=Vec::new();
     for &e in path {
         let input=&inputs[e.pool];let p=profile(input).ok()?;let d=&p.directions[e.direction];
         let output=quote(input,e.direction,amount).ok()?;
         if output==0{return None;}
-        legs.push(Leg{pool:input.observation.pool.clone(),input_mint:d.input_mint.clone(),output_mint:d.output_mint.clone(),input_raw:amount,output_raw:output});amount=output;
+        legs.push(Leg{pool:input.observation.pool.clone(),slot:input.slot^e.direction,input_mint:d.input_mint.clone(),output_mint:d.output_mint.clone(),input_raw:amount,output_raw:output});amount=output;
     }
-    if amount<=initial || amount-initial<=minimum_profit{return None;}
+    if amount<=initial{return None;}
     Some(Estimate{input_raw:initial,output_raw:amount,profit_raw:amount-initial,legs})
 }
-
-pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_conversion_other:Option<&str>)->Assessment {
-    let started=Instant::now();let mut result=Assessment::unknown("no_closed_cycle");result.pool_count=inputs.len();
-    // Scratch bounds for this frozen assessment only. A shared pair may occur
-    // in several mint cycles; do not rescan all of its levels for each cycle.
-    let bounds=inputs.iter().map(|i|[upper_rate(i,0),upper_rate(i,1)]).collect::<Vec<_>>();
-    let mut domains=Domains::new();
-    for (i,input) in inputs.iter().enumerate(){let o=&input.observation;
-        for (direction,a,b) in [(0,&o.base_mint,&o.quote_mint),(1,&o.quote_mint,&o.base_mint)] {
-            domains.entry((a.clone(),b.clone())).or_default().push(Edge{pool:i,direction});
+fn forward_path(domains:&[Vec<Edge>],inputs:&[Input],mut amount:u64)->Option<Vec<Edge>> {
+    let mut path=Vec::<Edge>::new();
+    for domain in domains {
+        let mut best=None::<(u64,Edge)>;
+        for &e in domain {
+            if path.iter().any(|p|p.pool==e.pool){continue;}
+            if let Ok(n)=quote(&inputs[e.pool],e.direction,amount){if n>0&&best.is_none_or(|(old,_)|n>old){best=Some((n,e));}}
         }
+        let (n,e)=best?;amount=n;path.push(e);
+    }Some(path)
+}
+// A capacity bound is valid only for complete observations. Unknown tails cannot
+// establish absence. These bounds ignore fees/rebates and overstate opportunity.
+pub(super) fn output_bound(input:&Input,direction:usize)->Calc<u64> {
+    let p=profile(input)?;let d=&p.directions[direction];
+    if let Some(c)=&p.reserve_curve {
+        return Ok(if d.input_mint==c.base_mint{c.spendable_quote_reserve_raw}else{c.base_reserve_raw});
     }
-    let mut paths=Vec::new();cycles(settlement,settlement,&domains,&mut vec![settlement.into()],&mut paths);
-    let mut any_unknown=false;
-    for mints in paths {
-        // The typed V10 request supplies only one conversion pool. Two different
-        // S/Q conversion pools cannot form their own two-leg route in this job.
-        if mints.len()==3 && single_conversion_other==Some(mints[1].as_str()){continue;}
-        let mut choices=mints.windows(2).map(|m|domains[&(m[0].clone(),m[1].clone())].clone()).collect::<Vec<_>>();
-        let maxima=choices.iter().map(|d|{
-            let mut max=Rate(0,1);
-            for e in d {let r=bounds[e.pool][e.direction]?;
-                if compare_products([r.0,max.1].into_iter(),[max.0,r.1].into_iter())==std::cmp::Ordering::Greater{max=r;}}
-            Ok(max)
-        }).collect::<Calc<Vec<_>>>();
-        if let Ok(maxima)=maxima {
-            if no_gross_gain(&maxima){result.cycles.push(Cycle{mints,status:"excluded",reason:"optimistic_rate_product_not_above_one",minimum_input_lower_bound_raw:None});continue;}
-            for (i,domain) in choices.iter_mut().enumerate(){domain.retain(|e|{
-                let Ok(rate)=bounds[e.pool][e.direction]else{return true;};
-                let mut rates=maxima.clone();rates[i]=rate;!no_gross_gain(&rates)
-            });}
-        }
-        match minimum_path(&choices,inputs,1,false) {
-            Err(Issue::Insufficient(reason))=>result.cycles.push(Cycle{mints,status:"excluded",reason,minimum_input_lower_bound_raw:None}),
-            Err(Issue::Unknown(reason))=>{any_unknown=true;result.cycles.push(Cycle{mints,status:"unknown",reason,minimum_input_lower_bound_raw:None});},
-            Ok((minimum,path))=>{
-                let mut probes=BTreeSet::from([minimum]);let mut n=minimum.max(1);
-                while let Some(next)=n.checked_mul(2){probes.insert(next);n=next;}
-                probes.insert(u64::MAX);
-                // Include every representable observed level boundary, projected
-                // backward through optimistic prefix costs. Sampling cannot veto.
-                for (i,e) in path.iter().enumerate(){if let Ok(p)=profile(&inputs[e.pool]){
-                    let mut total=0_u64;
-                    for l in &p.directions[e.direction].levels {
-                        let Some(v)=l.input_raw.and_then(|n|total.checked_add(n))else{break;};total=v;
-                        let mut need=total;let mut valid=true;
-                        for prior in path[..i].iter().rev(){match minimum_input(&inputs[prior.pool],prior.direction,need){Ok(n)=>need=n,Err(_)=>{valid=false;break;}}}
-                        if valid{probes.insert(need);}
-                    }
-                }}
-                let mut found=None;
-                for q in probes {if q==0{continue;}result.probes+=1;
-                    if let Some(e)=estimate(&path,inputs,q,minimum_profit){found=Some(e);break;}
-                }
-                if let Some(e)=found {
-                    result.estimate=Some(e);result.decision=Decision::Possible;result.reason="positive_amount_estimate";
-                    result.cycles.push(Cycle{mints,status:"possible",reason:"positive_amount_estimate",minimum_input_lower_bound_raw:Some(minimum)});
-                    result.elapsed_ns=started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;return result;
-                }
-                any_unknown=true;result.cycles.push(Cycle{mints,status:"unknown",reason:"no_positive_probe_is_not_a_proof",minimum_input_lower_bound_raw:Some(minimum)});
-            },
-        }
-    }
-    if !result.cycles.is_empty(){result.decision=if any_unknown{Decision::Unknown}else{Decision::Excluded};
-        result.reason=if any_unknown{"quantity_not_proven"}else{"all_model_cycles_excluded"};}
-    result.elapsed_ns=started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;result
+    if d.coverage!="exhausted_bitmap"{return Err(Issue::Unknown("capacity_tail_unknown"));}
+    d.levels.iter().try_fold(0_u64,|n,l|n.checked_add(raw_capacity(l)?).ok_or(Issue::Unknown("capacity_overflow")))
+}
+fn maxima(domains:&[Vec<Edge>],inputs:&[Input])->Calc<Vec<Rate>> {
+    domains.iter().map(|d|{
+        let mut best=Rate(0,1);
+        for e in d {let r=upper_rate(&inputs[e.pool],e.direction)?;
+            if compare_products([r.0,best.1].into_iter(),[best.0,r.1].into_iter())==std::cmp::Ordering::Greater{best=r;}}
+        Ok(best)
+    }).collect()
+}
+fn no_profit_above(rates:&[Rate],output:u64,profit:u64)->bool {
+    output<=profit||compare_products(std::iter::once(u128::from(output-profit)).chain(rates.iter().map(|r|r.0)),
+        std::iter::once(u128::from(output)).chain(rates.iter().map(|r|r.1)))!=std::cmp::Ordering::Greater
+}
+fn minimum_economic_input(rates:&[Rate],profit:u64)->Option<u64> {
+    let sufficient=|q:u64|compare_products(std::iter::once(u128::from(q)).chain(rates.iter().map(|r|r.0)),
+        std::iter::once(u128::from(q)+u128::from(profit)).chain(rates.iter().map(|r|r.1)))==std::cmp::Ordering::Greater;
+    if !sufficient(u64::MAX){return None;}
+    let (mut lo,mut hi)=(1_u64,u64::MAX);
+    while lo<hi{let mid=lo+(hi-lo)/2;if sufficient(mid){hi=mid}else{lo=mid+1}}
+    Some(lo)
 }
 
-/// Find a quantity-compatible seed without a Cartesian pool product. Each mint
-/// role has an independent monotone optimistic inverse; unknowns never prove a veto.
-pub(super) fn seed(inputs:&[Input],pairs:&[(String,String)])->Option<Vec<usize>> {
-    let domains=pairs.iter().map(|(a,b)|inputs.iter().enumerate().filter_map(|(i,input)|{
-        let o=&input.observation;
-        if &o.base_mint==a&&&o.quote_mint==b{Some(Edge{pool:i,direction:0})}
-        else if &o.quote_mint==a&&&o.base_mint==b{Some(Edge{pool:i,direction:1})}else{None}
-    }).collect::<Vec<_>>()).collect::<Vec<_>>();
-    let (_,path)=minimum_path(&domains,inputs,1,true).ok()?;
-    Some(path.iter().map(|e|inputs[e.pool].slot^e.direction).collect())
+/// Find the best *observed probe* of this primary mint route, before packing.
+/// Forward envelopes and optimistic inverse paths avoid pool Cartesian products.
+/// No positive probe is not a global no-profit proof; alternatives remain unknown.
+pub(super) fn assess(inputs:&[Input],pairs:&[(String,String)],cost_guard:u64,minimum_net_profit:u64)->Assessment {
+    let started=Instant::now();let mut result=Assessment::unknown("no_economic_witness_found");
+    result.pool_count=inputs.len();result.cost_guard_raw=cost_guard;
+    let Some(required)=cost_guard.checked_add(minimum_net_profit)else{result.reason="cost_guard_overflow";return result;};
+    result.required_profit_raw=required;
+    let finish=|mut r:Assessment|{r.elapsed_ns=started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;r};
+    let choices=domains(inputs,pairs);
+    if choices.iter().any(Vec::is_empty){result.reason="missing_primary_pair";return finish(result);}
+    let upper=maxima(&choices,inputs);
+    if let Err(Issue::Unknown(reason)|Issue::Insufficient(reason))=&upper{result.reason=reason;}
+    let mut start=1_u64;
+    if let Ok(rates)=&upper {
+        if no_gross_gain(rates){result.decision=Decision::Excluded;result.reason="raw_rate_upper_bound_not_profitable";return finish(result);}
+        for (i,domain) in choices.iter().enumerate(){
+            let cap=domain.iter().map(|e|output_bound(&inputs[e.pool],e.direction)).collect::<Calc<Vec<_>>>();
+            if let Ok(cap)=cap {
+                let mut bound=cap.into_iter().max().unwrap_or(0);let mut valid=true;
+                for rate in &rates[i+1..] {match mul_div(bound,rate.0,rate.1,true).ok().and_then(|n|u64::try_from(n).ok()){
+                    Some(n)=>bound=n,None=>{valid=false;break;}
+                }}
+                if valid {result.gross_output_upper_bound_raw=Some(result.gross_output_upper_bound_raw.map_or(bound,|n|n.min(bound)));
+                    if no_profit_above(rates,bound,required){result.decision=Decision::Excluded;result.reason="capacity_profit_upper_bound_below_cost_guard";return finish(result);}}
+            }
+        }
+        if let Some(n)=minimum_economic_input(rates,required){start=n;}
+        else{result.reason="economic_input_not_representable";return finish(result);}
+    }
+    let mut probes=BTreeSet::from([start]);let mut n=start;
+    while let Some(next)=n.checked_mul(2){probes.insert(next);n=next;}
+    probes.insert(u64::MAX);
+    // Include all known level input boundaries from every alternative, projected
+    // through the prefix domains. This is search coverage, not an exclusion rule.
+    for (i,domain) in choices.iter().enumerate(){for e in domain {if let Ok(p)=profile(&inputs[e.pool]){
+        let mut total=0_u64;
+        for l in &p.directions[e.direction].levels {
+            let Some(v)=l.input_raw.and_then(|v|total.checked_add(v))else{break;};total=v;
+            let q=if i==0{Some(total)}else{minimum_path(&choices[..i],inputs,total).ok().map(|p|p.0)};
+            if let Some(q)=q.filter(|q|*q>=start){probes.insert(q);if q>start{probes.insert(q-1);}if let Some(q)=q.checked_add(1){probes.insert(q);}}
+        }
+    }}}
+    result.first_probe_raw=probes.first().copied();result.last_probe_raw=probes.last().copied();
+    let mut best=None::<Estimate>;
+    for q in probes {
+        result.probes+=1;
+        let target=q.checked_add(required).and_then(|n|n.checked_add(1));
+        let paths=[forward_path(&choices,inputs,q),target.and_then(|n|minimum_path(&choices,inputs,n).ok().map(|p|p.1))];
+        for path in paths.into_iter().flatten(){if let Some(e)=estimate(&path,inputs,q){
+            if best.as_ref().is_none_or(|old|e.profit_raw>old.profit_raw){best=Some(e);}
+        }}
+    }
+    if let Some(best)=best {if best.profit_raw>required {
+        result.decision=Decision::Possible;result.reason="economic_primary_witness";result.estimate=Some(best);
+    }else{result.best_below_guard=Some(best);}}
+    finish(result)
+}
+
+pub(super) fn evaluate_slots(inputs:&[Input],pairs:&[(String,String)],slots:&[usize],amount:u64)->Option<Estimate>{
+    if pairs.len()!=slots.len(){return None;}
+    let choices=domains(inputs,pairs);let mut path=Vec::new();
+    for (domain,slot) in choices.iter().zip(slots){path.push(*domain.iter().find(|e|(inputs[e.pool].slot^e.direction)==*slot)?);}
+    if path.iter().enumerate().any(|(i,e)|path[..i].iter().any(|p|p.pool==e.pool)){return None;}
+    estimate(&path,inputs,amount)
 }

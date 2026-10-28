@@ -22,7 +22,10 @@ param(
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
     [switch]$RequireFeeEvidence,
     [switch]$RequireLiquidityEvidence,
-    [switch]$RequireAmountEvidence,
+    [Alias('RequireAmountEvidence')][switch]$RequireEconomicEvidence,
+    [UInt64]$EconomicNetworkFeeLamports = 5000,
+    [UInt64]$EconomicCostReserveLamports = 0,
+    [UInt64]$EconomicMinNetProfitLamports = 0,
     # Diagnostic raw snapshots only. This does not pin or filter pool selection.
     [string]$LiquidityEvidencePools = '',
     [string]$EnabledVenues = '',
@@ -42,7 +45,7 @@ if (($Rewatch -or $TracePrices) -and -not $marketEnabled) { throw 'Rewatch and T
 if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires GraphAudit for actual graph/reference evidence.' }
 if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage Signals.' }
 if (($RequireLiquidityEvidence -or $LiquidityEvidencePools) -and -not $signals) { throw 'Liquidity evidence requires Stage Signals.' }
-if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw 'Amount evidence requires Stage Signals and SimulateV10.' }
+if ($RequireEconomicEvidence -and (-not $signals -or -not $SimulateV10)) { throw 'Economic evidence requires Stage Signals and SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -50,6 +53,28 @@ if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10
 function Read-OptionalJson([string]$Path) {
     if (Test-Path -LiteralPath $Path) { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) }
     return $null
+}
+# Parse one full selection at a time, retain only small scalar evidence. The
+# combined owner report deliberately contains no duplicated frozen requests.
+function Read-SelectionSummary([string]$Path) {
+    $s = Read-OptionalJson $Path
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $payload = $s.request | Select-Object * -ExcludeProperty id | ConvertTo-Json -Depth 40 -Compress
+        $hash = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))
+    } finally { $hasher.Dispose() }
+    return [pscustomobject]@{
+        request=[pscustomobject]@{id=$s.request.id; settlement=$s.request.settlement; parameters=$s.request.parameters}
+        candidate=[pscustomobject]@{witness=[pscustomobject]@{log_sum_units=$s.candidate.witness.log_sum_units}}
+        threshold_units=$s.threshold_units; packing_seed_log_sum_units=$s.packing_seed_log_sum_units
+        amount_assessment=$s.amount_assessment; economic_primary_changed=$s.economic_primary_changed
+        cost_assumptions=$s.cost_assumptions; payload_sha256=$hash
+        selection_ns=$s.selection_ns; signal_to_request_us=$s.signal_to_request_us; frame_to_request_us=$s.frame_to_request_us
+        pools=@($s.pools | ForEach-Object { [pscustomobject]@{
+            pool=$_.pool; liquidity_window_checked=$_.liquidity_window_checked
+            observation=[pscustomobject]@{venue=$_.observation.venue; liquidity=$_.observation.liquidity.model}
+        } })
+    }
 }
 function Measure-Durations($Values) {
     # Exact post-run request samples; signal-owner percentiles remain histogram bounds.
@@ -147,6 +172,9 @@ try {
         GRAPH_EXECUTION_ROUTE_KIND = $RouteKind
         GRAPH_EXECUTION_PARAMETERS_PATH = $ExecutionParametersPath
         GRAPH_EXECUTION_REPORT_PATH = $executionPath
+        GRAPH_ECONOMIC_NETWORK_FEE_LAMPORTS = "$EconomicNetworkFeeLamports"
+        GRAPH_ECONOMIC_COST_RESERVE_LAMPORTS = "$EconomicCostReserveLamports"
+        GRAPH_ECONOMIC_MIN_NET_PROFIT_LAMPORTS = "$EconomicMinNetProfitLamports"
         GRAPH_DIAGNOSTIC_JSONL_PATH = $(if ($GraphAudit) { $auditPath } else { $null })
         CP6C_REFERENCE_EVERY = $(if ($GraphAudit -and $Stage -eq 'Graph') { '1' } elseif ($GraphAudit) { '10' } else { '0' })
         LIQ_GRAPH_LOG = (@(
@@ -188,7 +216,9 @@ try {
         require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=$EnabledVenues
         require_liquidity_evidence=[bool]$RequireLiquidityEvidence
         liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v2'
-        require_amount_evidence=[bool]$RequireAmountEvidence; amount_check='observed_simple_cycles_dex_only'
+        require_economic_evidence=[bool]$RequireEconomicEvidence; economic_check='primary_route_before_packing'
+        economic_network_fee_lamports=$EconomicNetworkFeeLamports; economic_cost_reserve_lamports=$EconomicCostReserveLamports
+        economic_min_net_profit_lamports=$EconomicMinNetProfitLamports
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -264,7 +294,7 @@ try {
         & python (Join-Path $PSScriptRoot 'graph_live_analyze.py') @analyzerArgs
         $graphPassed = $LASTEXITCODE -eq 0
     }
-    $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
+    $requests = @(Get-ChildItem -LiteralPath $folder -Filter 'selection-*.json' | ForEach-Object { Read-SelectionSummary $_.FullName })
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
     $netViolations = @($requests | Where-Object { $_.candidate.witness.log_sum_units -ge $_.threshold_units -or $_.packing_seed_log_sum_units -ge $_.threshold_units } | ForEach-Object { $_.request.id })
     $netPassed = $null
@@ -326,12 +356,14 @@ try {
     $amount = $execution.execution_candidates.amounts
     $amountViolations = @($requests | ForEach-Object {
         $r = $_; $a = $r.amount_assessment
-        if ($null -eq $a -or $a.decision -eq 'excluded' -or $a.reason -eq 'not_evaluated') { $r.request.id; return }
+        if ($null -eq $a -or $a.decision -ne 'possible' -or $a.reason -eq 'not_evaluated') { $r.request.id; return }
         if ($a.decision -ne 'possible') { return }
         $estimate = $a.estimate; $legs = @($estimate.legs)
         $invalid = $null -eq $estimate -or $legs.Count -lt 2 -or
             [decimal]$estimate.input_raw -le 0 -or [decimal]$estimate.output_raw -le [decimal]$estimate.input_raw -or
-            [decimal]$estimate.profit_raw -ne ([decimal]$estimate.output_raw-[decimal]$estimate.input_raw)
+            [decimal]$estimate.profit_raw -ne ([decimal]$estimate.output_raw-[decimal]$estimate.input_raw) -or
+            [decimal]$estimate.profit_raw -le [decimal]$a.required_profit_raw -or
+            $r.request.parameters.minimum_profit -ne 0 -or $r.request.parameters.trade_size -ne 0
         if ($legs.Count -ge 2) {
             $invalid = $invalid -or $legs[0].input_mint -ne $r.request.settlement -or
                 $legs[-1].output_mint -ne $r.request.settlement -or
@@ -346,12 +378,13 @@ try {
         if ($invalid) { $r.request.id }
     } | Sort-Object -Unique)
     if ($null -ne $amount) {
-        $amount | ConvertTo-Json -Depth 60 | Set-Content -LiteralPath (Join-Path $folder 'amount_evidence.json') -Encoding UTF8
+        $amount | ConvertTo-Json -Depth 60 | Set-Content -LiteralPath (Join-Path $folder 'economic_evidence.json') -Encoding UTF8
     }
     $amountPassed = $null
-    if ($RequireAmountEvidence) {
-        $amountPassed = $null -ne $amount -and [long]$amount.possible -gt 0 -and [long]$amount.excluded -gt 0 -and
-            ([long]$amount.possible+[long]$amount.unknown) -eq $requests.Count -and
+    if ($RequireEconomicEvidence) {
+        $amountPassed = $null -ne $amount -and [long]$amount.attempts -gt 0 -and
+            [long]$execution.request_count -eq $requests.Count -and
+            [long]$execution.execution_candidates.economic_qualified_requests -eq $requests.Count -and
             [long]$amount.attempts -eq ([long]$amount.possible+[long]$amount.unknown+[long]$amount.excluded) -and
             [long]$market.metrics.reserve_curve_observations -gt 0 -and
             [long]$market.metrics.reserve_curve_observations -eq [long]$production.reserve_curve_inputs -and
@@ -359,7 +392,7 @@ try {
     }
     $amountSummary = if ($null -eq $amount) { $null } else { [ordered]@{
         attempts=$amount.attempts; possible=$amount.possible; unknown=$amount.unknown; excluded=$amount.excluded
-        seed_repaired=$amount.seed_repaired; global_proofs=$amount.global_proofs; probes=$amount.probes
+        cache_hits=$amount.cache_hits; unchanged_states=$amount.unchanged_states; probes=$amount.probes
         reasons=$amount.reasons; processing_ns=(Measure-AmountStage $amount)
         violations=$amountViolations; reserve_curve_observations=$market.metrics.reserve_curve_observations
         reserve_curve_inputs=$production.reserve_curve_inputs; reserve_curve_build_ns=$market.metrics.reserve_curve_build
@@ -385,15 +418,11 @@ try {
     # Post-run payload identity only: equal accounts/parameters do not imply
     # equal pool state, equal liquidity, or the same economic opportunity.
     $payloads = @{}
-    $hasher = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        foreach ($selection in $requests) {
-            $payload = $selection.request | Select-Object * -ExcludeProperty id | ConvertTo-Json -Depth 40 -Compress
-            $key = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))
-            if (-not $payloads.ContainsKey($key)) { $payloads[$key] = [ordered]@{payload_sha256=$key; request_ids=@()} }
-            $payloads[$key].request_ids += $selection.request.id
-        }
-    } finally { $hasher.Dispose() }
+    foreach ($selection in $requests) {
+        $key = $selection.payload_sha256
+        if (-not $payloads.ContainsKey($key)) { $payloads[$key] = [ordered]@{payload_sha256=$key; request_ids=@()} }
+        $payloads[$key].request_ids += $selection.request.id
+    }
     $repeated = @($payloads.Values | Where-Object { $_.request_ids.Count -gt 1 } | Sort-Object { $_.request_ids.Count } -Descending)
     ConvertTo-Json -InputObject $repeated -Depth 10 |
         Set-Content -LiteralPath (Join-Path $folder 'repeated_request_sets.json') -Encoding UTF8
@@ -425,7 +454,8 @@ try {
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
         fee_evidence_passed=$feePassed; fee_valuation=$feeEvidence
         liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
-        amount_evidence_passed=$amountPassed; amount_evaluation=$amountSummary
+        economic_evidence_passed=$amountPassed; economic_evaluation=$amountSummary
+        economic_positive_after_network=$execution.economic_positive_after_network
         request_payload_repetition=$requestRepetition
         signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
         net_evidence_passed=$netPassed; net_witness_violations=$netViolations
@@ -462,11 +492,12 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Write-Host
     if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
     if ($RequireLiquidityEvidence -and -not $liquidityPassed) { throw "CP8B liquidity evidence incomplete; inspect liquidity_evidence.json in $folder." }
-    if ($RequireAmountEvidence -and -not $amountPassed) { throw "CP8C amount evidence incomplete; inspect amount_evidence.json in $folder. A real exclusion and a positive amount estimate are required." }
+    if ($RequireEconomicEvidence -and -not $amountPassed) { throw "CP8D economic evidence incomplete; inspect economic_evidence.json in $folder. Zero qualified requests are valid; decisions and model delivery must be observed." }
     if ($signals -and -not $netPassed) { throw "Net signal evidence incomplete; inspect $folder." }
     if (-not $protocolEvidence) { Write-Warning 'Nicht fuer jedes Completion-Protokoll angenommene Arbeit nachgewiesen; protocol_summary pruefen.' }
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
     Write-Host "Orchestrierungsnachweis bestanden. Artefakte: $folder"
+    if ($SimulateV10) { Write-Host "Wirtschaftlicher Vergleich: qualifizierte Requests=$($requests.Count), positive Ergebnisse nach Netzwerkgebuehr=$($execution.economic_positive_after_network). Details: economic_comparison.json" }
     if ($SimulateV10) {
         Write-Host "V10: Uebergabe an Simulation nachgewiesen; erfolgreiche Simulationen=$($execution.simulation_successes), fehlgeschlagene=$($execution.simulation_failures), DEX-Aufrufberichte=$($execution.simulation_dex_calls_observed)."
         Write-Host 'Erfolgreiche Handelsausfuehrung und Profitabilitaet bleiben gesondert nachzuweisen (CP8).'

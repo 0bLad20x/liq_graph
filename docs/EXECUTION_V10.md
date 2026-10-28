@@ -1,3 +1,5 @@
+[CP8D economic primary qualification](CP8D.md) runs before packing in the existing candidate consumer; marginal signals remain preliminary. External V10 parameters are unchanged.
+
 # V10 simulation
 
 [CP8C](CP8C.md) composes typed amount models in ExecutionCandidates before

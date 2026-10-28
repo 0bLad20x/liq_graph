@@ -1,3 +1,5 @@
+[CP8D economic primary qualification](CP8D.md) runs before packing in the existing candidate consumer; marginal signals remain preliminary. External V10 parameters are unchanged.
+
 # Gemeinsame Runtime und Live-Nachweis
 
 Der aktuelle Mengencheckpoint [CP8C.md](CP8C.md) verwendet denselben Starter mit

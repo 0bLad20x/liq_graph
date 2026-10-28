@@ -1,3 +1,5 @@
+[CP8D economic primary qualification](CP8D.md) runs before packing in the existing candidate consumer; marginal signals remain preliminary. External V10 parameters are unchanged.
+
 # Graph and Signal Engine
 
 Launch and acceptance: [RUNTIME.md](RUNTIME.md). Prices: [MARKET_STATE.md](MARKET_STATE.md).

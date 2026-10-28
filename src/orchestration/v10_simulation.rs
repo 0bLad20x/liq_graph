@@ -96,7 +96,9 @@ impl ExecutionTasks {
             .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r);
         let reports=tokio::time::timeout(Duration::from_secs(10),&mut self.reports.0).await
             .context("V10 report shutdown timeout")??;
-        evidence["execution_reports"]=serde_json::to_value(&reports)?;
+        // Full reports already have individual artifacts; keep the owner summary bounded.
+        evidence["execution_reports"]=serde_json::json!(reports.iter().map(|r|serde_json::json!({
+            "id":r.id,"outcome":r.outcome,"phase":r.phase,"error":r.error,"executor_invoked":r.executor_invoked})).collect::<Vec<_>>());
         evidence["simulation_successes"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,
             ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved)).count());
         evidence["simulation_failures"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,ExecutionOutcome::SimulationFailed)).count());
@@ -114,8 +116,19 @@ impl ExecutionTasks {
             }
         }
         executed?;
+        let comparisons=candidates.compare_simulations(&reports);
+        if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
+            let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
+            std::fs::write(folder.join("economic_comparison.json"),serde_json::to_vec_pretty(&comparisons)?)?;
+            std::fs::write(folder.join("economic_models.json"),serde_json::to_vec_pretty(candidates.economic_samples())?)?;
+        }
+        evidence["economic_positive_after_network"]=serde_json::json!(comparisons.iter()
+            .filter(|c|c["positive_after_network_without_other_token_inventory"]==true).count());
+        evidence["report_count"]=serde_json::json!(reports.len());
         let handoff=candidates.ensure_handoff(&reports);
-        evidence["execution_handoff_observed"]=serde_json::json!(handoff.is_ok());
+        evidence["execution_delivery_passed"]=serde_json::json!(handoff.is_ok());
+        evidence["request_count"]=serde_json::json!(candidates.request_count());
+        evidence["execution_handoff_observed"]=serde_json::json!(handoff.is_ok()&&candidates.request_count()>0);
         let acceptance=handoff.and_then(|_|candidates.ensure_successful_simulation(&reports));
         evidence["execution_integration_passed"]=serde_json::json!(acceptance.is_ok());
         evidence["execution_integration_error"]=serde_json::json!(acceptance.err().map(|e|format!("{e:#}")));

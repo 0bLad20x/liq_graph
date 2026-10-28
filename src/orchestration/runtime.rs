@@ -247,7 +247,7 @@ impl RunEvidence {
                 .and_then(|market|market.ensure_rewatch_evidence())));
         }
         if settings.simulate {
-            checks.push(("execution_handoff",if self.execution["execution_handoff_observed"]==true {Ok(())}
+            checks.push(("execution_handoff",if self.execution["execution_delivery_passed"]==true {Ok(())}
                 else {Err(anyhow!("no complete candidate -> request -> V10 simulation handoff; inspect execution.json"))}));
         }
         checks
@@ -409,8 +409,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
                         std::fs::write(path,serde_json::to_vec_pretty(&evidence)?)
                             .context("write combined V10 simulation report")?;
                     }
-                    let requests=evidence.pointer("/execution_candidates/requests")
-                        .and_then(serde_json::Value::as_array).map_or(0,|v|v.len());
+                    let requests=evidence["request_count"].as_u64().unwrap_or(0);
                     crate::log_event!(Info,"runtime v10 simulation completed requests={} successes={} failures={} dex_call_reports={} handoff={} integration_passed={} broadcasts=false",
                         requests,evidence["simulation_successes"],evidence["simulation_failures"],
                         evidence["simulation_dex_calls_observed"],evidence["execution_handoff_observed"],
