@@ -40,6 +40,24 @@ fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
     .as_micros().min(u128::from(u64::MAX)) as u64}
 fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 
+#[derive(Clone,Default,serde::Serialize)]
+struct RegistryReads {
+    calls:u64,wait_ns:u64,hold_ns:u64,max_wait_ns:u64,max_hold_ns:u64,
+}
+impl RegistryReads {
+    fn record(&mut self,wait:u64,hold:u64) {
+        self.calls+=1;self.wait_ns=self.wait_ns.saturating_add(wait);
+        self.hold_ns=self.hold_ns.saturating_add(hold);
+        self.max_wait_ns=self.max_wait_ns.max(wait);self.max_hold_ns=self.max_hold_ns.max(hold);
+    }
+    fn merge(&mut self,other:&Self) {
+        self.calls+=other.calls;self.wait_ns=self.wait_ns.saturating_add(other.wait_ns);
+        self.hold_ns=self.hold_ns.saturating_add(other.hold_ns);
+        self.max_wait_ns=self.max_wait_ns.max(other.max_wait_ns);
+        self.max_hold_ns=self.max_hold_ns.max(other.max_hold_ns);
+    }
+}
+
 #[derive(serde::Serialize)]
 struct PoolEvidence {
     pool: String, role: &'static str, slot: usize, log_weight_units: i64,
@@ -57,6 +75,7 @@ pub struct Selection {
     price_pipeline: Option<PricePipelineTiming>,
     frame_to_request_us: Option<u64>, signal_to_request_us: u64,
     selection_ns: u64, alternatives_considered: u64, packing_rejections: u64,
+    registry_reads:RegistryReads,
     unavailable_alternatives: u64, last_alternative_rejection: Option<String>,
     alternative_pools_added: usize,
 }
@@ -69,6 +88,7 @@ pub struct Report {
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
     catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
+    registry_reads:RegistryReads,
 }
 impl Report {
     pub fn ensure_complete(&self)->Result<()> {
@@ -191,11 +211,13 @@ impl State {
         }
         Ok(())
     }
-    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey)
+    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey,reads:&mut RegistryReads)
         ->Result<(ExecutionPool,PoolEvidence)> {
         let identity=self.pools.get(slot/2).context("candidate slot identity missing")?;
         let price=self.prices.get(slot/2).and_then(|p|p.as_ref()).context("candidate price unavailable")?;
-        let state=registry.get(identity.address).context("candidate missing from Registry")?;
+        let (state,wait,hold)=registry.measured_get(identity.address);
+        reads.record(wait,hold);
+        let state=state.context("candidate missing from Registry")?;
         ensure!(state.completion_admission.is_admitted() && state.completion_state==CompletionState::Prepared,
             "candidate {} no longer admitted Prepared",identity.address);
         let manifest=state.execution_manifest.context("Prepared manifest missing")?;
@@ -214,7 +236,7 @@ impl State {
     /// Pack an exact CP6A best-witness without rebuilding any route product.
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
-        registry:&PoolRegistry,cfg:&Settings,number:usize)->Result<Selection>{
+        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads)->Result<Selection>{
         let started=Instant::now();
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
@@ -252,7 +274,7 @@ impl State {
             parameters:cfg.parameters.clone()};
         let mut pools=Vec::new();
         for &(slot,r) in &slots{
-            pools.push(self.pool(slot,r,registry,cfg.wallet)?);
+            pools.push(self.pool(slot,r,registry,cfg.wallet,reads)?);
         }
         install_compact(&mut request,top,&pools);
         let mut packing=(cfg.capacity)(&request).context("compact seed does not fit V10")?;
@@ -281,7 +303,7 @@ impl State {
         for (_,slot,role_name,_) in options{
             if used.contains(&(slot/2)){continue;}
             considered+=1;
-            let pool=match self.pool(slot,role_name,registry,cfg.wallet){
+            let pool=match self.pool(slot,role_name,registry,cfg.wallet,reads){
                 Ok(pool)=>pool,Err(error)=>{
                     unavailable+=1;last_rejection=Some(format!("{error:#}"));continue;
                 }
@@ -306,6 +328,7 @@ impl State {
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
             frame_to_request_us:frame.and_then(|at|ready.checked_sub(at)),
             signal_to_request_us:ready.saturating_sub(self.ready_at_us),selection_ns:elapsed_ns(started),
+            registry_reads:reads.clone(),
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added})
@@ -414,13 +437,14 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
                     };
                     let started=Instant::now();
+                    let mut reads=RegistryReads::default();
                     ranked.sort_unstable_by_key(|entry|entry.0);
                     let mut chosen=None;
                     for (_,event,index) in &ranked {
                         let selected=match event.as_ref(){
                             SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
                                 block.threshold_units,block.trigger.clone(),&registry,&cfg,
-                                report.requests.len()+1),
+                                report.requests.len()+1,&mut reads),
                             _=>bail!("ranked event is not a compact candidate"),
                         };
                         match selected {
@@ -429,10 +453,12 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         }
                     }
                     ranked.clear();
+                    report.registry_reads.merge(&reads);
                     if let Some(selection)=chosen {
-                        crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} broadcasts=false",
+                        crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} registry_reads={} registry_wait_ns={} registry_hold_ns={} broadcasts=false",
                             selection.request.id,state.generation,state.revision,selection.route_kind,selection.reverse,
-                            selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us);
+                            selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us,
+                            selection.registry_reads.calls,selection.registry_reads.wait_ns,selection.registry_reads.hold_ns);
                         permit.send(selection.request.clone());report.requests.push(selection);
                     } else {
                         crate::log_event!(Warn,"execution candidates no_packable_seed=true generation={} revision={} last_rejection={:?}",

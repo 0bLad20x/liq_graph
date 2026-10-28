@@ -234,6 +234,24 @@ try {
             [long]$feeEvidence.known_dex_fees_by_model.pumpswap -gt 0 -and
             [long]$feeEvidence.asymmetric_rates -gt 0
     }
+    # Owner measurements only; no extra observer or per-pool timing logs.
+    $registryCycles = @(Select-String -LiteralPath $log -Pattern 'pool registry tvl_refresh=(\{.*\})$' | ForEach-Object {
+        $_.Matches[0].Groups[1].Value | ConvertFrom-Json
+    })
+    $registryMaintenance = [ordered]@{
+        cycles=$registryCycles.Count
+        scanned=[long](($registryCycles | Measure-Object -Property scanned -Sum).Sum)
+        changed=[long](($registryCycles | Measure-Object -Property changed -Sum).Sum)
+        persisted=[long](($registryCycles | Measure-Object -Property persisted -Sum).Sum)
+        write_batches=[long](($registryCycles | Measure-Object -Property write_batches -Sum).Sum)
+        max_write_batch_pools=[long](($registryCycles | Measure-Object -Property max_write_batch_pools -Maximum).Maximum)
+        max_prepare_ns=[long](($registryCycles | Measure-Object -Property prepare_ns -Maximum).Maximum)
+        write_lock_wait_ns=[long](($registryCycles | Measure-Object -Property write_lock_wait_ns -Sum).Sum)
+        write_lock_hold_ns=[long](($registryCycles | Measure-Object -Property write_lock_hold_ns -Sum).Sum)
+        max_write_lock_hold_ns=[long](($registryCycles | Measure-Object -Property max_write_lock_hold_ns -Maximum).Maximum)
+        max_elapsed_ns=[long](($registryCycles | Measure-Object -Property elapsed_ns -Maximum).Maximum)
+    }
+    $registryReads = $execution.execution_candidates.registry_reads
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
@@ -260,6 +278,10 @@ try {
         market_queue_ns=$market.metrics.queue
         signal_steady_state_processing_ns=$production.steady_state_inputs.processing_ns
         frame_to_signal_state_us=$production.steady_state_inputs.frame_to_state_ready_us
+        registry_maintenance=$registryMaintenance
+        execution_registry_reads=$registryReads
+        registry_timing_observed=($registryCycles.Count -ge 2 -and [long]$registryReads.calls -gt 0)
+        execution_skipped_busy_revisions=$execution.execution_candidates.skipped_busy_revisions
         candidate_delivery_passed=$candidateDelivery
         v10_requests=$requests.Count; v10_reports=$reports.Count
         v10_simulation_successes=$execution.simulation_successes

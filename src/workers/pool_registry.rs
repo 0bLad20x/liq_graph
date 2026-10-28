@@ -5,6 +5,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -27,6 +28,21 @@ const TVL_SOURCE_MAX_AGE_MS: u64 = 3_600_000;
 const TVL_PERSIST_INTERVAL_MS: u64 = 900_000;
 const DEX_SOURCE: &str = "dexscreener_token_pairs";
 const MIN_NATIVE_TVL_USD: f64 = 10.0;
+// Installation granularity, not a limit on pools, refreshes or route coverage.
+const TVL_WRITE_BATCH: usize = 64;
+
+fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
+
+#[derive(Default,serde::Serialize)]
+struct TvlRefreshMetrics {
+    started_at_ms:u64,scanned:usize,changed:usize,persisted:usize,
+    prepare_ns:u64,read_lock_wait_ns:u64,write_batches:usize,max_write_batch_pools:usize,
+    write_lock_wait_ns:u64,write_lock_hold_ns:u64,max_write_lock_hold_ns:u64,elapsed_ns:u64,
+}
+
+struct TvlPatch {
+    address:Pubkey, value:Option<f64>, observation:Option<Arc<Value>>, persist:bool,
+}
 
 /// Native pool TVL sources; Manifest has no meaningful TVL and PumpSwap uses RPC.
 fn native_source(venue: Venue) -> Option<&'static str> {
@@ -176,6 +192,18 @@ impl PoolRegistry {
             .get(&address).cloned()
     }
 
+    /// Same owner state as get(). The explicit timing boundary is used by the
+    /// execution consumer only: (state, read-lock wait ns, read-lock hold ns).
+    pub fn measured_get(&self,address:Pubkey)->(Option<PoolState>,u64,u64) {
+        let waiting=Instant::now();
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let wait_ns=elapsed_ns(waiting);
+        let holding=Instant::now();
+        let state=entries.get(&address).cloned();
+        drop(entries);
+        (state,wait_ns,elapsed_ns(holding))
+    }
+
     pub fn live_tvl_count(&self) -> usize {
         self.entries.read().expect("pool registry lock poisoned")
             .values().filter(|p|p.tvl_usd.is_some()).count()
@@ -183,6 +211,7 @@ impl PoolRegistry {
     /// Live accounting of the reference pair needed for Direct3/Triangle4.
     /// Diagnostic only: the PoolRegistry remains the sole admission authority.
     fn report_conversion_admission(&self) {
+        let started=Instant::now();
         let references=reference_mints();
         let entries=self.entries.read().expect("pool registry lock poisoned");
         let mut known=0_usize;
@@ -206,8 +235,8 @@ impl PoolRegistry {
         }
         drop(entries);
         crate::log_event!(Info,
-            "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} native_tvl_veto={} mint_not_qualified={}",
-            known,admitted,prepared,prepared_admitted,native_veto,missing_qualification);
+            "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} native_tvl_veto={} mint_not_qualified={} scan_ns={}",
+            known,admitted,prepared,prepared_admitted,native_veto,missing_qualification,elapsed_ns(started));
     }
 
     /// Bootstrap complete, previously validated state before any producer starts.
@@ -299,39 +328,72 @@ impl PoolRegistry {
     /// Historical last_observation stays intact; expired quotes never masquerade
     /// as current liquidity. Called only by the Registry's single writer.
     fn refresh_tvl(&self, now:u64) -> (Vec<PoolState>,Vec<Pubkey>) {
-        let mut entries=self.entries.write().expect("pool registry lock poisoned");
+        let started=Instant::now();
+        let preparing=Instant::now();
+        let mut metrics=TvlRefreshMetrics{started_at_ms:now,..Default::default()};
+        let waiting=Instant::now();
+        // All mutators are private to the one Registry writer. Its event loop
+        // awaits this maintenance job before accepting another input. Readers
+        // can therefore inspect the current state throughout the full scan;
+        // no second writer or stale background result can race installation.
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        metrics.read_lock_wait_ns=elapsed_ns(waiting);
         let mut quotes=self.quotes.write().expect("pool market state lock poisoned");
-        let mut updates=Vec::new();
-        let mut persist=Vec::new();
+        let mut patches=Vec::new();
         for (address, market) in quotes.iter_mut() {
+            metrics.scanned+=1;
             let selected=select_tvl(market,now);
-            if let Some(pool)=entries.get_mut(address) {
+            if let Some(pool)=entries.get(address) {
                 let source=pool.last_observation.as_ref().and_then(|o|o.get("source"))
                     .and_then(Value::as_str);
                 if pool.tvl_usd!=selected.map(|q|q.value)
                     || selected.is_some_and(|q|source!=Some(q.source)) {
                     // DexScreener/canonical TVL expiry must not change native admission.
-                    pool.tvl_usd=selected.map(|q|q.value);
-                    if let Some(q)=selected {
-                        pool.last_observation=Some(Arc::new(json!({
+                    let observation=selected.map(|q|Arc::new(json!({
                             "tvl_usd":q.value,"source":q.source,
                             "observed_at_ms":q.at,"first_seen_ms":pool.first_seen_ms
                         })));
-                        if market.last_persisted==0
-                            || now.saturating_sub(market.last_persisted)>=TVL_PERSIST_INTERVAL_MS {
-                            market.last_persisted=now;
-                            persist.push(*address);
-                        }
-                    }
-                    // Expiry only clears the live value; the DB retains history.
-                    pool.last_changed_ms=now;
-                    updates.push(pool.clone());
+                    let persist=selected.is_some() && (market.last_persisted==0
+                        || now.saturating_sub(market.last_persisted)>=TVL_PERSIST_INTERVAL_MS);
+                    if persist {market.last_persisted=now;}
+                    patches.push(TvlPatch{address:*address,value:selected.map(|q|q.value),observation,persist});
                 }
             }
         }
         // Prevent indefinite growth from ever-seen, now-expired sources.
         quotes.retain(|_,q|q.protocol.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS)
              || q.dex.is_some_and(|v|now.saturating_sub(v.at)<=TVL_SOURCE_MAX_AGE_MS));
+        drop(quotes);
+        drop(entries);
+        metrics.prepare_ns=elapsed_ns(preparing);
+        let mut updates=Vec::with_capacity(patches.len());
+        let mut persist=Vec::with_capacity(patches.iter().filter(|p|p.persist).count());
+        // Allocate observations before taking any write lock. Even a mass expiry
+        // installs all changes in short sections rather than one catalog-wide lock.
+        for chunk in patches.chunks(TVL_WRITE_BATCH) {
+            let waiting=Instant::now();
+            let mut entries=self.entries.write().expect("pool registry lock poisoned");
+            metrics.write_lock_wait_ns=metrics.write_lock_wait_ns.saturating_add(elapsed_ns(waiting));
+            let holding=Instant::now();
+            for patch in chunk {
+                let pool=entries.get_mut(&patch.address).expect("single-writer TVL pool disappeared");
+                pool.tvl_usd=patch.value;
+                // Expiry only clears the live value; historical provenance stays.
+                if let Some(observation)=&patch.observation {pool.last_observation=Some(observation.clone());}
+                pool.last_changed_ms=now;
+                updates.push(pool.clone());
+                if patch.persist {persist.push(patch.address);}
+            }
+            drop(entries);
+            let held=elapsed_ns(holding);
+            metrics.write_lock_hold_ns=metrics.write_lock_hold_ns.saturating_add(held);
+            metrics.max_write_lock_hold_ns=metrics.max_write_lock_hold_ns.max(held);
+            metrics.write_batches+=1;
+            metrics.max_write_batch_pools=metrics.max_write_batch_pools.max(chunk.len());
+            std::thread::yield_now();
+        }
+        metrics.changed=updates.len();metrics.persisted=persist.len();metrics.elapsed_ns=elapsed_ns(started);
+        crate::log_event!(Info,"pool registry tvl_refresh={}",serde_json::to_string(&metrics).expect("typed TVL timing"));
         (updates,persist)
     }
 
@@ -837,8 +899,15 @@ pub async fn run(
                 }
             },
             _=freshness.tick()=>{
-                registry.report_conversion_admission();
-                let (invalidated,persist)=registry.refresh_tvl(now_unix_ms()?);
+                let maintenance=registry.clone();
+                let now=now_unix_ms()?;
+                // This is still the single writer: await completion before any
+                // apply/apply_completion/qualification input can mutate state.
+                // CPU maintenance and synchronous locks must not occupy Tokio.
+                let (invalidated,persist)=tokio::task::spawn_blocking(move || {
+                    maintenance.report_conversion_admission();
+                    maintenance.refresh_tvl(now)
+                }).await.map_err(|e|anyhow::anyhow!("Registry maintenance task failed: {e}"))?;
                 if !invalidated.is_empty() {
                     let count=invalidated.len();
                     output.send(Arc::new(PoolUpdateBatch {

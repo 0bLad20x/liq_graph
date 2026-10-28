@@ -125,3 +125,79 @@ Live acceptance is pending until real input/output artifacts have been evaluated
 This implementation environment has no Rust/PowerShell, DB/RPC configuration or
 wallet; GitHub CI supplies the locked build, not the live proof. No new automated
 unit/mock/regression suites or historical checkpoint scripts are introduced.
+
+## CP8A.1: Registry maintenance and request read timing
+
+Continues on `cp8a-directed-fee-signals`, based on 2af5e94. The two real
+600-second runs 20261028T080230472Z and 20261028T084147169Z used that exact head.
+The second eliminated the first run's native-SOL account funding failures and
+recorded 28 successful simulations, 18 involving both DLMM and PumpSwap.
+All 32 emitted PumpSwap swap events matched the recorded LP/protocol/creator
+fee rates. Successful requests are not necessarily economically profitable.
+
+The second run's three largest request builds took 290.6, 292.8 and 208.5 ms
+at approximately 311, 371 and 431 seconds after process start. Two considered
+zero alternatives. These are steady-running stalls, not startup/shutdown samples.
+They coincided with minute maintenance; the old reports did not measure Registry
+lock waits and therefore do not prove the exact contribution of each cause.
+
+Registry remains the only writer. The minute task is awaited on the blocking
+pool before the owner accepts another source/completion/qualification update.
+The reference-pair diagnostic scan also runs there. TVL preparation uses a read
+lock on entries, so execution readers can proceed during the full quote scan and
+cleanup. Only changed TVL/provenance values are installed, in write sections of
+at most 64 pools, with a scheduler yield between sections. This is installation
+granularity, not a pool/route limit. All patches are applied before publication.
+No alternate Registry, legacy mode, new worker, crate or dependency is introduced.
+
+TTL, source precedence, persistence coalescing, historical observations and
+native-TVL admission rules are preserved. Canonical TVL expiry does not withdraw
+native admission. MarketState can still use canonical TVL when budgets bind.
+Execution manifests and mint proofs are untouched by TVL installation.
+
+Measurements:
+- One `pool registry tvl_refresh={...}` log per maintenance cycle: scan count,
+  changed/persisted pools, preparation time, lock wait, total/max write hold and
+  actual maximum batch size. `scan_ns` on the existing reference-pair log records
+  that separate diagnostic scan. No per-pool maintenance logs are added.
+- Each selection stores `registry_reads`: call count, total read-lock wait/hold,
+  and maximum individual wait/hold in ns. This includes seed attempts and
+  alternatives, including failed lookups. The aggregate is in
+  `execution.json.execution_candidates.registry_reads`. Ordinary untimed Registry
+  consumers continue using `get()`.
+- `selection_ns` remains total wall time, including Registry access. A large
+  selection time with small measured Registry wait must not be labelled a lock
+  stall without further evidence; scheduling/other work can still contribute.
+- `summary.json` includes `registry_maintenance`, `execution_registry_reads`,
+  `registry_timing_observed` and `execution_skipped_busy_revisions`. The timing flag
+  means at least two maintenance cycles and actual request reads were measured;
+  it does not assert absence of contention or replace functional acceptance.
+
+Run the command above with `-DurationSeconds 600`, retaining the same venues,
+budgets, wallet, automatic sizing, minimum profit and flashloan configuration.
+Inspect several maintenance cycles, actual read waits, request tails, coverage,
+delivery and simulation results. `changed=0`/`write_batches=0` correctly means a
+scan needed no installation; that run cannot prove mass-expiry installation.
+Large expiry batches require real observations of such expiry, not synthetic
+inputs or a claim inferred from the configured duration. Other source/completion
+write sections are not refactored by this checkpoint; measured waits include them.
+The new head still requires its own real-input live acceptance.
+
+### Deferred candidate/swap analysis
+
+Dispatch is unchanged: a full output channel skips a revision with no retry,
+and at most one packable candidate is sent per revision. `skipped_busy_revisions`
+counts revisions, not unique pools, executable swaps or missed profitable trades.
+No pending queue, new threshold or duplicate-opportunity filter is installed.
+Accepted requests and failed simulations remain individually available in the
+existing request/selection/simulation artifacts. Busy revision identities are
+not retained by the existing counter, so those cannot be reconstructed later.
+
+The later analysis should compare actual pool/direction/route and time, both
+negative-estimate successful requests (graph-32-47837-315 and graph-35-51873-384),
+three-swap successes, slippage failures and repeated pool sets. Equality of pool
+sets alone does not prove equal opportunities: direction, state revision and
+available liquidity matter. Complete historical DLMM BinArray pre-states are
+absent from the current evidence. Request route labels also do not prove the
+executed hop count: successful Direct3/Triangle4 requests in the second run
+executed two swaps. Real four-swap execution remains unproven.

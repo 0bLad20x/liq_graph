@@ -5,6 +5,9 @@ Persistence, CompletionLifecycle, Graph, WatchCatalog, MarketState, Signal Engin
 optionale V10-Simulation. Endliche und dauerhafte Läufe verwenden dieselbe Verkabelung.
 `RUN_DURATION_SECONDS=0` bedeutet Dauerbetrieb; `q` plus Enter stoppt kontrolliert.
 Worker bleiben über ihre vorhandenen CLI-Einstiege eigenständig ausführbar.
+Der Registry-Nachlauf zu CP8A misst Request-Lesewartezeiten und entfernt den
+langen TVL-Wartungsschreiblock; Messfelder und der 600-Sekunden-Nachweis stehen
+in [CP8A.md](CP8A.md#cp8a1-registry-maintenance-and-request-read-timing).
 Discovery-Module, gemeinsame Startverkabelung und begrenzte Einzelaufrufe beschreibt
 [DISCOVERY.md](DISCOVERY.md).
 Completion-Module und der gemeinsame Einzelstart sind in [COMPLETION.md](COMPLETION.md) beschrieben.
