@@ -7,6 +7,12 @@ complete requests. The executor independently validates requests because it also
 accepts manual file input. It owns transaction packing, signing and simulation;
 it has no Registry/DB/graph lookup, route search, manifest refresh or broadcast.
 
+[CP8B](CP8B.md) requires an observed DLMM liquidity direction and matches its
+account digest to the current Prepared manifest before packing witnesses or pool
+alternatives. Selection records level capacities and a diagnostic linearized
+first-depth boundary; it does not choose a trade amount or override V10 sizing.
+The independent executor validation and transaction path are unchanged.
+
 ## Input and resources
 
 The typed/JSON contract lives in `src/core/execution.rs`:

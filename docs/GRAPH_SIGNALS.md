@@ -34,8 +34,11 @@ CP8A.2 uses directed DLMM/PumpSwap marginal DEX-net weights as its sole
 selection/admission score. The default zero threshold requires strictly positive
 estimated DEX-net return. Missing net rates make that direction unavailable;
 there is no gross fallback. The existing factorized index and all topologies stay.
-Amount, depth, exact transfer-fee effects, slippage and execution costs are outside
-this estimate. See [CP8A](CP8A.md).
+Amount-specific route profit, exact transfer-fee effects, slippage and execution
+costs are outside this estimate. [CP8B](CP8B.md) restricts DLMM marginal rates to
+observed reachable positive-output levels and carries depth in the same price
+contract. Material depth changes refresh affected candidates even at equal net
+weights. There is no second index or gross fallback. See also [CP8A](CP8A.md).
 
 On graph replacement, the worker compares the two actually installed generations.
 It remaps winners by topology identity and directed roles. New topologies and those

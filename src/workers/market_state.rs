@@ -1,6 +1,7 @@
 //! Indicative market state: Prepared pool inputs -> account watches -> typed prices.
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
 mod fees;
+mod dlmm;
 use crate::core::rpc::{RpcAnswer,RpcHandle,RpcOperation};
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -91,7 +92,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
     }
     Ok(records)
 }
-#[derive(Clone)]struct Watch {address:String,venue:Venue}
+#[derive(Clone)]struct Watch {address:String,venue:Venue,dlmm:Option<dlmm::Dependencies>}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
 impl Venue {
@@ -238,7 +239,7 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
 }
 
 #[derive(Clone)]enum State{
-    Dlmm{active:i32,step:u16,fee:fees::Dlmm},
+    Dlmm{active:i32,step:u16,fee:fees::Dlmm,book:Box<dlmm::Book>},
     Pump{vquote:i128,base:u64,quote:u64,base_vault:String,quote_vault:String,
          pool_slot:u64,base_slot:u64,quote_slot:u64,fee_pool:fees::PumpPool,
          global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>},
@@ -263,6 +264,16 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
     last_valuation:Option<FeeValuation>,
 }
 impl Pool{
+    fn refresh_liquidity(&mut self)->bool {
+        match &mut self.state {
+            State::Dlmm{active,step,fee,book}=>book.rebuild(*active,*step,fee,self.clock,
+                &self.a,&self.b,self.da,self.db,&self.canon_base),
+            _=>false,
+        }
+    }
+    fn liquidity(&self)->Option<Arc<crate::core::market_state::PoolLiquidity>> {
+        match &self.state{State::Dlmm{book,..}=>book.profile.clone(),_=>None}
+    }
     fn valuation(&self)->Option<FeeValuation> {
         if !matches!(self.venue,Venue::Dlmm|Venue::Pump){return None;}
         let mut token_status=std::array::from_fn(|i|match &self.mint_states[i] {
@@ -282,12 +293,24 @@ impl Pool{
         let calculated=(||->Result<[f64;2]>{
             ensure!(self.clock>0,"chain Clock unavailable");
             let raw=match &self.state {
-                State::Dlmm{active,step,fee}=>{
+                State::Dlmm{active,step,fee,book}=>{
                     let (base,total,on_input)=fee.rates(*active,*step,self.clock)?;
                     v.base_fee_rate=Some(base);v.variable_fee_rate=Some(total-base);
                     v.dex_fee_rates=[Some(total);2];v.fees_on_input=on_input;
-                    let p=dlmm_spot(*active,*step,self.da,self.db)?;
-                    [p*(1.0-total),(1.0/p)*(1.0-total)]
+                    v.scope="reachable_execution_window_dex_net_no_sizing";
+                    let profile=book.profile.as_ref().context("DLMM liquidity profile unavailable")?;
+                    // Profiles already use the canonical mint direction. Convert
+                    // to native here; the shared normalization below runs once.
+                    let mut rates=[0.0;2];
+                    for native in 0..2 {
+                        let direction=native^usize::from(self.a!=self.canon_base);
+                        let value=&profile.directions[direction];
+                        rates[native]=value.marginal_net_rate.unwrap_or(0.0);
+                        v.dex_fee_rates[native]=value.levels.first().map(|l|l.fee_rate);
+                        v.fees_on_input[native]=value.levels.first().map_or(on_input[native],|l|l.fees_on_input);
+                    }
+                    if rates.contains(&0.0){v.unknown_reason=Some("DLMM direction empty or outside observed execution window; inspect liquidity".into());}
+                    rates
                 },
                 State::Pump{fee_pool,global,config,supply,base,quote,vquote,..}=>{
                     let global=global.as_ref().context("Pump global fees unavailable")?;
@@ -369,11 +392,11 @@ impl Pool{
         }
     }
 }
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
 impl Field{
-    fn full(self)->bool{matches!(self,Self::Dlmm|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook)}
+    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook)}
 
-    fn label(self)->&'static str{match self{Self::Clock=>"chain_clock",Self::PumpGlobal=>"pump_global_fees",Self::PumpFees=>"pump_fee_config",Self::PumpSupply=>"pump_base_supply",Self::Dlmm=>"dlmm_lbpair",Self::VirtualQuote=>"pump_pool",Self::BaseVault=>"pump_base_vault",Self::QuoteVault=>"pump_quote_vault",Self::DammSqrt=>"damm_v2_pool",Self::RaydiumV4Pnl=>"raydium_v4_pool_pnl",
+    fn label(self)->&'static str{match self{Self::Clock=>"chain_clock",Self::PumpGlobal=>"pump_global_fees",Self::PumpFees=>"pump_fee_config",Self::PumpSupply=>"pump_base_supply",Self::Dlmm=>"dlmm_lbpair",Self::DlmmArray(_)=>"dlmm_bin_array",Self::DlmmBitmap=>"dlmm_bitmap",Self::VirtualQuote=>"pump_pool",Self::BaseVault=>"pump_base_vault",Self::QuoteVault=>"pump_quote_vault",Self::DammSqrt=>"damm_v2_pool",Self::RaydiumV4Pnl=>"raydium_v4_pool_pnl",
         Self::RaydiumV4BaseVault=>"raydium_v4_base_vault",Self::RaydiumV4QuoteVault=>"raydium_v4_quote_vault",
         Self::RaydiumClmmSqrt=>"raydium_clmm_pool",
         Self::RaydiumCpmmFees=>"raydium_cpmm_pool_fees",Self::RaydiumCpmmBaseVault=>"raydium_cpmm_base_vault",
@@ -381,7 +404,7 @@ impl Field{
         Self::OrcaWhirlpoolSqrt=>"orca_whirlpool_pool",
         Self::PancakeSwapClmmSqrt=>"pancakeswap_clmm_pool",Self::ManifestBook=>"manifest_market_book",
         Self::ByrealClmmSqrt=>"byreal_clmm_pool"}}
-    fn slice(self)->(usize,usize){match self{Self::Dlmm|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply=>(0,0),Self::BaseVault|Self::QuoteVault=>(64,8),Self::DammSqrt=>(DAMM_SQRT_OFFSET,16),Self::RaydiumV4Pnl=>(192,16),
+    fn slice(self)->(usize,usize){match self{Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply=>(0,0),Self::BaseVault|Self::QuoteVault=>(64,8),Self::DammSqrt=>(DAMM_SQRT_OFFSET,16),Self::RaydiumV4Pnl=>(192,16),
         Self::RaydiumV4BaseVault|Self::RaydiumV4QuoteVault=>(64,8),
         Self::RaydiumClmmSqrt=>(RAYDIUM_CLMM_SQRT_OFFSET,16),
         Self::RaydiumCpmmFees=>(RAYDIUM_CPMM_FEES_OFFSET,RAYDIUM_CPMM_FEES_LEN),
@@ -423,7 +446,7 @@ struct Metrics {
     max_hydration_in_flight:usize,initial_hydration:Latency,baseline_hydration:Latency,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,decode_errors:u64,
     post_rewatch_websocket_observations:u64,removals:u64,
-    fee_valuation:FeeEvidence,
+    fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
     #[serde(skip)] cleared:bool,#[serde(skip)] rewatching:bool,
 }
 #[derive(serde::Serialize)]
@@ -437,6 +460,16 @@ struct FeeEvidence {
     unchanged_net_rate_updates:u64,revaluations:u64,asymmetric_rates:u64,
     calculation:Latency,samples:Vec<FeeSample>,
 }
+#[derive(Default,serde::Serialize)]
+struct LiquidityEvidence {
+    profile_observations:u64,profile_changes:u64,array_websocket_updates:u64,bitmap_websocket_updates:u64,
+    directions_by_status:BTreeMap<&'static str,u64>,directions_by_coverage:BTreeMap<&'static str,u64>,
+    first_level_differs_from_active:u64,cross_array_directions:u64,negative_bin_directions:u64,profile_build:Latency,
+    samples:Vec<serde_json::Value>,focused:BTreeMap<String,FocusedLiquidity>,
+    #[serde(skip)] focus:HashSet<String>,
+}
+#[derive(serde::Serialize)]
+struct FocusedLiquidity {observations:u64,first:serde_json::Value,last:serde_json::Value}
 struct Engine {
     pools: Vec<Pool>, subs: Vec<Subscription>, metrics:Metrics,
     events: broadcast::Sender<Arc<MarketStateEvent>>, sequence: u64,trace:bool,
@@ -447,7 +480,10 @@ struct Engine {
 }
 impl Engine{
     fn empty(events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64)->Self {
-        Self{pools:Vec::new(),subs:Vec::new(),metrics:Metrics::default(),events,sequence,trace:false,
+        let mut metrics=Metrics::default();
+        metrics.liquidity.focus=env::var("MARKET_STATE_LIQUIDITY_EVIDENCE_POOLS").unwrap_or_default()
+            .split(',').map(str::trim).filter(|v|!v.is_empty()).map(str::to_owned).collect();
+        Self{pools:Vec::new(),subs:Vec::new(),metrics,events,sequence,trace:false,
             account_ranges:HashMap::new(),account_bindings:Vec::new(),pool_subs:Vec::new(),pool_index:HashMap::new(),shared_fees:HashMap::new()}
     }
     fn index(&mut self) {
@@ -574,7 +610,11 @@ impl Engine{
                 Venue::Dlmm=>{
                     ensure!(acc.owner==DLMM_PROGRAM&&acc.data.starts_with(&DLMM_DISC),"{} not a DLMM LbPair",watch.address);
                     let active=i32_le(&acc.data,76)?;let step=u16_le(&acc.data,80)?;details.push(fees::CLOCK.into());
-                    (key(&acc.data,88)?,key(&acc.data,120)?,State::Dlmm{active,step,fee:fees::Dlmm::decode(&acc.data)?})
+                    let dependencies=watch.dlmm.context("DLMM Prepared manifest has no valid array dependency block")?;
+                    details.extend(dependencies.addresses().iter().map(ToString::to_string));
+                    if let Some(bitmap)=dependencies.bitmap{details.push(bitmap.to_string());}
+                    let book=Box::new(dlmm::Book::new(watch.address.parse()?,dependencies,&acc.data)?);
+                    (key(&acc.data,88)?,key(&acc.data,120)?,State::Dlmm{active,step,fee:fees::Dlmm::decode(&acc.data)?,book})
                 },
                 Venue::Pump=>{
                     ensure!(acc.owner==PUMP_PROGRAM&&acc.data.starts_with(&POOL_DISC),"{} not a PumpSwap Pool",watch.address);
@@ -746,11 +786,26 @@ impl Engine{
                 *supply=Some(u64_le(&mint.data,36)?);
                 fee_subs.extend([(Field::PumpGlobal,fees::GLOBAL.into(),g),(Field::PumpFees,faddr,f),(Field::PumpSupply,a.clone(),mint)]);
             }
+            if let State::Dlmm{book,..}=&mut state {
+                let dependencies=book.dependencies;
+                for (position,address) in dependencies.addresses().iter().copied().enumerate() {
+                    let name=address.to_string();let acc=dict.get(&name).context("DLMM BinArray baseline missing")?;
+                    ensure!(acc.owner==DLMM_PROGRAM,"DLMM BinArray owner mismatch");
+                    book.array(position as u8,address,&acc.data)?;
+                    fee_subs.push((Field::DlmmArray(position as u8),name,acc));
+                }
+                if let Some(address)=dependencies.bitmap {
+                    let name=address.to_string();let acc=dict.get(&name).context("DLMM bitmap baseline missing")?;
+                    ensure!(acc.owner==DLMM_PROGRAM,"DLMM bitmap owner mismatch");book.bitmap(&acc.data)?;
+                    fee_subs.push((Field::DlmmBitmap,name,acc));
+                }
+            }
             let mint_states=[mints.mint(a.parse()?).and_then(|m|m.onchain),mints.mint(b.parse()?).and_then(|m|m.onchain)];
-            let pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
+            let mut pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
                 clock,epoch,mint_states,last_valuation:None,price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,
             };
+            pool.refresh_liquidity();
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
             subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),key:watch.address.parse()?,owner:pool_records[idx].owner.parse()?,slot:pool_slot,received_us:pool_records[idx].received_us,floor:Some(pool_slot),valid:true});
             if let State::Pump{base_vault,quote_vault,..}=&pool.state{
@@ -811,18 +866,48 @@ impl Engine{
             origin,pool:pool.id.clone(),venue:pool.venue.label(),
             mint_a:pool.a.clone(),mint_b:pool.b.clone(),
             base_mint:pool.canon_base.clone(),quote_mint:pool.canon_quote.clone(),
-            price_quote_per_base:pool.price,valuation,
+            price_quote_per_base:pool.price,valuation,liquidity:pool.liquidity(),
             previous_price:previous,
             delta_bps:previous.map(|old|bps(old,pool.price)).filter(|v|v.is_finite()),
             price_kind:pool.price_kind(),
             best_bid_quote_per_base:best_bid,best_ask_quote_per_base:best_ask,
-            consistency:pool.consistency(),slot:pool.slot,received_at_us:component_received_at_us_max,
+            consistency:if pool.venue==Venue::Dlmm {
+                if component_slot_min==component_slot_max{Consistency::SameSlotNonAtomic}else{Consistency::MixedSlotNonAtomic}
+            }else{pool.consistency()},slot:pool.slot,received_at_us:component_received_at_us_max,
             sequence,component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max,trigger_field:field.map(Field::label),
             pipeline:None,
         };
         let mut event=event;
         if let Some(t)=pipeline.as_mut(){t.price_published_at_us=timestamp_us();}
         event.pipeline=pipeline;
+        if let Some(profile)=&event.liquidity {
+            let evidence=&mut self.metrics.liquidity;
+            evidence.profile_observations+=1;
+            for direction in &profile.directions {
+                *evidence.directions_by_status.entry(direction.status).or_default()+=1;
+                *evidence.directions_by_coverage.entry(direction.coverage).or_default()+=1;
+                evidence.cross_array_directions+=u64::from(direction.levels.first().zip(direction.levels.last())
+                    .is_some_and(|(a,b)|a.source_position.div_euclid(70)!=b.source_position.div_euclid(70)));
+                evidence.negative_bin_directions+=u64::from(direction.levels.iter().any(|l|l.source_position<0));
+                if let State::Dlmm{active,..}=&pool.state {
+                    evidence.first_level_differs_from_active+=u64::from(direction.first_source_position.is_some_and(|id|id!=*active));
+                }
+            }
+            if evidence.samples.len()<8 {
+                evidence.samples.push(serde_json::json!({"observation":event}));
+            }
+            if evidence.focus.contains(&pool.id) {
+                if let State::Dlmm{book,..}=&pool.state {
+                    let sample=serde_json::json!({"observation":event,"accounts":book.evidence(),
+                        "components":self.pool_subs[pi].iter().map(|&i|{let s=&self.subs[i];serde_json::json!({
+                            "address":s.address,"field":s.field.label(),"slot":s.slot,"received_at_us":s.received_us,"valid":s.valid})}).collect::<Vec<_>>()});
+                    match evidence.focused.get_mut(&pool.id) {
+                        Some(entry)=>{entry.observations+=1;entry.last=sample;},
+                        None=>{evidence.focused.insert(pool.id.clone(),FocusedLiquidity{observations:1,first:sample.clone(),last:sample});},
+                    }
+                }
+            }
+        }
         if let Some(v)=&event.valuation {
             let evidence=&mut self.metrics.fee_valuation;
             *evidence.observations_by_model.entry(v.model).or_default()+=1;
@@ -836,7 +921,7 @@ impl Engine{
             if evidence.samples.iter().filter(|p|p.observation.venue==event.venue).count()<8 {
                 let p=&self.pools[pi];
                 let inputs=match &p.state {
-                    State::Dlmm{active,step,fee}=>serde_json::json!({"native_mint_a":p.a,"native_mint_b":p.b,
+                    State::Dlmm{active,step,fee,..}=>serde_json::json!({"native_mint_a":p.a,"native_mint_b":p.b,
                         "decimals":[p.da,p.db],"active_id":active,"bin_step":step,"fee_parameters":fee}),
                     State::Pump{base,quote,vquote,fee_pool,global,config,supply,..}=>serde_json::json!({
                         "native_mint_a":p.a,"native_mint_b":p.b,"decimals":[p.da,p.db],"base_raw":base,
@@ -892,14 +977,19 @@ impl Engine{
                     Err(error)=>{*available=false;unavailable_reason=Some(error.to_string());},
                 }
             },
-            (State::Dlmm{active,step,fee},Field::Dlmm)=>{
+            (State::Dlmm{active,step,fee,book},Field::Dlmm)=>{
                 ensure!(key(data,88)?==pool.a && key(data,120)?==pool.b,"DLMM mint identity changed");
                 *fee=fees::Dlmm::decode(data)?;
                 let next_active=i32_le(data,76)?;
                 let next_step=u16_le(data,80)?;
                 ensure!(next_step>0,"DLMM step zero");
                 *active=next_active;*step=next_step;
+                book.pair(data)?;
             },
+            (State::Dlmm{book,..},Field::DlmmArray(position))=>{
+                book.array(position,self.subs[index].key,data)?;
+            },
+            (State::Dlmm{book,..},Field::DlmmBitmap)=>{book.bitmap(data)?;},
             (State::Pump{vquote,pool_slot,fee_pool,..},Field::VirtualQuote)=>{
                 ensure!(key(data,43)?==pool.a&&key(data,75)?==pool.b,"Pump mint identity changed");
                 *fee_pool=fees::PumpPool::decode(data)?;
@@ -953,10 +1043,19 @@ impl Engine{
             if emit {self.publish_unavailable(pi,slot,recv_us,reason);}
             return Ok(());
         }
-        if field==Field::Clock && prior_epoch==pool.epoch && pool.last_valuation.as_ref().is_some_and(|v|v.estimated_net_rates.iter().all(Option::is_some)) {
+        if field==Field::Clock && prior_epoch==pool.epoch && pool.last_valuation.is_some() {
             let due=match &pool.state{State::Dlmm{fee,..}=>pool.clock>=fee.next_change(prior_clock),_=>false};
             if !due{return Ok(());}
         }
+        let liquidity_started=Instant::now();
+        let liquidity_changed=if pool.venue==Venue::Dlmm {
+            let changed=pool.refresh_liquidity();
+            self.metrics.liquidity.profile_build.add(nanos(liquidity_started));
+            self.metrics.liquidity.profile_changes+=u64::from(changed);
+            if emit && matches!(field,Field::DlmmArray(_)){self.metrics.liquidity.array_websocket_updates+=1;}
+            if emit && field==Field::DlmmBitmap{self.metrics.liquidity.bitmap_websocket_updates+=1;}
+            changed
+        }else{false};
         let compute_started=Instant::now();
         let price=match pool.compute_price() {
             Ok(price)=>price,
@@ -974,7 +1073,7 @@ impl Engine{
         let previous=if was_available{Some(old)}else{None};
         // Clock account writes are frequent; emit only when the actual fee estimate changes.
         let next=if field==Field::Clock{pool.valuation()}else{None};
-        let clock_changed=field!=Field::Clock || prior_epoch!=pool.epoch || pool.last_valuation.as_ref().map(|v|(&v.estimated_net_rates,&v.unknown_reason))
+        let clock_changed=liquidity_changed || field!=Field::Clock || prior_epoch!=pool.epoch || pool.last_valuation.as_ref().map(|v|(&v.estimated_net_rates,&v.unknown_reason))
             !=next.as_ref().map(|v|(&v.estimated_net_rates,&v.unknown_reason));
         if emit && clock_changed {self.publish_price(pi,if field==Field::Clock{PriceOrigin::Revaluation}else{PriceOrigin::Websocket},previous,Some(field),Some(pipeline));}
         Ok(())
@@ -986,7 +1085,12 @@ impl Engine{
 #[derive(Clone,Copy)]
 pub struct Settings {pub pool_limit:usize,pub trace:bool}
 impl Settings {
-    pub fn from_env()->Result<Self> {Ok(Self{
+    pub fn from_env()->Result<Self> {
+        let focus=env::var("MARKET_STATE_LIQUIDITY_EVIDENCE_POOLS").unwrap_or_default();
+        let addresses=focus.split(',').map(str::trim).filter(|v|!v.is_empty()).collect::<Vec<_>>();
+        ensure!(addresses.len()<=32,"at most 32 explicit liquidity evidence pools");
+        for address in addresses {let _:Pubkey=address.parse().context("invalid liquidity evidence pool")?;}
+        Ok(Self{
         pool_limit:env_parse("MARKET_STATE_POOL_LIMIT",15000)?,
         trace:env_parse::<u8>("MARKET_STATE_TRACE",0)?!=0,
     })}
@@ -995,11 +1099,14 @@ impl Settings {
 // Only the price worker's identity index is retained; manifests and canonical pool
 // lifecycle remain in the Registry. Notifications reconcile against the current owner.
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey}
+struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>}
 impl PoolInput {
     fn of(p:&PoolState)->Option<Self> {
         if !p.completion_admission.is_admitted() || p.completion_state!=CompletionState::Prepared{return None;}
-        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?})
+        let dlmm=if p.venue==CoreVenue::MeteoraDlmm {
+            p.execution_manifest.as_ref().and_then(|m|dlmm::Dependencies::from_manifest(m).ok())
+        }else{None};
+        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
@@ -1008,8 +1115,9 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
     if let Some(p)=current {candidates.insert(address,p);}else{candidates.remove(&address);}
     true
 }
-fn watch_cost(v:CoreVenue)->usize {
-    match v {CoreVenue::PumpSwap=>4,CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
+fn watch_cost(p:&PoolInput)->usize {
+    match p.venue {CoreVenue::MeteoraDlmm=>p.dlmm.map_or(8,|d|d.account_cost()),
+        CoreVenue::PumpSwap=>4,CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
 }
 fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
     use super::graph_liquidity::RouteTopologyKind as K;
@@ -1057,7 +1165,7 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     let shared_cost=if eligible.values().any(|p|p.venue==CoreVenue::PumpSwap){3}
         else if eligible.values().any(|p|p.venue==CoreVenue::MeteoraDlmm){1}else{0};
     let pool_budget=account_budget.saturating_sub(shared_cost);
-    let required_accounts=eligible.values().map(|p|watch_cost(p.venue)).sum::<usize>()+shared_cost;
+    let required_accounts=eligible.values().map(watch_cost).sum::<usize>()+shared_cost;
     let (picked,used,backbone,mode)=if eligible.len()<=max_pools && required_accounts<=account_budget {
         // All admissible catalog pools fit. Ranking cannot improve this set.
         (eligible.keys().copied().collect::<HashSet<_>>(),required_accounts,0,"all_fit")
@@ -1109,7 +1217,7 @@ fn select_budgeted(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     for &address in &conversions {
         let p=candidates[&address];
         if venues.contains(&p.venue){continue;}
-        let cost=watch_cost(p.venue);
+        let cost=watch_cost(&p);
         if picked.len()<max_pools && used+cost<=account_budget {
             picked.insert(address);used+=cost;backbone.push(address);venues.push(p.venue);
         }
@@ -1177,7 +1285,7 @@ fn select_budgeted(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
                     if !valid {cursors_for[kind]+=1;continue;}
                     let additional:Vec<_>=local.iter().copied()
                         .filter(|p|!picked.contains(p)).collect();
-                    let cost=additional.iter().map(|p|watch_cost(candidates[p].venue)).sum::<usize>();
+                    let cost=additional.iter().map(|p|watch_cost(&candidates[p])).sum::<usize>();
                     if cost==0 || picked.len()+additional.len()>max_pools
                         ||used+cost>account_budget {
                         cursors_for[kind]+=1;continue;
@@ -1232,7 +1340,7 @@ fn select_budgeted(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
     });
     for p in remaining {
         if picked.len()>=max_pools {break;}
-        let cost=watch_cost(p.venue);
+        let cost=watch_cost(&p);
         if used+cost<=account_budget {picked.insert(p.address);used+=cost;}
     }
     (picked,used,backbone.len())
@@ -1254,7 +1362,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
-            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?}))
+            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,dlmm:p.dlmm}))
             .collect::<Result<Vec<_>>>()?})})();
         let result=match (baseline_source,config) {
             (Some(source),_)=>{
@@ -1437,7 +1545,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 mints_to_check.sort_unstable();mints_to_check.dedup();
                 selected_mints.send_replace(Arc::from(mints_to_check));
                 crate::log_event!(Info,"market state graph selection selected_pools={} ws_upper_bound={} ws_capacity={} graph_topologies={}",
-                    selected.len(),selected.iter().map(|p|watch_cost(p.venue)).sum::<usize>(),
+                    selected.len(),selected.iter().map(watch_cost).sum::<usize>(),
                     selection_capacity,catalog.borrow().graph.topologies.len());
                 engine.sequence+=1;engine.emit(MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});

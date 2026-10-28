@@ -21,6 +21,9 @@ param(
     [ValidateRange(0,2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
     [switch]$RequireFeeEvidence,
+    [switch]$RequireLiquidityEvidence,
+    # Diagnostic raw snapshots only. This does not pin or filter pool selection.
+    [string]$LiquidityEvidencePools = '',
     [string]$EnabledVenues = '',
     [switch]$SimulateV10,
     [string]$WalletPath,
@@ -37,6 +40,7 @@ if (($SimulateV10 -or $RequireCatalogReconciliation -or $TraceSignals -or $Profi
 if (($Rewatch -or $TracePrices) -and -not $marketEnabled) { throw 'Rewatch and TracePrices require MarketState.' }
 if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires GraphAudit for actual graph/reference evidence.' }
 if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage Signals.' }
+if (($RequireLiquidityEvidence -or $LiquidityEvidencePools) -and -not $signals) { throw 'Liquidity evidence requires Stage Signals.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -113,6 +117,7 @@ try {
         MARKET_STATE_HYDRATION_CONCURRENCY = '8'
         MINT_ONCHAIN_PARALLEL_BATCHES = '4'
         MARKET_STATE_TRACE = $(if ($TracePrices) { '1' } else { '0' })
+        MARKET_STATE_LIQUIDITY_EVIDENCE_POOLS = $LiquidityEvidencePools
         RPC_WS_PROVIDER_SELECTION = $WsProviders
         RPC_WS_ACCOUNT_BUDGET = "$WsAccountBudget"
         RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
@@ -167,6 +172,8 @@ try {
         signal_score_basis='marginal_dex_net'; signal_net_threshold_bps=$ThresholdBps
         profile_signals=[bool]$ProfileSignals
         require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=$EnabledVenues
+        require_liquidity_evidence=[bool]$RequireLiquidityEvidence
+        liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v1'
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -261,6 +268,46 @@ try {
             [long]$feeEvidence.known_dex_fees_by_model.pumpswap -gt 0 -and
             [long]$feeEvidence.asymmetric_rates -gt 0
     }
+    $liquidityEvidence = $market.metrics.liquidity
+    $liquidityPassed = $null
+    $liquidityViolations = @($requests | ForEach-Object {
+        $id = $_.request.id
+        foreach ($pool in $_.pools) {
+            if ($pool.observation.venue -eq 'meteora_dlmm' -and
+                ($null -eq $pool.observation.liquidity -or -not $pool.liquidity_window_checked)) { $id }
+        }
+    } | Sort-Object -Unique)
+    $focusRequested = @($LiquidityEvidencePools -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $focusObserved = @($liquidityEvidence.focused.PSObject.Properties | ForEach-Object { $_.Name })
+    $focusMissing = @($focusRequested | Where-Object { $_ -notin $focusObserved })
+    if ($null -ne $liquidityEvidence) {
+        $liquidityEvidence | ConvertTo-Json -Depth 40 |
+            Set-Content -LiteralPath (Join-Path $folder 'liquidity_evidence.json') -Encoding UTF8
+    }
+    if ($RequireLiquidityEvidence) {
+        $liquidityPassed = $null -ne $liquidityEvidence -and
+            [long]$liquidityEvidence.profile_observations -gt 0 -and
+            [long]$liquidityEvidence.directions_by_status.available -gt 0 -and
+            [long]$liquidityEvidence.array_websocket_updates -gt 0 -and
+            [long]$production.liquidity_inputs -gt 0 -and
+            $liquidityViolations.Count -eq 0 -and $focusMissing.Count -eq 0
+    }
+    $liquiditySummary = if ($null -eq $liquidityEvidence) { $null } else { [ordered]@{
+        profile_observations=$liquidityEvidence.profile_observations
+        profile_changes=$liquidityEvidence.profile_changes
+        array_websocket_updates=$liquidityEvidence.array_websocket_updates
+        bitmap_websocket_updates=$liquidityEvidence.bitmap_websocket_updates
+        directions_by_status=$liquidityEvidence.directions_by_status
+        directions_by_coverage=$liquidityEvidence.directions_by_coverage
+        first_level_differs_from_active=$liquidityEvidence.first_level_differs_from_active
+        cross_array_directions=$liquidityEvidence.cross_array_directions
+        negative_bin_directions=$liquidityEvidence.negative_bin_directions
+        profile_build_ns=$liquidityEvidence.profile_build
+        signal_liquidity_inputs=$production.liquidity_inputs
+        signal_liquidity_only_updates=$production.liquidity_only_updates
+        focused_requested=$focusRequested; focused_observed=$focusObserved; focused_missing=$focusMissing
+        request_window_violations=$liquidityViolations
+    } }
     # Owner measurements only; no extra observer or per-pool timing logs.
     $registryCycles = @(Select-String -LiteralPath $log -Pattern 'pool registry tvl_refresh=(\{.*\})$' | ForEach-Object {
         $_.Matches[0].Groups[1].Value | ConvertFrom-Json
@@ -279,6 +326,26 @@ try {
         max_elapsed_ns=[long](($registryCycles | Measure-Object -Property elapsed_ns -Maximum).Maximum)
     }
     $registryReads = $execution.execution_candidates.registry_reads
+    # Post-run payload identity only: equal accounts/parameters do not imply
+    # equal pool state, equal liquidity, or the same economic opportunity.
+    $payloads = @{}
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($selection in $requests) {
+            $payload = $selection.request | Select-Object * -ExcludeProperty id | ConvertTo-Json -Depth 40 -Compress
+            $key = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))
+            if (-not $payloads.ContainsKey($key)) { $payloads[$key] = [ordered]@{payload_sha256=$key; request_ids=@()} }
+            $payloads[$key].request_ids += $selection.request.id
+        }
+    } finally { $hasher.Dispose() }
+    $repeated = @($payloads.Values | Where-Object { $_.request_ids.Count -gt 1 } | Sort-Object { $_.request_ids.Count } -Descending)
+    ConvertTo-Json -InputObject $repeated -Depth 10 |
+        Set-Content -LiteralPath (Join-Path $folder 'repeated_request_sets.json') -Encoding UTF8
+    $requestRepetition = [ordered]@{
+        unique_payloads=$payloads.Count; repeated_payload_sets=$repeated.Count
+        requests_in_repeated_sets=[long](($repeated | ForEach-Object { $_.request_ids.Count } | Measure-Object -Sum).Sum)
+        largest_set=[long](($repeated | ForEach-Object { $_.request_ids.Count } | Measure-Object -Maximum).Maximum)
+    }
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
@@ -301,6 +368,8 @@ try {
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
         fee_evidence_passed=$feePassed; fee_valuation=$feeEvidence
+        liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
+        request_payload_repetition=$requestRepetition
         signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
         net_evidence_passed=$netPassed; net_witness_violations=$netViolations
         observations_by_known_net_directions=$production.observations_by_known_net_directions
@@ -335,6 +404,7 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
     if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
+    if ($RequireLiquidityEvidence -and -not $liquidityPassed) { throw "CP8B liquidity evidence incomplete; inspect liquidity_evidence.json in $folder." }
     if ($signals -and -not $netPassed) { throw "Net signal evidence incomplete; inspect $folder." }
     if (-not $protocolEvidence) { Write-Warning 'Nicht fuer jedes Completion-Protokoll angenommene Arbeit nachgewiesen; protocol_summary pruefen.' }
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }

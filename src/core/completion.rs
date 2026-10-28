@@ -66,6 +66,25 @@ pub struct ExecutionManifest {
     pub base_b: Arc<[AccountMeta]>,
 }
 
+impl ExecutionManifest {
+    /// Stable account dependency identity. A renewed proof slot alone does not
+    /// change subscriptions; either oriented account block or signer does.
+    pub fn account_set_digest(&self) -> [u8;32] {
+        let mut digest=ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(b"liq_graph_manifest_accounts_v1");
+        for key in [self.pool,self.mint_a,self.mint_b] {digest.update(key.as_ref());}
+        digest.update(&[u8::from(self.bound_signer.is_some())]);
+        if let Some(signer)=self.bound_signer {digest.update(signer.as_ref());}
+        for block in [&self.base_a,&self.base_b] {
+            digest.update(&(block.len() as u64).to_le_bytes());
+            for account in block.iter() {
+                digest.update(account.address.as_ref());digest.update(&[u8::from(account.writable)]);
+            }
+        }
+        digest.finish().as_ref().try_into().expect("SHA256 length")
+    }
+}
+
 /// Versioned protocol evidence; consumers do not interpret the schema.
 #[derive(Clone, Debug)]
 pub struct CompletionEvidence {

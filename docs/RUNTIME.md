@@ -1,5 +1,11 @@
 # Gemeinsame Runtime und Live-Nachweis
 
+Der aktuelle DLMM-Liquiditaetscheckpoint und sein einzelner 600-Sekunden-Lauf
+stehen in [CP8B.md](CP8B.md). `RequireLiquidityEvidence` verlangt echte BinArray-
+WS-Eingaben, Signalverbrauch und konsistente Request-Fenster. Optionale
+`LiquidityEvidencePools` sichern begrenzte Rohdaten ohne Auswahl-Pinning oder
+zusaetzlichen Diagnosekonsumenten. Die Ausgabe bleibt im Laufverzeichnis.
+
 `--run` ist der einzige vollständige Aufbau: Discovery, Mintversorgung, Registry,
 Persistence, CompletionLifecycle, Graph, WatchCatalog, MarketState, Signal Engine und
 optionale V10-Simulation. Endliche und dauerhafte Läufe verwenden dieselbe Verkabelung.

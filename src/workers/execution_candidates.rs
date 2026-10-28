@@ -63,6 +63,7 @@ struct PoolEvidence {
     pool: String, role: &'static str, slot: usize, log_weight_units: i64,
     observation: Arc<crate::core::market_state::PoolPriceObservation>,
     manifest_validated_slot: u64, manifest_checked_at_ms: Option<u64>,
+    liquidity_window_checked:bool,
 }
 #[derive(serde::Serialize)]
 pub struct Selection {
@@ -78,6 +79,10 @@ pub struct Selection {
     registry_reads:RegistryReads,
     unavailable_alternatives: u64, last_alternative_rejection: Option<String>,
     alternative_pools_added: usize,
+    /// Linearized first-level capacity is diagnostic, never an exclusion or
+    /// selected trade amount. V10 still receives trade_size=0 by default.
+    indicative_seed_input_at_first_depth_boundary:Option<f64>,
+    liquidity_profile_legs:usize,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
@@ -229,10 +234,21 @@ impl State {
             && [manifest.mint_a.min(manifest.mint_b),manifest.mint_a.max(manifest.mint_b)]==[identity.mint_a,identity.mint_b],
             "candidate Registry/price/manifest identity mismatch");
         ensure!(manifest.bound_signer.is_none_or(|bound|bound==wallet), "candidate manifest belongs to another wallet");
+        ensure!(state.venue!=crate::core::Venue::MeteoraDlmm || price.observation.liquidity.is_some(),
+            "DLMM candidate has no observed liquidity profile");
+        let liquidity_window_checked=if let Some(profile)=&price.observation.liquidity {
+            ensure!(profile.account_set_digest==manifest.account_set_digest(),
+                "candidate liquidity window differs from current Prepared account dependencies");
+            let direction=usize::from(if slot%2==0{identity.mint_a.to_string()}else{identity.mint_b.to_string()}
+                !=price.observation.base_mint);
+            ensure!(profile.directions[direction].status=="available"
+                &&profile.directions[direction].marginal_net_rate.is_some(),"candidate liquidity direction unavailable");
+            true
+        }else{false};
         let evidence=PoolEvidence {pool:identity.address.to_string(),role,slot,
             log_weight_units:self.weight(slot).context("candidate direction unavailable")?,
             observation:price.observation.clone(),manifest_validated_slot:manifest.validated_slot,
-            manifest_checked_at_ms:state.completion_checked_at_ms};
+            manifest_checked_at_ms:state.completion_checked_at_ms,liquidity_window_checked};
         Ok((ExecutionPool{manifest,mints},evidence))
     }
     /// Pack an exact CP6A best-witness without rebuilding any route product.
@@ -321,6 +337,21 @@ impl State {
         let ready=now_us();
         let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
         let alternative_pools_added=pools.len()-slots.len();
+        let mut product=1.0_f64;let mut boundary=None::<f64>;let mut liquidity_profile_legs=0;
+        for leg in &witness.legs {
+            let observation=&leg.observation;
+            let direction=usize::from(leg.input_mint.to_string()!=observation.base_mint);
+            if let Some(profile)=&observation.liquidity {
+                liquidity_profile_legs+=1;
+                let data=&profile.directions[direction];
+                if let Some(raw)=data.levels.first().and_then(|level|level.input_raw) {
+                    let capacity=raw as f64/10_f64.powi(i32::from(data.input_decimals))/product;
+                    if capacity.is_finite()&&capacity>0.0 {boundary=Some(boundary.map_or(capacity,|old|old.min(capacity)));}
+                }
+            }
+            product*=observation.valuation.as_ref().and_then(|v|v.estimated_net_rates[direction])
+                .context("candidate net rate disappeared")?;
+        }
         Ok(Selection{request,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
@@ -333,7 +364,7 @@ impl State {
             registry_reads:reads.clone(),
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
-            alternative_pools_added})
+            alternative_pools_added,indicative_seed_input_at_first_depth_boundary:boundary,liquidity_profile_legs})
     }
 
 }
