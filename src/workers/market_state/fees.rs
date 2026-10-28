@@ -12,7 +12,7 @@ pub(super) fn config_address()->Pubkey {
     Pubkey::find_program_address(&[b"fee_config",super::PUMP_PROGRAM.parse::<Pubkey>().unwrap().as_ref()],
         &FEE_PROGRAM.parse().unwrap()).0
 }
-#[derive(Clone,Debug,PartialEq)]
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub(super) struct Dlmm {
     factor:u16,filter:u16,decay:u16,reduction:u16,control:u32,max_vol:u32,
     power:u8,mode:u8,vol:u32,reference:u32,index:i32,last:i64,
@@ -20,7 +20,7 @@ pub(super) struct Dlmm {
 impl Dlmm {
     pub fn decode(d:&[u8])->Result<Self> {
         ensure!(d.len()==904 && d.starts_with(&super::DLMM_DISC),"unsupported DLMM LbPair layout");
-        let mode=d[36];ensure!(mode<=1 && d[34]<=9,"unsupported DLMM fee mode/power");
+        let mode=d[36];ensure!(mode<=1,"unsupported DLMM fee mode");
         Ok(Self{factor:u16_le(d,8)?,filter:u16_le(d,10)?,decay:u16_le(d,12)?,
             reduction:u16_le(d,14)?,control:u32_le(d,16)?,max_vol:u32_le(d,20)?,
             power:d[34],mode,vol:u32_le(d,40)?,reference:u32_le(d,44)?,index:i32_le(d,48)?,
@@ -38,16 +38,22 @@ impl Dlmm {
             (active,if elapsed<i64::from(self.decay){u64::from(self.vol)*u64::from(self.reduction)/10000}else{0})
         }else{(self.index,u64::from(self.reference))};
         let vol=(reference+u64::from(index.abs_diff(active))*10000).min(u64::from(self.max_vol));
-        let base=u128::from(self.factor)*u128::from(step)*10*10_u128.pow(u32::from(self.power));
+        let power=10_u128.checked_pow(u32::from(self.power)).context("DLMM fee power overflow")?;
+        let base=u128::from(self.factor).checked_mul(u128::from(step)).and_then(|n|n.checked_mul(10))
+            .and_then(|n|n.checked_mul(power)).context("DLMM base fee overflow")?;
         let square=(u128::from(vol)*u128::from(step)).checked_pow(2).context("DLMM volatility overflow")?;
-        let variable=(u128::from(self.control)*square).div_ceil(100_000_000_000);
-        let total=(base+variable).min(100_000_000);
+        let variable=u128::from(self.control).checked_mul(square).context("DLMM variable fee overflow")?.div_ceil(100_000_000_000);
+        let total=base.checked_add(variable).context("DLMM total fee overflow")?.min(100_000_000);
         Ok((base.min(100_000_000) as f64/1e9,total as f64/1e9,
             if self.mode==0{[true,true]}else{[false,true]})) // native X->Y, Y->X
     }
 }
-#[derive(Clone,Debug,PartialEq)]
-pub(super) struct PumpPool {pub creator:Pubkey,pub coin_creator:Pubkey,pub mayhem:bool,pub override_bps:u64,pub canonical:bool}
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub(super) struct PumpPool {
+    #[serde(with="crate::core::execution::pubkey_json")]
+    pub creator:Pubkey,
+    #[serde(with="crate::core::execution::pubkey_json")]
+    pub coin_creator:Pubkey,pub mayhem:bool,pub override_bps:u64,pub canonical:bool}
 impl PumpPool {
     pub fn decode(d:&[u8])->Result<Self> {
         ensure!(d.len()>=243 && d.starts_with(&super::POOL_DISC),"unsupported Pump pool layout");
@@ -61,7 +67,7 @@ impl PumpPool {
             override_bps:if d.len()>=269{u64_le(d,261)?}else{0}})
     }
 }
-#[derive(Clone,Debug,PartialEq)]
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub(super) struct Global {pub configurable:bool,pub disabled:u8}
 impl Global {
     pub fn decode(d:&[u8])->Result<Self>{
@@ -69,14 +75,14 @@ impl Global {
         Ok(Self{disabled:d[56],configurable:d.get(940).copied().unwrap_or(0)!=0})
     }
 }
-#[derive(Clone,Copy,Debug,PartialEq)]
+#[derive(Clone,Copy,Debug,PartialEq,serde::Serialize)]
 pub(super) struct Rates {pub lp:u64,pub protocol:u64,pub creator:u64}
 impl Rates {
     fn decode(d:&[u8],p:usize)->Result<Self>{Ok(Self{lp:u64_le(d,p)?,protocol:u64_le(d,p+8)?,creator:u64_le(d,p+16)?})}
     pub fn total(self)->Result<f64>{let n=self.lp.checked_add(self.protocol).and_then(|n|n.checked_add(self.creator)).context("Pump fee overflow")?;
         ensure!(n<10000,"Pump fee >=100 percent");Ok(n as f64/10000.0)}
 }
-#[derive(Clone,Debug,PartialEq)]
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub(super) struct Config {flat:Rates,tiers:Vec<(u128,Rates)>,stable:Vec<(u128,Rates)>,exotic:Option<Rates>}
 impl Config {
     pub fn decode(d:&[u8])->Result<Self> {

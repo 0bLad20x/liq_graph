@@ -425,6 +425,8 @@ struct Metrics {
     fee_valuation:FeeEvidence,
     #[serde(skip)] cleared:bool,#[serde(skip)] rewatching:bool,
 }
+#[derive(serde::Serialize)]
+struct FeeSample {observation:PoolPriceObservation,inputs:serde_json::Value}
 #[derive(Default,serde::Serialize)]
 struct FeeEvidence {
     observations_by_model:BTreeMap<&'static str,u64>,
@@ -432,7 +434,7 @@ struct FeeEvidence {
     unknown_by_reason:BTreeMap<String,u64>,
     updates_by_field:BTreeMap<&'static str,u64>,
     unchanged_gross_price_updates:u64,revaluations:u64,asymmetric_rates:u64,
-    calculation:Latency,samples:Vec<PoolPriceObservation>,
+    calculation:Latency,samples:Vec<FeeSample>,
 }
 struct Engine {
     pools: Vec<Pool>, subs: Vec<Subscription>, metrics:Metrics,
@@ -726,6 +728,7 @@ impl Engine{
             let mut clock=0;let mut epoch=0;
             if matches!(watch.venue,Venue::Dlmm|Venue::Pump) {
                 let acc=dict.get(fees::CLOCK).context("chain clock unavailable")?;
+                ensure!(acc.owner=="Sysvar1111111111111111111111111111111111111" && acc.data.len()==40,"invalid chain Clock");
                 clock=i64::from_le_bytes(bytes(&acc.data,32,8)?.try_into()?);epoch=u64_le(&acc.data,16)?;
                 fee_subs.push((Field::Clock,fees::CLOCK.to_string(),acc));
             }
@@ -826,7 +829,19 @@ impl Engine{
             evidence.unchanged_gross_price_updates+=u64::from(previous==Some(event.price_quote_per_base));
             evidence.asymmetric_rates+=u64::from(v.estimated_net_rates.iter().all(Option::is_some)
                 && (v.estimated_net_rates[0].unwrap()*v.estimated_net_rates[1].unwrap()-1.0).abs()>1e-12);
-            if evidence.samples.iter().filter(|p|p.venue==event.venue).count()<8 {evidence.samples.push(event.clone());}
+            if evidence.samples.iter().filter(|p|p.observation.venue==event.venue).count()<8 {
+                let p=&self.pools[pi];
+                let inputs=match &p.state {
+                    State::Dlmm{active,step,fee}=>serde_json::json!({"native_mint_a":p.a,"native_mint_b":p.b,
+                        "decimals":[p.da,p.db],"active_id":active,"bin_step":step,"fee_parameters":fee}),
+                    State::Pump{base,quote,vquote,fee_pool,global,config,supply,..}=>serde_json::json!({
+                        "native_mint_a":p.a,"native_mint_b":p.b,"decimals":[p.da,p.db],"base_raw":base,
+                        "quote_vault_raw":quote,"virtual_quote_raw":vquote.to_string(),"base_supply_raw":supply,
+                        "pool_fee_fields":fee_pool,"global":global,"fee_config":config}),
+                    _=>serde_json::Value::Null,
+                };
+                evidence.samples.push(FeeSample{observation:event.clone(),inputs});
+            }
         }
         self.emit(MarketStateEvent::Price(event));
         if matches!(origin,PriceOrigin::Websocket){
@@ -886,7 +901,7 @@ impl Engine{
                 *fee_pool=fees::PumpPool::decode(data)?;
                 *vquote=if data.len()<261{0}else{i128_le(data,245)?};*pool_slot=slot;
             },
-            (_,Field::Clock)=>{pool.clock=i64::from_le_bytes(bytes(data,32,8)?.try_into()?);pool.epoch=u64_le(data,16)?;},
+            (_,Field::Clock)=>{ensure!(data.len()==40,"invalid chain Clock length");pool.clock=i64::from_le_bytes(bytes(data,32,8)?.try_into()?);pool.epoch=u64_le(data,16)?;},
             (State::Pump{global,..},Field::PumpGlobal)=>{if let Some(fees::Shared::Global(value))=shared{*global=Some(value);}},
             (State::Pump{config,..},Field::PumpFees)=>{if let Some(fees::Shared::Config(value))=shared{*config=Some(value);}},
             (State::Pump{supply,..},Field::PumpSupply)=>{ensure!(bytes(data,45,1)?[0]==1,"Pump mint uninitialized");*supply=Some(u64_le(data,36)?);},
@@ -934,7 +949,7 @@ impl Engine{
             if emit {self.publish_unavailable(pi,slot,recv_us,reason);}
             return Ok(());
         }
-        if field==Field::Clock && prior_epoch==pool.epoch && pool.last_valuation.is_some() {
+        if field==Field::Clock && prior_epoch==pool.epoch && pool.last_valuation.as_ref().is_some_and(|v|v.estimated_net_rates.iter().all(Option::is_some)) {
             let due=match &pool.state{State::Dlmm{fee,..}=>pool.clock>=fee.next_change(prior_clock),_=>false};
             if !due{return Ok(());}
         }
@@ -1035,13 +1050,16 @@ fn select(candidates:&HashMap<Pubkey,PoolInput>,catalog:&WatchCatalog,
         candidates.get(&pool.address).copied().filter(|p|
             (p.mint_a.min(p.mint_b),p.mint_a.max(p.mint_b))==(pool.mint_a,pool.mint_b))
     }).map(|p|(p.address,p)).collect::<HashMap<_,_>>();
-    let required_accounts=eligible.values().map(|p|watch_cost(p.venue)).sum::<usize>();
+    let shared_cost=if eligible.values().any(|p|p.venue==CoreVenue::PumpSwap){3}
+        else if eligible.values().any(|p|p.venue==CoreVenue::MeteoraDlmm){1}else{0};
+    let pool_budget=account_budget.saturating_sub(shared_cost);
+    let required_accounts=eligible.values().map(|p|watch_cost(p.venue)).sum::<usize>()+shared_cost;
     let (picked,used,backbone,mode)=if eligible.len()<=max_pools && required_accounts<=account_budget {
         // All admissible catalog pools fit. Ranking cannot improve this set.
         (eligible.keys().copied().collect::<HashSet<_>>(),required_accounts,0,"all_fit")
     }else{
-        let (picked,used,backbone)=select_budgeted(&eligible,catalog,limit,account_budget,previous,registry);
-        (picked,used,backbone,"budgeted")
+        let (picked,used,backbone)=select_budgeted(&eligible,catalog,limit,pool_budget,previous,registry);
+        (picked,used+shared_cost,backbone,"budgeted")
     };
     // Keep actual route coverage; there is no historical comparison selection.
     let actual=route_coverage(catalog,&picked);
@@ -1386,9 +1404,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     ensure!((1000..=300000).contains(&selection_interval_ms)
         && account_budget>0,"invalid selection interval or WS account budget");
     let selection_capacity=control.capacity().min(account_budget);
-    // Shared Clock + Pump GlobalConfig/FeeConfig are watched once, not per pool.
-    ensure!(selection_capacity>3,"CP8A requires room for shared fee accounts");
-    let pool_capacity=selection_capacity-3;
+
     ensure!((1..=32).contains(&concurrency) && (1..=256).contains(&batch_pools),
         "invalid market hydration concurrency/batch configuration");
     crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_source=central_registry baseline=dynamic_only graph_selection=true");
@@ -1485,7 +1501,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 let enabled_now=*enabled.borrow();
                 selector_jobs.spawn_blocking(move||{
                     let picked=if enabled_now {
-                        select(&source,&view,pool_cap,pool_capacity,&previous,&owner)
+                        select(&source,&view,pool_cap,selection_capacity,&previous,&owner)
                     }else{Vec::new()};
                     (generation,picked)
                 });
@@ -1644,7 +1660,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
     for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence});}
     crate::log_event!(Info,"market state stopped=true events={} observations={} websocket={} lost={}",
-        engine.sequence,engine.metrics.baseline_prices+engine.metrics.websocket_prices,engine.metrics.websocket_prices,engine.metrics.lost);
+        engine.sequence,engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,engine.metrics.websocket_prices,engine.metrics.lost);
     Ok(ProductionReport{events:engine.sequence,
         observations:engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,
         websocket_observations:engine.metrics.websocket_prices,

@@ -30,7 +30,11 @@ Signal Engine owns stable pool identities, current prices, ordered directed weig
 compact topology rankings and qualifying candidates. Weights use integer Q48
 negative logarithms. A candidate is the best closed-route witness for a topology and
 direction below the configured threshold; it is not a swap quote or profit guarantee.
-Fees, amount, depth, slippage and execution costs are not included.
+The optimistic gross screening score remains unchanged. CP8A additionally carries
+current directed DLMM/PumpSwap marginal DEX-fee estimates in each price and witness;
+ExecutionCandidates uses the estimated net score for prioritization without a new
+exclusion threshold. Amount, depth, exact transfer-fee effects, slippage and execution
+costs are not included. See [CP8A](CP8A.md).
 
 On graph replacement, the worker compares the two actually installed generations.
 It remaps winners by topology identity and directed roles. New topologies and those

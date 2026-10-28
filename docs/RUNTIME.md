@@ -184,3 +184,7 @@ MarketState unterscheidet im Abschlussbericht `selected_pools`, strukturell
 installierte `hydrated_pools`, nach Baseline betriebsbereite `ready_pools` und
 `priced_pools`. Der alte Final-Logname `prepared` fuer installierte Pools entfaellt;
 Completion-Prepared und Preisbereitschaft werden dadurch nicht verwechselt.
+
+For the two-protocol 30-minute fee checkpoint, use the existing starter with
+`-EnabledVenues meteora_dlmm,pumpswap -RequireFeeEvidence`; the exact PowerShell
+command and acceptance limits are in [CP8A](CP8A.md).

@@ -62,7 +62,7 @@ stateless counting consumer, which retains no pool or price state.
 
 Decoders and price formulas derive from the original standalone producer. Transport, independent pool lists and standalone startup from that prototype are replaced by framework contracts. The decoder rejects an unknown owner/layout; unsupported pools remain unavailable instead of receiving a fabricated price. Raydium Stable has no decoder in that input and is explicitly unavailable.
 
-These are price indicators, not amount-dependent executable quotes. They omit swap fees, slippage, DLMM bin traversal, tick liquidity traversal, transfer-fee execution effects and other execution costs. AMM V4 does not reconstruct OpenOrders inventory. Manifest midpoint is not a directional fill quote. Successful live coverage of one venue does not validate every other venue's layout; the real price events identify the observed venue; unobserved decoders remain unproven.
+These are price indicators, not amount-dependent executable quotes. For DLMM/PumpSwap, CP8A additionally publishes directed marginal DEX-fee estimates and fee provenance (see [CP8A](CP8A.md)). Other venues retain their existing indicators. They omit exact amount rounding, slippage, DLMM bin traversal, tick liquidity traversal, transfer-fee execution effects and other execution costs. AMM V4 does not reconstruct OpenOrders inventory. Manifest midpoint is not a directional fill quote. Successful live coverage of one venue does not validate every other venue's layout; the real price events identify the observed venue; unobserved decoders remain unproven.
 
 ## Bootstrap, recovery and removal
 
@@ -98,3 +98,5 @@ MARKET_STATE_TRACE=0
 
 `Stats.ws_text_bytes` counts received WS text-frame payload bytes, including JSON/base64 overhead. It excludes HTTP traffic, TLS/TCP framing and provider-specific billing multipliers. It is not a billing estimate.
 
+
+CP8A watches full DLMM/PumpSwap pool accounts plus shared chain Clock, Pump GlobalConfig/FeeConfig and Pump base Mint supply. Shared addresses are deduplicated; see [CP8A](CP8A.md) for fee-only revaluation, unknown token-transfer costs and live acceptance.

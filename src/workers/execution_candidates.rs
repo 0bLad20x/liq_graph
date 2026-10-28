@@ -152,7 +152,7 @@ impl State {
             .context("candidate state topology absent")?;
         ensure!(witness.legs.len()==top.length && (2..=4).contains(&top.length)
             && !(top.kind==SignalRouteKind::Direct2&&reverse),"candidate state length/direction invalid");
-        let mut unique=HashSet::new();let mut sum=0_i128;
+        let mut unique=HashSet::new();let mut sum=0_i128;let mut net_sum=Some(0_i128);
         for (i,leg) in witness.legs.iter().enumerate(){
             let j=if reverse{top.length-1-i}else{i};
             let (a,b)=top.roles[j];let (input,output)=if reverse{(b,a)}else{(a,b)};
@@ -163,7 +163,12 @@ impl State {
                 && unique.insert(leg.slot/2),"candidate state pool/direction invalid");
             ensure!(self.weight(leg.slot)==Some(leg.log_weight_units),"candidate state weight mismatch");
             sum+=i128::from(leg.log_weight_units);
+            net_sum=net_sum.zip(self.prices.get(leg.slot/2).and_then(|p|p.as_ref())
+                .and_then(|p|p.estimated_net_weight_units[leg.slot%2]))
+                .map(|(sum,n)|sum+i128::from(n));
         }
+        ensure!(net_sum.and_then(|n|i64::try_from(n).ok())==witness.estimated_net_log_sum_units,
+            "candidate net estimate revision mismatch");
         ensure!(witness.legs[0].input_mint==top.settlement
             && witness.legs.last().is_some_and(|l|l.output_mint==top.settlement)
             && witness.legs.windows(2).all(|l|l[0].output_mint==l[1].input_mint)
