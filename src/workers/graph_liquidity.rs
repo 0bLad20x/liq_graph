@@ -2,7 +2,7 @@
 //! No RPC, database, protocol-account interpretation, signal producer, or transaction building.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     mem::size_of,
     fs::File,
     io::{BufWriter, Write},
@@ -10,26 +10,52 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, ensure, bail};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch, mpsc}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
 
-use crate::core::{CompletionState, PoolState, PoolUpdateBatch};
+use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 pub type Pair = (Pubkey, Pubkey);
 
-#[derive(Clone, Copy, Debug)]
-pub struct Settings;
-
+/// Explicit graph-only venue allowlist. Upstream Registry/Completion keep all venues.
+#[derive(Clone, Debug)]
+pub struct Settings { enabled_venues: Vec<Venue> }
 impl Settings {
     pub fn from_env() -> Result<Self> {
         if std::env::var_os("GRAPH_MIN_TVL_USD").is_some() {
             crate::log_event!(Warn,"GRAPH_MIN_TVL_USD is ignored; Registry completion admission owns the common TVL gate");
         }
-        Ok(Self)
+        let configured = std::env::var("GRAPH_ENABLED_VENUES")
+            .context("GRAPH_ENABLED_VENUES is required for graph runs (example: meteora_dlmm,pumpswap)")?;
+        let mut enabled_venues = Vec::new();
+        for name in configured.split(',').map(str::trim) {
+            let venue = match name {
+                "meteora_dlmm" => Venue::MeteoraDlmm,
+                "meteora_damm_v2" => Venue::MeteoraDammV2,
+                "raydium_amm_v4" => Venue::RaydiumAmmV4,
+                "raydium_cpmm" => Venue::RaydiumCpmm,
+                "raydium_clmm" => Venue::RaydiumClmm,
+                "raydium_stable" => Venue::RaydiumStable,
+                "orca_whirlpool" => Venue::OrcaWhirlpool,
+                "pancakeswap_clmm" => Venue::PancakeSwapClmm,
+                "byreal_clmm" => Venue::ByrealClmm,
+                "manifest" => Venue::Manifest,
+                "pumpswap" => Venue::PumpSwap,
+                _ => bail!("unknown GRAPH_ENABLED_VENUES entry '{name}'"),
+            };
+            ensure!(!enabled_venues.contains(&venue),
+                "duplicate GRAPH_ENABLED_VENUES entry '{name}'");
+            enabled_venues.push(venue);
+        }
+        ensure!(!enabled_venues.is_empty(), "GRAPH_ENABLED_VENUES must not be empty");
+        Ok(Self { enabled_venues })
+    }
+    fn allows(&self, venue: Venue) -> bool {
+        self.enabled_venues.contains(&venue)
     }
 }
 
@@ -40,7 +66,7 @@ struct PreparedPool {
     b: Pubkey,
 }
 
-fn eligible(pool: &PoolState) -> Option<PreparedPool> {
+fn valid_prepared(pool: &PoolState) -> Option<PreparedPool> {
     let (Some(a), Some(b), Some(slot), Some(manifest)) =
         (pool.mint_a, pool.mint_b, pool.completion_validated_slot,
          pool.execution_manifest.as_ref()) else { return None };
@@ -53,6 +79,10 @@ fn eligible(pool: &PoolState) -> Option<PreparedPool> {
         return None;
     }
     Some(PreparedPool { address: pool.address, a, b })
+}
+fn eligible(pool: &PoolState, settings: &Settings) -> Option<PreparedPool> {
+    if !settings.allows(pool.venue) { return None; }
+    valid_prepared(pool)
 }
 
 /// CP6B observational evidence; never participates in admission or routing.
@@ -335,6 +365,9 @@ impl GraphSnapshot {
 #[derive(serde::Serialize)]
 pub struct MembershipReport {
     pub passed:bool,
+    pub registry_prepared_pools:usize,
+    pub registry_excluded_by_venue:usize,
+    pub eligible_by_venue:BTreeMap<String,usize>,
     pub registry_eligible_pools:usize,
     pub graph_pools:usize,
     pub registry_conversion_pools:usize,
@@ -352,9 +385,22 @@ impl MembershipReport {
         Ok(())
     }
 }
-pub fn compare_registry(graph:&GraphSnapshot,registry:&[PoolState])->Result<MembershipReport> {
-    let expected:HashMap<_,_>=registry.iter().filter_map(eligible)
-        .map(|p|(p.address,pair(p.a,p.b))).collect();
+pub fn compare_registry(graph:&GraphSnapshot,registry:&[PoolState],settings:&Settings)->Result<MembershipReport> {
+    let mut expected=HashMap::new();
+    let mut registry_prepared_pools=0_usize;
+    let mut registry_excluded_by_venue=0_usize;
+    let mut eligible_by_venue=BTreeMap::<String,usize>::new();
+    for pool in registry {
+        if let Some(p)=valid_prepared(pool) {
+            registry_prepared_pools+=1;
+            if settings.allows(pool.venue) {
+                expected.insert(p.address,pair(p.a,p.b));
+                *eligible_by_venue.entry(format!("{:?}",pool.venue)).or_default()+=1;
+            } else {
+                registry_excluded_by_venue+=1;
+            }
+        }
+    }
     let conversion=pair(WSOL.parse()?,USDC.parse()?);
     let mut missing_pools=Vec::new();let mut unexpected_pools=Vec::new();let mut pair_mismatches=Vec::new();
     for (address,mints) in &expected {
@@ -369,14 +415,17 @@ pub fn compare_registry(graph:&GraphSnapshot,registry:&[PoolState])->Result<Memb
     }
     missing_pools.sort_unstable();unexpected_pools.sort_unstable();pair_mismatches.sort_unstable();
     let passed=missing_pools.is_empty() && unexpected_pools.is_empty() && pair_mismatches.is_empty()
-        && graph.qualified_pools==graph.pool_pairs.len();
-    let report=MembershipReport{passed,registry_eligible_pools:expected.len(),graph_pools:graph.pool_pairs.len(),
+        && graph.qualified_pools==graph.pool_pairs.len()
+        && registry_prepared_pools==registry_excluded_by_venue+expected.len();
+    let report=MembershipReport{passed,registry_prepared_pools,registry_excluded_by_venue,
+        eligible_by_venue,registry_eligible_pools:expected.len(),graph_pools:graph.pool_pairs.len(),
         registry_conversion_pools:expected.values().filter(|p|**p==conversion).count(),
         graph_conversion_pools:graph.pool_pairs.values().filter(|p|**p==conversion).count(),
         missing_pools,unexpected_pools,pair_mismatches};
     crate::log_event!(Info,
-        "graph registry_membership passed={} registry_pools={} graph_pools={} registry_conversion={} graph_conversion={} missing={} unexpected={} pair_mismatches={}",
-        report.passed,report.registry_eligible_pools,report.graph_pools,
+        "graph registry_membership passed={} registry_prepared={} excluded_by_venue={} eligible_by_venue={} registry_pools={} graph_pools={} registry_conversion={} graph_conversion={} missing={} unexpected={} pair_mismatches={}",
+        report.passed,report.registry_prepared_pools,report.registry_excluded_by_venue,
+        serde_json::json!(report.eligible_by_venue),report.registry_eligible_pools,report.graph_pools,
         report.registry_conversion_pools,report.graph_conversion_pools,report.missing_pools.len(),
         report.unexpected_pools.len(),report.pair_mismatches.len());
     Ok(report)
@@ -695,8 +744,10 @@ const REBUILD_SPACING:Duration=Duration::from_secs(3);
 pub async fn run(
     mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     output:watch::Sender<Arc<GraphSnapshot>>,
-    _settings:Settings,
+    settings:Settings,
 )->Result<()>{
+    crate::log_event!(Info,"graph venue_filter enabled={:?} allowed={} scope=graph_only",
+        settings.enabled_venues,settings.enabled_venues.len());
     let mut prepared=HashMap::<Pubkey,PreparedPool>::new();
     let mut dirty=HashMap::<Pubkey,Option<PreparedPool>>::new();
     let mut pending_traces=Vec::<ObservedTransition>::new();
@@ -733,7 +784,7 @@ pub async fn run(
                 Ok(batch)=>{
                     let mut changes=0;
                     for pool in &batch.pools {
-                        let next=eligible(pool);
+                        let next=eligible(pool,&settings);
                         let before=prepared.get(&pool.address).copied();
                         if before==next {
                             // Track the latest Registry evidence for previously
