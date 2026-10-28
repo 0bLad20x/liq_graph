@@ -23,6 +23,11 @@ impl Dependencies {
         ensure!(m.base_a.first().is_some_and(|a|a.address==program),"DLMM manifest program mismatch");
         let root=m.base_a.iter().position(|a|a.address==m.pool).context("DLMM manifest root missing")?;
         let mut tail=&m.base_a.get(root+4..).context("DLMM manifest vault/oracle block missing")?[..];
+        ensure!(m.base_b.first().is_some_and(|a|a.address==program),"DLMM reverse manifest program mismatch");
+        let reverse_root=m.base_b.iter().position(|a|a.address==m.pool).context("DLMM reverse manifest root missing")?;
+        let reverse_tail=m.base_b.get(reverse_root+4..).context("DLMM reverse manifest vault/oracle block missing")?;
+        ensure!(tail.len()==reverse_tail.len() && tail.iter().zip(reverse_tail).all(|(a,b)|
+            a.address==b.address && a.writable==b.writable),"DLMM directional array windows differ");
         let bitmap_address=Pubkey::find_program_address(&[b"bitmap",m.pool.as_ref()],&program).0;
         let bitmap=if tail.first().is_some_and(|a|a.address==bitmap_address) {
             tail=&tail[1..];Some(bitmap_address)
@@ -213,7 +218,8 @@ impl Book {
             "active_id":i32_le(&self.raw_pair,76).ok(),"bin_step":super::u16_le(&self.raw_pair,80).ok(),
             "arrays":self.arrays.iter().enumerate().filter_map(|(i,a)|a.as_ref().map(|a|serde_json::json!({
                 "address":self.dependencies.arrays[i].to_string(),"index":a.index,"version":a.version,"data_base64":encode(&a.raw)}))).collect::<Vec<_>>(),
-            "bitmap_extension_base64":self.extension.as_ref().map(|v|encode(v)),"profile":self.profile})
+            "bitmap_extension_base64":self.extension.as_ref().map(|v|encode(v)),"profile":self.profile,
+            "complete_levels":self.profile.as_ref().map(|p|p.directions.iter().map(|d|&d.levels).collect::<Vec<_>>())})
     }
 }
 

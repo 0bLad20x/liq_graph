@@ -164,3 +164,9 @@ and account/price coverage as well as simulation counts to the earlier run;
 different duration or subscription workload is not an isolated speed benchmark.
 
 Checkpoint completion and merge readiness require the real artifacts to pass review.
+
+Ordinary observation/request JSON includes `levels.count` and `levels.first`, plus
+directional totals, coverage and the material content digest. Complete level vectors
+stay in the live typed contract and are included in explicitly focused raw snapshots
+as `accounts.complete_levels`. This bounds evidence duplication across thousands of
+requests; it does not limit traversal, signal calculation or pool alternatives.

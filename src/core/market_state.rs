@@ -73,8 +73,16 @@ pub struct DirectedLiquidity {
     pub first_source_position:Option<i32>,
     pub marginal_net_rate:Option<f64>,
     pub input_capacity_raw:Option<String>,pub output_capacity_raw:String,
+    /// Complete live calculation data. Ordinary JSON evidence records count and
+    /// first level; explicit raw-account evidence can include the full vector.
+    #[serde(serialize_with="level_summary")]
     pub levels:Vec<LiquidityLevel>,
     pub reason:Option<String>,
+}
+fn level_summary<S:serde::Serializer>(levels:&[LiquidityLevel],serializer:S)->Result<S::Ok,S::Error> {
+    #[derive(serde::Serialize)]
+    struct Summary<'a>{count:usize,first:Option<&'a LiquidityLevel>}
+    serde::Serialize::serialize(&Summary{count:levels.len(),first:levels.first()},serializer)
 }
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct PoolLiquidity {
