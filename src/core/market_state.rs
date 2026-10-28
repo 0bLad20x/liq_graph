@@ -1,4 +1,5 @@
 //! Shared indicative pool-price stream. No execution sizing or admission policy.
+use std::sync::Arc;
 /// Prices use human token units: quote-mint units per one base-mint unit.
 /// The canonical base/quote orientation is deterministic across venues.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -23,7 +24,7 @@ pub struct PricePipelineTiming {
     pub initialization_replay:bool,
 }
 /// CP8A estimates in human units, in canonical base->quote / quote->base order.
-/// Gross screening remains optimistic; net estimates never prove exclusion.
+/// Marginal DEX-net estimates are not amount-specific profit or sizing proofs.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct FeeValuation {
     pub model: &'static str,
@@ -39,6 +40,52 @@ pub struct FeeValuation {
     /// Host rebates, integer rounding and price impact are not estimated here.
     pub scope: &'static str,
 }
+
+/// A protocol-independent description of observed directed price levels.
+/// Raw amounts belong to the named input/output mints. No token UI scaling is
+/// applied to integer fee and fill calculations. Coverage is not a pool veto.
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct LiquidityLevel {
+    pub source_position:i32,
+    pub gross_rate:f64,
+    pub net_rate:f64,
+    pub fee_rate:f64,
+    pub fees_on_input:bool,
+    /// Full-level output/input after integer rounding, unlike marginal net_rate.
+    pub full_level_net_rate:Option<f64>,
+    /// Cost/output of filling this level, including integer fee rounding.
+    /// None means its complete input does not fit the protocol's u64 amount.
+    pub input_raw:Option<u64>,
+    pub output_raw:u64,
+    pub minimum_input_raw:Option<u64>,
+    pub fee_raw:Option<u64>,
+}
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct DirectedLiquidity {
+    pub input_mint:String,pub output_mint:String,
+    pub input_decimals:u8,pub output_decimals:u8,
+    /// available / empty / uncovered / unknown. Empty is relative to coverage.
+    pub status:&'static str,
+    /// exhausted_bitmap / execution_window_end / account_unavailable / invalid /
+    /// amount_unrepresentable. Exhaustion refers to the observed bitmap only.
+    pub coverage:&'static str,
+    pub next_required_account:Option<String>,
+    pub first_source_position:Option<i32>,
+    pub marginal_net_rate:Option<f64>,
+    pub input_capacity_raw:Option<String>,pub output_capacity_raw:String,
+    pub levels:Vec<LiquidityLevel>,
+    pub reason:Option<String>,
+}
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct PoolLiquidity {
+    pub model:&'static str,pub revision:u64,
+    /// Material identity survives rehydration/revision restarts.
+    pub content_digest:[u8;32],
+    pub account_set_digest:[u8;32],
+    pub execution_accounts:Vec<String>,
+    /// Canonical base->quote / quote->base, like FeeValuation.
+    pub directions:[DirectedLiquidity;2],
+}
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PoolPriceObservation {
     pub origin: PriceOrigin,
@@ -50,6 +97,7 @@ pub struct PoolPriceObservation {
     pub quote_mint: String,
     pub price_quote_per_base: f64,
     pub valuation: Option<FeeValuation>,
+    pub liquidity:Option<Arc<PoolLiquidity>>,
     pub previous_price: Option<f64>,
     pub delta_bps: Option<f64>,
     pub price_kind: PriceKind,

@@ -13,7 +13,7 @@ use crate::core::{
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
 use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
 
-const OUTPUT_LAYOUT:&str="versioned_net_candidate_state_cp8a2";
+const OUTPUT_LAYOUT:&str="versioned_net_liquidity_state_cp8b";
 pub const OUTPUT_CAPACITY:usize=16384;
 
 #[derive(Clone,Copy)]
@@ -554,6 +554,13 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                             .map(|v|(&v.dex_fee_rates,&v.fees_on_input,&v.token_fee_status,&v.unknown_reason));
                         let current_fee=p.valuation.as_ref().map(|v|(&v.dex_fee_rates,&v.fees_on_input,&v.token_fee_status,&v.unknown_reason));
                         let fee_changed=previous_fee!=current_fee;
+                        let previous_liquidity=old.price.as_ref().and_then(|v|v.observation.liquidity.as_ref())
+                            .map(|v|(v.account_set_digest,v.content_digest));
+                        let current_liquidity=p.liquidity.as_ref().map(|v|(v.account_set_digest,v.content_digest));
+                        let liquidity_changed=previous_liquidity!=current_liquidity;
+                        e.production.liquidity_inputs+=u64::from(p.liquidity.is_some());
+                        e.production.liquidity_only_updates+=u64::from(liquidity_changed&&!fee_changed
+                            &&old.price.as_ref().is_some_and(|v|v.log_weight_units==e.prices.values[old.pool].as_ref().unwrap().log_weight_units));
                         let change=e.index.refresh(address,&old,&e.prices)?;
                         let index_ns=nanos(index_start);
                         let mut work=e.begin(SignalTrigger::Price{pool:address,
@@ -562,7 +569,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         work.stats.price_preparation_ns=preparation_ns;
                         work.stats.index_update_ns=index_ns;work.stats.logarithms_prepared=known as u64;
                         e.state(&mut work,false,false,vec![e.prices.change(old.pool)])?;
-                        if change||fee_changed{e.candidates(&mut work,address,fee_changed)?;}
+                        if change||fee_changed||liquidity_changed{e.candidates(&mut work,address,fee_changed||liquidity_changed)?;}
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Unavailable{pool,sequence,..}|MarketStateEvent::Removed{pool,sequence,..}=>{
@@ -805,6 +812,7 @@ pub struct ProductionReport {
     score_basis:&'static str,
     error: Option<String>, counts: Counts,pub input_events:u64,
     observations_by_known_net_directions:[u64;3],candidate_windows:CandidateWindows,
+    liquidity_inputs:u64,liquidity_only_updates:u64,
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
     steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
     revaluation_inputs:ProductionTimings,

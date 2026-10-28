@@ -27,24 +27,34 @@ impl Dlmm {
             last:i64::from_le_bytes(bytes(d,56,8)?.try_into()?)})
     }
     pub fn next_change(&self,now:i64)->i64 {
+        if now<self.last{return self.last;}
         let filter=self.last.saturating_add(i64::from(self.filter));
         let decay=self.last.saturating_add(i64::from(self.decay));
         if now<filter{filter}else if now<decay{decay}else{i64::MAX}
     }
     pub fn rates(&self,active:i32,step:u16,now:i64)->Result<(f64,f64,[bool;2])> {
+        self.rates_at(active,active,step,now)
+    }
+    /// Reference reset uses the actual current bin; volatility then follows the
+    /// reached price level. Resetting at the target would erase crossing fees.
+    pub fn rates_at(&self,active:i32,target:i32,step:u16,now:i64)->Result<(f64,f64,[bool;2])> {
+        let (base,total,directions)=self.rate_units_at(active,target,step,now)?;
+        Ok((base as f64/1e9,total as f64/1e9,directions))
+    }
+    pub fn rate_units_at(&self,active:i32,target:i32,step:u16,now:i64)->Result<(u64,u64,[bool;2])> {
         ensure!(now>=self.last && self.reduction<=10000,"DLMM clock/fee reference invalid");
         let elapsed=now-self.last;
         let (index,reference)=if elapsed>=i64::from(self.filter) {
             (active,if elapsed<i64::from(self.decay){u64::from(self.vol)*u64::from(self.reduction)/10000}else{0})
         }else{(self.index,u64::from(self.reference))};
-        let vol=(reference+u64::from(index.abs_diff(active))*10000).min(u64::from(self.max_vol));
+        let vol=(reference+u64::from(index.abs_diff(target))*10000).min(u64::from(self.max_vol));
         let power=10_u128.checked_pow(u32::from(self.power)).context("DLMM fee power overflow")?;
         let base=u128::from(self.factor).checked_mul(u128::from(step)).and_then(|n|n.checked_mul(10))
             .and_then(|n|n.checked_mul(power)).context("DLMM base fee overflow")?;
         let square=(u128::from(vol)*u128::from(step)).checked_pow(2).context("DLMM volatility overflow")?;
         let variable=u128::from(self.control).checked_mul(square).context("DLMM variable fee overflow")?.div_ceil(100_000_000_000);
         let total=base.checked_add(variable).context("DLMM total fee overflow")?.min(100_000_000);
-        Ok((base.min(100_000_000) as f64/1e9,total as f64/1e9,
+        Ok((base.min(100_000_000) as u64,total as u64,
             if self.mode==0{[true,true]}else{[false,true]})) // native X->Y, Y->X
     }
 }

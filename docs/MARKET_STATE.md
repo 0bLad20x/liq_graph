@@ -16,15 +16,17 @@ route coverage is computed once. There is no alphabetical historical comparison.
 
 `MARKET_STATE_POOL_LIMIT` defaults to 15000; zero removes only the pool-count cap.
 Effective account capacity is the minimum of `MARKET_STATE_WS_ACCOUNT_BUDGET` and
-transport capacity. Reserve venues cost at most three watched accounts per pool,
-other supported venues one; the actual plan deduplicates shared account addresses.
+transport capacity. DLMM costs its root plus declared arrays and optional bitmap;
+PumpSwap costs four per-pool accounts. Reserve venues cost three, other supported
+venues one, plus shared fee/Clock accounts. The actual plan deduplicates addresses.
 An account-budget violation fails explicitly. Selection is not a profitability rule.
 
 Structural installation updates pools and account indices once. Dynamic baseline
 installation retains pool positions, static account bindings and desired watches.
 HTTP baselines remain necessary after subscription ACKs and resyncs. Ticket revisions,
 identity checks, component slot floors and cached WebSocket catch-up protect against
-stale initializer results. A manifest-only refresh does not change the static watches.
+stale initializer results. A renewed manifest validation slot keeps static watches;
+changed DLMM account dependencies require structural replacement.
 
 ## Output and measurement
 
@@ -49,7 +51,7 @@ stateless counting consumer, which retains no pool or price state.
 
 | Venue | Indicative price | Account watches |
 |---|---|---|
-| Meteora DLMM | Active bin and bin step, decimal normalization | Pool field slice |
+| Meteora DLMM | Active-bin raw indicator; directed net uses first reachable liquid bin | Full pool, declared BinArrays, optional bitmap, shared Clock |
 | Meteora DAMM V2 | Squared Q64.64 sqrt price | Pool field slice |
 | Raydium CLMM | Squared Q64.64 sqrt price | Pool field slice |
 | Orca Whirlpool | Squared Q64.64 sqrt price | Pool field slice |
@@ -62,7 +64,14 @@ stateless counting consumer, which retains no pool or price state.
 
 Decoders and price formulas derive from the original standalone producer. Transport, independent pool lists and standalone startup from that prototype are replaced by framework contracts. The decoder rejects an unknown owner/layout; unsupported pools remain unavailable instead of receiving a fabricated price. Raydium Stable has no decoder in that input and is explicitly unavailable.
 
-These are price indicators, not amount-dependent executable quotes. For DLMM/PumpSwap, CP8A additionally publishes directed marginal DEX-fee estimates and fee provenance (see [CP8A](CP8A.md)). Other venues retain their existing indicators. They omit exact amount rounding, slippage, DLMM bin traversal, tick liquidity traversal, transfer-fee execution effects and other execution costs. AMM V4 does not reconstruct OpenOrders inventory. Manifest midpoint is not a directional fill quote. Successful live coverage of one venue does not validate every other venue's layout; the real price events identify the observed venue; unobserved decoders remain unproven.
+These are price indicators, not amount-dependent executable route quotes. For
+DLMM/PumpSwap, CP8A publishes directed marginal DEX-fee estimates and provenance
+(see [CP8A](CP8A.md)). [CP8B](CP8B.md) adds observed DLMM traversal, raw level fill
+amounts and integer fee rounding inside the execution account window. Other venues
+retain their indicators. Full route slippage, tick traversal, transfer-fee execution
+effects and other execution costs remain outside the signal. AMM V4 does not
+reconstruct OpenOrders inventory. Manifest midpoint is not a directional fill quote.
+One venue's coverage does not validate other unobserved decoders.
 
 ## Bootstrap, recovery and removal
 
