@@ -85,8 +85,18 @@ impl Prices {
         let units = (-logarithm * SIGNAL_LOG_SCALE as f64).round() as i64;
         weights[forward] = logarithm.is_finite().then_some(units);
         weights[forward ^ 1] = (logarithm.is_finite() && (1.0 / price).is_finite()).then_some(-units);
+        let mut net=[None;2];
+        if let Some(v)=&p.valuation {
+            for (direction,rate) in v.estimated_net_rates.iter().enumerate(){
+                if let Some(rate)=rate.filter(|r|r.is_finite()&&*r>0.0) {
+                    let n=(-rate.ln()*SIGNAL_LOG_SCALE as f64).round();
+                    ensure!(n.is_finite()&&n>=i64::MIN as f64&&n<i64::MAX as f64,"net weight overflow");
+                    net[forward^direction]=Some(n as i64);
+                }
+            }
+        }
         let old = self.values[id].replace(Arc::new(SignalPoolPrice {
-            log_weight_units: weights, observation: Arc::new(p.clone()),
+            log_weight_units: weights, estimated_net_weight_units:net, observation: Arc::new(p.clone()),
         }));
         Ok((address, Previous { pool: id, price: old }))
     }
@@ -106,7 +116,7 @@ struct Key { weight: i64, slot: usize }
 fn key(weight: i64, slot: usize) -> Key { Key { weight, slot } }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-struct Winner{slots:[usize;4],length:usize,total:i64}
+struct Winner{slots:[usize;4],length:usize,total:i64,net:Option<i64>}
 fn first_two(set:Option<&BTreeSet<Key>>)->[Option<Key>;2]{
     let mut values=set.into_iter().flat_map(|v|v.iter());
     [values.next().copied(),values.next().copied()]
@@ -200,7 +210,9 @@ impl CompactIndex {
             let slot=2*old.pool+direction;
             let before=old.price.as_ref().and_then(|p|p.log_weight_units[direction]);
             let after=prices.weight(slot,None);
-            if before==after{continue;}
+            let before_net=old.price.as_ref().and_then(|p|p.estimated_net_weight_units[direction]);
+            let after_net=prices.values[old.pool].as_ref().and_then(|p|p.estimated_net_weight_units[direction]);
+            if before==after{changed|=before_net!=after_net;continue;}
             let set=self.ranked.entry(role).or_default();
             let old_top=first_two(Some(set));
             if let Some(w)=before {
@@ -216,7 +228,7 @@ impl CompactIndex {
     fn first(&self,a:Pubkey,b:Pubkey,exclude:Option<usize>)->Option<Key>{
         self.ranked.get(&(a,b))?.iter().find(|p|Some(p.slot/2)!=exclude).copied()
     }
-    fn best(&self,top:&SignalTopology,reverse:bool)->Result<Option<Winner>>{
+    fn best(&self,top:&SignalTopology,reverse:bool,prices:&Prices)->Result<Option<Winner>>{
         let mut slots=[0_usize;4];
         if top.kind==SignalRouteKind::Direct2 {
             if reverse{return Ok(None);}
@@ -229,7 +241,7 @@ impl CompactIndex {
                 .map(|l|(l,r)));
             let result=[first,second].into_iter().flatten().filter_map(|(l,r)|{
                 let total=i64::try_from(i128::from(l.weight)+i128::from(r.weight)).ok()?;
-                Some(Winner{slots:[l.slot,r.slot,0,0],length:2,total})
+                Some(Winner{slots:[l.slot,r.slot,0,0],length:2,total,net:Self::net_total(&[l.slot,r.slot],prices)})
             }).min_by_key(|p|(p.total,p.slots));
             return Ok(result);
         }
@@ -243,7 +255,12 @@ impl CompactIndex {
             total+=i128::from(chosen.weight);
         }
         let total=i64::try_from(total).context("CP6A sum exceeds fixed log-weight representation")?;
-        Ok(Some(Winner{slots,length:top.length,total}))
+        Ok(Some(Winner{slots,length:top.length,total,net:Self::net_total(&slots[..top.length],prices)}))
+    }
+    fn net_total(slots:&[usize],prices:&Prices)->Option<i64>{
+        let mut sum=0_i128;
+        for &slot in slots {sum+=i128::from(prices.values.get(slot/2)?.as_ref()?.estimated_net_weight_units[slot%2]?);}
+        i64::try_from(sum).ok()
     }
     fn witness(&self,top:&SignalTopology,winner:Winner,reverse:bool,prices:&Prices)->Result<SignalWitness>{
         let mut legs=Vec::with_capacity(winner.length);
@@ -270,7 +287,9 @@ impl CompactIndex {
         let sum=winner.total as f64/SIGNAL_LOG_SCALE as f64;
         let bps=(-sum).exp_m1()*10_000.0;
         Ok(SignalWitness{legs,log_sum_units:winner.total,negative_log_sum:sum,
-            indicative_return_bps:bps.is_finite().then_some(bps)})
+            indicative_return_bps:bps.is_finite().then_some(bps),
+            estimated_net_log_sum_units:winner.net,
+            estimated_net_return_bps:winner.net.and_then(|n|{let r=(-(n as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;r.is_finite().then_some(r)})})
     }
     fn reconcile(&mut self,ids:&[u32],prices:&Prices,threshold:i64,
         stats:&mut SignalEvaluation,publish_changes:bool)->Result<(Vec<SignalCandidate>,[usize;3])>{
@@ -292,7 +311,7 @@ impl CompactIndex {
             for reverse in [false,true] {
                 if kind==SignalRouteKind::Direct2 && reverse{continue;}
                 stats.range_queries+=1;
-                let best=self.best(&definition,reverse)?;
+                let best=self.best(&definition,reverse,prices)?;
                 if best.is_some(){stats.ready_anchors[kind_id(kind)]+=1;}
                 let selected=best.filter(|b|b.total<threshold);
                 let key=(id,reverse);

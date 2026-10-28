@@ -19,6 +19,8 @@ param(
     [string]$WsProviders = 'Configured',
     [ValidateRange(0,2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
+    [switch]$RequireFeeEvidence,
+    [string]$EnabledVenues = '',
     [switch]$SimulateV10,
     [string]$WalletPath,
     [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
@@ -33,6 +35,7 @@ if (($SimulateV10 -or $RequireCatalogReconciliation -or $TraceSignals -or $Profi
 }
 if (($Rewatch -or $TracePrices) -and -not $marketEnabled) { throw 'Rewatch and TracePrices require MarketState.' }
 if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires GraphAudit for actual graph/reference evidence.' }
+if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage Signals.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -123,6 +126,7 @@ try {
             'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info'
         ) -join ',')
     }
+    if ($EnabledVenues) { $values.GRAPH_ENABLED_VENUES = $EnabledVenues }
     if ($CompletionRefreshSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_REFRESH_SECONDS = "$CompletionRefreshSeconds" }
     if ($CompletionRecheckSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_RECHECK_SECONDS = "$CompletionRecheckSeconds" }
     if ($SimulateV10 -and -not $PlanOnly) {
@@ -145,6 +149,7 @@ try {
         branch=$branch; head=$head; start_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         duration_seconds=$DurationSeconds; pool_limit=$PoolLimit; ws_account_budget=$AccountBudget
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
+        require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=$EnabledVenues
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -221,6 +226,14 @@ try {
     }
     $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
     $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
+    $feeEvidence = $market.metrics.fee_valuation
+    $feePassed = $null
+    if ($RequireFeeEvidence) {
+        $feePassed = $null -ne $feeEvidence -and
+            [long]$feeEvidence.known_dex_fees_by_model.dlmm -gt 0 -and
+            [long]$feeEvidence.known_dex_fees_by_model.pumpswap -gt 0 -and
+            [long]$feeEvidence.asymmetric_rates -gt 0
+    }
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
@@ -242,6 +255,7 @@ try {
         ready_pools=$market.ready_pools; priced_pools=$market.priced_pools
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
+        fee_evidence_passed=$feePassed; fee_valuation=$feeEvidence
         market_account_processing_ns=$market.metrics.processing
         market_queue_ns=$market.metrics.queue
         signal_steady_state_processing_ns=$production.steady_state_inputs.processing_ns
@@ -256,6 +270,7 @@ try {
     }
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
+    if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
     if (-not $protocolEvidence) { Write-Warning 'Nicht fuer jedes Completion-Protokoll angenommene Arbeit nachgewiesen; protocol_summary pruefen.' }
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
     Write-Host "Orchestrierungsnachweis bestanden. Artefakte: $folder"

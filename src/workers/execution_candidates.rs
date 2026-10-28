@@ -51,7 +51,7 @@ pub struct Selection {
     pub request: ExecutionRequest,
     graph_generation: u64, revision: u64, topology_id: Option<usize>, route_kind: SignalRouteKind,
     reverse: bool, trigger: Arc<SignalTrigger>, candidate: Option<SignalCandidate>,
-    threshold_units: i64, indicative_return_bps: Option<f64>,
+    threshold_units: i64, indicative_return_bps: Option<f64>, estimated_net_return_bps:Option<f64>,
     pools: Vec<PoolEvidence>, packing: ExecutionMetrics,
     signal_ready_at_us: u64, candidate_received_at_us: u64, request_ready_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
@@ -295,7 +295,7 @@ impl State {
         Ok(Selection{request,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
-            indicative_return_bps:witness.indicative_return_bps,
+            indicative_return_bps:witness.indicative_return_bps,estimated_net_return_bps:witness.estimated_net_return_bps,
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
             signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
@@ -371,8 +371,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         "candidate batch references wrong state");
                     for candidate in &b.candidates {state.candidate(b,candidate)?;}
                     if (cfg.limit>0 && report.requests.len()>=cfg.limit)
-                        ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket,..})
-                        ||!b.price_pipeline.is_some_and(|t|!t.initialization_replay){continue;}
+                        ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket|PriceOrigin::Revaluation,..})
+                        ||b.price_pipeline.is_some_and(|t|t.initialization_replay){continue;}
                     for (index,candidate) in b.candidates.iter().enumerate(){
                         if candidate.change==SignalRangeChange::Exited{continue;}
                         let top=state.plan.as_ref()
@@ -383,7 +383,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             ensure!(w.log_sum_units<b.threshold_units,
                                 "best candidate does not satisfy threshold");
                             report.qualifying_ranges+=1;
-                            ranked.push((w.log_sum_units,event.clone(),index));
+                            ranked.push((w.estimated_net_log_sum_units.unwrap_or(w.log_sum_units),event.clone(),index));
                         }
                     }
                 },

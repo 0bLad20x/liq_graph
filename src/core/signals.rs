@@ -31,6 +31,8 @@ pub struct SignalPool {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SignalPoolPrice {
     pub log_weight_units: [Option<i64>; 2],
+    /// Current marginal DEX-fee estimates; never an exclusion proof.
+    pub estimated_net_weight_units: [Option<i64>;2],
     pub observation: Arc<PoolPriceObservation>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -145,6 +147,8 @@ pub struct SignalWitness {
     pub legs: Vec<SignalLeg>,
     /// Current score for Entered/Updated; prior score for Exited.
     pub log_sum_units: i64, pub negative_log_sum: f64, pub indicative_return_bps: Option<f64>,
+    pub estimated_net_return_bps: Option<f64>,
+    pub estimated_net_log_sum_units: Option<i64>,
 }
 #[derive(Debug, serde::Serialize)]
 pub struct SignalEvaluation {
