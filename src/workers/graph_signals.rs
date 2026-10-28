@@ -292,7 +292,7 @@ impl CompactIndex {
             estimated_net_return_bps:winner.net.and_then(|n|{let r=(-(n as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;r.is_finite().then_some(r)})})
     }
     fn reconcile(&mut self,ids:&[u32],prices:&Prices,threshold:i64,
-        stats:&mut SignalEvaluation,publish_changes:bool)->Result<(Vec<SignalCandidate>,[usize;3])>{
+        stats:&mut SignalEvaluation,publish_changes:bool,force_updates:bool)->Result<(Vec<SignalCandidate>,[usize;3])>{
         let mut out=Vec::new();
         let mut transitions=[0;3];
         for &id in ids {
@@ -316,7 +316,7 @@ impl CompactIndex {
                 let selected=best.filter(|b|b.total<threshold);
                 let key=(id,reverse);
                 let previous=self.qualifying.get(&key).copied();
-                if previous==selected{continue;}
+                if previous==selected && !(force_updates && selected.is_some()){continue;}
                 let change=match(previous,selected){
                     (None,Some(_))=>SignalRangeChange::Entered,
                     (Some(_),None)=>SignalRangeChange::Exited,
@@ -338,9 +338,9 @@ impl CompactIndex {
         Ok((out,transitions))
     }
     fn candidates(&mut self,address:Pubkey,prices:&Prices,threshold:i64,
-        stats:&mut SignalEvaluation)->Result<Vec<SignalCandidate>>{
+        stats:&mut SignalEvaluation,force_updates:bool)->Result<Vec<SignalCandidate>>{
         let graph=self.graph.clone();
-        self.reconcile(graph.topologies_for_pool(address),prices,threshold,stats,true)
+        self.reconcile(graph.topologies_for_pool(address),prices,threshold,stats,true,force_updates)
             .map(|(changes,_)|changes)
     }
     fn snapshot_candidates(&self,plan:&SignalPlan,prices:&Prices)->Result<Vec<SignalActiveCandidate>>{
@@ -401,9 +401,9 @@ impl Engine {
         work.stats.publication_ns+=nanos(started);
         Ok(())
     }
-    fn candidates(&mut self,work:&mut Work,address:Pubkey)->Result<()>{
+    fn candidates(&mut self,work:&mut Work,address:Pubkey,force_updates:bool)->Result<()>{
         let started=Instant::now();
-        let candidates=self.index.candidates(address,&self.prices,self.threshold,&mut work.stats)?;
+        let candidates=self.index.candidates(address,&self.prices,self.threshold,&mut work.stats,force_updates)?;
         work.stats.query_ns=nanos(started);
         if candidates.is_empty(){return Ok(());}
         let t=Instant::now();
@@ -447,7 +447,7 @@ impl Engine {
     fn reconcile_catalog(&mut self,work:&mut Work,mut installed:CatalogInstall,sample_limit:usize)->Result<()>{
         let started=Instant::now();
         let (changes,transitions)=self.index.reconcile(&installed.affected,&self.prices,
-            self.threshold,&mut work.stats,false)?;
+            self.threshold,&mut work.stats,false,false)?;
         work.stats.query_ns=nanos(started);
         let summary=&mut installed.summary;
         summary.entered_candidates=transitions[0];
@@ -525,6 +525,10 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         let (address,old)=e.prices.observe(p)?;
                         let preparation_ns=nanos(preparing);
                         let index_start=Instant::now();
+                        let previous_fee=old.price.as_ref().and_then(|v|v.observation.valuation.as_ref())
+                            .map(|v|(&v.dex_fee_rates,&v.fees_on_input,&v.token_fee_status,&v.unknown_reason));
+                        let current_fee=p.valuation.as_ref().map(|v|(&v.dex_fee_rates,&v.fees_on_input,&v.token_fee_status,&v.unknown_reason));
+                        let fee_changed=previous_fee!=current_fee;
                         let change=e.index.refresh(address,&old,&e.prices)?;
                         let index_ns=nanos(index_start);
                         let mut work=e.begin(SignalTrigger::Price{pool:address,
@@ -533,7 +537,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         work.stats.price_preparation_ns=preparation_ns;
                         work.stats.index_update_ns=index_ns;work.stats.logarithms_prepared=1;
                         e.state(&mut work,false,false,vec![e.prices.change(old.pool)])?;
-                        if change{e.candidates(&mut work,address)?;}
+                        if change||fee_changed{e.candidates(&mut work,address,fee_changed)?;}
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Unavailable{pool,sequence,..}|MarketStateEvent::Removed{pool,sequence}=>{
@@ -549,7 +553,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                             reason:"pool unavailable or removed".into()},started,received,None,input.len());
                         let changes=id.map(|i|e.prices.change(i)).into_iter().collect();
                         e.state(&mut work,false,false,changes)?;
-                        if changed{e.candidates(&mut work,address)?;}
+                        if changed{e.candidates(&mut work,address,false)?;}
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Gap{sequence,reason}=>{
@@ -577,7 +581,7 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,
                             reason:"observation selection reconciled".into()},started,received,None,input.len());
                         e.state(&mut work,false,false,changes)?;
-                        for address in affected{e.candidates(&mut work,address)?;}
+                        for address in affected{e.candidates(&mut work,address,false)?;}
                         e.evaluate(work)?;
                     },
                     MarketStateEvent::Stats{..}=>{},

@@ -24,7 +24,9 @@ witness is not claimed to be the globally best net or amount-dependent witness.
 Quantity/depth-aware alternatives and busy-request retry remain CP8B/CP8C.
 
 A fee-only change recalculates affected topology witnesses even when gross
-weights stay equal. Changed witness net sums produce Updated candidates.
+weights stay equal. A relevant fee change also republishes active affected candidates when the
+best gross witness is unchanged, so a fee change on a parallel alternative
+can reach V10. This does not require that alternative to win the gross index.
 Catalog reconciliation remains state maintenance, not an execution trigger.
 Clock/mint revaluation has its own PriceOrigin and can trigger a new request;
 initialization replay and baseline-only observations do not request execution.

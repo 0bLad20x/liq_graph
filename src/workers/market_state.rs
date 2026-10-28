@@ -265,7 +265,7 @@ fn pump_spot(base:u64,quote:u64,vquote:i128,da:u8,db:u8)->Result<f64>{
 impl Pool{
     fn valuation(&self)->Option<FeeValuation> {
         if !matches!(self.venue,Venue::Dlmm|Venue::Pump){return None;}
-        let token_status=std::array::from_fn(|i|match &self.mint_states[i] {
+        let mut token_status=std::array::from_fn(|i|match &self.mint_states[i] {
             None=>"unknown",
             Some(m)=>match m.token_extensions.get("classification").and_then(serde_json::Value::as_str) {
                 Some("verified_no_standard_transfer_fee")=>"verified_no_standard_transfer_fee",
@@ -273,6 +273,7 @@ impl Pool{
                 _=>"unresolved_transfer_behavior",
             }
         });
+        if self.a!=self.canon_base{token_status.swap(0,1);}
         let mut v=FeeValuation{model:if self.venue==Venue::Dlmm{"dlmm"}else{"pumpswap"},
             estimated_net_rates:[None;2],dex_fee_rates:[None;2],fees_on_input:[true;2],
             base_fee_rate:None,variable_fee_rate:None,lp_fee_bps:None,protocol_fee_bps:None,creator_fee_bps:None,
