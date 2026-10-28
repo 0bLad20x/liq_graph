@@ -73,7 +73,7 @@ fn included(amount:u128,level:&LiquidityLevel,optimistic:bool)->Calc<u128> {
     let (rate,den)=(u128::from(level.fee_numerator),u128::from(level.fee_denominator));
     if den==0||rate>=den||level.maximum_rebate_bps>10000{return Err(Issue::Unknown("invalid_fee_fraction"));}
     let full=amount.checked_mul(den).ok_or(Issue::Unknown("amount_overflow"))?.div_ceil(den-rate);
-    Ok(if optimistic {full-(full-amount)*u128::from(level.maximum_rebate_bps)/10000}else{full})
+    Ok(if optimistic {full-(full-amount).checked_mul(u128::from(level.maximum_rebate_bps)).ok_or(Issue::Unknown("amount_overflow"))?/10000}else{full})
 }
 
 // Exact 64*128 /128 math, with the common u128 product as a fast path.
@@ -128,7 +128,8 @@ pub(super) fn minimum_input(input:&Input,direction:usize,mut output:u64)->Calc<u
         let cost=(u128::from(rin)*u128::from(output)).div_ceil(u128::from(rout-output));
         let cost=if sell{cost}else{
             if c.fee_bps[0]>=10000{return Err(Issue::Unknown("invalid_lp_fee"));}
-            cost+ (cost*u128::from(c.fee_bps[0])).div_ceil(10000)
+            cost.checked_add(cost.checked_mul(u128::from(c.fee_bps[0])).ok_or(Issue::Unknown("amount_overflow"))?.div_ceil(10000))
+                .ok_or(Issue::Unknown("amount_overflow"))?
         };
         return u64::try_from(cost).map_err(|_|Issue::Unknown("amount_overflow"));
     }
@@ -161,8 +162,7 @@ fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
         let net=(u128::from(amount)*10000/u128::from(10000+total)) as u64;
         let over=u128::from(net)+u128::from(fee(net)?);
         let net=net.saturating_sub(u64::try_from(over.saturating_sub(u128::from(amount))).map_err(|_|Issue::Unknown("amount_overflow"))?);
-        // SDK buyQuoteInput's one-atom padding is conservative for exact-quote-in.
-        let net=net.saturating_sub(1);
+        let net=net.saturating_sub(c.buy_input_padding_raw);
         return Ok((u128::from(c.base_reserve_raw)*u128::from(net)/(u128::from(c.effective_quote_reserve_raw)+u128::from(net))) as u64);
     }
     let mut output=0_u64;
@@ -229,8 +229,7 @@ fn upper_rate(input:&Input,direction:usize)->Calc<Rate> {
 }
 
 fn cycles(node:&str,settlement:&str,domains:&Domains,path:&mut Vec<String>,out:&mut Vec<Vec<String>>) {
-    for (a,b) in domains.keys().filter(|(a,_)|a==node) {
-        let _=a;
+    for (_,b) in domains.keys().filter(|pair|pair.0.as_str()==node) {
         if b==settlement {if path.len()>=2 {let mut p=path.clone();p.push(b.clone());out.push(p);}continue;}
         if path.contains(b){continue;}
         path.push(b.clone());cycles(b,settlement,domains,path,out);path.pop();
@@ -269,6 +268,9 @@ fn estimate(path:&[Edge],inputs:&[Input],initial:u64,minimum_profit:u64)->Option
 
 pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_conversion_other:Option<&str>)->Assessment {
     let started=Instant::now();let mut result=Assessment::unknown("no_closed_cycle");result.pool_count=inputs.len();
+    // Scratch bounds for this frozen assessment only. A shared pair may occur
+    // in several mint cycles; do not rescan all of its levels for each cycle.
+    let bounds=inputs.iter().map(|i|[upper_rate(i,0),upper_rate(i,1)]).collect::<Vec<_>>();
     let mut domains=Domains::new();
     for (i,input) in inputs.iter().enumerate(){let o=&input.observation;
         for (direction,a,b) in [(0,&o.base_mint,&o.quote_mint),(1,&o.quote_mint,&o.base_mint)] {
@@ -284,14 +286,14 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
         let mut choices=mints.windows(2).map(|m|domains[&(m[0].clone(),m[1].clone())].clone()).collect::<Vec<_>>();
         let maxima=choices.iter().map(|d|{
             let mut max=Rate(0,1);
-            for e in d {let r=upper_rate(&inputs[e.pool],e.direction)?;
+            for e in d {let r=bounds[e.pool][e.direction]?;
                 if compare_products([r.0,max.1].into_iter(),[max.0,r.1].into_iter())==std::cmp::Ordering::Greater{max=r;}}
             Ok(max)
         }).collect::<Calc<Vec<_>>>();
         if let Ok(maxima)=maxima {
             if no_gross_gain(&maxima){result.cycles.push(Cycle{mints,status:"excluded",reason:"optimistic_rate_product_not_above_one",minimum_input_lower_bound_raw:None});continue;}
             for (i,domain) in choices.iter_mut().enumerate(){domain.retain(|e|{
-                let Ok(rate)=upper_rate(&inputs[e.pool],e.direction)else{return true;};
+                let Ok(rate)=bounds[e.pool][e.direction]else{return true;};
                 let mut rates=maxima.clone();rates[i]=rate;!no_gross_gain(&rates)
             });}
         }

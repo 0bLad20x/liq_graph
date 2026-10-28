@@ -105,7 +105,10 @@ fn decimal_u128<S:serde::Serializer>(value:&u128,serializer:S)->Result<S::Ok,S::
 pub struct ReserveCurve {
     pub base_mint:String,pub base_reserve_raw:u64,
     pub effective_quote_reserve_raw:u64,pub spendable_quote_reserve_raw:u64,
+    /// First charge is retained LP fee; other quote charges may be rebated.
     pub fee_bps:[u64;3],
+    /// Conservative quoting padding; zero for models without such padding.
+    pub buy_input_padding_raw:u64,
 }
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct PoolLiquidity {

@@ -269,6 +269,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
             digest.update(&n.to_le_bytes());
         }
         for n in curve.fee_bps{digest.update(&n.to_le_bytes());}
+        digest.update(&curve.buy_input_padding_raw.to_le_bytes());
     }else{digest.update(&[0]);}
     digest.finish().as_ref().try_into().expect("SHA256 length")
 }
@@ -323,7 +324,7 @@ impl Pool{
         Some(PoolLiquidity{model:"constant_product_quote_fees_v1",revision:0,content_digest:[0;32],
             account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
             reserve_curve:Some(ReserveCurve{base_mint:self.a.clone(),base_reserve_raw:*base,
-                effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps}),directions})
+                effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps,buy_input_padding_raw:1}),directions})
     }
     fn refresh_liquidity(&mut self)->bool {
         if self.venue==Venue::Pump {
