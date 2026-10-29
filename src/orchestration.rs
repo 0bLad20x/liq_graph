@@ -100,7 +100,9 @@ fn spawn_sources(
     let registry_input = output.subscribe();
     let (registry_output, registry_observer) =
         broadcast::channel::<Arc<core::PoolUpdateBatch>>(registry_capacity);
-    let registry = initial_registry.unwrap_or_default();
+    let registry = match initial_registry {
+        Some(registry)=>registry,None=>pool_registry::PoolRegistry::from_env()?,
+    };
     let (source_done_tx,_) = watch::channel(false);
     let persistence_input = persist.as_ref().map(|_| registry_output.subscribe());
     if let Some(settings) = graph {
