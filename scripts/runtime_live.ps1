@@ -160,7 +160,8 @@ try {
             'liq_graph::workers::graph_watch_catalog=info','liq_graph::workers::market_state=info',
             'liq_graph::workers::mint_extensions=info','liq_graph::workers::mint_qualification=info',
             'liq_graph::workers::graph_signals=info','liq_graph::workers::execution_candidates=info',
-            'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info'
+            'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info',
+            'liq_graph::workers::rpc_transport::ws=info'
         ) -join ',')
     }
     if ($EnabledVenues) { $values.GRAPH_ENABLED_VENUES = $EnabledVenues }
@@ -466,8 +467,8 @@ try {
         net_candidate_windows=$production.candidate_windows
         market_account_processing_ns=$market.metrics.processing
         prepared_bootstrap_passed=$preparedPassed; market_preparation=$market.preparation
-        # Bounded owner samples live in market_state.json; the summary shows the final sample.
-        market_readiness=($market.metrics.preparation_samples | Select-Object -Last 1)
+        # Detailed readiness is projected only after the live loop has stopped.
+        market_readiness=$market.metrics.preparation_final
         subscription_gaps_by_source=$market.metrics.subscription_gaps
         prepared_structures_by_venue=$market.metrics.prepared_structures_by_venue
         prepared_structure_build_ns=$market.metrics.prepared_structure_build

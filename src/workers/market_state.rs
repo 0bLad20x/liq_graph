@@ -538,7 +538,7 @@ struct Metrics {
     post_rewatch_websocket_observations:u64,removals:u64,
     fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
     reserve_curve_observations:u64,reserve_curve_build:Latency,
-    preparation_samples:VecDeque<PreparationSample>,subscription_gaps:BTreeMap<String,u64>,
+    preparation_final:Option<PreparationSample>,subscription_gaps:BTreeMap<String,u64>,
     subscription_gap_samples:VecDeque<serde_json::Value>,
     baseline_failure_samples:Vec<serde_json::Value>,
     #[serde(skip)] cleared:bool,#[serde(skip)] rewatching:bool,
@@ -553,6 +553,8 @@ struct FeeEvidence {
     updates_by_field:BTreeMap<&'static str,u64>,
     unchanged_net_rate_updates:u64,revaluations:u64,asymmetric_rates:u64,
     calculation:Latency,samples:Vec<FeeSample>,invalid_reference_samples:Vec<serde_json::Value>,
+    clock_reference_lag_observations:u64,clock_reference_lag_max_seconds:u64,
+    clock_reference_lag_samples:Vec<serde_json::Value>,
 }
 #[derive(Default,serde::Serialize)]
 struct LiquidityEvidence {
@@ -993,8 +995,25 @@ impl Engine{
             *evidence.observations_by_model.entry(v.model).or_default()+=1;
             if v.dex_fee_rates.iter().all(Option::is_some){*evidence.known_dex_fees_by_model.entry(v.model).or_default()+=1;}
             if let Some(reason)=&v.unknown_reason{*evidence.unknown_by_reason.entry(reason.clone()).or_default()+=1;}
-            if let Some(reason)=v.unknown_reason.as_deref().filter(|r|matches!(*r,
-                "DLMM clock behind fee reference"|"DLMM reduction factor invalid")) {
+            if let State::Dlmm{active,step,fee,..}=&pool.state {
+                let lag=fee.reference_lag(pool.clock);
+                if lag>0 {
+                    evidence.clock_reference_lag_observations+=1;
+                    evidence.clock_reference_lag_max_seconds=evidence.clock_reference_lag_max_seconds.max(lag);
+                    if evidence.clock_reference_lag_samples.len()<4 {
+                        evidence.clock_reference_lag_samples.push(serde_json::json!({
+                            "pool":pool.id,"origin":origin,"trigger_field":event.trigger_field,
+                            "observed_at_us":timestamp_us(),"chain_timestamp":pool.clock,"lag_seconds":lag,
+                            "active_id":active,"bin_step":step,"fee_parameters":fee,
+                            "estimated_net_rates":v.estimated_net_rates,"unknown_reason":v.unknown_reason,
+                            "components":self.pool_subs[pi].iter().map(|&i|{let s=&self.subs[i];serde_json::json!({
+                                "address":s.address,"field":s.field.label(),"slot":s.slot,
+                                "received_at_us":s.received_us,"baseline_floor":s.floor,"valid":s.valid})}).collect::<Vec<_>>()
+                        }));
+                    }
+                }
+            }
+            if let Some(reason)=v.unknown_reason.as_deref().filter(|r|*r=="DLMM reduction factor invalid") {
                 if evidence.invalid_reference_samples.iter().filter(|s|s["reason"].as_str()==Some(reason)).count()<4 {
                     if let State::Dlmm{active,step,fee,..}=&pool.state {
                         evidence.invalid_reference_samples.push(serde_json::json!({
@@ -1536,7 +1555,7 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
 fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
     engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))
 }
-// Owner-only samples every 30 seconds and at shutdown. No per-frame projection.
+// Detailed owner-only projection after the live loop. Progress uses existing Stats.
 impl Engine {
     fn preparation_sample(&self,selected:&[PoolInput],mints:&dyn MintReader,
         active:&HashMap<Pubkey,String>,planned:&HashMap<Pubkey,String>,
@@ -1600,10 +1619,6 @@ impl Engine {
             }
         }
         sample.build_ns=nanos(started);sample
-    }
-    fn retain_preparation_sample(&mut self,sample:PreparationSample) {
-        if self.metrics.preparation_samples.len()==24{self.metrics.preparation_samples.pop_front();}
-        self.metrics.preparation_samples.push_back(sample);
     }
 }
 // The source session owns continuity. Invalidate only pools using affected accounts.
@@ -1963,10 +1978,6 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 if !retry.is_empty(){schedule=true;}
                 // TVL quality may change without changing PoolInput identity.
                 if ticks%60==0 {rebuild=true;}
-                if ticks%30==0 {
-                    let sample=engine.preparation_sample(&selected,mints.as_ref(),&active,&planned,&in_flight,&retry);
-                    engine.retain_preparation_sample(sample);
-                }
                 if ticks%5==0 {
                     let hydrated=engine.pools.len();
                     let ready=engine.pools.iter().filter(|p|p.ready).count();
@@ -2002,7 +2013,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let ready_pools=engine.pools.iter().filter(|p|p.ready).count();
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
     let final_sample=engine.preparation_sample(&selected,mints.as_ref(),&active,&planned,&in_flight,&retry);
-    let preparation=final_sample.stages.clone();engine.retain_preparation_sample(final_sample);
+    let preparation=final_sample.stages.clone();engine.metrics.preparation_final=Some(final_sample);
     for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence,reason:PoolRemovalReason::Shutdown});}
     crate::log_event!(Info,"market state stopped=true events={} observations={} websocket={} lost={}",
         engine.sequence,engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,engine.metrics.websocket_prices,engine.metrics.lost);

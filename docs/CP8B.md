@@ -99,8 +99,9 @@ Input cost uses ceil division/multiplication per liquidity component; no floatin
 point enters raw fill arithmetic. Input fees gross up with ceil(excluded * 1e9 /
 (1e9-fee)); output fees use ceil(output * fee / 1e9). Total fee stays capped at 10%.
 Volatility reference reset uses actual active ID and chain Clock; each reached bin
-then uses its distance from that reference. Future fee timestamps wait for Clock
-recovery. A nonrepresentable full u64 input is explicitly absent, never wrapped.
+then uses its distance from that reference. When LbPair arrives before Clock,
+the signed negative time delta retains the existing reference, as in the SDK;
+it does not invalidate the quote. A nonrepresentable full u64 input is explicitly absent, never wrapped.
 
 ## Ten-minute live proof and analysis
 

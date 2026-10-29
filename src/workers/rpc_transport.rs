@@ -112,7 +112,7 @@ struct HttpSettings {
 #[derive(Clone, Debug)]
 struct WsSettings {
     index:usize, name:String, url:String, max_connections:usize, max_subscriptions:usize,
-    per_connection:usize, spacing_ms:u64, timeout_ms:u64, reconnect_ms:u64,
+    per_connection:usize, max_pending:usize, spacing_ms:u64, timeout_ms:u64, reconnect_ms:u64,
 }
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -125,7 +125,7 @@ pub struct Settings {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WsProviderPlan {
     pub index:usize, pub name:String, pub max_connections:usize, pub max_subscriptions:usize,
-    pub subscriptions_per_connection:usize, pub subscribe_spacing_ms:u64,
+    pub subscriptions_per_connection:usize, pub max_pending_requests:usize, pub subscribe_spacing_ms:u64,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WsPlan {
@@ -142,7 +142,7 @@ impl Settings {
         Ok(WsPlan{selection:self.ws_selection.clone(),account_capacity,socket_count,
             test_account_budget:self.ws_account_budget,providers:self.ws.iter().map(|p|WsProviderPlan{
                 index:p.index,name:p.name.clone(),max_connections:p.max_connections,max_subscriptions:p.max_subscriptions,
-                subscriptions_per_connection:p.per_connection,subscribe_spacing_ms:p.spacing_ms}).collect()})
+                subscriptions_per_connection:p.per_connection,max_pending_requests:p.max_pending,subscribe_spacing_ms:p.spacing_ms}).collect()})
     }
 }
 
@@ -250,14 +250,15 @@ pub fn settings_from_env()->Result<Settings> {
                 let maximum:usize=if ws_budget>0 {1}else{var(&format!("{prefix}WS_MAX_SUBSCRIPTIONS"),1)?};
                 let per_connection:usize=if ws_budget>0 {1}else{var(&format!("{prefix}WS_SUBSCRIPTIONS_PER_CONNECTION"),1)?};
                 let spacing_ms:u64=var(&format!("{prefix}WS_SUBSCRIBE_SPACING_MS"),10)?;
+                let max_pending:usize=var(&format!("{prefix}WS_MAX_PENDING_REQUESTS"),4)?;
                 let timeout_ms:u64=var(&format!("{prefix}WS_TIMEOUT_MS"),45000)?;
                 let reconnect_ms:u64=var(&format!("{prefix}WS_RECONNECT_MS"),1000)?;
                 ensure!(connections>0 && connections<=64 && maximum>0 && per_connection>0
                     && connections.checked_mul(per_connection).is_some_and(|n|n>=maximum)
-                    && timeout_ms>0 && reconnect_ms>0,
+                    && (1..=32).contains(&max_pending) && timeout_ms>0 && reconnect_ms>0,
                     "invalid WebSocket limits for provider {name}");
                 ws.push(WsSettings{index,name,url:endpoint,max_connections:connections,max_subscriptions:maximum,
-                    per_connection,spacing_ms,timeout_ms,reconnect_ms});
+                    per_connection,max_pending,spacing_ms,timeout_ms,reconnect_ms});
             }
         }
     }
@@ -842,7 +843,7 @@ struct RpcError {code:i64}
 struct Frame<'a> {id:Option<u64>,result:Option<Reply>,error:Option<RpcError>,
     #[serde(borrow)] method:Option<Cow<'a,str>>,#[serde(borrow)] params:Option<Params<'a>>}
 
-enum Write {Message(Message,bool),Flush}
+enum Write {Control{id:u64,message:Message},Message(Message),Flush}
 enum Pending {Subscribe(AccountWatch),Unsubscribe{subscription:u64,address:Pubkey}}
 
 async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
@@ -872,17 +873,22 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
         if sessions>0 {gap("reconnect_requires_resync");}
         sessions+=1;failures=0;let session=sessions;
         let (mut sink,mut reader)=socket.split();
-        // <=32 pending RPC requests; a separate bounded writer also carries heartbeat/flush work.
+        // Bounded control requests; the writer also carries heartbeat/flush work.
         let (commands,mut outgoing)=mpsc::channel::<Write>(64);
+        let (sent,mut sent_requests)=mpsc::channel(cfg.max_pending);
         let writer=async {
             let mut next=Instant::now();
             while let Some(command)=outgoing.recv().await {
-                let paced=matches!(&command,Write::Message(_,true));
-                if paced {sleep_until(next).await;}
+                let request_id=match &command{Write::Control{id,..}=>Some(*id),_=>None};
+                if request_id.is_some(){sleep_until(next).await;}
                 timeout(Duration::from_millis(cfg.timeout_ms),async {
-                    match command {Write::Message(m,_)=>sink.send(m).await,Write::Flush=>sink.flush().await}
+                    match command {Write::Control{message,..}|Write::Message(message)=>sink.send(message).await,
+                        Write::Flush=>sink.flush().await}
                 }).await.context("WebSocket write timed out")??;
-                if paced {next=Instant::now()+Duration::from_millis(cfg.spacing_ms);}
+                if let Some(id)=request_id {
+                    let written_at=Instant::now();next=written_at+Duration::from_millis(cfg.spacing_ms);
+                    sent.send((id,written_at)).await.context("WebSocket control receipt channel closed")?;
+                }
             }
             Ok::<(),anyhow::Error>(())
         };
@@ -891,7 +897,7 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
         let mut active=HashMap::<u64,AccountWatch>::new();let mut retired=HashSet::new();
         let mut pending=HashMap::<u64,Pending>::new();let mut deadlines=VecDeque::<(u64,Instant)>::new();
         let mut busy=HashSet::new();let mut subscribe=VecDeque::new();let mut unsubscribe=VecDeque::new();
-        let mut dirty=true;let mut id=0_u64;let mut pending_subscriptions=0_usize;
+        let mut dirty=true;let mut id=0_u64;let mut pending_subscriptions=0_usize;let mut pending_unsubscriptions=0_usize;
         let mut progress=time::interval(Duration::from_secs(30));progress.set_missed_tick_behavior(time::MissedTickBehavior::Skip);progress.tick().await;
         let mut heartbeat=time::interval(Duration::from_secs(20));heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);heartbeat.tick().await;
         'connected:loop {
@@ -900,13 +906,14 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
                 subscribe=desired.iter().filter(|(a,_)|!busy.contains(*a)).map(|(&address,&view)|AccountWatch{address,view}).collect();
                 dirty=false;
             }
-            while pending.len()<32 {
+            while pending.len()<cfg.max_pending {
                 let (request,command)=if let Some((subscription,address))=unsubscribe.pop_front() {
                     if !active.contains_key(&subscription) || desired.contains_key(&address){continue;}
                     id+=1;
                     (Pending::Unsubscribe{subscription,address},json!({"jsonrpc":"2.0","id":id,"method":"accountUnsubscribe","params":[subscription]}))
                 }else {
-                    if active.len()+pending_subscriptions>=capacity {break;}
+                    // Removed watches still occupy server capacity until their ACK.
+                    if active.len()+pending_subscriptions+pending_unsubscriptions>=capacity {break;}
                     let Some(mut w)=subscribe.pop_front() else {break;};
                     if busy.contains(&w.address) || desired.get(&w.address)!=Some(&w.view){continue;}
                     if !slices {w.view=AccountView::Full;}
@@ -914,14 +921,14 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
                     if let AccountView::Slice{offset,length}=w.view {config["dataSlice"]=json!({"offset":offset,"length":length});}
                     (Pending::Subscribe(w),json!({"jsonrpc":"2.0","id":id,"method":"accountSubscribe","params":[w.address.to_string(),config]}))
                 };
-                if commands.try_send(Write::Message(Message::Text(command.to_string().into()),matches!(&request,Pending::Subscribe(_)))).is_err() {
+                if commands.try_send(Write::Control{id,message:Message::Text(command.to_string().into())}).is_err() {
                     gap("control_queue_full");break 'connected;
                 }
                 match &request {
                     Pending::Subscribe(w)=>{busy.insert(w.address);pending_subscriptions+=1;},
-                    Pending::Unsubscribe{subscription,..}=>{active.remove(subscription);retired.insert(*subscription);},
+                    Pending::Unsubscribe{subscription,..}=>{active.remove(subscription);retired.insert(*subscription);pending_unsubscriptions+=1;},
                 }
-                pending.insert(id,request);deadlines.push_back((id,Instant::now()+Duration::from_millis(cfg.timeout_ms)));
+                pending.insert(id,request);
             }
             while deadlines.front().is_some_and(|(id,_)|!pending.contains_key(id)){deadlines.pop_front();}
             let deadline=deadlines.front().map(|(_,at)|*at).unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
@@ -930,19 +937,24 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
                     if let Err(error)=&result {crate::log_event!(Warn,"rpc websocket writer source={name} error={error:#}");}
                     gap(if result.is_err(){"socket_write_failed"}else{"socket_writer_closed"});break;
                 },
-                _=heartbeat.tick()=>if commands.try_send(Write::Message(Message::Ping(Vec::new().into()),false)).is_err(){gap("control_queue_full");break;},
+                written=sent_requests.recv()=>{
+                    let Some((id,at))=written else{gap("socket_writer_closed");break;};
+                    // A fast server ACK can be consumed before this receipt.
+                    if pending.contains_key(&id){deadlines.push_back((id,at+Duration::from_millis(cfg.timeout_ms)));}
+                },
+                _=heartbeat.tick()=>if commands.try_send(Write::Message(Message::Ping(Vec::new().into()))).is_err(){gap("control_queue_full");break;},
                 _=sleep_until(deadline),if !deadlines.is_empty()=>{
                     let oldest=deadlines.front().and_then(|(id,_)|pending.get(id)).map(|p|match p {
                         Pending::Subscribe(w)=>format!("subscribe:{}",w.address),
                         Pending::Unsubscribe{address,..}=>format!("unsubscribe:{address}"),
                     });
-                    crate::log_event!(Warn,"rpc websocket reply_timeout source={name} session={session} desired={} active={} pending={} queued_subscribe={} writer_queue={} oldest={oldest:?}",
-                        desired.len(),active.len(),pending.len(),subscribe.len(),commands.max_capacity()-commands.capacity());
+                    crate::log_event!(Warn,"rpc websocket reply_timeout source={name} session={session} desired={} active={} pending={} max_pending={} pending_unsubscribe={} queued_subscribe={} writer_queue={} oldest={oldest:?}",
+                        desired.len(),active.len(),pending.len(),cfg.max_pending,pending_unsubscriptions,subscribe.len(),commands.max_capacity()-commands.capacity());
                     gap("subscription_reply_timeout");break;
                 },
                 _=progress.tick()=>{
-                    crate::log_event!(Info,"rpc websocket subscription_progress source={name} session={session} desired={} active={} pending={} queued_subscribe={} writer_queue={}",
-                        desired.len(),active.len(),pending.len(),subscribe.len(),commands.max_capacity()-commands.capacity());
+                    crate::log_event!(Info,"rpc websocket subscription_progress source={name} session={session} desired={} active={} pending={} max_pending={} pending_unsubscribe={} queued_subscribe={} writer_queue={}",
+                        desired.len(),active.len(),pending.len(),cfg.max_pending,pending_unsubscriptions,subscribe.len(),commands.max_capacity()-commands.capacity());
                 },
                 change=targets.changed()=>{
                     if change.is_err(){return Ok(());}
@@ -998,6 +1010,7 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
                             },
                             Some(Pending::Unsubscribe{address,..})=>{
                                 if !matches!(frame.result,Some(Reply::Unsubscribed(true))) || frame.error.is_some(){gap("unsubscribe_rejected");break;}
+                                pending_unsubscriptions-=1;
                                 busy.remove(&address);
                                 emit(AccountEvent::Unsubscribed{provider:name.clone(),address});
                                 if let Some(&view)=desired.get(&address){subscribe.push_back(AccountWatch{address,view});}

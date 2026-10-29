@@ -118,12 +118,12 @@ outside that request. This can correctly result in fewer simulations.
 
 The same MarketState owner now retains bounded diagnostic evidence:
 
-- `metrics.preparation_samples`: last 24 samples, one every 30 seconds plus shutdown,
-  each with its timestamp and sampling duration (`build_ns`). They partition the
+- `metrics.preparation_final`: one projection after the live loop, with its
+  timestamp and projection duration (`build_ns`). It partitions the
   selected set using the existing preparation stages. `net_direction_pools[0..2]`
   additionally counts ready/available pools with a fee valuation by known net
   directions; these counts do not redefine the existing indicative `priced` field.
-- Each sample splits baseline waiting into in-flight, retry backoff and queued
+- The projection splits baseline waiting into in-flight, retry backoff and queued
   pools, and reports the oldest in-flight baseline age among those waiting pools.
 - Per-source component-account counts show acknowledged and missing accounts.
   `blocked_pools` is unique within each source; pools can be blocked by several
@@ -137,20 +137,67 @@ The same MarketState owner now retains bounded diagnostic evidence:
   ready counts and up to eight shared affected accounts. Reconnect lifecycle
   events can describe the same outage more than once.
 - Up to four failed preparation samples preserve pool, phase and exact reason.
-- `metrics.fee_valuation.invalid_reference_samples` keeps at most four examples
-  per DLMM error: `DLMM clock behind fee reference` versus `DLMM reduction factor
-  invalid`, with Clock timestamp, fee parameters and component slots/timestamps.
-  Guards and fee math remain enforced. No assumed Clock correction is applied.
+- `metrics.fee_valuation.invalid_reference_samples` keeps at most four invalid
+  DLMM reduction-factor examples. Separate `clock_reference_lag_observations`,
+  `clock_reference_lag_max_seconds` and at most four `clock_reference_lag_samples`
+  record Clock/LbPair arrival skew, including resulting net rates, parameters and
+  component slots/timestamps. Arrival skew is no longer itself an invalid quote.
 
 The transport logs per-socket counts every 30 seconds and the oldest pending
 request/address when a reply times out. It does not log account notifications or
-credentials. Allocation, full readiness projections and sample serialization are
-outside ordinary price updates, except bounded samples of the actual fee error.
+credentials. The full readiness projection runs only after the live loop stops.
+Ordinary price updates retain counters and bounded examples of fee-reference skew/errors.
 There are no new diagnostic consumers, database tables or services.
 
 Use the command above for one new 600-second run. `market_state.json` holds the
-bounded evidence; `summary.json` includes the final readiness sample and gap counts.
+bounded evidence; `summary.json` includes the final readiness projection and gap counts.
 Inspect `amount_evidence.json` for preserved exclusions and `execution.json` for
 the requests actually simulated. Existing `-RequirePreparedEvidence` still proves
 bootstrap only; it does not certify full coverage or successful trading.
 The follow-up is not functionally accepted until this new live evidence exists.
+
+## Stabilization after the c56a1de live run
+
+The subsequent real 600-second run on `c56a1de` restored 3,418 persisted vault roles
+and again needed zero MarketState structure RPC calls. All 751 requests reached
+simulation (10 succeeded, 741 failed); no source/signal events were lost. This is
+an integration proof, not proof of cost-covering signals. The next economic and
+liquidity checkpoint remains separate.
+
+Readiness was only 795/5,086 pools at shutdown. All 4,291 remaining pools waited
+for subscription ACKs, with no baseline backlog. Ten Helius sockets acknowledged
+all 9,997 assigned accounts; two Orbitflare sockets acknowledged only 756/4,684
+and 641/4,682 accounts and suffered 13 reply-timeout reconnect cycles. The exact
+provider-side cause is not established. Reducing each Orbitflare configured maximum
+from 10,000 to 5,000 does not materially change this observed ~4,700-account load.
+The private ENV remains operator-owned; effective limits are shown by the existing
+`-PlanOnly`/`websocket_plan.json` output.
+
+Current stabilization changes:
+
+- DLMM follows the official SDK signed time-difference behavior. A negative
+  `now - last_update_timestamp` leaves the existing reference unchanged instead
+  of rejecting all net rates. Neither timestamp is fabricated or clamped. Source:
+  [Meteora SDK update_references](https://github.com/MeteoraAg/dlmm-sdk/blob/af36dd53ab180783ccecda306926189a4700953c/commons/src/extensions/lb_pair.rs#L77).
+- The transport defaults to four outstanding control requests per socket instead
+  of 32; `RPC_N_WS_MAX_PENDING_REQUESTS` optionally configures 1..=32 and is visible
+  in the effective plan. Both subscribe and unsubscribe obey the existing spacing.
+- A queued unsubscribe no longer frees subscription capacity before its ACK.
+  New subscriptions reserve space alongside active and retiring subscriptions.
+  Reply timeout starts after actual writer completion, not while a request waits
+  in the local pacing queue. The write timeout remains independently enforced.
+- The periodic full readiness projection measured 13..42 ms in the MarketState
+  owner on c56a1de. It is removed from the live loop; only shutdown constructs
+  `preparation_final`. Existing five-second progress remains.
+- The starter explicitly enables `rpc_transport::ws=info`, matching the repository's
+  exact module filter, so the already bounded 30-second transport progress is visible.
+
+Keep using the single 600-second command above after updating the private ENV.
+Compare effective capacities, final readiness, per-source ACK progress/reconnects,
+queue/processing latency and Clock-skew examples with the c56a1de run. If no Clock
+skew occurs, the run cannot claim live exercise of that particular recovery case.
+No additional RPC requests, workers, signer policy, signal threshold, quantity
+qualification, pool admission or V10 parameter changes are part of this stabilization.
+Complete subscriptions and post-ACK baseline are still required after a gap;
+unanswered subscriptions are never treated as ready. Stable provider operation
+and better coverage require the next real live run, not just a successful build.

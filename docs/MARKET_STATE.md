@@ -91,6 +91,13 @@ One venue's coverage does not validate other unobserved decoders.
 
 Provider assignment preserves existing addresses and balances new accounts across configured sockets. It does not promise automatic migration from a permanently unavailable provider to another provider. Failed sockets reconnect with the existing retry policy, including handshake HTTP 429 backoff.
 
+Subscribe and unsubscribe control requests share a per-socket pending limit
+(`RPC_N_WS_MAX_PENDING_REQUESTS`, default 4, valid 1..=32) and the configured
+`WS_SUBSCRIBE_SPACING_MS` pacing. A retiring subscription still reserves a server
+slot until its unsubscribe ACK. Reply deadlines begin after the writer flushed
+the request; local pacing/queue waiting does not consume the reply timeout.
+These transport limits do not restrict account notifications or route calculations.
+
 ## Configuration
 
 Use the existing `DATABASE_URL` (or `LIQ_GRAPH_DATABASE_URL`), `JUPITER_SEARCH_API_KEYS`, CP1 mint-catalogue/HTTP-proxy configuration and `RPC_N_*` configuration. The finite entrypoint is the production pipeline; DexScreener requires verified working proxies. No signer or wallet is needed. An RPC WebSocket URL alone does not enable account subscriptions. Each provider used for WS must have explicitly configured account capabilities and capacity, for example:
@@ -101,6 +108,7 @@ RPC_1_WS_MAX_CONNECTIONS=1
 RPC_1_WS_MAX_SUBSCRIPTIONS=100
 RPC_1_WS_SUBSCRIPTIONS_PER_CONNECTION=100
 RPC_1_WS_SUBSCRIBE_SPACING_MS=20
+RPC_1_WS_MAX_PENDING_REQUESTS=4
 ```
 
 The numbers above are an example configuration, not a statement about a provider's permitted limits. Set them to your actual plan. Additional `RPC_2_*`, `RPC_3_*` providers use the same mechanism. HTTP and WS need to refer to the same Solana network and compatible commitment. Existing HTTP capability flags, rate limits and `RPC_ACCOUNT_BATCH_SIZE` are respected.
@@ -116,6 +124,17 @@ MARKET_STATE_TRACE=0
 
 
 CP8A watches full DLMM/PumpSwap pool accounts plus shared chain Clock, Pump GlobalConfig/FeeConfig and Pump base Mint supply. Shared addresses are deduplicated; see [CP8A](CP8A.md) for fee-only revaluation, unknown token-transfer costs and live acceptance.
+
+DLMM fee evaluation uses the SDK's signed time difference. If a newer LbPair
+arrives before Clock, the existing volatility reference is retained; the pool
+is not withdrawn merely because `Clock.timestamp < last_update_timestamp`.
+Clock and pool timestamps remain unmodified. Subsequent Clock updates retain
+the existing fee-change revaluation scheduling. Invalid fee parameters and
+arithmetic overflows still fail validation. Bounded `clock_reference_lag_*`
+evidence records this arrival skew independently from actual valuation errors.
+Detailed readiness (`metrics.preparation_final`) is built only after the live
+loop stops. Normal five-second progress and per-source 30-second control counters
+provide ongoing visibility without the former periodic full account projection.
 
 CP8A.2 Signal Engine consumes the directed fee-adjusted rates exclusively. Raw
 indicative prices remain protocol evidence; they are not a fallback selection

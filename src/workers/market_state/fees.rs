@@ -32,6 +32,9 @@ impl Dlmm {
         let decay=self.last.saturating_add(i64::from(self.decay));
         if now<filter{filter}else if now<decay{decay}else{i64::MAX}
     }
+    pub fn reference_lag(&self,now:i64)->u64 {
+        if now<self.last{self.last.abs_diff(now)}else{0}
+    }
     pub fn rates(&self,active:i32,step:u16,now:i64)->Result<(f64,f64,[bool;2])> {
         self.rates_at(active,active,step,now)
     }
@@ -43,8 +46,9 @@ impl Dlmm {
     }
     pub fn rate_units_at(&self,active:i32,target:i32,step:u16,now:i64)->Result<(u64,u64,[bool;2])> {
         ensure!(self.reduction<=10000,"DLMM reduction factor invalid");
-        ensure!(now>=self.last,"DLMM clock behind fee reference");
-        let elapsed=now-self.last;
+        // SDK update_references uses a signed delta. A newer LbPair may arrive
+        // before Clock; negative elapsed keeps the existing reference unchanged.
+        let elapsed=now.checked_sub(self.last).context("DLMM fee timestamp difference overflow")?;
         let (index,reference)=if elapsed>=i64::from(self.filter) {
             (active,if elapsed<i64::from(self.decay){u64::from(self.vol)*u64::from(self.reduction)/10000}else{0})
         }else{(self.index,u64::from(self.reference))};
