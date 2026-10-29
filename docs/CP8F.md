@@ -70,7 +70,8 @@ of every selected pool. Existing delivery and orchestration checks still apply.
 
 ## Live proof
 
-First run: the normal pipeline, 600 seconds, bounded simulation, no broadcasts.
+Next run: the normal pipeline, 600 seconds, one executor and one queued request,
+no lifetime simulation cap, no broadcasts.
 Use the existing `.env`, RPC configuration and test wallet. No extra provider budget.
 
 ```powershell
@@ -84,7 +85,7 @@ Use the existing `.env`, RPC configuration and test wallet. No extra provider bu
     -ProfileSignals `
     -RequirePreparedEvidence `
     -SimulateV10 `
-    -SimulationLimit 3 `
+    -SimulationLimit 0 `
     -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
 ```
 
@@ -92,4 +93,64 @@ A later short restart with the same command and `-DurationSeconds 60` checks act
 DB reuse. Subscription recovery/rewatch can be inspected with the existing `-Rewatch`;
 initial bootstrap measurement should first use the uninterrupted selection above.
 A successful locked release build is required before handoff. A real live run and
-its artifacts are still required for acceptance; no live result is claimed here.
+its artifacts are still required for acceptance of the follow-up below.
+
+## Follow-up: preserve packed exclusions and explain readiness failures
+
+The 600-second run on `d288a4e` proved direct structure installation without
+MarketState structure RPC calls. It did not prove stable readiness: the final
+5,072 installed pools split into 4,151 waiting for subscription ACKs and 921
+waiting for baseline. The three-request cap was reached after roughly 45 seconds;
+all three simulations returned Custom1 before a DEX call. This cannot establish
+market weakness or the meaning of Custom1.
+
+Two selections exposed a pre-existing CP8C bug: their actual packed pool set was
+excluded, but unknown alternatives outside that request replaced the exclusion
+with `unknown`. The follow-up preserves the exclusion. The existing alternative
+seed path may still produce a different request, but that rebuilt packed set must
+pass its own assessment. No new quantity search, threshold, RPC query or change
+to Flashloan, auto trade size or V10 minimum profit is introduced.
+`amounts.packed_exclusions` counts preserved packed exclusions when the wider
+universe was not excluded and seed repair did not produce an admissible request.
+Existing global exclusions remain counted separately within `amounts.excluded`.
+Retained packed exclusion samples describe the packed inputs, not unknown pools
+outside that request. This can correctly result in fewer simulations.
+
+The same MarketState owner now retains bounded diagnostic evidence:
+
+- `metrics.preparation_samples`: last 24 samples, one every 30 seconds plus shutdown,
+  each with its timestamp and sampling duration (`build_ns`). They partition the
+  selected set using the existing preparation stages. `net_direction_pools[0..2]`
+  additionally counts ready/available pools with a fee valuation by known net
+  directions; these counts do not redefine the existing indicative `priced` field.
+- Each sample splits baseline waiting into in-flight, retry backoff and queued
+  pools, and reports the oldest in-flight baseline age among those waiting pools.
+- Per-source component-account counts show acknowledged and missing accounts.
+  `blocked_pools` is unique within each source; pools can be blocked by several
+  sources, so these counts must not be summed as unique pools.
+- Up to eight missing accounts and eight shared accounts show address, field,
+  binding fan-out, intended source and acknowledged source. Assignment metadata is
+  published through the existing account contract in one batch per changed socket,
+  never one event per account and never as a subscription ACK.
+- `metrics.subscription_gaps` counts gap events per source. The last eight gaps
+  that actually removed active accounts retain affected pool counts, previously
+  ready counts and up to eight shared affected accounts. Reconnect lifecycle
+  events can describe the same outage more than once.
+- Up to four failed preparation samples preserve pool, phase and exact reason.
+- `metrics.fee_valuation.invalid_reference_samples` keeps at most four examples
+  per DLMM error: `DLMM clock behind fee reference` versus `DLMM reduction factor
+  invalid`, with Clock timestamp, fee parameters and component slots/timestamps.
+  Guards and fee math remain enforced. No assumed Clock correction is applied.
+
+The transport logs per-socket counts every 30 seconds and the oldest pending
+request/address when a reply times out. It does not log account notifications or
+credentials. Allocation, full readiness projections and sample serialization are
+outside ordinary price updates, except bounded samples of the actual fee error.
+There are no new diagnostic consumers, database tables or services.
+
+Use the command above for one new 600-second run. `market_state.json` holds the
+bounded evidence; `summary.json` includes the final readiness sample and gap counts.
+Inspect `amount_evidence.json` for preserved exclusions and `execution.json` for
+the requests actually simulated. Existing `-RequirePreparedEvidence` still proves
+bootstrap only; it does not certify full coverage or successful trading.
+The follow-up is not functionally accepted until this new live evidence exists.

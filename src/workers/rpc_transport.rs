@@ -892,6 +892,7 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
         let mut pending=HashMap::<u64,Pending>::new();let mut deadlines=VecDeque::<(u64,Instant)>::new();
         let mut busy=HashSet::new();let mut subscribe=VecDeque::new();let mut unsubscribe=VecDeque::new();
         let mut dirty=true;let mut id=0_u64;let mut pending_subscriptions=0_usize;
+        let mut progress=time::interval(Duration::from_secs(30));progress.set_missed_tick_behavior(time::MissedTickBehavior::Skip);progress.tick().await;
         let mut heartbeat=time::interval(Duration::from_secs(20));heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);heartbeat.tick().await;
         'connected:loop {
             if dirty {
@@ -930,7 +931,19 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
                     gap(if result.is_err(){"socket_write_failed"}else{"socket_writer_closed"});break;
                 },
                 _=heartbeat.tick()=>if commands.try_send(Write::Message(Message::Ping(Vec::new().into()),false)).is_err(){gap("control_queue_full");break;},
-                _=sleep_until(deadline),if !deadlines.is_empty()=>{gap("subscription_reply_timeout");break;},
+                _=sleep_until(deadline),if !deadlines.is_empty()=>{
+                    let oldest=deadlines.front().and_then(|(id,_)|pending.get(id)).map(|p|match p {
+                        Pending::Subscribe(w)=>format!("subscribe:{}",w.address),
+                        Pending::Unsubscribe{address,..}=>format!("unsubscribe:{address}"),
+                    });
+                    crate::log_event!(Warn,"rpc websocket reply_timeout source={name} session={session} desired={} active={} pending={} queued_subscribe={} writer_queue={} oldest={oldest:?}",
+                        desired.len(),active.len(),pending.len(),subscribe.len(),commands.max_capacity()-commands.capacity());
+                    gap("subscription_reply_timeout");break;
+                },
+                _=progress.tick()=>{
+                    crate::log_event!(Info,"rpc websocket subscription_progress source={name} session={session} desired={} active={} pending={} queued_subscribe={} writer_queue={}",
+                        desired.len(),active.len(),pending.len(),subscribe.len(),commands.max_capacity()-commands.capacity());
+                },
                 change=targets.changed()=>{
                     if change.is_err(){return Ok(());}
                     desired=targets.borrow_and_update().iter().map(|w|(w.address,w.view)).collect();
@@ -1024,13 +1037,14 @@ async fn session(cfg:WsSettings,name:String,capacity:usize,commitment:String,
 
 pub(super) async fn run(settings:Vec<WsSettings>,commitment:String,mut targets:watch::Receiver<Vec<AccountWatch>>,
     events:broadcast::Sender<AccountEvent>,control:AccountStreamControl)->Result<()> {
-    let mut tasks=JoinSet::new();let mut sockets=Vec::new();
+    let mut tasks=JoinSet::new();let mut sockets=Vec::new();let mut names=Vec::new();
     for cfg in settings {
         let mut remaining=cfg.max_subscriptions;
         for i in 0..cfg.max_connections {
             if remaining==0{break;}
             let capacity=remaining.min(cfg.per_connection);remaining-=capacity;
             let (tx,rx)=watch::channel(Vec::new());let name=format!("{}/socket-{}",cfg.name,i+1);
+            names.push(name.clone());
             tasks.spawn(session(cfg.clone(),name,capacity,commitment.clone(),rx,events.clone(),control.clone()));
             sockets.push((capacity,tx));
         }
@@ -1050,6 +1064,15 @@ pub(super) async fn run(settings:Vec<WsSettings>,commitment:String,mut targets:w
             if next.contains_key(&address){continue;}
             let i=groups.iter().enumerate().filter(|(i,g)|g.len()<sockets[*i].0).min_by_key(|(_,g)|g.len()).map(|(i,_)|i).context("WS socket distribution exhausted")?;
             groups[i].push(w);next.insert(address,i);
+        }
+        let mut assigned=vec![Vec::new();sockets.len()];
+        for (&address,&i) in &next {
+            if assignments.get(&address)!=Some(&i) {
+                assigned[i].push(address);
+            }
+        }
+        for (i,addresses) in assigned.into_iter().enumerate().filter(|(_,a)|!a.is_empty()) {
+            let _=events.send(AccountEvent::Assigned{provider:names[i].clone(),addresses:Arc::from(addresses)});
         }
         assignments=next;
         for ((_,tx),group) in sockets.iter().zip(groups){tx.send_if_modified(|old|if *old==group{false}else{*old=group;true});}

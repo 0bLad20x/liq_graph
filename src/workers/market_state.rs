@@ -4,7 +4,7 @@ mod fees;
 mod dlmm;
 use crate::core::rpc::{RpcAnswer,RpcHandle,RpcOperation};
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, BTreeMap, VecDeque}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
@@ -538,6 +538,9 @@ struct Metrics {
     post_rewatch_websocket_observations:u64,removals:u64,
     fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
     reserve_curve_observations:u64,reserve_curve_build:Latency,
+    preparation_samples:VecDeque<PreparationSample>,subscription_gaps:BTreeMap<String,u64>,
+    subscription_gap_samples:VecDeque<serde_json::Value>,
+    baseline_failure_samples:Vec<serde_json::Value>,
     #[serde(skip)] cleared:bool,#[serde(skip)] rewatching:bool,
 }
 #[derive(serde::Serialize)]
@@ -549,7 +552,7 @@ struct FeeEvidence {
     unknown_by_reason:BTreeMap<String,u64>,
     updates_by_field:BTreeMap<&'static str,u64>,
     unchanged_net_rate_updates:u64,revaluations:u64,asymmetric_rates:u64,
-    calculation:Latency,samples:Vec<FeeSample>,
+    calculation:Latency,samples:Vec<FeeSample>,invalid_reference_samples:Vec<serde_json::Value>,
 }
 #[derive(Default,serde::Serialize)]
 struct LiquidityEvidence {
@@ -990,6 +993,21 @@ impl Engine{
             *evidence.observations_by_model.entry(v.model).or_default()+=1;
             if v.dex_fee_rates.iter().all(Option::is_some){*evidence.known_dex_fees_by_model.entry(v.model).or_default()+=1;}
             if let Some(reason)=&v.unknown_reason{*evidence.unknown_by_reason.entry(reason.clone()).or_default()+=1;}
+            if let Some(reason)=v.unknown_reason.as_deref().filter(|r|matches!(*r,
+                "DLMM clock behind fee reference"|"DLMM reduction factor invalid")) {
+                if evidence.invalid_reference_samples.iter().filter(|s|s["reason"].as_str()==Some(reason)).count()<4 {
+                    if let State::Dlmm{active,step,fee,..}=&pool.state {
+                        evidence.invalid_reference_samples.push(serde_json::json!({
+                            "reason":reason,"pool":pool.id,"origin":origin,"trigger_field":event.trigger_field,
+                            "observed_at_us":timestamp_us(),"chain_timestamp":pool.clock,
+                            "active_id":active,"bin_step":step,"fee_parameters":fee,
+                            "components":self.pool_subs[pi].iter().map(|&i|{let s=&self.subs[i];serde_json::json!({
+                                "address":s.address,"field":s.field.label(),"slot":s.slot,
+                                "received_at_us":s.received_us,"baseline_floor":s.floor,"valid":s.valid})}).collect::<Vec<_>>()
+                        }));
+                    }
+                }
+            }
             *evidence.updates_by_field.entry(event.trigger_field.unwrap_or("baseline_or_mint")).or_default()+=1;
             evidence.revaluations+=u64::from(matches!(origin,PriceOrigin::Revaluation));
             evidence.unchanged_net_rate_updates+=u64::from(unchanged_net_rates);
@@ -1518,15 +1536,87 @@ fn watches(engine:&Engine,failed:&[Pubkey])->Result<Vec<AccountWatch>> {
 fn complete(engine:&Engine,pi:usize,active:&HashMap<Pubkey,String>)->bool {
     engine.pool_subs[pi].iter().all(|&i|active.contains_key(&engine.subs[i].key))
 }
+// Owner-only samples every 30 seconds and at shutdown. No per-frame projection.
+impl Engine {
+    fn preparation_sample(&self,selected:&[PoolInput],mints:&dyn MintReader,
+        active:&HashMap<Pubkey,String>,planned:&HashMap<Pubkey,String>,
+        in_flight:&HashMap<Pubkey,time::Instant>,retry:&HashMap<Pubkey,time::Instant>)->PreparationSample {
+        let started=Instant::now();
+        let mut sample=PreparationSample{at_us:timestamp_us(),build_ns:0,selected:selected.len(),net_direction_pools:[0;3],
+            stages:PreparationStatus::default(),baseline_in_flight:0,baseline_backoff:0,baseline_queued:0,
+            oldest_baseline_in_flight_ms:0,providers:BTreeMap::new(),missing_bindings_by_field:BTreeMap::new(),
+            blockers:Vec::new(),shared_accounts:Vec::new()};
+        let now=time::Instant::now();
+        for p in selected {
+            if let Some(&pi)=self.pool_index.get(&p.address) {
+                if self.pools[pi].ready&&self.pools[pi].available {
+                    if let Some(value)=&self.pools[pi].last_valuation {
+                        sample.net_direction_pools[value.estimated_net_rates.iter().flatten().count()]+=1;
+                    }
+                }
+                if !complete(self,pi,active){sample.stages.waiting_subscriptions+=1;}
+                else if !self.pools[pi].ready {
+                    sample.stages.waiting_baseline+=1;
+                    if let Some(at)=in_flight.get(&p.address) {
+                        sample.baseline_in_flight+=1;
+                        sample.oldest_baseline_in_flight_ms=sample.oldest_baseline_in_flight_ms.max(
+                            now.duration_since(*at).as_millis().min(u128::from(u64::MAX)) as u64);
+                    }else if retry.get(&p.address).is_some_and(|at|*at>now){sample.baseline_backoff+=1;}
+                    else{sample.baseline_queued+=1;}
+                }else if !self.pools[pi].available{sample.stages.unpriceable+=1;}
+                else{sample.stages.priced+=1;}
+            }else if [p.mint_a,p.mint_b].into_iter().any(|mint|mints.mint(mint).and_then(|m|m.onchain).is_none()) {
+                sample.stages.waiting_mints+=1;
+            }else{sample.stages.waiting_structure+=1;}
+        }
+        let mut accounts=Vec::with_capacity(self.account_ranges.len());
+        let mut blocked=BTreeMap::<&str,HashSet<usize>>::new();
+        for (&key,range) in &self.account_ranges {
+            let provider=planned.get(&key).map(String::as_str).unwrap_or("assignment_not_observed");
+            let row=sample.providers.entry(provider.to_owned()).or_default();row.component_accounts+=1;
+            let acknowledged=active.contains_key(&key);
+            if acknowledged{row.acknowledged+=1;}else {
+                row.missing+=1;
+                let pools=blocked.entry(provider).or_default();
+                for position in range.clone() {
+                    let sub=&self.subs[self.account_bindings[position]];pools.insert(sub.pool);
+                    *sample.missing_bindings_by_field.entry(sub.field.label()).or_default()+=1;
+                }
+            }
+            accounts.push((range.len(),key,acknowledged));
+        }
+        for (provider,pools) in blocked {sample.providers.get_mut(provider).unwrap().blocked_pools=pools.len();}
+        accounts.sort_unstable_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (bindings,key,acknowledged) in accounts {
+            let missing_sample=!acknowledged&&sample.blockers.len()<8;
+            let shared_sample=bindings>1&&sample.shared_accounts.len()<8;
+            if missing_sample||shared_sample {
+                let range=&self.account_ranges[&key];let first=&self.subs[self.account_bindings[range.start]];
+                let value=serde_json::json!({"address":key.to_string(),"field":first.field.label(),
+                    "pool_bindings":bindings,"assigned_provider":planned.get(&key),
+                    "acknowledged_provider":active.get(&key)});
+                if missing_sample{sample.blockers.push(value.clone());}
+                if shared_sample{sample.shared_accounts.push(value);}
+            }
+        }
+        sample.build_ns=nanos(started);sample
+    }
+    fn retain_preparation_sample(&mut self,sample:PreparationSample) {
+        if self.metrics.preparation_samples.len()==24{self.metrics.preparation_samples.pop_front();}
+        self.metrics.preparation_samples.push_back(sample);
+    }
+}
 // The source session owns continuity. Invalidate only pools using affected accounts.
-fn invalidate_accounts(engine:&mut Engine,keys:&HashSet<Pubkey>,versions:&mut HashMap<Pubkey,u64>,revision:&mut u64,reason:&str) {
+fn invalidate_accounts(engine:&mut Engine,keys:&HashSet<Pubkey>,versions:&mut HashMap<Pubkey,u64>,revision:&mut u64,reason:&str)->(usize,usize) {
     let pools:HashSet<_>=keys.iter().filter_map(|key|engine.account_ranges.get(key))
         .flat_map(|range|range.clone().map(|i|engine.subs[engine.account_bindings[i]].pool)).collect();
+    let affected=pools.len();let ready=pools.iter().filter(|&&pi|engine.pools[pi].ready).count();
     for pi in pools {
         let p=&mut engine.pools[pi];p.ready=false;p.available=false;
         *revision+=1;versions.insert(p.key,*revision);
         engine.publish_unavailable(pi,engine.pools[pi].slot,timestamp_us(),reason.into());
     }
+    (affected,ready)
 }
 
 impl Engine {
@@ -1603,11 +1693,12 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let mut candidates=snapshot(&registry);
     let mut selected=Vec::<PoolInput>::new();let mut current=HashMap::<Pubkey,PoolInput>::new();
     let mut engine=Engine::empty(out.clone(),0);engine.trace=settings.trace;let mut wanted=Vec::<AccountWatch>::new();
-    let mut active=HashMap::<Pubkey,String>::new();let mut versions=HashMap::<Pubkey,u64>::new();let mut revision=0;
+    let mut active=HashMap::<Pubkey,String>::new();let mut planned=HashMap::<Pubkey,String>::new();
+    let mut versions=HashMap::<Pubkey,u64>::new();let mut revision=0;
     let mut retry=HashMap::<Pubkey,time::Instant>::new();
     let mut cached=HashMap::<Pubkey,(WsEvent,u64)>::new();
     let mut jobs=tokio::task::JoinSet::new();
-    let mut in_flight=HashSet::<Pubkey>::new();
+    let mut in_flight=HashMap::<Pubkey,time::Instant>::new();
      let concurrency:usize=env_parse("MARKET_STATE_HYDRATION_CONCURRENCY",8)?;
     let batch_pools:usize=env_parse("MARKET_STATE_HYDRATION_BATCH_POOLS",64)?;
     let selection_interval_ms:u64=env_parse("MARKET_STATE_SELECTION_INTERVAL_MS",5000)?;
@@ -1676,6 +1767,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 invalidate_accounts(&mut engine,&changed,&mut versions,&mut revision,"account watch changed; awaiting baseline");
                 let desired:HashSet<_>=next.iter().map(|w|w.address).collect();
                 active.retain(|key,_|desired.contains(key)&&!changed.contains(key));
+                planned.retain(|key,_|desired.contains(key));
                 control.replace(next.clone())?;wanted=next;
             }
             engine.metrics.watch_plan.add(nanos(started));replan=false;schedule=true;
@@ -1687,12 +1779,12 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 let present=&engine.pool_index;
                 let mut targets:Vec<_>=selected.iter().filter(|p|present.get(&p.address)
                     .is_some_and(|&pi|!engine.pools[pi].ready && complete(&engine,pi,&active))
-                    && !in_flight.contains(&p.address)
+                    && !in_flight.contains_key(&p.address)
                     && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
                 let baseline=!targets.is_empty();
                 if !baseline {
                     targets=selected.iter().filter(|p|!p.direct() && !present.contains_key(&p.address)
-                        && !in_flight.contains(&p.address)
+                        && !in_flight.contains_key(&p.address)
                         && retry.get(&p.address).is_none_or(|at|*at<=now)
                         && [p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
                             .and_then(|record|record.onchain).is_some())).copied().collect();
@@ -1701,7 +1793,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 if targets.is_empty(){break;}
                 let source=baseline.then(||engine.subset(&targets.iter().map(|p|p.address).collect()));
                 let tickets:Vec<_>=targets.iter().map(|p|(*p,versions[&p.address])).collect();
-                for p in &targets {in_flight.insert(p.address);}
+                for p in &targets {in_flight.insert(p.address,now);}
                 let rpc=rpc.clone();let output=out.clone();let reader=mints.clone();
                 engine.metrics.hydration_jobs+=1;
                 jobs.spawn(async move {
@@ -1788,6 +1880,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 let mut failed_watch_changed=false;
                 for (p,reason) in failures {if valid.contains(&p.address) {
                     retry.insert(p.address,time::Instant::now()+Duration::from_secs(30));engine.metrics.hydration_failures+=1;
+                    if engine.metrics.baseline_failure_samples.len()<4 {
+                        engine.metrics.baseline_failure_samples.push(serde_json::json!({"at_us":timestamp_us(),
+                            "pool":p.address.to_string(),"baseline":baseline,"reason":reason}));
+                    }
                     // First-hydration failures need a root watch; baseline failures keep their watches.
                     failed_watch_changed|=!baseline;
                     engine.sequence+=1;engine.emit(MarketStateEvent::Unavailable{pool:p.address.to_string(),venue:Venue::from_core(p.venue).map_or("unsupported",Venue::label),slot:0,received_at_us:timestamp_us(),sequence:engine.sequence,reason});
@@ -1820,15 +1916,33 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                             if newer && cached.insert(address,(event,received)).is_some(){engine.metrics.buffer_replaced+=1;}
                         }
                     },
+                    Ok(WsEvent::Assigned{addresses,provider})=>{
+                        for &address in addresses.iter(){planned.insert(address,provider.clone());}
+                    },
                     Ok(WsEvent::Subscribed{address,provider})=>{active.insert(address,provider);schedule=true;},
                     Ok(WsEvent::Unsubscribed{address,provider})=>{
                         if active.get(&address)==Some(&provider){active.remove(&address);invalidate_accounts(&mut engine,&HashSet::from([address]),&mut versions,&mut revision,"account unsubscribed");}
                     },
                     Ok(WsEvent::Gap{provider,reason})=>{
                         engine.metrics.gaps+=1;
+                        *engine.metrics.subscription_gaps.entry(provider.clone()).or_default()+=1;
                         let keys:HashSet<_>=active.iter().filter(|(_,source)|source.as_str()==provider.as_str()).map(|(key,_)|*key).collect();
                         active.retain(|_,source|source.as_str()!=provider.as_str());
-                        invalidate_accounts(&mut engine,&keys,&mut versions,&mut revision,reason);
+                        let (affected,ready)=invalidate_accounts(&mut engine,&keys,&mut versions,&mut revision,reason);
+                        if !keys.is_empty() {
+                            let mut shared=keys.iter().filter_map(|key|engine.account_ranges.get(key)
+                                .filter(|r|r.len()>1).map(|r|(r.len(),*key))).collect::<Vec<_>>();
+                            shared.sort_unstable_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                            if engine.metrics.subscription_gap_samples.len()==8{engine.metrics.subscription_gap_samples.pop_front();}
+                            engine.metrics.subscription_gap_samples.push_back(serde_json::json!({
+                                "at_us":timestamp_us(),"provider":provider,"reason":reason,"removed_accounts":keys.len(),
+                                "invalidated_pools":affected,"previously_ready_pools":ready,
+                                "shared_accounts":shared.into_iter().take(8).map(|(count,key)| {
+                                    let range=&engine.account_ranges[&key];let sub=&engine.subs[engine.account_bindings[range.start]];
+                                    serde_json::json!({"address":key.to_string(),"field":sub.field.label(),"pool_bindings":count})
+                                }).collect::<Vec<_>>()
+                            }));
+                        }
                     },
                     Ok(WsEvent::Rejected{address,provider,code})=>{
                         engine.metrics.rejections+=1;active.remove(&address);
@@ -1849,6 +1963,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 if !retry.is_empty(){schedule=true;}
                 // TVL quality may change without changing PoolInput identity.
                 if ticks%60==0 {rebuild=true;}
+                if ticks%30==0 {
+                    let sample=engine.preparation_sample(&selected,mints.as_ref(),&active,&planned,&in_flight,&retry);
+                    engine.retain_preparation_sample(sample);
+                }
                 if ticks%5==0 {
                     let hydrated=engine.pools.len();
                     let ready=engine.pools.iter().filter(|p|p.ready).count();
@@ -1883,17 +2001,8 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let hydrated_pools=engine.pools.len();
     let ready_pools=engine.pools.iter().filter(|p|p.ready).count();
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
-    let mut preparation=PreparationStatus::default();
-    for p in &selected {
-        if let Some(&pi)=engine.pool_index.get(&p.address) {
-            if !complete(&engine,pi,&active){preparation.waiting_subscriptions+=1;}
-            else if !engine.pools[pi].ready{preparation.waiting_baseline+=1;}
-            else if !engine.pools[pi].available{preparation.unpriceable+=1;}
-            else {preparation.priced+=1;}
-        }else if [p.mint_a,p.mint_b].into_iter().any(|mint|mints.mint(mint).and_then(|m|m.onchain).is_none()) {
-            preparation.waiting_mints+=1;
-        }else {preparation.waiting_structure+=1;}
-    }
+    let final_sample=engine.preparation_sample(&selected,mints.as_ref(),&active,&planned,&in_flight,&retry);
+    let preparation=final_sample.stages.clone();engine.retain_preparation_sample(final_sample);
     for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence,reason:PoolRemovalReason::Shutdown});}
     crate::log_event!(Info,"market state stopped=true events={} observations={} websocket={} lost={}",
         engine.sequence,engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,engine.metrics.websocket_prices,engine.metrics.lost);
@@ -1905,10 +2014,19 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
 }
 
 /// Mutually exclusive stages of the selected set at shutdown; no price mirror.
-#[derive(Default,serde::Serialize)]
+#[derive(Clone,Default,serde::Serialize)]
 struct PreparationStatus {
     waiting_structure:usize,waiting_mints:usize,waiting_subscriptions:usize,
     waiting_baseline:usize,unpriceable:usize,priced:usize,
+}
+#[derive(Default,serde::Serialize)]
+struct ProviderReadiness {component_accounts:usize,acknowledged:usize,missing:usize,blocked_pools:usize}
+#[derive(serde::Serialize)]
+struct PreparationSample {
+    at_us:u64,build_ns:u64,selected:usize,net_direction_pools:[usize;3],stages:PreparationStatus,
+    baseline_in_flight:usize,baseline_backoff:usize,baseline_queued:usize,oldest_baseline_in_flight_ms:u64,
+    providers:BTreeMap<String,ProviderReadiness>,missing_bindings_by_field:BTreeMap<&'static str,usize>,
+    blockers:Vec<serde_json::Value>,shared_accounts:Vec<serde_json::Value>,
 }
 /// Counters and timings from the state owner; no diagnostic price mirror.
 #[derive(serde::Serialize)]

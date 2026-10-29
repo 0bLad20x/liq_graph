@@ -182,7 +182,7 @@ impl State {
             amounts::Assessment::unknown("nondefault_execution_mode")
         }else{amounts::assess(&self.packed_amount_inputs(&selection),&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref())};
         if assessment.decision==amounts::Decision::Excluded {
-            let candidate=selection.candidate.as_ref().context("quantity candidate missing")?;
+            let candidate=selection.candidate.clone().context("quantity candidate missing")?;
             let top=&self.plan.as_ref().context("quantity plan missing")?.compact_topologies[candidate.topology_id];
             let universe=self.amount_universe(top,registry,cfg.wallet,reads);
             let mut global=amounts::assess(&universe,&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
@@ -198,16 +198,29 @@ impl State {
             let witness=candidate.witness.as_ref().context("quantity witness missing")?;
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
             if let Some(preferred)=amounts::seed(&universe,&pairs) {
-                if let Ok(mut repaired)=self.build_compact(candidate,selection.threshold_units,selection.trigger.clone(),
+                if let Ok(mut repaired)=self.build_compact(&candidate,selection.threshold_units,selection.trigger.clone(),
                     registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,Some(&preferred)) {
                     if repaired.amount_seed_changed {
                         let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
                         if next.decision!=amounts::Decision::Excluded {
                             assessment=next;repaired.amount_seed_changed=true;report.seed_repaired+=1;selection=repaired;
-                        }else{assessment=amounts::Assessment::unknown("unpacked_or_untested_alternative");}
-                    }else{assessment=amounts::Assessment::unknown("unpacked_or_untested_alternative");}
-                }else{assessment=amounts::Assessment::unknown("quantity_seed_does_not_fit");}
-            }else{assessment=amounts::Assessment::unknown("alternative_quantity_unknown");}
+                        }
+                    }
+                }
+            }
+            // Unknown alternatives do not change the proof for this packed set.
+            // Only an actually rebuilt, re-assessed request can replace it.
+            if assessment.decision==amounts::Decision::Excluded {
+                assessment.elapsed_ns=elapsed_ns(started);report.record(&assessment);
+                report.packed_exclusions+=1;
+                report.retain_exclusion(assessment,&self.packed_amount_inputs(&selection),serde_json::json!({
+                    "scope":"actual_packed_request","request_id":selection.request.id,
+                    "graph_generation":self.generation,"signal_revision":self.revision,
+                    "topology_id":candidate.topology_id,"reverse":candidate.reverse,
+                    "trigger":selection.trigger,"source_witness":candidate.witness,
+                    "universe_decision":global.decision
+                }));return Ok(None);
+            }
         }
         assessment.elapsed_ns=elapsed_ns(started);report.record(&assessment);
         selection.amount_assessment=assessment;Ok(Some(selection))

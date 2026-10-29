@@ -42,7 +42,8 @@ impl Dlmm {
         Ok((base as f64/1e9,total as f64/1e9,directions))
     }
     pub fn rate_units_at(&self,active:i32,target:i32,step:u16,now:i64)->Result<(u64,u64,[bool;2])> {
-        ensure!(now>=self.last && self.reduction<=10000,"DLMM clock/fee reference invalid");
+        ensure!(self.reduction<=10000,"DLMM reduction factor invalid");
+        ensure!(now>=self.last,"DLMM clock behind fee reference");
         let elapsed=now-self.last;
         let (index,reference)=if elapsed>=i64::from(self.filter) {
             (active,if elapsed<i64::from(self.decay){u64::from(self.vol)*u64::from(self.reduction)/10000}else{0})

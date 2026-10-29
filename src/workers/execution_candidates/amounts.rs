@@ -34,7 +34,7 @@ impl Assessment {
 #[derive(Default,serde::Serialize)]
 pub(super) struct Report {
     pub attempts:u64,pub possible:u64,pub unknown:u64,pub excluded:u64,pub seed_repaired:u64,
-    pub global_proofs:u64,pub probes:u64,pub processing_ns_total:u64,pub processing_ns_max:u64,
+    pub global_proofs:u64,pub packed_exclusions:u64,pub probes:u64,pub processing_ns_total:u64,pub processing_ns_max:u64,
     pub processing_ns_histogram:Vec<u64>,pub reasons:BTreeMap<&'static str,u64>,
     pub excluded_samples:Vec<serde_json::Value>,
 }

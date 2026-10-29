@@ -18,6 +18,8 @@ pub struct AccountData {
 /// Source gap and per-account slot are explicit; timestamps measure local processing only.
 #[derive(Clone,Debug)]
 pub enum AccountEvent {
+    /// Desired source assignment, before its subscription is acknowledged.
+    Assigned {provider:String,addresses:Arc<[Pubkey]>},
     Subscribed {provider:String,address:Pubkey},
     Unsubscribed {provider:String,address:Pubkey},
     Account {provider:String,address:Pubkey,slot:u64,

@@ -387,7 +387,8 @@ try {
     }
     $amountSummary = if ($null -eq $amount) { $null } else { [ordered]@{
         attempts=$amount.attempts; possible=$amount.possible; unknown=$amount.unknown; excluded=$amount.excluded
-        seed_repaired=$amount.seed_repaired; global_proofs=$amount.global_proofs; probes=$amount.probes
+        seed_repaired=$amount.seed_repaired; global_proofs=$amount.global_proofs
+        packed_exclusions=$amount.packed_exclusions; probes=$amount.probes
         reasons=$amount.reasons; processing_ns=(Measure-AmountStage $amount)
         violations=$amountViolations; reserve_curve_observations=$market.metrics.reserve_curve_observations
         reserve_curve_inputs=$production.reserve_curve_inputs; reserve_curve_build_ns=$market.metrics.reserve_curve_build
@@ -465,6 +466,9 @@ try {
         net_candidate_windows=$production.candidate_windows
         market_account_processing_ns=$market.metrics.processing
         prepared_bootstrap_passed=$preparedPassed; market_preparation=$market.preparation
+        # Bounded owner samples live in market_state.json; the summary shows the final sample.
+        market_readiness=($market.metrics.preparation_samples | Select-Object -Last 1)
+        subscription_gaps_by_source=$market.metrics.subscription_gaps
         prepared_structures_by_venue=$market.metrics.prepared_structures_by_venue
         prepared_structure_build_ns=$market.metrics.prepared_structure_build
         prepared_to_first_baseline_ns=$market.metrics.prepared_to_first_baseline
