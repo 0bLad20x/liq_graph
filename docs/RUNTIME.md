@@ -1,5 +1,10 @@
 # Gemeinsame Runtime und Live-Nachweis
 
+Der Vorbereitungscheckpoint [CP8F.md](CP8F.md) entfernt fuer DLMM/PumpSwap die
+RPC-Strukturermittlung vor dem Watch-Aufbau. `-RequirePreparedEvidence` prueft
+den direkten Strukturpfad und die frische dynamische Baseline. Der bestehende
+Starter liefert Stufenzaehler und RPC-Lesemengen ohne weitere Diagnosekonsumenten.
+
 Der aktuelle Mengencheckpoint [CP8C.md](CP8C.md) verwendet denselben Starter mit
 `RequireAmountEvidence` fuer einen einzelnen 1800-Sekunden-Simulationslauf.
 `amount_evidence.json` enthaelt Mengenentscheidungen, begruendete Ausschluesse,

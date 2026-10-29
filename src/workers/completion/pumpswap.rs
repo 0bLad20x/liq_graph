@@ -420,13 +420,11 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
         let selected_buyback=warmed_buyback.unwrap_or(buyback);
         let [a,b]=[l.mints[0],l.mints[1]];
         let evidence=Arc::new(CompletionEvidence{
-            kind:"pumpswap_pool_validated_v1".into(),version:1,
+            kind:"pumpswap_pool_validated_v2".into(),version:2,
             payload:Arc::new(json!({
                 "program":program.to_string(),"pool":l.address.to_string(),
                 "global_config":global_addr.to_string(),
                 "base_mint":a.to_string(),"quote_mint":b.to_string(),
-                "base_vault":l.vaults[0].to_string(),
-                "quote_vault":l.vaults[1].to_string(),
                 "base_token_program":m0.owner.to_string(),
                 "quote_token_program":m1.owner.to_string(),
                 "base_decimals":m0.bytes[44],"quote_decimals":m1.bytes[44],
@@ -444,11 +442,12 @@ async fn process(rpc:&RpcHandle,pools:Vec<PoolState>,settings:Settings)
             }))
         });
         if let Some(wallet)=settings.wallet {
+            let vaults=crate::core::PoolVaults{vault_a:l.vaults[0],vault_b:l.vaults[1]};
             let descriptor=manifest(l,pool_slot,wallet,recipient,selected_buyback,
                 m1.owner,use_v2,program,associated);
             results.insert(pool.address,result(pool.address,
                 CompletionStatus::Prepared,Some(pool_slot),None,
-                Some(evidence),Some(proofs),Some(Arc::new(descriptor))));
+                Some(evidence),Some(proofs),Some(Arc::new(descriptor))).with_vaults(vaults));
         } else {
             results.insert(pool.address,result(pool.address,
                 CompletionStatus::Incomplete,Some(pool_slot),
@@ -472,8 +471,9 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
         && r.pool.completion_state==crate::core::CompletionState::Prepared
         && r.pool.execution_manifest.as_ref().is_some_and(|m|m.bound_signer==settings.wallet)
         && r.pool.mint_proofs.is_some()
+        && r.pool.vaults.is_some()
         && r.pool.completion_evidence.as_ref().is_some_and(|e|
-            e.kind=="pumpswap_pool_validated_v1"&&e.version==1)
+            e.kind=="pumpswap_pool_validated_v2"&&e.version==2)
         && r.pool.completion_validated_slot.is_some() && settings.wallet.is_some())
         .collect::<Vec<_>>();
     let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
@@ -549,8 +549,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                 let matched=previous_creator==Some(layout.creator.to_string().as_str())
                                     && ev.payload["is_mayhem_mode"].as_bool()==Some(layout.mayhem)
                                     && ev.payload["is_cashback_coin"].as_bool()==Some(layout.cashback)
-                                    && ev.payload["base_vault"].as_str()==Some(layout.vaults[0].to_string().as_str())
-                                    && ev.payload["quote_vault"].as_str()==Some(layout.vaults[1].to_string().as_str())
+                                    && p.vaults==Some(crate::core::PoolVaults{vault_a:layout.vaults[0],vault_b:layout.vaults[1]})
                                     && p.execution_manifest.as_ref().is_some_and(|cached|{
                                         let wallet=settings.wallet.expect("eligible wallet");
                                         let fresh=manifest(layout,cached.validated_slot,wallet,recipient,

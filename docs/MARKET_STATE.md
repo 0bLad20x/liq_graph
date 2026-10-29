@@ -9,6 +9,8 @@ The worker owns selected pool identities, account bindings and indicative prices
 Registry is the sole owner of admission and Completion; `rpc_transport` owns HTTP,
 subscriptions, ACKs and reconnections. MarketState never modifies manifests or SQL.
 Current launch and acceptance instructions: [RUNTIME.md](RUNTIME.md).
+[CP8F](CP8F.md) replaces DLMM/PumpSwap HTTP structure hydration with direct
+installation from Completion and Mint Registry, followed by the existing post-ACK baseline.
 
 ## Selection and installation
 
@@ -62,7 +64,7 @@ stateless counting consumer, which retains no pool or price state.
 | Orca Whirlpool | Squared Q64.64 sqrt price | Pool field slice |
 | PancakeSwap CLMM | Squared Q64.64 sqrt price | Pool field slice |
 | Byreal CLMM | Squared Q64.64 sqrt price | Pool field slice |
-| PumpSwap | Effective quote/base reserves, including the supplied layout's virtual quote adjustment | Pool field and two vault amount slices |
+| PumpSwap | Effective quote/base reserves, including the supplied layout's virtual quote adjustment | Full pool, two vault amount slices, base Mint supply, shared GlobalConfig/FeeConfig/Clock |
 | Raydium AMM V4 | Vault reserves minus accrued PnL | Pool PnL and two vault amount slices |
 | Raydium CPMM | Vault reserves minus protocol, fund and creator fee accruals | Pool fee and two vault amount slices |
 | Manifest | Midpoint of unexpired, two-sided, uncrossed best bid/ask | Full variable-size market account |
@@ -80,7 +82,7 @@ One venue's coverage does not validate other unobserved decoders.
 
 ## Bootstrap, recovery and removal
 
-1. Resolve selected pool identities, mint decimals and necessary reserves over shared HTTP; isolate failed pools. A failed pool retains a root-account watch and is retried every 30 seconds.
+1. For DLMM/PumpSwap, install the validated account structure from Registry/manifest and mint metadata from Mint Registry without HTTP. Old PumpSwap proofs missing vault roles receive a full Completion refresh. Other supported venues retain their structure hydration; its failed pools keep a root watch. Failed dynamic baselines keep the complete watch set and retry every 30 seconds.
 2. Deduplicate account watches and request slices where supported. Providers that explicitly reject a slice with invalid-parameter errors are retried with full accounts; the worker extracts its own fields. Providers that ignore slices and return full data are also handled when response metadata identifies the full account.
 3. Wait for subscription ACKs and establish an HTTP baseline after subscriptions. Consume incoming transport notifications while hydration is pending. Only pools with all required active subscriptions can publish usable prices.
 4. Discard queued notifications at or below each component's baseline slot until the first strictly newer slot. Thereafter preserve WS order within a slot and reject older-slot updates. This avoids overwriting the HTTP baseline with an ambiguously ordered notification.

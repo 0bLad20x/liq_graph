@@ -284,6 +284,7 @@ impl PoolRegistry {
             match pool.completion_state {
                 CompletionState::Unknown => {
                     ensure!(pool.completion_validated_slot.is_none()
+                        && pool.vaults.is_none()
                         && pool.execution_manifest.is_none()
                         && pool.completion_evidence.is_none()
                         && pool.mint_proofs.is_none(),
@@ -294,6 +295,7 @@ impl PoolRegistry {
                         (a, b, pool.completion_validated_slot, pool.execution_manifest.as_ref())
                     else { anyhow::bail!("restored Prepared pool missing identity or proof"); };
                     ensure!(m.pool == pool.address && m.mint_a == a && m.mint_b == b
+                        && pool.vaults.is_none_or(|vaults|vaults.matches_manifest(m))
                         && m.validated_slot == slot && !m.base_a.is_empty() && !m.base_b.is_empty()
                         && pool.completion_evidence.as_ref().is_some_and(|e|
                         !e.kind.is_empty() && e.version > 0 && e.payload.is_object())
@@ -304,6 +306,7 @@ impl PoolRegistry {
                     ensure!(a.is_some() && b.is_some()
                         && pool.completion_validated_slot.is_some()
                         && pool.execution_manifest.is_none()
+                        && pool.vaults.is_none()
                         && pool.completion_evidence.as_ref().is_none_or(|e|
                             !e.kind.is_empty() && e.version > 0 && e.payload.is_object()),
                         "invalid restored Incomplete pool");
@@ -496,6 +499,7 @@ impl PoolRegistry {
                         completion_state: CompletionState::Unknown,
                         completion_validated_slot: None,
                         execution_manifest: None,
+                        vaults: None,
                         completion_evidence: None,
                         mint_proofs: None,
                         completion_reason: None,
@@ -631,7 +635,7 @@ impl PoolRegistry {
             // accepted no-op before checking stale terminal completion proofs.
             if result.status == CompletionStatus::Retryable {
                 if result.reason_code != Some(crate::core::CompletionReason::TransientFailure)
-                    || result.checked_at_ms.is_some() || result.manifest.is_some() {
+                    || result.checked_at_ms.is_some() || result.manifest.is_some() || result.vaults.is_some() {
                     stats.invalid += 1;
                     continue;
                 }
@@ -683,12 +687,14 @@ impl PoolRegistry {
                     || pool.mint_a != Some(manifest.mint_a)
                     || pool.mint_b != Some(manifest.mint_b)
                     || manifest.base_a.is_empty() || manifest.base_b.is_empty()
+                    || result.vaults.is_some_and(|vaults|!vaults.matches_manifest(manifest))
+                    || (pool.venue==Venue::PumpSwap && result.vaults.is_none())
                     || result.evidence.is_none() || result.mints.as_ref().is_none_or(|m|
                         pool.mint_a!=Some(m[0].address) || pool.mint_b!=Some(m[1].address)) {
                     stats.invalid += 1;
                     continue;
                 }
-            } else if result.manifest.is_some() {
+            } else if result.manifest.is_some() || result.vaults.is_some() {
                 stats.invalid += 1;
                 continue;
             }
@@ -720,6 +726,7 @@ impl PoolRegistry {
             pool.completion_state = next_state;
             pool.completion_validated_slot = Some(slot);
             pool.execution_manifest = result.manifest.clone();
+            pool.vaults = result.vaults;
             pool.completion_evidence = result.evidence.clone();
             pool.mint_proofs = result.mints.clone();
             pool.completion_reason = result.reason.clone();

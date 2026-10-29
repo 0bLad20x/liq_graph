@@ -7,7 +7,7 @@ pub mod signals;
 pub mod account_stream;
 pub mod completion;
 pub mod rpc;
-pub use completion::{CompletionAdmission,CompletionReason,CompletionStatus,AccountMeta,ExecutionManifest,CompletionEvidence,MintProof,CompletionResult,CompletionResultBatch,CompletionWork,CompletionRequest,CompletionRequestBatch,CompletionUnchanged,CompletionOutcome,CompletionResponse,CompletionResponseBatch,CompletionState};
+pub use completion::{CompletionAdmission,CompletionReason,CompletionStatus,AccountMeta,PoolVaults,ExecutionManifest,CompletionEvidence,MintProof,CompletionResult,CompletionResultBatch,CompletionWork,CompletionRequest,CompletionRequestBatch,CompletionUnchanged,CompletionOutcome,CompletionResponse,CompletionResponseBatch,CompletionState};
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -142,6 +142,7 @@ pub struct PoolState {
     pub completion_state: CompletionState,
     pub completion_validated_slot: Option<u64>,
     pub execution_manifest: Option<Arc<ExecutionManifest>>,
+    pub vaults: Option<PoolVaults>,
     pub completion_evidence: Option<Arc<CompletionEvidence>>,
     pub mint_proofs: Option<[MintProof; 2]>,
     pub completion_reason: Option<String>,

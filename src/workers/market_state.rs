@@ -8,7 +8,7 @@ use std::{collections::{HashMap, HashSet, BTreeMap}, env, sync::Arc, time::{Dura
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
-use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue as CoreVenue, MintReader,
+use crate::core::{CompletionState, PoolState, PoolVaults, PoolUpdateBatch, Venue as CoreVenue, MintReader,
     market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, 
     graph_watch_catalog::WatchCatalog};
@@ -67,11 +67,21 @@ where T::Err:std::fmt::Display {
     env::var(key).map_or(Ok(default),|s|s.parse().map_err(|e|anyhow::anyhow!("invalid {key}: {e}")))
 }
 #[derive(Clone)]struct RpcAccount{owner:String,data:Vec<u8>,slot:u64,received_us:u64}
+#[derive(Default,serde::Serialize)]
+struct RpcReads {batch_requests:u64,requested_accounts:u64,decoded_account_bytes:u64}
+impl RpcReads {
+    fn add(&mut self,other:&Self) {
+        self.batch_requests+=other.batch_requests;self.requested_accounts+=other.requested_accounts;
+        self.decoded_account_bytes+=other.decoded_account_bytes;
+    }
+}
 // Bounded parallel RPC chunks; the transport continues to enforce provider RPS.
-async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>> {
+async fn fetch_batch(rpc:&RpcHandle,addresses:&[String],reads:&mut RpcReads)->Result<Vec<RpcAccount>> {
     let chunks=addresses.chunks(rpc.account_batch_size()).collect::<Vec<_>>();
     let mut records=Vec::with_capacity(addresses.len());
     for wave in chunks.chunks(4) {
+        reads.batch_requests+=wave.len() as u64;
+        reads.requested_accounts+=wave.iter().map(|chunk|chunk.len() as u64).sum::<u64>();
         let batches=join_all(wave.iter().map(|chunk|async move {
             let expected=chunk.iter().map(|a|a.parse::<Pubkey>()).collect::<std::result::Result<Vec<_>,_>>()?;
             let answer=rpc.call(RpcOperation::Multiple{addresses:expected,view:AccountView::Full,
@@ -88,11 +98,16 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String])->Result<Vec<RpcAccount>
             }
             Ok::<Vec<RpcAccount>,anyhow::Error>(result)
         })).await;
-        for batch in batches {records.extend(batch?);}
+        let mut error=None;
+        for batch in batches {match batch {
+            Ok(batch)=>{reads.decoded_account_bytes+=batch.iter().map(|a|a.data.len() as u64).sum::<u64>();records.extend(batch);},
+            Err(e)=>{error=Some(e);},
+        }}
+        if let Some(error)=error{return Err(error);}
     }
     Ok(records)
 }
-#[derive(Clone)]struct Watch {address:String,venue:Venue,dlmm:Option<dlmm::Dependencies>,manifest_digest:[u8;32]}
+#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32]}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
 impl Venue {
@@ -275,6 +290,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
 }
 
 #[derive(Clone)]enum State{
+    Pending{dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>},
     Dlmm{active:i32,step:u16,fee:fees::Dlmm,book:Box<dlmm::Book>},
     Pump{vquote:i128,base:u64,quote:u64,base_vault:String,quote_vault:String,
          pool_slot:u64,base_slot:u64,quote_slot:u64,fee_pool:fees::PumpPool,
@@ -299,6 +315,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
     clock:i64,epoch:u64,mint_states:[Option<Arc<crate::core::MintOnchainState>>;2],
     last_valuation:Option<FeeValuation>,
     manifest_digest:[u8;32],
+    prepared_at:Instant,
 }
 impl Pool{
     fn reserve_profile(&self)->Option<PoolLiquidity> {
@@ -345,7 +362,7 @@ impl Pool{
         match &self.state{State::Dlmm{book,..}=>book.profile.clone(),State::Pump{liquidity,..}=>liquidity.clone(),_=>None}
     }
     fn valuation(&self)->Option<FeeValuation> {
-        if !matches!(self.venue,Venue::Dlmm|Venue::Pump){return None;}
+        if !matches!(self.venue,Venue::Dlmm|Venue::Pump) || matches!(&self.state,State::Pending{..}){return None;}
         let mut token_status=std::array::from_fn(|i|match &self.mint_states[i] {
             None=>"unknown",
             Some(m)=>match m.token_extensions.get("classification").and_then(serde_json::Value::as_str) {
@@ -412,6 +429,7 @@ impl Pool{
     }
     fn compute_price(&self)->Result<f64>{
         let raw=match &self.state{
+            State::Pending{..}=>bail!("pool awaits its first dynamic baseline"),
             State::Dlmm{active,step,..}=>dlmm_spot(*active,*step,self.da,self.db)?,
             State::Pump{vquote,base,quote,..}=>pump_spot(*base,*quote,*vquote,self.da,self.db)?,
             State::DammV2{sqrt}=>damm_spot(*sqrt,self.da,self.db)?,
@@ -514,6 +532,8 @@ struct Metrics {
     selection_changes:u64,hydration_jobs:u64,discarded_results:u64,hydration_failures:u64,
     index_rebuilds:u64,structure_installs:u64,baseline_installs:u64,baseline_pools_installed:u64,
     max_hydration_in_flight:usize,initial_hydration:Latency,baseline_hydration:Latency,
+    prepared_structures_by_venue:BTreeMap<&'static str,u64>,prepared_structure_build:Latency,
+    prepared_to_first_baseline:Latency,structure_rpc:RpcReads,baseline_rpc:RpcReads,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,decode_errors:u64,
     post_rewatch_websocket_observations:u64,removals:u64,
     fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
@@ -599,17 +619,24 @@ impl Engine{
     }
     // Read only dynamic subscribed account values, after every subscription is active.
     // Keep all updates private to the staged batch until one coherent baseline is ready.
-    async fn refresh_baseline(&mut self,rpc:&RpcHandle)->Result<()> {
+    async fn refresh_baseline(&mut self,rpc:&RpcHandle,reads:&mut RpcReads)->Result<()> {
         let mut addresses=Vec::new();let mut seen=HashSet::new();
         for sub in &self.subs {
             if seen.insert(sub.address.clone()){addresses.push(sub.address.clone());}
         }
-        let accounts=fetch_batch(rpc,&addresses).await?;
+        let accounts=fetch_batch(rpc,&addresses,reads).await?;
         let dict:HashMap<_,_>=addresses.into_iter().zip(accounts).collect();
+        for sub in &mut self.subs {sub.valid=false;}
+        for pool in &mut self.pools {pool.available=false;pool.last_valuation=None;}
         for i in 0..self.subs.len() {
             let sub=&self.subs[i];
             let acc=dict.get(&sub.address).context("baseline account missing")?;
             let owner:Pubkey=acc.owner.parse()?;
+            if matches!(sub.field,Field::BaseVault|Field::QuoteVault) {
+                let pool=&self.pools[sub.pool];
+                vault_amount(acc,if sub.field==Field::BaseVault{&pool.a}else{&pool.b})?;
+                ensure!(key(&acc.data,32)?==pool.id,"Pump vault authority changed");
+            }
             let (offset,length)=sub.field.slice();
             let data=if sub.field.full() {acc.data.as_slice()}
                 else if sub.field==Field::VirtualQuote && acc.data.len()<offset+length {&[]}
@@ -623,6 +650,45 @@ impl Engine{
             self.update(i,acc.slot,owner,data,acc.received_us,timing,false)?;
         }
         Ok(())
+    }
+    // Install only addresses and verified mint metadata. This does no RPC and
+    // publishes no price; the ordinary post-ACK baseline initializes live state.
+    fn prepared(inputs:&[PoolInput],mints:&dyn MintReader,events:broadcast::Sender<Arc<MarketStateEvent>>)->Result<Self> {
+        let mut engine=Self::empty(events,0);
+        for p in inputs {
+            let venue=Venue::from_core(p.venue)?;
+            let a=mints.mint(p.mint_a).and_then(|m|m.onchain).context("prepared mint A proof missing")?;
+            let b=mints.mint(p.mint_b).and_then(|m|m.onchain).context("prepared mint B proof missing")?;
+            ensure!(a.address==p.mint_a && b.address==p.mint_b,"prepared mint identity mismatch");
+            let mut bindings=vec![(if venue==Venue::Dlmm{Field::Dlmm}else{Field::VirtualQuote},p.address,
+                if venue==Venue::Dlmm{DLMM_PROGRAM}else{PUMP_PROGRAM}.parse::<Pubkey>()?)];
+            match venue {
+                Venue::Dlmm=>{
+                    let deps=p.dlmm.context("DLMM Prepared manifest dependencies missing")?;
+                    for (i,&key) in deps.addresses().iter().enumerate() {bindings.push((Field::DlmmArray(i as u8),key,DLMM_PROGRAM.parse()?));}
+                    if let Some(key)=deps.bitmap {bindings.push((Field::DlmmBitmap,key,DLMM_PROGRAM.parse()?));}
+                },
+                Venue::Pump=>{
+                    let v=p.vaults.context("PumpSwap Prepared vault roles missing")?;
+                    bindings.extend([(Field::BaseVault,v.vault_a,a.owner),(Field::QuoteVault,v.vault_b,b.owner),
+                        (Field::PumpGlobal,fees::GLOBAL.parse()?,PUMP_PROGRAM.parse()?),
+                        (Field::PumpFees,fees::config_address(),fees::FEE_PROGRAM.parse()?),
+                        (Field::PumpSupply,p.mint_a,a.owner)]);
+                },
+                _=>bail!("venue has no direct prepared structure"),
+            }
+            bindings.push((Field::Clock,fees::CLOCK.parse()?,"Sysvar1111111111111111111111111111111111111".parse()?));
+            let (mint_a,mint_b)=(p.mint_a.to_string(),p.mint_b.to_string());
+            let (canon_base,canon_quote)=canonical(&mint_a,&mint_b);
+            let pi=engine.pools.len();
+            engine.pools.push(Pool{key:p.address,ready:false,id:p.address.to_string(),venue,a:mint_a,b:mint_b,
+                da:a.decimals,db:b.decimals,canon_base,canon_quote,state:State::Pending{dlmm:p.dlmm,vaults:p.vaults},price:0.0,
+                available:false,slot:0,received_us:0,updates:0,clock:0,epoch:0,mint_states:[Some(a),Some(b)],
+                last_valuation:None,manifest_digest:p.manifest_digest,prepared_at:Instant::now()});
+            for (field,key,owner) in bindings {engine.subs.push(Subscription{pool:pi,field,key,address:key.to_string(),owner,
+                slot:0,received_us:0,floor:None,valid:false});}
+        }
+        Ok(engine)
     }
     fn install_structure(&mut self,mut part:Engine)->bool {
         if part.pools.is_empty() {return false;}
@@ -658,6 +724,9 @@ impl Engine{
         }
         for (source,(pool,&pi)) in part.pools.into_iter().zip(&positions).enumerate() {
             let old=&mut self.pools[pi];
+            if matches!(&old.state,State::Pending{..}) {
+                self.metrics.prepared_to_first_baseline.add(nanos(old.prepared_at));
+            }
             old.ready=pool.ready;old.state=pool.state;old.price=pool.price;
             old.available=pool.available;old.slot=pool.slot;
             old.received_us=pool.received_us;old.updates=pool.updates;old.clock=pool.clock;old.epoch=pool.epoch;old.mint_states=pool.mint_states;old.last_valuation=pool.last_valuation;
@@ -672,33 +741,14 @@ impl Engine{
         }
         Ok(positions)
     }
-    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,mints:&dyn MintReader)->Result<Self>{
+    async fn hydrate(cfg:Config,rpc:&RpcHandle,events:broadcast::Sender<Arc<MarketStateEvent>>,sequence:u64,mints:&dyn MintReader,reads:&mut RpcReads)->Result<Self>{
         let pool_addrs:Vec<_>=cfg.watches.iter().map(|w|w.address.clone()).collect();
-        let pool_records=fetch_batch(rpc,&pool_addrs).await?;
+        let pool_records=fetch_batch(rpc,&pool_addrs,reads).await?;
         let mut raw_pools=Vec::new();let mut details=Vec::<String>::new();
         for (watch,acc) in cfg.watches.iter().zip(&pool_records){
             let pool_slot=acc.slot;
             let (a,b,state)=match watch.venue{
-                Venue::Dlmm=>{
-                    ensure!(acc.owner==DLMM_PROGRAM&&acc.data.starts_with(&DLMM_DISC),"{} not a DLMM LbPair",watch.address);
-                    let active=i32_le(&acc.data,76)?;let step=u16_le(&acc.data,80)?;details.push(fees::CLOCK.into());
-                    let dependencies=watch.dlmm.context("DLMM Prepared manifest has no valid array dependency block")?;
-                    details.extend(dependencies.addresses().iter().map(ToString::to_string));
-                    if let Some(bitmap)=dependencies.bitmap{details.push(bitmap.to_string());}
-                    let book=Box::new(dlmm::Book::new(watch.address.parse()?,dependencies,&acc.data)?);
-                    (key(&acc.data,88)?,key(&acc.data,120)?,State::Dlmm{active,step,fee:fees::Dlmm::decode(&acc.data)?,book})
-                },
-                Venue::Pump=>{
-                    ensure!(acc.owner==PUMP_PROGRAM&&acc.data.starts_with(&POOL_DISC),"{} not a PumpSwap Pool",watch.address);
-                    let a=key(&acc.data,43)?;let b=key(&acc.data,75)?;
-                    let base_vault=key(&acc.data,139)?;let quote_vault=key(&acc.data,171)?;
-                    details.push(base_vault.clone());details.push(quote_vault.clone());
-                    details.extend([a.clone(),fees::GLOBAL.into(),fees::config_address().to_string(),fees::CLOCK.into()]);
-                    let vquote=if acc.data.len()>=261{i128_le(&acc.data,245)?}else{0};
-                    (a,b,State::Pump{vquote,base:0,quote:0,base_vault,quote_vault,
-                        pool_slot,base_slot:pool_slot,quote_slot:pool_slot,
-                        fee_pool:fees::PumpPool::decode(&acc.data)?,global:None,config:None,supply:None,liquidity:None})
-                },
+                Venue::Dlmm|Venue::Pump=>bail!("prepared pool must use the direct structure path"),
                 Venue::DammV2=>{
                     ensure!(acc.owner==DAMM_V2_PROGRAM&&acc.data.starts_with(&POOL_DISC),"{} not a DAMM V2 Pool",watch.address);
                     ensure!(acc.data.len()>=472,"DAMM V2 Pool layout shorter than expected: {}",acc.data.len());
@@ -771,11 +821,9 @@ impl Engine{
                 }
             };
             ensure!(a!=b,"Pool with identical mints {}",watch.address);
-            details.push(a.clone());details.push(b.clone());
             raw_pools.push((a,b,state,acc.slot));
         }
-        // One authoritative Mint Registry. Only dynamic vault accounts are read here;
-        // onchain Mint verification and decimals are owned by the Mint-enrichment worker.
+        // Mint metadata comes exclusively from the authoritative Mint Registry.
         let mint_addresses:HashSet<String>=raw_pools.iter().flat_map(|(a,b,_,_)|
             [a.clone(),b.clone()]).collect();
         let mut verified=HashMap::new();
@@ -792,7 +840,7 @@ impl Engine{
                 unique.push(address);
             }
         }
-        let records=fetch_batch(rpc,&unique).await?;
+        let records=fetch_batch(rpc,&unique,reads).await?;
         let dict:HashMap<String,RpcAccount>=unique.into_iter().zip(records).collect();
         let mut pools=Vec::new();let mut subs=Vec::new();
         for (idx,(watch,(a,b,mut state,pool_slot))) in cfg.watches.iter().zip(raw_pools).enumerate(){
@@ -808,12 +856,6 @@ impl Engine{
                 let acc=&pool_records[idx].data;
                 ensure!(bytes(acc,233,1)?[0]==da && bytes(acc,234,1)?[0]==db,
                     "{} CLMM PoolState decimals disagree with SPL mints",watch.address);
-            }
-            if let State::Pump{base,quote,base_vault,quote_vault,base_slot,quote_slot,..}=&mut state {
-                *base=vault_amount(dict.get(base_vault).context("base vault missing")?,&a)?;
-                *quote=vault_amount(dict.get(quote_vault).context("quote vault missing")?,&b)?;
-                *base_slot=dict.get(base_vault).context("base vault slot missing")?.slot;
-                *quote_slot=dict.get(quote_vault).context("quote vault slot missing")?.slot;
             }
             if let State::RaydiumAmmV4{base,quote,base_vault,quote_vault,base_slot,quote_slot,..}=&mut state {
                 *base=vault_amount(dict.get(base_vault).context("Raydium base vault missing")?,&a)?;
@@ -832,61 +874,18 @@ impl Engine{
             // unrelated later mint-decimal hydration slot. Composite reserve
             // baselines can contain account values from both fetches.
             let observed_slot=match &state {
-                State::Pump{base_slot,quote_slot,..}|
                 State::RaydiumAmmV4{base_slot,quote_slot,..}|
                 State::RaydiumCpmm{base_slot,quote_slot,..}=>pool_slot.max(*base_slot).max(*quote_slot),
                 _=>pool_slot,
             };
-            let mut fee_subs=Vec::new();
-            let mut clock=0;let mut epoch=0;
-            if matches!(watch.venue,Venue::Dlmm|Venue::Pump) {
-                let acc=dict.get(fees::CLOCK).context("chain clock unavailable")?;
-                ensure!(acc.owner=="Sysvar1111111111111111111111111111111111111" && acc.data.len()==40,"invalid chain Clock");
-                clock=i64::from_le_bytes(bytes(&acc.data,32,8)?.try_into()?);epoch=u64_le(&acc.data,16)?;
-                fee_subs.push((Field::Clock,fees::CLOCK.to_string(),acc));
-            }
-            if let State::Pump{global,config,supply,..}=&mut state {
-                let g=dict.get(fees::GLOBAL).context("Pump GlobalConfig unavailable")?;
-                ensure!(g.owner==PUMP_PROGRAM,"Pump GlobalConfig owner mismatch");
-                *global=Some(Arc::new(fees::Global::decode(&g.data)?));
-                let faddr=fees::config_address().to_string();let f=dict.get(&faddr).context("Pump FeeConfig unavailable")?;
-                ensure!(f.owner==fees::FEE_PROGRAM,"Pump FeeConfig owner mismatch");
-                *config=Some(Arc::new(fees::Config::decode(&f.data)?));
-                let mint=dict.get(&a).context("Pump base mint unavailable")?;
-                ensure!(mint.owner==TOKEN_PROGRAM||mint.owner==TOKEN_2022,"Pump mint owner invalid");
-                ensure!(bytes(&mint.data,45,1)?[0]==1,"Pump base mint uninitialized");
-                *supply=Some(u64_le(&mint.data,36)?);
-                fee_subs.extend([(Field::PumpGlobal,fees::GLOBAL.into(),g),(Field::PumpFees,faddr,f),(Field::PumpSupply,a.clone(),mint)]);
-            }
-            if let State::Dlmm{book,..}=&mut state {
-                let dependencies=book.dependencies;
-                for (position,address) in dependencies.addresses().iter().copied().enumerate() {
-                    let name=address.to_string();let acc=dict.get(&name).context("DLMM BinArray baseline missing")?;
-                    ensure!(acc.owner==DLMM_PROGRAM,"DLMM BinArray owner mismatch");
-                    book.array(position as u8,address,&acc.data)?;
-                    fee_subs.push((Field::DlmmArray(position as u8),name,acc));
-                }
-                if let Some(address)=dependencies.bitmap {
-                    let name=address.to_string();let acc=dict.get(&name).context("DLMM bitmap baseline missing")?;
-                    ensure!(acc.owner==DLMM_PROGRAM,"DLMM bitmap owner mismatch");book.bitmap(&acc.data)?;
-                    fee_subs.push((Field::DlmmBitmap,name,acc));
-                }
-            }
             let mint_states=[mints.mint(a.parse()?).and_then(|m|m.onchain),mints.mint(b.parse()?).and_then(|m|m.onchain)];
-            let mut pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
+            let pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
-                clock,epoch,mint_states,last_valuation:None,manifest_digest:watch.manifest_digest,
-                price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,
+                clock:0,epoch:0,mint_states,last_valuation:None,manifest_digest:watch.manifest_digest,
+                price:0.0,available:false,slot:observed_slot,received_us:pool_records[idx].received_us,updates:0,prepared_at:Instant::now(),
             };
-            pool.refresh_liquidity();
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
             subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),key:watch.address.parse()?,owner:pool_records[idx].owner.parse()?,slot:pool_slot,received_us:pool_records[idx].received_us,floor:Some(pool_slot),valid:true});
-            if let State::Pump{base_vault,quote_vault,..}=&pool.state{
-                for (field,address) in [(Field::BaseVault,base_vault),(Field::QuoteVault,quote_vault)]{
-                    let acc=dict.get(address).context("vault not found")?;
-                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
-                }
-            }
             if let State::RaydiumAmmV4{base_vault,quote_vault,..}=&pool.state {
                 for (field,address) in [(Field::RaydiumV4BaseVault,base_vault),
                     (Field::RaydiumV4QuoteVault,quote_vault)] {
@@ -900,10 +899,6 @@ impl Engine{
                     let acc=dict.get(address).context("Raydium CPMM vault missing")?;
                     subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
                 }
-            }
-            for (field,address,acc) in fee_subs {
-                subs.push(Subscription{pool:idx,field,key:address.parse()?,address,owner:acc.owner.parse()?,slot:acc.slot,
-                    received_us:acc.received_us,floor:Some(acc.slot),valid:true});
             }
             pools.push(pool);
         }
@@ -1045,6 +1040,20 @@ impl Engine{
             })
         }else{None};
         let pool=&mut self.pools[pi];
+        if let State::Pending{dlmm,vaults}=&pool.state {
+            pool.state=match field {
+                Field::Dlmm=>State::Dlmm{active:i32_le(data,76)?,step:u16_le(data,80)?,
+                    fee:fees::Dlmm::decode(data)?,book:Box::new(dlmm::Book::new(pool.key,
+                        dlmm.context("prepared DLMM dependencies missing")?,data)?)},
+                Field::VirtualQuote=>{
+                    let v=vaults.context("prepared PumpSwap vaults missing")?;
+                    State::Pump{vquote:0,base:0,quote:0,base_vault:v.vault_a.to_string(),quote_vault:v.vault_b.to_string(),
+                        pool_slot:slot,base_slot:0,quote_slot:0,fee_pool:fees::PumpPool::decode(data)?,
+                        global:None,config:None,supply:None,liquidity:None}
+                },
+                _=>bail!("baseline must initialize the pool account before its components"),
+            };
+        }
         let old=pool.price;
         let was_available=pool.available;
         let mut unavailable_reason=None;
@@ -1068,8 +1077,9 @@ impl Engine{
                 book.array(position,self.subs[index].key,data)?;
             },
             (State::Dlmm{book,..},Field::DlmmBitmap)=>{book.bitmap(data)?;},
-            (State::Pump{vquote,pool_slot,fee_pool,..},Field::VirtualQuote)=>{
+            (State::Pump{vquote,pool_slot,fee_pool,base_vault,quote_vault,..},Field::VirtualQuote)=>{
                 ensure!(key(data,43)?==pool.a&&key(data,75)?==pool.b,"Pump mint identity changed");
+                ensure!(key(data,139)?==*base_vault && key(data,171)?==*quote_vault,"Pump vault identity changed; awaiting Completion");
                 *fee_pool=fees::PumpPool::decode(data)?;
                 *vquote=if data.len()<261{0}else{i128_le(data,245)?};*pool_slot=slot;
             },
@@ -1177,8 +1187,12 @@ impl Settings {
 // Only the price worker's identity index is retained; manifests and canonical pool
 // lifecycle remain in the Registry. Notifications reconcile against the current owner.
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,manifest_digest:[u8;32]}
+struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32]}
 impl PoolInput {
+    fn direct(self)->bool {matches!(self.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap)}
+    fn structure_available(self)->bool {
+        match self.venue {CoreVenue::MeteoraDlmm=>self.dlmm.is_some(),CoreVenue::PumpSwap=>self.vaults.is_some(),_=>false}
+    }
     fn of(p:&PoolState)->Option<Self> {
         if !p.completion_admission.is_admitted() || p.completion_state!=CompletionState::Prepared{return None;}
         let dlmm=if p.venue==CoreVenue::MeteoraDlmm {
@@ -1187,7 +1201,7 @@ impl PoolInput {
         let manifest_digest=if matches!(p.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap) {
             p.execution_manifest.as_ref()?.account_set_digest()
         }else{[0;32]};
-        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm,manifest_digest})
+        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm,vaults:p.vaults,manifest_digest})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
@@ -1437,21 +1451,21 @@ impl Engine {
 // Preparation never publishes or borrows the running engine. Only the event loop
 // installs results, after checking that identities and resync revisions still match.
 async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<MarketStateEvent>>,
-    mints:&dyn MintReader,baseline_source:Option<&Engine>)->Result<(Engine,Vec<(PoolInput,String)>)> {
+    mints:&dyn MintReader,baseline_source:Option<&Engine>,reads:&mut RpcReads)->Result<(Engine,Vec<(PoolInput,String)>)> {
     let mut engine=Engine::empty(out.clone(),0);
     let mut pending=vec![pools.to_vec()];let mut failed=Vec::new();
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
-            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,dlmm:p.dlmm,manifest_digest:p.manifest_digest}))
+            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest}))
             .collect::<Result<Vec<_>>>()?})})();
         let result=match (baseline_source,config) {
             (Some(source),_)=>{
                 let selected=batch.iter().map(|p|p.address).collect();
                 let mut part=source.subset(&selected);
-                part.refresh_baseline(rpc).await.map(|()|part)
+                part.refresh_baseline(rpc,reads).await.map(|()|part)
             },
-            (None,Ok(cfg))=>Engine::hydrate(cfg,rpc,out.clone(),0,mints).await,
+            (None,Ok(cfg))=>Engine::hydrate(cfg,rpc,out.clone(),0,mints,reads).await,
             (None,Err(error))=>Err(error),
         };
         let result=result.and_then(|part| {
@@ -1573,7 +1587,7 @@ impl Engine {
 }
 
 /// Registry identities select observations, never establish market prices.
-/// Exactly one bounded preparation job may run while live events continue on this task.
+/// Bounded baseline/legacy hydration jobs run while this task consumes live events.
 async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpdateBatch>>,
     rpc:RpcHandle,control:AccountStreamControl,mut events:AccountEventStream,out:broadcast::Sender<Arc<MarketStateEvent>>,
     mut catalog:watch::Receiver<Arc<WatchCatalog>>,mints:Arc<dyn MintReader>,
@@ -1601,7 +1615,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     ensure!((1..=32).contains(&concurrency) && (1..=256).contains(&batch_pools),
         "invalid market hydration concurrency/batch configuration");
     crate::log_event!(Info,"market state hydration configured concurrency={concurrency} batch_pools={batch_pools} mint_source=central_registry baseline=dynamic_only graph_selection=true");
-    let mut rebuild=true;let mut replan=false;let mut schedule=true;let mut input_open=true;let mut ticks=0;
+    let mut rebuild=true;let mut replan=false;let mut prepare=true;let mut schedule=true;let mut input_open=true;let mut ticks=0;
     let mut selector_jobs=tokio::task::JoinSet::<(u64,Vec<PoolInput>)>::new();
     let mut selected_ready:Option<Vec<PoolInput>>=None;
     let mut next_selection_at=time::Instant::now();
@@ -1620,7 +1634,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 for p in &next {if !keep.contains(&p.address){revision+=1;versions.insert(p.address,revision);}}
                 if next.is_empty(){engine.metrics.cleared=true;}
                 else if engine.metrics.cleared {engine.metrics.rewatching=true;}
-                selected=next;current=next_map;replan=true;engine.metrics.selection_changes+=1;
+                selected=next;current=next_map;prepare=true;replan=true;engine.metrics.selection_changes+=1;
                 let mut mints_to_check=selected.iter().flat_map(|p|[p.mint_a,p.mint_b])
                     .collect::<Vec<_>>();
                 mints_to_check.sort_unstable();mints_to_check.dedup();
@@ -1631,6 +1645,19 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 engine.sequence+=1;engine.emit(MarketStateEvent::Selection{prepared:candidates.len(),
                     selected:selected.iter().map(|p|p.address.to_string()).collect(),accounts:0,sequence:engine.sequence});
                 crate::log_event!(Debug,"market state selection prepared={} selected={} retained={} initialization=incremental",candidates.len(),selected.len(),keep.len());
+            }
+        }
+        if prepare {
+            prepare=false;
+            let next=selected.iter().filter(|p|!engine.pool_index.contains_key(&p.address)
+                && p.structure_available() && [p.mint_a,p.mint_b].into_iter().all(|mint|
+                    mints.mint(mint).and_then(|record|record.onchain).is_some())).copied().collect::<Vec<_>>();
+            if !next.is_empty() {
+                let started=Instant::now();
+                let part=Engine::prepared(&next,mints.as_ref(),out.clone())?;
+                for p in &next {*engine.metrics.prepared_structures_by_venue.entry(p.venue.name()).or_default()+=1;}
+                replan|=engine.install_structure(part);schedule=true;
+                engine.metrics.prepared_structure_build.add(nanos(started));
             }
         }
         if replan {
@@ -1660,7 +1687,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                     && retry.get(&p.address).is_none_or(|at|*at<=now)).copied().collect();
                 let baseline=!targets.is_empty();
                 if !baseline {
-                    targets=selected.iter().filter(|p|!present.contains_key(&p.address)
+                    targets=selected.iter().filter(|p|!p.direct() && !present.contains_key(&p.address)
                         && !in_flight.contains(&p.address)
                         && retry.get(&p.address).is_none_or(|at|*at<=now)
                         && [p.mint_a,p.mint_b].into_iter().all(|mint|mints.mint(mint)
@@ -1675,8 +1702,9 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
                 engine.metrics.hydration_jobs+=1;
                 jobs.spawn(async move {
                     let started=Instant::now();
-                    let result=hydrate(&targets,&rpc,&output,reader.as_ref(),source.as_ref()).await;
-                    (tickets,baseline,result,started.elapsed())
+                    let mut reads=RpcReads::default();
+                    let result=hydrate(&targets,&rpc,&output,reader.as_ref(),source.as_ref(),&mut reads).await;
+                    (tickets,baseline,result,started.elapsed(),reads)
                 });
                 engine.metrics.max_hydration_in_flight=engine.metrics.max_hydration_in_flight.max(jobs.len());
             }
@@ -1726,7 +1754,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             },
             changed=catalog.changed()=>{if changed.is_err(){break;}rebuild=true;},
             changed=mint_revision.changed()=>{
-                if changed.is_err(){break;}schedule=true;
+                if changed.is_err(){break;}schedule=true;prepare=true;
                 for pi in 0..engine.pools.len() {
                     let p=&mut engine.pools[pi];
                     let next=[p.a.parse().ok().and_then(|a|mints.mint(a)).and_then(|m|m.onchain),
@@ -1744,10 +1772,10 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             },
             joined=jobs.join_next(),if !jobs.is_empty()=>{
                 let started=Instant::now();
-                let (tickets,baseline,result,elapsed)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
+                let (tickets,baseline,result,elapsed,reads)=joined.context("market preparation task disappeared")?.context("market preparation panicked")?;
                 for (pool,_) in &tickets {in_flight.remove(&pool.address);}
-                if baseline {engine.metrics.baseline_hydration.add(elapsed.as_nanos() as u64);}
-                else {engine.metrics.initial_hydration.add(elapsed.as_nanos() as u64);}
+                if baseline {engine.metrics.baseline_hydration.add(elapsed.as_nanos() as u64);engine.metrics.baseline_rpc.add(&reads);}
+                else {engine.metrics.initial_hydration.add(elapsed.as_nanos() as u64);engine.metrics.structure_rpc.add(&reads);}
                 let (mut part,failures)=result?;schedule=true;
                 let valid:HashSet<_>=tickets.iter().filter(|(p,version)|current.get(&p.address)==Some(p)&&versions.get(&p.address)==Some(version))
                     .map(|(p,_)|p.address).collect();
@@ -1839,7 +1867,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
             }
         }
     }
-    // JoinSet drops/cancels the one preparation job. No detached HTTP initializer.
+    // Dropping JoinSet cancels unfinished preparation; no detached HTTP initializer.
     drop(jobs);
     crate::log_event!(Info,"market state hydration final selected={} hydrated={} ready={} priced={} initial_jobs={} baseline_jobs={} max_in_flight={} hydration_failures={} live_index_rebuilds={} structure_installs={} baseline_installs={} baseline_pools_installed={} watch_plans={}",
         selected.len(),engine.pools.len(),engine.pools.iter().filter(|p|p.ready).count(),engine.pools.iter().filter(|p|p.ready&&p.available).count(),
@@ -1851,6 +1879,17 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let hydrated_pools=engine.pools.len();
     let ready_pools=engine.pools.iter().filter(|p|p.ready).count();
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
+    let mut preparation=PreparationStatus::default();
+    for p in &selected {
+        if let Some(&pi)=engine.pool_index.get(&p.address) {
+            if !complete(&engine,pi,&active){preparation.waiting_subscriptions+=1;}
+            else if !engine.pools[pi].ready{preparation.waiting_baseline+=1;}
+            else if !engine.pools[pi].available{preparation.unpriceable+=1;}
+            else {preparation.priced+=1;}
+        }else if [p.mint_a,p.mint_b].into_iter().any(|mint|mints.mint(mint).and_then(|m|m.onchain).is_none()) {
+            preparation.waiting_mints+=1;
+        }else {preparation.waiting_structure+=1;}
+    }
     for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence,reason:PoolRemovalReason::Shutdown});}
     crate::log_event!(Info,"market state stopped=true events={} observations={} websocket={} lost={}",
         engine.sequence,engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,engine.metrics.websocket_prices,engine.metrics.lost);
@@ -1858,15 +1897,22 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
         observations:engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,
         websocket_observations:engine.metrics.websocket_prices,
         post_rewatch_websocket_observations:engine.metrics.post_rewatch_websocket_observations,
-        selected_pools,hydrated_pools,ready_pools,priced_pools,metrics:engine.metrics})
+        selected_pools,hydrated_pools,ready_pools,priced_pools,preparation,metrics:engine.metrics})
 }
 
+/// Mutually exclusive stages of the selected set at shutdown; no price mirror.
+#[derive(Default,serde::Serialize)]
+struct PreparationStatus {
+    waiting_structure:usize,waiting_mints:usize,waiting_subscriptions:usize,
+    waiting_baseline:usize,unpriceable:usize,priced:usize,
+}
 /// Counters and timings from the state owner; no diagnostic price mirror.
 #[derive(serde::Serialize)]
 pub struct ProductionReport {
     pub events:u64,pub observations:u64,pub websocket_observations:u64,
     pub post_rewatch_websocket_observations:u64,
-    selected_pools:usize,hydrated_pools:usize,ready_pools:usize,priced_pools:usize,metrics:Metrics,
+    selected_pools:usize,hydrated_pools:usize,ready_pools:usize,priced_pools:usize,
+    preparation:PreparationStatus,metrics:Metrics,
 }
 impl ProductionReport {
     pub fn ensure_delivery_evidence(&self)->Result<()> {

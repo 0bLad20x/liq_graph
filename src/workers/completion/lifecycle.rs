@@ -139,12 +139,17 @@ impl Scheduler {
             _=>true,
         })
     }
+    fn needs_structure(pool:&PoolState)->bool {
+        pool.venue==Venue::PumpSwap && pool.completion_state==CompletionState::Prepared
+            && pool.vaults.is_none()
+    }
     fn plan(pool:&PoolState,configuration_ready:bool,settings:Settings,now:u64)->(CompletionWork,Option<u64>) {
         if !pool.completion_admission.is_admitted() {
             return (CompletionWork::Recheck,None);
         }
         match pool.completion_state {
             CompletionState::Unknown=>(CompletionWork::Initial,Some(now)),
+            CompletionState::Prepared if Self::needs_structure(pool)=>(CompletionWork::Refresh,Some(now)),
             CompletionState::Prepared=>(CompletionWork::Refresh,
                 Some(pool.completion_checked_at_ms.map_or(now,|at|at.saturating_add(settings.refresh_ms)))),
             CompletionState::Incomplete=>{
@@ -403,6 +408,7 @@ impl Scheduler {
                     self.next_id=self.next_id.checked_add(1).context("lifecycle request id overflow")?;
                     let id=self.next_id;
                     let force_full=entry.force_once || entry.pool.completion_state==CompletionState::Unknown
+                        || Self::needs_structure(&entry.pool)
                         || entry.pool.completion_validated_slot.is_none()
                         || entry.pool.completion_checked_at_ms.is_none_or(|at|
                             now.saturating_sub(at)>=settings.full_refresh_ms);

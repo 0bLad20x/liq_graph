@@ -23,6 +23,7 @@ param(
     [switch]$RequireFeeEvidence,
     [switch]$RequireLiquidityEvidence,
     [switch]$RequireAmountEvidence,
+    [switch]$RequirePreparedEvidence,
     # Diagnostic raw snapshots only. This does not pin or filter pool selection.
     [string]$LiquidityEvidencePools = '',
     # Overrides the single ENV allowlist for the complete pipeline.
@@ -44,6 +45,7 @@ if ($Stage -eq 'Graph' -and -not $GraphAudit) { throw 'Stage Graph requires Grap
 if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage Signals.' }
 if (($RequireLiquidityEvidence -or $LiquidityEvidencePools) -and -not $signals) { throw 'Liquidity evidence requires Stage Signals.' }
 if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw 'Amount evidence requires Stage Signals and SimulateV10.' }
+if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidence requires MarketState.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
@@ -190,6 +192,7 @@ try {
         require_liquidity_evidence=[bool]$RequireLiquidityEvidence
         liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v2'
         require_amount_evidence=[bool]$RequireAmountEvidence; amount_check='observed_simple_cycles_dex_only'
+        require_prepared_evidence=[bool]$RequirePreparedEvidence
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -202,6 +205,9 @@ try {
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
     if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
+    if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
+        throw 'Prepared evidence currently covers only meteora_dlmm and pumpswap.'
+    }
     Write-Host "WS accounts=$($plan.websocket_plan.account_capacity) sockets=$($plan.websocket_plan.socket_count)"
     if ($PlanOnly) {
         @{ plan_only=$true; runtime_started=$false; orchestration_evidence_passed=$false } |
@@ -283,6 +289,21 @@ try {
             (-not $SimulateV10 -or $execution.execution_candidates.score_basis -eq 'marginal_dex_net')
     }
     $feeEvidence = $market.metrics.fee_valuation
+    $preparedPassed = $null
+    if ($RequirePreparedEvidence) {
+        $stages = $market.preparation
+        $partition = [long]$stages.waiting_structure + [long]$stages.waiting_mints + [long]$stages.waiting_subscriptions +
+            [long]$stages.waiting_baseline + [long]$stages.unpriceable + [long]$stages.priced
+        $preparedPassed = $null -ne $stages -and $partition -eq [long]$market.selected_pools -and
+            [long]$market.metrics.structure_rpc.batch_requests -eq 0 -and [long]$market.metrics.initial_hydration.count -eq 0 -and
+            [long]$market.metrics.baseline_rpc.batch_requests -gt 0 -and [long]$market.metrics.baseline_prices -gt 0 -and
+            [long]$market.metrics.decode_errors -eq 0 -and [long]$market.metrics.lost -eq 0
+        foreach ($venue in $plan.enabled_venues) {
+            $model = if ($venue -eq 'meteora_dlmm') { 'dlmm' } else { 'pumpswap' }
+            $preparedPassed = $preparedPassed -and [long]$market.metrics.prepared_structures_by_venue.$venue -gt 0 -and
+                [long]$feeEvidence.known_dex_fees_by_model.$model -gt 0
+        }
+    }
     $feePassed = $null
     if ($RequireFeeEvidence) {
         $feePassed = $null -ne $feeEvidence -and
@@ -443,6 +464,11 @@ try {
         observations_by_known_net_directions=$production.observations_by_known_net_directions
         net_candidate_windows=$production.candidate_windows
         market_account_processing_ns=$market.metrics.processing
+        prepared_bootstrap_passed=$preparedPassed; market_preparation=$market.preparation
+        prepared_structures_by_venue=$market.metrics.prepared_structures_by_venue
+        prepared_structure_build_ns=$market.metrics.prepared_structure_build
+        prepared_to_first_baseline_ns=$market.metrics.prepared_to_first_baseline
+        completed_structure_rpc=$market.metrics.structure_rpc; completed_baseline_rpc=$market.metrics.baseline_rpc
         market_queue_ns=$market.metrics.queue
         signal_steady_state_processing_ns=$production.steady_state_inputs.processing_ns
         signal_preparation_ns=$production.steady_state_inputs.preparation_ns
@@ -472,6 +498,7 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     $summary | ConvertTo-Json -Depth 10 | Write-Host
     if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
+    if ($RequirePreparedEvidence -and -not $preparedPassed) { throw "CP8F prepared bootstrap evidence incomplete; inspect $folder." }
     if ($RequireLiquidityEvidence -and -not $liquidityPassed) { throw "CP8B liquidity evidence incomplete; inspect liquidity_evidence.json in $folder." }
     if ($RequireAmountEvidence -and -not $amountPassed) { throw "CP8C amount evidence incomplete; inspect amount_evidence.json in $folder. A real exclusion and a positive amount estimate are required." }
     if ($signals -and -not $netPassed) { throw "Net signal evidence incomplete; inspect $folder." }

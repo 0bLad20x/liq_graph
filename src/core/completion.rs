@@ -49,6 +49,26 @@ pub struct AccountMeta {
     pub writable: bool,
 }
 
+/// Validated vault roles in the pool's mint_a / mint_b orientation. Stored with
+/// the same completion proof as the manifest; balances remain live-only data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolVaults {
+    #[serde(with = "execution::pubkey_json")]
+    pub vault_a: Pubkey,
+    #[serde(with = "execution::pubkey_json")]
+    pub vault_b: Pubkey,
+}
+impl PoolVaults {
+    pub fn matches_manifest(self, manifest: &ExecutionManifest) -> bool {
+        self.vault_a != Pubkey::default() && self.vault_b != Pubkey::default()
+            && self.vault_a != self.vault_b
+            && [&manifest.base_a, &manifest.base_b].iter().all(|block|
+                [self.vault_a, self.vault_b].iter().all(|key|
+                    block.iter().any(|account| account.address == *key && account.writable)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionManifest {
@@ -110,6 +130,7 @@ pub struct CompletionResult {
     pub status: CompletionStatus,
     pub validated_slot: Option<u64>,
     pub manifest: Option<Arc<ExecutionManifest>>,
+    pub vaults: Option<PoolVaults>,
     pub reason: Option<String>,
     pub reason_code: Option<CompletionReason>,
     /// Completion finished at this wall-clock time. Retryable attempts do not
@@ -130,12 +151,17 @@ impl CompletionResult {
         };
         let checked_at_ms = if status == CompletionStatus::Retryable { None }
             else { now_unix_ms().ok() };
-        Self { pool, status, validated_slot, manifest, reason, reason_code,
+        Self { pool, status, validated_slot, manifest, vaults:None, reason, reason_code,
             checked_at_ms, evidence, mints }
     }
 
     pub fn with_reason_code(mut self, reason: CompletionReason) -> Self {
         self.reason_code = Some(reason);
+        self
+    }
+
+    pub fn with_vaults(mut self, vaults: PoolVaults) -> Self {
+        self.vaults = Some(vaults);
         self
     }
 }

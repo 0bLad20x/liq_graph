@@ -9,7 +9,7 @@ use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
-    core::{AccountMeta, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue, MintState, DataBatch, RecordIdentity,
+    core::{AccountMeta, PoolVaults, CompletionAdmission, CompletionEvidence, CompletionReason, ExecutionManifest, MintProof, Venue, MintState, DataBatch, RecordIdentity,
         CompletionState, PoolState, PoolUpdateBatch, PoolUpdateKind},
 };
 
@@ -218,6 +218,7 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
     })).collect::<Vec<_>>());
     let payload = json!({
         "manifest":manifest,
+        "vaults":pool.vaults,
         "bound_signer":pool.execution_manifest.as_ref().and_then(|m|m.bound_signer).map(|wallet|wallet.to_string()),
         "evidence":evidence,
         "mints":mints,
@@ -232,7 +233,7 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
 fn decode_descriptor(
     address: Pubkey, a: Pubkey, b: Pubkey, slot: u64, payload: &Value
 ) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
-             Option<[MintProof;2]>, Option<String>, Option<CompletionReason>, Option<u64>)> {
+             Option<[MintProof;2]>, Option<PoolVaults>, Option<String>, Option<CompletionReason>, Option<u64>)> {
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
         let value = &payload["manifest"];
         // Upgrade the old persisted wallet context once at the storage boundary.
@@ -246,6 +247,10 @@ fn decode_descriptor(
             base_b:decode_accounts(value,"base_b")?,
         }))
     } else { None };
+    let vaults=payload.get("vaults").filter(|v|!v.is_null())
+        .map(|value|serde_json::from_value::<PoolVaults>(value.clone())).transpose()?;
+    ensure!(vaults.is_none_or(|v|manifest.as_ref().is_some_and(|m|v.matches_manifest(m))),
+        "persisted vault roles do not match the execution manifest");
     let evidence = payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
         let kind = v.get("kind").and_then(Value::as_str)
             .filter(|v| !v.is_empty()).context("completion evidence kind missing")?;
@@ -299,7 +304,7 @@ fn decode_descriptor(
         .filter(|v|*v>0).context("completion requires positive checked_at_ms")?;
     ensure!(reason_code!=Some(CompletionReason::TransientFailure),
         "transient attempt is not a durable completion proof");
-    Ok((manifest, evidence, mints, reason, reason_code, Some(checked_at_ms)))
+    Ok((manifest, evidence, mints, vaults, reason, reason_code, Some(checked_at_ms)))
 }
 
 #[derive(Clone, Copy)]
@@ -514,7 +519,7 @@ impl Persistence {
                     !(a.is_some() && a==b), "invalid stored pool identity");
                 let venue=venue_from(row.get("venue"))?;
                 let raw_completion:Option<String>=row.get("payload");
-                let (status,slot,manifest,evidence,mints,reason,reason_code,checked_at_ms)=
+                let (status,slot,manifest,evidence,mints,vaults,reason,reason_code,checked_at_ms)=
                     if let Some(raw)=raw_completion {
                         let a=a.context("completed pool mint A missing")?;
                         let b=b.context("completed pool mint B missing")?;
@@ -532,13 +537,13 @@ impl Persistence {
                             incomplete+=1;
                             CompletionState::Incomplete
                         };
-                        let (manifest,evidence,mints,reason,reason_code,checked)=
+                        let (manifest,evidence,mints,vaults,reason,reason_code,checked)=
                             decode_descriptor(address,a,b,slot,&payload)
                                 .with_context(||format!("restore pool={address}"))?;
-                        (status,Some(slot),manifest,evidence,mints,reason,reason_code,checked)
+                        (status,Some(slot),manifest,evidence,mints,vaults,reason,reason_code,checked)
                     }else{
                         unknown+=1;
-                        (CompletionState::Unknown,None,None,None,None,None,None,None)
+                        (CompletionState::Unknown,None,None,None,None,None,None,None,None)
                     };
                 let raw_config:String=row.get("config");
                 let config:Value=serde_json::from_str(&raw_config)?;
@@ -562,7 +567,7 @@ impl Persistence {
                     completion_admission:CompletionAdmission::MissingIdentity,
                     pool_config,last_observation,
                     completion_state:status,completion_validated_slot:slot,
-                    execution_manifest:manifest,completion_evidence:evidence,
+                    execution_manifest:manifest,vaults,completion_evidence:evidence,
                     mint_proofs:mints,completion_reason:reason,
                     completion_reason_code:reason_code,completion_checked_at_ms:checked_at_ms,
                 });
@@ -571,6 +576,9 @@ impl Persistence {
         }
         crate::log_event!(Info,"persistence restored pools={} unknown={} prepared={} incomplete={} table={TABLE}",
             pools.len(),unknown,prepared,incomplete);
+        crate::log_event!(Info,"persistence prepared_vault_roles_restored={} pumpswap_prepared_missing_vault_roles={}",
+            pools.iter().filter(|p|p.vaults.is_some()).count(),
+            pools.iter().filter(|p|p.venue==Venue::PumpSwap && p.completion_state==CompletionState::Prepared && p.vaults.is_none()).count());
         Ok(pools)
     }
 
