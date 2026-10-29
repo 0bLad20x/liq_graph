@@ -93,32 +93,36 @@ impl Worker {
         lifecycle::Executor{venue,requests,batch_size,max_in_flight,configuration_ready}
     }
 }
+pub(super) fn protocols(enabled:core::EnabledVenues)->impl Iterator<Item=Venue> {
+    enabled.iter().filter(|v|*v!=Venue::RaydiumStable)
+}
 pub(super) fn configured(name:&str)->Result<Vec<Worker>> {
-    Ok(match name {
-        "all"=>vec![
-            Worker::Dlmm(meteora_dlmm::Settings::from_env()?),
-            Worker::Damm(meteora_damm_v2::Settings::from_env()?),
-            Worker::Amm(raydium_amm_v4::Settings::from_env()?),
-            Worker::Cpmm(raydium_cpmm::Settings::from_env()?),
-            Worker::Clmm(raydium_clmm::Settings::from_env()?),
-            Worker::Orca(orca_whirlpool::Settings::from_env()?),
-            Worker::Pancake(pancakeswap_clmm::Settings::from_env()?),
-            Worker::Byreal(byreal_clmm::Settings::from_env()?),
-            Worker::Manifest(manifest::Settings::from_env()?),
-            Worker::Pump(pumpswap::Settings::from_env()?),
-        ],
-        "meteora_dlmm"=>vec![Worker::Dlmm(meteora_dlmm::Settings::from_env()?)],
-        "meteora_damm_v2"=>vec![Worker::Damm(meteora_damm_v2::Settings::from_env()?)],
-        "raydium_amm_v4"=>vec![Worker::Amm(raydium_amm_v4::Settings::from_env()?)],
-        "raydium_cpmm"=>vec![Worker::Cpmm(raydium_cpmm::Settings::from_env()?)],
-        "raydium_clmm"=>vec![Worker::Clmm(raydium_clmm::Settings::from_env()?)],
-        "orca_whirlpool"=>vec![Worker::Orca(orca_whirlpool::Settings::from_env()?)],
-        "pancakeswap_clmm"=>vec![Worker::Pancake(pancakeswap_clmm::Settings::from_env()?)],
-        "byreal_clmm"=>vec![Worker::Byreal(byreal_clmm::Settings::from_env()?)],
-        "manifest"=>vec![Worker::Manifest(manifest::Settings::from_env()?)],
-        "pumpswap"=>vec![Worker::Pump(pumpswap::Settings::from_env()?)],
-        _=>bail!("unknown Completion protocol {name}; use a workers/completion module name or all"),
-    })
+    let enabled=core::EnabledVenues::from_env()?;
+    if name!="all" {
+        let venue=Venue::ALL.into_iter().find(|v|v.name()==name)
+            .with_context(||format!("unknown Completion protocol {name}"))?;
+        ensure!(enabled.contains(venue),"Completion protocol {name} is disabled by GRAPH_ENABLED_VENUES");
+        ensure!(venue!=Venue::RaydiumStable,"Raydium Stable has no Completion executor");
+    }
+    let mut workers=Vec::new();
+    for venue in protocols(enabled).filter(|v|name=="all"||v.name()==name) {
+        let worker=match venue {
+            Venue::MeteoraDlmm=>Worker::Dlmm(meteora_dlmm::Settings::from_env()?),
+            Venue::MeteoraDammV2=>Worker::Damm(meteora_damm_v2::Settings::from_env()?),
+            Venue::RaydiumAmmV4=>Worker::Amm(raydium_amm_v4::Settings::from_env()?),
+            Venue::RaydiumCpmm=>Worker::Cpmm(raydium_cpmm::Settings::from_env()?),
+            Venue::RaydiumClmm=>Worker::Clmm(raydium_clmm::Settings::from_env()?),
+            Venue::OrcaWhirlpool=>Worker::Orca(orca_whirlpool::Settings::from_env()?),
+            Venue::PancakeSwapClmm=>Worker::Pancake(pancakeswap_clmm::Settings::from_env()?),
+            Venue::ByrealClmm=>Worker::Byreal(byreal_clmm::Settings::from_env()?),
+            Venue::Manifest=>Worker::Manifest(manifest::Settings::from_env()?),
+            Venue::PumpSwap=>Worker::Pump(pumpswap::Settings::from_env()?),
+            Venue::RaydiumStable=>continue,
+        };
+        workers.push(worker);
+    }
+    ensure!(!workers.is_empty(),"GRAPH_ENABLED_VENUES selects no supported Completion executor");
+    Ok(workers)
 }
 /// Called before publishing restored manifests to any graph consumer.
 pub(super) fn validate_bootstrap(workers:&[Worker],pools:&[PoolState])->Result<()> {
@@ -178,7 +182,7 @@ pub(super) async fn live(args:&[String])->Result<()> {
     let restored=database.restore().await?.into_iter().filter(|p|venues.contains(&p.venue)).collect::<Vec<_>>();
     let mints=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
     validate_bootstrap(&workers,&restored)?;
-    let registry=pool_registry::PoolRegistry::default();
+    let registry=pool_registry::PoolRegistry::from_env()?;
     let restored_count=registry.restore(restored)?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let mut rpc_task=AbortOnDrop(rpc_task);

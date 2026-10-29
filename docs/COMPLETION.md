@@ -1,5 +1,11 @@
 # Completion ownership and live proof
 
+`GRAPH_ENABLED_VENUES` now gates the entire pipeline. `--completion-live all`
+registers only enabled executors; disabled protocols have no Initial, Refresh,
+Recheck or Retry work. Their settings are not loaded. Persisted disabled pools stay
+in PostgreSQL and are omitted from active restore. See [RUNTIME.md](RUNTIME.md).
+
+
 All ten protocol workers and the single lifecycle live under `src/workers/completion/`.
 The protocol module names are: `meteora_dlmm`, `meteora_damm_v2`, `raydium_amm_v4`,
 `raydium_cpmm`, `raydium_clmm`, `orca_whirlpool`, `pancakeswap_clmm`, `byreal_clmm`,

@@ -1,5 +1,10 @@
 # Persistence and Completion ownership
 
+Pool restore applies `GRAPH_ENABLED_VENUES` in the SELECT before decoding
+completion payloads. This is an operational read scope, not a deletion or migration;
+records of disabled protocols remain available for a later enabled run.
+
+
 PostgreSQL is a bootstrap/persistence cache. No price or execution hotpath reads SQL.
 Persistence is the single database writer; Registry is the sole in-memory pool owner.
 CompletionLifecycle dispatches protocol validation and refresh, and Registry accepts

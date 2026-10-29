@@ -174,14 +174,30 @@ fn combine_metadata(previous: Option<&Arc<Value>>, incoming: &crate::core::PoolC
 }
 
 /// The write owner is the registry worker. Consumers can only request typed snapshots.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PoolRegistry {
+    enabled_venues: crate::core::EnabledVenues,
     entries: Arc<RwLock<HashMap<Pubkey, PoolState>>>,
     quotes: Arc<RwLock<HashMap<Pubkey,PoolQuotes>>>,
     admission: Arc<RwLock<AdmissionIndex>>,
 }
 
 impl PoolRegistry {
+    pub fn from_env()->Result<Self> {
+        Ok(Self{enabled_venues:crate::core::EnabledVenues::from_env()?,
+            entries:Default::default(),quotes:Default::default(),admission:Default::default()})
+    }
+    /// Owner evidence at shutdown; no diagnostic consumer or copied pool state.
+    pub fn protocol_counts(&self)->Result<std::collections::BTreeMap<&'static str,usize>> {
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let mut counts=std::collections::BTreeMap::new();
+        for pool in entries.values() {
+            anyhow::ensure!(self.enabled_venues.contains(pool.venue),
+                "disabled protocol {} present in active Registry",pool.venue.name());
+            *counts.entry(pool.venue.name()).or_default()+=1;
+        }
+        Ok(counts)
+    }
     pub fn snapshot(&self) -> Vec<PoolState> {
         self.entries.read().expect("pool registry lock poisoned")
             .values().cloned().collect()
@@ -248,6 +264,7 @@ impl PoolRegistry {
         ensure!(entries.is_empty(), "Registry restore requires an empty RAM state");
         let mut restored = HashMap::with_capacity(pools.len());
         for mut pool in pools {
+            if !self.enabled_venues.contains(pool.venue){continue;}
             admission.index(pool.address,pool.mint_a,pool.mint_b);
             admission.restore_native(&pool);
             pool.completion_admission=admission.admission(&pool);
@@ -444,6 +461,9 @@ impl PoolRegistry {
                 stats.ignored_mints += 1;
                 continue;
             };
+
+            // Mixed-source responses cannot activate a disabled protocol.
+            if !self.enabled_venues.contains(*venue){continue;}
 
             if *address == Pubkey::default() {
                 stats.conflicts += 1;

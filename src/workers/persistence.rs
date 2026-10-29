@@ -482,6 +482,8 @@ impl Persistence {
     /// Incremental database pages bound SQL-response memory during large restores.
     /// Historical observations are kept separate; live TVL stays unknown on restart.
     pub async fn restore(&self) -> Result<Vec<PoolState>> {
+        let enabled=crate::core::EnabledVenues::from_env()?;
+        let venues=enabled.iter().map(venue_code).collect::<Vec<_>>();
         let mut pools=Vec::new();
         let mut after:Option<String>=None;
         let mut prepared=0_usize;
@@ -493,10 +495,10 @@ impl Persistence {
                 tvl_usd::double precision AS historical_tvl,tvl_source,
                 (extract(epoch FROM tvl_observed_at)*1000)::bigint AS observed_ms
              FROM {TABLE}
-             WHERE ($1::text IS NULL OR pool_address > $1)
+             WHERE ($1::text IS NULL OR pool_address > $1) AND venue=ANY($2::smallint[])
              ORDER BY pool_address LIMIT 8192");
         loop {
-            let rows=self.client.query(&query,&[&after]).await
+            let rows=self.client.query(&query,&[&after,&venues]).await
                 .context("read persistence bootstrap page")?;
             if rows.is_empty(){break;}
             for row in rows {

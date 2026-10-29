@@ -10,7 +10,7 @@ pub mod rpc;
 pub use completion::{CompletionAdmission,CompletionReason,CompletionStatus,AccountMeta,ExecutionManifest,CompletionEvidence,MintProof,CompletionResult,CompletionResultBatch,CompletionWork,CompletionRequest,CompletionRequestBatch,CompletionUnchanged,CompletionOutcome,CompletionResponse,CompletionResponseBatch,CompletionState};
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 
@@ -28,6 +28,44 @@ pub enum Venue {
     ByrealClmm,
     Manifest,
     PumpSwap,
+}
+
+impl Venue {
+    pub const ALL: [Self; 11] = [Self::MeteoraDlmm,Self::MeteoraDammV2,
+        Self::RaydiumAmmV4,Self::RaydiumCpmm,Self::RaydiumClmm,Self::RaydiumStable,
+        Self::OrcaWhirlpool,Self::PancakeSwapClmm,Self::ByrealClmm,Self::Manifest,Self::PumpSwap];
+    pub fn name(self)->&'static str {match self {
+        Self::MeteoraDlmm=>"meteora_dlmm",Self::MeteoraDammV2=>"meteora_damm_v2",
+        Self::RaydiumAmmV4=>"raydium_amm_v4",Self::RaydiumCpmm=>"raydium_cpmm",
+        Self::RaydiumClmm=>"raydium_clmm",Self::RaydiumStable=>"raydium_stable",
+        Self::OrcaWhirlpool=>"orca_whirlpool",Self::PancakeSwapClmm=>"pancakeswap_clmm",
+        Self::ByrealClmm=>"byreal_clmm",Self::Manifest=>"manifest",Self::PumpSwap=>"pumpswap",
+    }}
+}
+
+/// One operational protocol scope shared by source registration and consumers.
+/// The existing ENV name is retained; it now governs the complete pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct EnabledVenues { mask:u16 }
+impl EnabledVenues {
+    pub fn from_env()->Result<Self> {
+        let configured=std::env::var("GRAPH_ENABLED_VENUES")
+            .context("GRAPH_ENABLED_VENUES is required for pool pipelines (example: meteora_dlmm,pumpswap)")?;
+        ensure!(!configured.trim().is_empty(),"GRAPH_ENABLED_VENUES must not be empty");
+        let mut selection=Self{mask:0};
+        for name in configured.split(',').map(str::trim) {
+            let Some(venue)=Venue::ALL.into_iter().find(|v|v.name()==name)
+                else {bail!("unknown GRAPH_ENABLED_VENUES entry '{name}'");};
+            ensure!(!selection.contains(venue),"duplicate GRAPH_ENABLED_VENUES entry '{name}'");
+            selection.mask|=1_u16<<(venue as u16);
+        }
+        Ok(selection)
+    }
+    pub fn contains(self,venue:Venue)->bool {self.mask&(1_u16<<(venue as u16))!=0}
+    pub fn iter(self)->impl Iterator<Item=Venue> {
+        Venue::ALL.into_iter().filter(move|&venue|self.contains(venue))
+    }
+    pub fn names(self)->Vec<&'static str> {self.iter().map(Venue::name).collect()}
 }
 
 pub use source::{DataBatch, DataRecord, RecordIdentity, PoolConfigUpdate, ConfigObservation};

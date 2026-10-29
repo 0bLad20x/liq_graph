@@ -27,7 +27,8 @@ const CLMM: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const STABLE: &str = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
 
 #[derive(Clone, Copy)]
-pub struct Settings { pub once: bool, pub max_pages: Option<u32>, pub rps: u32 }
+pub struct Settings { pub once: bool, pub max_pages: Option<u32>, pub rps: u32,
+    pub enabled_venues: crate::core::EnabledVenues }
 
 #[derive(Deserialize)]
 struct Response { success: bool, data: Option<Page> }
@@ -197,7 +198,7 @@ async fn fetch_page(
 /// Decode the full provider objects once and publish the existing DataBatch contract.
 fn publish(
     output: &broadcast::Sender<Arc<DataBatch>>, payloads: Vec<Value>,
-    sort: &str, direction: &str,
+    sort: &str, direction: &str, enabled: crate::core::EnabledVenues,
 ) -> Result<Published> {
     let received = payloads.len();
     let mut records = Vec::with_capacity(received);
@@ -205,7 +206,9 @@ fn publish(
     let mut rejected_unknown = 0;
     for payload in payloads {
         match decode(payload) {
-            Ok(record) => records.push(record),
+            Ok(record) => if matches!(&record.identity,RecordIdentity::Pool{venue,..} if enabled.contains(*venue)) {
+                records.push(record);
+            },
             Err(error) => {
                 rejected += 1;
                 if error.to_string().contains("unknown Raydium programId") { rejected_unknown += 1; }
@@ -314,7 +317,7 @@ async fn route_pass(
                 "Raydium {sort}/{direction} repeated cursor");
         }
         page_no += 1;
-        let published = publish(output, page.data, sort, direction)?;
+        let published = publish(output, page.data, sort, direction, settings.enabled_venues)?;
         received += published.received;
         accepted += published.accepted;
         rejected += published.rejected;
@@ -377,13 +380,13 @@ async fn ordinary_lane(
 async fn refresh_head(
     client: reqwest::Client, gate: Arc<Mutex<Instant>>, spacing: Duration,
     output: broadcast::Sender<Arc<DataBatch>>, interval: Duration,
-    sort: &'static str, direction: &'static str,
+    sort: &'static str, direction: &'static str, enabled: crate::core::EnabledVenues,
 ) -> Result<()> {
     loop {
         sleep(interval).await;
         let started = Instant::now();
         let page=fetch_page(&client,&gate,spacing,sort,direction,None).await?;
-        let decoded=publish(&output,page.data,sort,direction)?;
+        let decoded=publish(&output,page.data,sort,direction,enabled)?;
         crate::log_event!(Debug,
             "raydium head_refresh sort={sort} direction={direction} received={} accepted={} rejected={} elapsed_ms={}",
             decoded.received,decoded.accepted,decoded.rejected,started.elapsed().as_millis());
@@ -410,7 +413,7 @@ pub async fn run(
     for (sort, direction) in ROUTES.into_iter().filter(|_|!settings.once) {
         refresh_tasks.spawn(refresh_head(
             client.clone(), gate.clone(), spacing, output.clone(),
-            Duration::from_secs(refresh_seconds), sort, direction,
+            Duration::from_secs(refresh_seconds), sort, direction, settings.enabled_venues,
         ));
     }
     let mut tasks = JoinSet::new();

@@ -15,12 +15,7 @@ use crate::{
 };
 
 const SOURCE: &str = "multi_venue_identity_hydration";
-const VENUES: [Venue; 11] = [
-    Venue::MeteoraDlmm, Venue::MeteoraDammV2, Venue::RaydiumAmmV4,
-    Venue::RaydiumCpmm, Venue::RaydiumClmm, Venue::RaydiumStable,
-    Venue::OrcaWhirlpool, Venue::PancakeSwapClmm, Venue::ByrealClmm,
-    Venue::Manifest, Venue::PumpSwap,
-];
+const VENUES: [Venue; 11] = Venue::ALL;
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -108,6 +103,7 @@ fn layout(venue: Venue) -> Layout {
 
 #[derive(Clone, Copy)]
 pub struct Settings {
+    enabled_venues: crate::core::EnabledVenues,
     pub batch_size: usize,
     pub parallel_batches: usize,
 }
@@ -122,7 +118,7 @@ impl Settings {
             .context("invalid IDENTITY_HYDRATION_PARALLEL_BATCHES")?;
         ensure!((1..=100).contains(&batch_size), "invalid hydration RPC batch size");
         ensure!((1..=16).contains(&parallel_batches), "hydration parallel batches must be 1..=16");
-        Ok(Self { batch_size, parallel_batches })
+        Ok(Self { batch_size, parallel_batches,enabled_venues:crate::core::EnabledVenues::from_env()? })
     }
 }
 
@@ -216,6 +212,7 @@ pub async fn run(
     let mut queues = vec![VecDeque::<Pubkey>::new(); VENUES.len()];
     let mut pending = HashSet::new();
     for (address, venue) in initial {
+        if !settings.enabled_venues.contains(venue){continue;}
         enqueue(address, venue, &mut queues, &mut pending);
     }
     let initial_pending = pending.len();
@@ -261,6 +258,7 @@ pub async fn run(
         tokio::select! {
             event = live.recv(), if !finite => match event {
                 Ok(batch) => for pool in &batch.pools {
+                    if !settings.enabled_venues.contains(pool.venue){continue;}
                     if pool.mint_a.is_some() && pool.mint_b.is_some() {
                         pending.remove(&pool.address);
                     } else {

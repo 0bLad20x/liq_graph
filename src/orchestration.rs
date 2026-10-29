@@ -86,6 +86,8 @@ fn spawn_sources(
     source_set: SourceSet,
     strict_lag: bool,
 ) -> Result<()> {
+    let workers=discovery::configured(source_set,settings.once,settings.max_pages)?;
+    ensure!(!workers.is_empty(),"discovery source {source_set:?} is disabled by GRAPH_ENABLED_VENUES");
     let source_capacity: usize = env::var("REST_BROADCAST_CAPACITY")
         .unwrap_or_else(|_| "256".into()).parse().context("invalid REST_BROADCAST_CAPACITY")?;
     let registry_capacity: usize = env::var("REGISTRY_BROADCAST_CAPACITY")
@@ -132,7 +134,6 @@ fn spawn_sources(
     tasks.spawn(pool_registry::run(registry_input, None, registry,
         registry_output, source_done_tx, strict_lag, None));
     let (_stop,stop_rx)=watch::channel(false);
-    let workers=discovery::configured(source_set,settings.once,settings.max_pages)?;
     discovery::spawn_finite(tasks,workers,discovery::Resources {
         http:core::http_client()?,rpc:None,output,stop:stop_rx,
     });
@@ -299,7 +300,7 @@ pub async fn run() -> Result<()> {
         || (args.len()==2 && args[0]=="--test" && args[1]=="source_dexscreener")
     {
         let db=persistence::Persistence::connect().await?;
-        let registry=pool_registry::PoolRegistry::default();
+        let registry=pool_registry::PoolRegistry::from_env()?;
         registry.restore(db.restore().await?)?;
         return source_dexscreener::live_diagnostic(registry).await;
     }
@@ -336,7 +337,7 @@ pub async fn run() -> Result<()> {
         let jupiter = jupiter_settings()?
             .context("--jupiter-only requires JUPITER_SEARCH_API_KEYS")?;
         let database = persistence::Persistence::connect().await?;
-        let registry = pool_registry::PoolRegistry::default();
+        let registry = pool_registry::PoolRegistry::from_env()?;
         let restored = registry.restore(database.restore().await?)?;
         ensure!(restored > 0, "--jupiter-only requires persisted pools for graph bootstrap");
         let graph_settings = graph_liquidity::Settings::from_env()?;
@@ -363,7 +364,7 @@ pub async fn run() -> Result<()> {
     }
     if cli.persistence_v2_live {
         let database=persistence::Persistence::connect().await?;
-        let registry=pool_registry::PoolRegistry::default();
+        let registry=pool_registry::PoolRegistry::from_env()?;
         let restored=registry.restore(database.restore().await?)?;
         crate::log_event!(Info,"orchestration persistence-v2-live bootstrap_pools={restored} sources=All rpc_calls=0");
         let mut tasks=JoinSet::new();
@@ -375,7 +376,7 @@ pub async fn run() -> Result<()> {
     }
     if cli.persistence_restore_live {
         let database = persistence::Persistence::connect().await?;
-        let registry = pool_registry::PoolRegistry::default();
+        let registry = pool_registry::PoolRegistry::from_env()?;
         let restored = registry.restore(database.restore().await?)?;
         ensure!(restored > 0, "persistence restore-live requires stored pools");
         let graph_settings = graph_liquidity::Settings::from_env()?;
@@ -408,7 +409,7 @@ pub async fn run() -> Result<()> {
         // Reuse validated completion state; new REST discoveries still require
         // their own completion before they can enter the graph watchlist.
         let database = persistence::Persistence::connect().await?;
-        let registry = pool_registry::PoolRegistry::default();
+        let registry = pool_registry::PoolRegistry::from_env()?;
         let restored = registry.restore(database.restore().await?)?;
         crate::log_event!(Info,"orchestration Jupiter graph bootstrap restored_pools={restored}");
         (Some(registry), Some(graph_liquidity::Settings::from_env()?))

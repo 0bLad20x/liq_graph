@@ -50,29 +50,31 @@ fn rate(name:&str,default:u32)->Result<u32> {
 }
 /// All means the seven REST sources; rolling V2 and full bootstrap are explicit.
 pub(super) fn configured(set:SourceSet,once:bool,max_pages:Option<u32>)->Result<Vec<Worker>> {
+    let enabled=core::EnabledVenues::from_env()?;
     let mut out=Vec::new();
-    if matches!(set,SourceSet::Dlmm|SourceSet::All) {
+    if enabled.contains(Venue::MeteoraDlmm) && matches!(set,SourceSet::Dlmm|SourceSet::All) {
         out.push(Worker::Dlmm(meteora_dlmm::Settings{once,max_pages}));
     }
-    if matches!(set,SourceSet::DammV2|SourceSet::All) {
+    if enabled.contains(Venue::MeteoraDammV2) && matches!(set,SourceSet::DammV2|SourceSet::All) {
         out.push(Worker::Damm(meteora_damm_v2::Settings{once,max_pages}));
     }
-    if matches!(set,SourceSet::Raydium|SourceSet::All) {
-        out.push(Worker::Raydium(raydium::Settings{once,max_pages,rps:rate("RAYDIUM_API_RPS",10)?}));
+    if [Venue::RaydiumAmmV4,Venue::RaydiumCpmm,Venue::RaydiumClmm,Venue::RaydiumStable]
+        .into_iter().any(|v|enabled.contains(v)) && matches!(set,SourceSet::Raydium|SourceSet::All) {
+        out.push(Worker::Raydium(raydium::Settings{once,max_pages,enabled_venues:enabled,rps:rate("RAYDIUM_API_RPS",10)?}));
     }
-    if matches!(set,SourceSet::Orca|SourceSet::All) {
+    if enabled.contains(Venue::OrcaWhirlpool) && matches!(set,SourceSet::Orca|SourceSet::All) {
         out.push(Worker::Orca(orca_whirlpool::Settings{once,max_pages,rps:rate("ORCA_API_RPS",10)?}));
     }
-    if matches!(set,SourceSet::PancakeSwap|SourceSet::All) {
+    if enabled.contains(Venue::PancakeSwapClmm) && matches!(set,SourceSet::PancakeSwap|SourceSet::All) {
         out.push(Worker::Pancake(pancakeswap_clmm::Settings{once,max_pages,rpm:rate("PANCAKESWAP_API_RPM",57)?}));
     }
-    if matches!(set,SourceSet::Byreal|SourceSet::All) {
+    if enabled.contains(Venue::ByrealClmm) && matches!(set,SourceSet::Byreal|SourceSet::All) {
         out.push(Worker::Byreal(byreal_clmm::Settings{once,max_pages,rpm:rate("BYREAL_API_RPM",57)?}));
     }
-    if matches!(set,SourceSet::Manifest|SourceSet::All) {
+    if enabled.contains(Venue::Manifest) && matches!(set,SourceSet::Manifest|SourceSet::All) {
         out.push(Worker::Manifest(manifest::Settings{once}));
     }
-    if matches!(set,SourceSet::PumpSwap) {
+    if enabled.contains(Venue::PumpSwap) && matches!(set,SourceSet::PumpSwap) {
         out.push(Worker::Pump(pumpswap::Settings::from_env(once,max_pages)?));
     }
     Ok(out)
@@ -98,6 +100,11 @@ pub(super) fn spawn_finite(tasks:&mut JoinSet<Result<()>>,workers:Vec<Worker>,r:
 /// Bootstrap is a single process, not a continuously restarted source. Stop is
 /// cooperative: the worker kills/reaps curl and joins its blocking reader first.
 pub(super) fn spawn_bootstrap(tasks:&mut JoinSet<Result<()>>,r:Resources)->Result<()> {
+    let venue=rpc_full::Settings::venue_from_env()?;
+    if !core::EnabledVenues::from_env()?.contains(venue) {
+        crate::log_event!(Info,"runtime worker=discovery.rpc_full enabled=false protocol_disabled={}",venue.name());
+        return Ok(());
+    }
     let worker=Worker::Full(rpc_full::Settings::from_env()?);
     tasks.spawn(async move {
         let mut stop=r.stop.clone();
@@ -162,16 +169,22 @@ pub(super) async fn live(args:&[String])->Result<()> {
         "rest"=>Some(SourceSet::All),"rpc_full"|"identity_hydration"=>None,
         _=>bail!("unknown discovery source {name}"),
     };
+    let workers=if let Some(set)=set {
+        let workers=configured(set,true,pages)?;
+        ensure!(!workers.is_empty(),"discovery source {name} is disabled by GRAPH_ENABLED_VENUES");
+        workers
+    }else if name=="rpc_full" {vec![Worker::Full(rpc_full::Settings::from_env()?)]}else{
+        core::EnabledVenues::from_env()?;
+        Vec::new()
+    };
     let needs_rpc=matches!(name.as_str(),"pumpswap"|"identity_hydration");
     let (rpc,rpc_task)=if needs_rpc {
         let (rpc,task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
         (Some(rpc),Some(super::runtime::AbortOnDrop(task)))
     }else{(None,None)};
     let database=if persist||name=="identity_hydration" {Some(persistence::Persistence::connect().await?)}else{None};
-    let registry=pool_registry::PoolRegistry::default();
+    let registry=pool_registry::PoolRegistry::from_env()?;
     if let Some(db)=&database {registry.restore(db.restore().await?)?;}
-    let workers=if let Some(set)=set {configured(set,true,pages)?}
-        else if name=="rpc_full" {vec![Worker::Full(rpc_full::Settings::from_env()?)]}else{Vec::new()};
     let (stop,stop_rx)=watch::channel(false);
     let (source,input)=broadcast::channel(256);
     let registry_input=source.subscribe();

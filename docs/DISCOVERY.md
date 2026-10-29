@@ -1,5 +1,11 @@
 # Discovery: sources, identity and Registry ingress
 
+The single `GRAPH_ENABLED_VENUES` setting now gates registration before source
+settings are loaded. Disabled source workers do not start. Shared Raydium responses
+are filtered by the enabled subtype before publication. Identity hydration and the
+optional full scan obey the same scope; see [RUNTIME.md](RUNTIME.md).
+
+
 Discovery workers live under `src/workers/discovery/`. They have no Completion,
 Graph, MarketState or execution dependencies. Each worker owns its provider schema,
 program IDs, account layouts, pagination, local deduplication and request pacing.

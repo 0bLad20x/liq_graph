@@ -23,6 +23,62 @@ Discovery-Module, gemeinsame Startverkabelung und begrenzte Einzelaufrufe beschr
 [DISCOVERY.md](DISCOVERY.md).
 Completion-Module und der gemeinsame Einzelstart sind in [COMPLETION.md](COMPLETION.md) beschrieben.
 
+## Eine Protokollauswahl fuer die gesamte Pipeline
+
+```dotenv
+GRAPH_ENABLED_VENUES=meteora_dlmm,pumpswap
+```
+
+Der bestehende ENV-Name gilt jetzt fuer Discovery-Registrierung, RPC-Identitaetshydration,
+Pool-Restore und Registry-Eingang, Completion-Worker samt Initial/Refresh/Recheck/Retry,
+Graph und damit WatchCatalog, MarketState, Signale und automatische V10-Kandidaten.
+Zum Hinzuschalten einen dokumentierten Namen ergaenzen und den Prozess neu starten.
+Es gibt keine zweite Allowlist und kein Nachladen dieser ENV waehrend eines Laufs.
+`runtime_live.ps1 -EnabledVenues ...` ueberschreibt genau diese Einstellung fuer den Lauf.
+
+Bei der obigen Auswahl starten eine DLMM-REST-Discovery und genau zwei Completion-
+Worker. PumpSwap-Rolling-Discovery startet nur mit der bereits benoetigten RPC-V2/Slot-
+Faehigkeit. Andere Discovery-Worker und deren protokollspezifische Konfigurationen
+werden nicht geladen. Identitaetshydration bearbeitet nur die freigegebenen Protokolle.
+Der optionale Full Scan beachtet dieselbe Freigabe und bleibt ein expliziter Einmallauf.
+
+PostgreSQL behaelt alle vorhandenen Pools. Restore liest nur die ausgewaehlten
+Protokolle; deaktivierte Manifeste erreichen auch keine Wallet-/Completion-Pruefung.
+Die Registry weist ausgeschaltete Protokolle auch bei gemischten Live-Eingaben ab.
+Mintdaten bleiben ein gemeinsamer persistierter Katalog; aktive Jupiter-/DexScreener-
+und Mint-Erweiterungsziele ergeben sich aus den ausgewaehlten Pools. Eine API-Antwort
+kann weitere Pools desselben Tokens enthalten; diese werden dadurch nicht aktiviert.
+Raydiums gemeinsamer API-Worker veroeffentlicht nur freigegebene Raydium-Untertypen.
+
+Eigenstaendige Pool-Worker beachten die Einstellung ebenfalls: `--completion-live all`
+meint alle **freigegebenen** Completion-Worker, `--discovery-live rest` nur freigegebene
+REST-Quellen. Der explizite Start eines abgeschalteten Protokolls endet vor seinem
+Quellaufruf mit einer Konfigurationsmeldung. Raydium Stable besitzt weiterhin nur
+Discovery, keinen Completion-/MarketState-Executor. Ein manuelles Replay einer bereits
+vollstaendig eingefrorenen V10-Requestdatei ist kein automatischer Poolauswahlpfad.
+
+`--run-plan` zeigt `enabled_venues`, `completion_protocols` und
+`discovery_configured_workers`. Der Starter erwartet die dort genannten Completion-
+Protokolle statt immer zehn. Der Abschlussbericht zeigt `registry_pools_by_venue`;
+`protocol_scope_passed` prueft die beobachteten Lifecycle-Protokolle gegen den Plan.
+Das belegt den Umfang des Laufs, weder Profitabilitaet noch vollstaendige Preisversorgung.
+
+Ein kurzer realer Lauf prueft die Auswahl mit dem vorhandenen Starter, beispielsweise:
+
+```powershell
+.\scripts\runtime_live.ps1 `
+    -ExpectedBranch cp8e-runtime-protocol-scope `
+    -EnabledVenues 'meteora_dlmm,pumpswap' `
+    -DurationSeconds 60 -PoolLimit 0 -AccountBudget 25000 `
+    -SimulateV10 -SimulationLimit 3 `
+    -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
+```
+
+Dieser Checkpoint aendert keine Qualifikationsschwellen, Gebuehren-/Mengenmodelle,
+Completion-Taktraten, Reconnect-Regeln oder statischen Poolvorbereitungsvertraege.
+Flashloans bleiben fuer jede Simulation vorgeschrieben, Broadcasts deaktiviert.
+Die Abnahme benoetigt einen locked Build und echte Laufartefakte auf dem Feature-HEAD.
+
 ## Werkzeuge
 
 Unter `scripts/` bleiben genau drei wiederverwendbare Dateien:

@@ -87,7 +87,7 @@ pub async fn cp1_live() -> Result<()> {
     let database=persistence::Persistence::connect().await?;
     let restored=database.restore().await?;
     let mint_registry=mint_qualification::MintRegistry::restore(database.restore_mints().await?)?;
-    let registry=pool_registry::PoolRegistry::default();
+    let registry=pool_registry::PoolRegistry::from_env()?;
     let pool_count=registry.restore(restored)?;
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
     let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
@@ -141,12 +141,14 @@ fn ensure_duration(n:u64)->Result<()> {
 
 #[derive(Clone,Copy)]
 struct RunSettings {
+    venues:core::EnabledVenues,
     duration:u64,full_scan:bool,hydration_only:bool,
     market:bool,signals:bool,simulate:bool,rewatch:bool,signal_proof:bool,
 }
 impl RunSettings {
     fn from_env()->Result<Self> {
         let settings=Self {
+            venues:core::EnabledVenues::from_env()?,
             duration:number("RUN_DURATION_SECONDS",0)?,
             full_scan:enabled("RUN_FULL_SCAN")?,
             hydration_only:enabled("IDENTITY_HYDRATION_ONLY")?,
@@ -171,6 +173,9 @@ impl RunSettings {
     }
     fn describe(self)->serde_json::Value {
         serde_json::json!({"pipeline":"runtime","duration_seconds":self.duration,
+            "enabled_venues":self.venues.names(),
+            "completion_protocols":if self.hydration_only {Vec::new()}else{
+                completion::protocols(self.venues).map(|v|format!("{v:?}")).collect::<Vec<_>>()},
             "market_state_enabled":self.market,"signals_enabled":self.signals,
             "simulation_enabled":self.simulate,"rewatch":self.rewatch,
             "signal_proof":self.signal_proof,
@@ -190,6 +195,13 @@ pub fn plan()->Result<serde_json::Value> {
         crate::workers::completion::lifecycle::Settings::from_env()?;
     }
     let mut plan=settings.describe();
+    let mut sources=if settings.hydration_only {Vec::new()}else{
+        discovery::configured(discovery::SourceSet::All,false,None)?
+    };
+    if !settings.hydration_only && settings.venues.contains(Venue::PumpSwap) {
+        sources.extend(discovery::configured(discovery::SourceSet::PumpSwap,false,None)?);
+    }
+    plan["discovery_configured_workers"]=serde_json::json!(sources.iter().map(|w|w.label()).collect::<Vec<_>>());
     plan["websocket_plan"]=serde_json::to_value(rpc_transport::settings_from_env()?.websocket_plan()?)?;
     Ok(plan)
 }
@@ -197,6 +209,7 @@ pub fn plan()->Result<serde_json::Value> {
 // Completed worker outputs only. No second live state or processing algorithm.
 #[derive(Default)]
 struct RunEvidence {
+    registry_pools_by_venue:Option<std::collections::BTreeMap<&'static str,usize>>,
     market:Option<market_state::ProductionReport>,
     market_consumer:Option<market_state::ObservationReport>,
     candidates:Option<execution_candidates::Report>,
@@ -271,6 +284,7 @@ pub async fn run()->Result<()> {
         report[field]=serde_json::json!(checks.iter().find(|(name,_)|*name==check).map(|(_,r)|r.is_ok()));
     }
     report["graph_membership"]=serde_json::to_value(&evidence.graph_membership)?;
+    report["registry_pools_by_venue"]=serde_json::to_value(&evidence.registry_pools_by_venue)?;
     report["candidate_delivery_passed"]=if settings.simulate {report["signal_delivery_passed"].clone()}
         else {serde_json::Value::Null};
     report["evidence_errors"]=serde_json::json!(checks.iter().filter_map(|(stage,check)|
@@ -309,6 +323,12 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         else {completion::configured("all")?};
     let completion_settings=if settings.hydration_only {None}
         else {Some(crate::workers::completion::lifecycle::Settings::from_env()?)};
+    let completion_count=completion_workers.len();
+    let discovery_workers=if settings.hydration_only {Vec::new()}else{
+        discovery::configured(discovery::SourceSet::All,false,None)?
+    };
+    crate::log_event!(Info,"runtime protocol_scope enabled={:?} completion_workers={completion_count} discovery_rest_workers={:?}",
+        settings.venues.names(),discovery_workers.iter().map(|w|w.label()).collect::<Vec<_>>());
     let http=core::http_client()?;
     let (rpc,rpc_task)=rpc_transport::spawn(rpc_transport::settings_from_env()?)?;
     let mut rpc_task=AbortOnDrop(rpc_task);
@@ -318,14 +338,14 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     let mint_registry=mint_qualification::MintRegistry::restore(persisted_mints)?;
     let hydration_only=settings.hydration_only;
     let venue_hydration_settings=identity_hydration_venues::Settings::from_env()?;
-    // Every unresolved pool, independent of venue, is assigned to one hydration worker.
+    // Unresolved identities from enabled protocols share one hydration worker.
     let venue_hydration_seed:Vec<(solana_pubkey::Pubkey,Venue)>=restored.iter()
         .filter(|p|p.mint_a.is_none() || p.mint_b.is_none())
         .map(|p|(p.address,p.venue)).collect();
     // Finite real-provider checkpoint: only multi-venue Hydration, Registry and
     // Persistence. No REST discovery, Graph, Completion or legacy PumpSwap worker.
     if hydration_only {
-        let registry=pool_registry::PoolRegistry::default();
+        let registry=pool_registry::PoolRegistry::from_env()?;
         let restored_count=registry.restore(restored)?;
         let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(256);
         let (updates,_) = broadcast::channel::<Arc<PoolUpdateBatch>>(256);
@@ -358,9 +378,9 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     // Check the current signer before seeding the graph with persisted blocks.
     let completion_settings=completion_settings.context("missing enabled Completion settings")?;
     completion::validate_bootstrap(&completion_workers,&restored)?;
-    let registry=pool_registry::PoolRegistry::default();
+    let registry=pool_registry::PoolRegistry::from_env()?;
     let count=registry.restore(restored)?;
-    crate::log_event!(Info,"runtime bootstrap restored={count} lifecycle_executors=10 backpressure_unchanged=true");
+    crate::log_event!(Info,"runtime bootstrap restored={count} lifecycle_executors={completion_count} backpressure_unchanged=true");
 
     let (stop_tx,stop_rx)=watch::channel(false);
     let (source,source_rx)=broadcast::channel::<Arc<DataBatch>>(source_capacity);
@@ -535,16 +555,17 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     discovery::spawn_hydration(&mut tasks,registry.clone(),updates.clone(),
         discovery_resources.clone(),venue_hydration_settings,venue_hydration_seed)?;
     discovery::spawn_continuous(&mut tasks,
-        discovery::configured(discovery::SourceSet::All,false,None)?,discovery_resources.clone());
-    if discovery::pump_supported(&rpc) {
+        discovery_workers,discovery_resources.clone());
+    if settings.venues.contains(Venue::PumpSwap) && discovery::pump_supported(&rpc) {
         discovery::spawn_continuous(&mut tasks,
             discovery::configured(discovery::SourceSet::PumpSwap,false,None)?,discovery_resources.clone());
     }else{
-        crate::log_event!(Info,"runtime worker=discovery.pumpswap_rolling enabled=false missing_rpc_v2_or_slot=true");
+        crate::log_event!(Info,"runtime worker=discovery.pumpswap_rolling enabled=false protocol_selected={} missing_rpc_v2_or_slot={}",
+            settings.venues.contains(Venue::PumpSwap),!discovery::pump_supported(&rpc));
     }
     if full_scan {discovery::spawn_bootstrap(&mut tasks,discovery_resources.clone())?;}
     drop(discovery_resources);
-    crate::log_event!(Info,"runtime ready=true workers_completion=10 v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
+    crate::log_event!(Info,"runtime ready=true workers_completion={completion_count} v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
     drop(jupiter_out);drop(source);drop(updates);drop(rpc);
 
     // Operator termination uses q + Enter; finite RUN_DURATION_SECONDS supports
@@ -614,6 +635,8 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     if let Some(error)=error{return Err(error);}
     let graph=final_graph.borrow().clone();
+    evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
+        .registry_pools_by_venue=Some(registry.protocol_counts()?);
     let membership=graph_liquidity::compare_registry(&graph,&registry.snapshot(),&graph_audit_settings)?;
     evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
         .graph_membership=Some(membership);

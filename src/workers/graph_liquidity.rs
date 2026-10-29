@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, ensure, bail};
+use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch, mpsc}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
 
@@ -21,41 +21,19 @@ const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 pub type Pair = (Pubkey, Pubkey);
 
-/// Explicit graph-only venue allowlist. Upstream Registry/Completion keep all venues.
+/// The graph uses the same protocol scope as Discovery, Registry and Completion.
 #[derive(Clone, Debug)]
-pub struct Settings { enabled_venues: Vec<Venue> }
+pub struct Settings { enabled_venues: crate::core::EnabledVenues }
 impl Settings {
     pub fn from_env() -> Result<Self> {
         if std::env::var_os("GRAPH_MIN_TVL_USD").is_some() {
             crate::log_event!(Warn,"GRAPH_MIN_TVL_USD is ignored; Registry completion admission owns the common TVL gate");
         }
-        let configured = std::env::var("GRAPH_ENABLED_VENUES")
-            .context("GRAPH_ENABLED_VENUES is required for graph runs (example: meteora_dlmm,pumpswap)")?;
-        let mut enabled_venues = Vec::new();
-        for name in configured.split(',').map(str::trim) {
-            let venue = match name {
-                "meteora_dlmm" => Venue::MeteoraDlmm,
-                "meteora_damm_v2" => Venue::MeteoraDammV2,
-                "raydium_amm_v4" => Venue::RaydiumAmmV4,
-                "raydium_cpmm" => Venue::RaydiumCpmm,
-                "raydium_clmm" => Venue::RaydiumClmm,
-                "raydium_stable" => Venue::RaydiumStable,
-                "orca_whirlpool" => Venue::OrcaWhirlpool,
-                "pancakeswap_clmm" => Venue::PancakeSwapClmm,
-                "byreal_clmm" => Venue::ByrealClmm,
-                "manifest" => Venue::Manifest,
-                "pumpswap" => Venue::PumpSwap,
-                _ => bail!("unknown GRAPH_ENABLED_VENUES entry '{name}'"),
-            };
-            ensure!(!enabled_venues.contains(&venue),
-                "duplicate GRAPH_ENABLED_VENUES entry '{name}'");
-            enabled_venues.push(venue);
-        }
-        ensure!(!enabled_venues.is_empty(), "GRAPH_ENABLED_VENUES must not be empty");
+        let enabled_venues=crate::core::EnabledVenues::from_env()?;
         Ok(Self { enabled_venues })
     }
     fn allows(&self, venue: Venue) -> bool {
-        self.enabled_venues.contains(&venue)
+        self.enabled_venues.contains(venue)
     }
 }
 
@@ -746,8 +724,8 @@ pub async fn run(
     output:watch::Sender<Arc<GraphSnapshot>>,
     settings:Settings,
 )->Result<()>{
-    crate::log_event!(Info,"graph venue_filter enabled={:?} allowed={} scope=graph_only",
-        settings.enabled_venues,settings.enabled_venues.len());
+    crate::log_event!(Info,"graph venue_filter enabled={:?} allowed={} scope=runtime",
+        settings.enabled_venues.names(),settings.enabled_venues.iter().count());
     let mut prepared=HashMap::<Pubkey,PreparedPool>::new();
     let mut dirty=HashMap::<Pubkey,Option<PreparedPool>>::new();
     let mut pending_traces=Vec::<ObservedTransition>::new();

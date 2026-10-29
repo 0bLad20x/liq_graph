@@ -25,6 +25,7 @@ param(
     [switch]$RequireAmountEvidence,
     # Diagnostic raw snapshots only. This does not pin or filter pool selection.
     [string]$LiquidityEvidencePools = '',
+    # Overrides the single ENV allowlist for the complete pipeline.
     [string]$EnabledVenues = '',
     [switch]$SimulateV10,
     [string]$WalletPath,
@@ -185,7 +186,7 @@ try {
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
         signal_score_basis='marginal_dex_net'; signal_net_threshold_bps=$ThresholdBps
         profile_signals=[bool]$ProfileSignals
-        require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=$EnabledVenues
+        require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=@($plan.enabled_venues)
         require_liquidity_evidence=[bool]$RequireLiquidityEvidence
         liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v2'
         require_amount_evidence=[bool]$RequireAmountEvidence; amount_check='observed_simple_cycles_dex_only'
@@ -200,6 +201,7 @@ try {
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
     if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
+    Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     Write-Host "WS accounts=$($plan.websocket_plan.account_capacity) sockets=$($plan.websocket_plan.socket_count)"
     if ($PlanOnly) {
         @{ plan_only=$true; runtime_started=$false; orchestration_evidence_passed=$false } |
@@ -236,7 +238,12 @@ try {
             proofs=[long]$fields[4].Value; unchanged=[long]$fields[5].Value; prepared=[long]$fields[6].Value
             incomplete=[long]$fields[7].Value; retryable=[long]$fields[8].Value}
     })
-    $protocolEvidence = $protocols.Count -eq 10 -and @($protocols | Where-Object { $_.accepted -eq 0 }).Count -eq 0
+    $expectedProtocols = @($plan.completion_protocols)
+    $observedProtocols = @($protocols | ForEach-Object { $_.venue } | Sort-Object -Unique)
+    $unexpectedProtocols = @($observedProtocols | Where-Object { $_ -notin $expectedProtocols })
+    $missingProtocols = @($expectedProtocols | Where-Object { $_ -notin $observedProtocols })
+    $protocolScopePassed = $expectedProtocols.Count -gt 0 -and $unexpectedProtocols.Count -eq 0 -and $missingProtocols.Count -eq 0
+    $protocolEvidence = $protocolScopePassed -and @($protocols | Where-Object { $_.accepted -eq 0 }).Count -eq 0
     $discovery = [ordered]@{}
     $sourceRecord = Select-String -LiteralPath $log -Pattern 'pool registry discovery_sources=' | Select-Object -Last 1
     if ($null -ne $sourceRecord) {
@@ -251,7 +258,7 @@ try {
     }
     $issueRecords = @(Select-String -LiteralPath $log -Pattern 'pool registry completion_issue ' | ForEach-Object { $_.Line })
     $candidateDelivery = $runtime.candidate_delivery_passed
-    $orchestrationPassed = $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
+    $orchestrationPassed = $protocolScopePassed -and $exitCode -eq 0 -and $null -ne $runtime -and $runtime.run_complete -eq $true -and
         $runtime.orchestration_evidence_passed -eq $true -and $lifecycleStarted -and
         (-not $marketEnabled -or $refreshes -gt 0) -and
         (-not $SimulateV10 -or $candidateDelivery) -and $clock.Elapsed.TotalSeconds -ge ($DurationSeconds - 1)
@@ -412,6 +419,10 @@ try {
         rewatch_evidence_passed=$runtime.rewatch_evidence_passed
         graph_membership_passed=$runtime.graph_membership_passed
         graph_membership=$runtime.graph_membership
+        protocol_scope_passed=[bool]$protocolScopePassed; enabled_venues=@($plan.enabled_venues)
+        registry_pools_by_venue=$runtime.registry_pools_by_venue
+        expected_completion_protocols=$expectedProtocols
+        unexpected_completion_protocols=$unexpectedProtocols; missing_completion_protocols=$missingProtocols
         evidence_errors=$runtime.evidence_errors
         elapsed_seconds=[Math]::Round($clock.Elapsed.TotalSeconds,2)
         requested_duration_seconds=$DurationSeconds; completion_lifecycle_started=$lifecycleStarted

@@ -67,7 +67,7 @@ pub struct Settings {
     batch_spacing_ms: u64,
 }
 impl Settings {
-    pub fn from_env() -> Result<Self> {
+    pub fn venue_from_env() -> Result<Venue> {
         let venue_name = env::var("FULL_SCAN_VENUE").unwrap_or_else(|_| "PumpSwap".into());
         let venue = match venue_name.as_str() {
             "PumpSwap" => Venue::PumpSwap,
@@ -83,6 +83,12 @@ impl Settings {
             "Manifest" => Venue::Manifest,
             _ => bail!("unsupported FULL_SCAN_VENUE={venue_name}"),
         };
+        Ok(venue)
+    }
+    pub fn from_env() -> Result<Self> {
+        let venue=Self::venue_from_env()?;
+        ensure!(crate::core::EnabledVenues::from_env()?.contains(venue),
+            "full scan protocol {} is disabled by GRAPH_ENABLED_VENUES",venue.name());
         let program_name = match env::var("FULL_SCAN_PROGRAM_ID") {
             Ok(value) => value,
             Err(env::VarError::NotPresent) if venue == Venue::PumpSwap => PUMP.into(),
