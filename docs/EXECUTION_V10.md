@@ -46,12 +46,20 @@ the RPC replaces the blockhash and disables signature verification. Signed mode
 local signing in fast mode and reusing compiled messages remain CP8 work.
 
 Parameter defaults: `minimum_profit=0`, `trade_size=0` (executor auto sizing),
-`use_flashloan=false`, `no_failure=false`, `constant_conversion=false`,
+`use_flashloan=true`, `no_failure=false`, `constant_conversion=false`,
 `executor_compute_unit_limit=1000000`, `transaction_compute_unit_limit=1400000`,
 `loaded_accounts_data_size_limit=67108864`, `priority_fee_lamports=0`,
 `additional_fee_bp=0`, `additional_fee_collector=null`.
 Profit/size are settlement base units; priority fee is absolute lamports.
 No parameter is overwritten by a capacity-test mode.
+
+All simulations require `use_flashloan=true`, including manually replayed requests.
+An explicit `false` is rejected rather than silently changed. Omitted fields use
+the defaults above. Trading capital comes from the executor's settlement loan
+vault; the wallet needs native SOL for fees and required account deposits.
+Historical request/parameter JSON files with `use_flashloan=false` must be updated
+before replay. `minimum_profit=0` and executor auto sizing (`trade_size=0`) remain
+the defaults.
 
 The worker validates four groups / sixteen declarations including conversion,
 the exact resulting account set (this worker uses a 64-account boundary), instruction

@@ -107,6 +107,7 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
     ensure!([key(SOL),key(USDC)].contains(&s), "settlement must be WSOL or USDC");
     let q=if s==key(SOL) { key(USDC) } else { key(SOL) };
     let p=&request.parameters;
+    ensure!(p.use_flashloan,"V10 simulation requires use_flashloan=true; trading capital must come from the settlement loan vault");
     ensure!((1..=1_400_000).contains(&p.executor_compute_unit_limit)
         && (1..=1_400_000).contains(&p.transaction_compute_unit_limit), "invalid compute limits");
     ensure!(p.loaded_accounts_data_size_limit>0 && p.loaded_accounts_data_size_limit<=64*1024*1024,

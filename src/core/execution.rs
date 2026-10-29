@@ -39,6 +39,7 @@ pub struct ExecutionParameters {
     pub minimum_profit: u64,
     /// Zero delegates amount selection to the on-chain executor.
     pub trade_size: u64,
+    /// Simulation trading capital comes from the executor's settlement loan vault.
     pub use_flashloan: bool,
     pub no_failure: bool,
     pub constant_conversion: bool,
@@ -53,7 +54,7 @@ pub struct ExecutionParameters {
 }
 impl Default for ExecutionParameters {
     fn default() -> Self {
-        Self { minimum_profit: 0, trade_size: 0, use_flashloan: false,
+        Self { minimum_profit: 0, trade_size: 0, use_flashloan: true,
             no_failure: false, constant_conversion: false,
             executor_compute_unit_limit: 1_000_000,
             transaction_compute_unit_limit: 1_400_000,

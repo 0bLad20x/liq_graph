@@ -130,7 +130,10 @@ dieselbe Runtime ohne `SimulateV10` und genau einen ausgewiesenen Prüfkonsument
 `Stage` ist Graph, MarketState oder Signals. Graph verlangt `GraphAudit`; bei Signals
 kann `SimulateV10` zugeschaltet werden. `PlanOnly` löst Einstellungen ohne DB/RPC auf.
 `RouteKind` begrenzt nur Execution-Auswahl. `ExecutionParametersPath` übernimmt die
-vorhandene Parameter-JSON, unter anderem Flashloan. Rewatch pausiert Beobachtungen
+vorhandene Parameter-JSON. Simulationen verwenden verpflichtend `use_flashloan=true`;
+ein ausdrückliches `false` wird abgewiesen. Das Handelskapital stammt aus dem
+Settlement-Flashloan-Vault, native SOL auf der Wallet bezahlt Gebühren und nötige
+Kontoeinlagen. Rewatch pausiert Beobachtungen
 nach halber Laufzeit für sechs Sekunden. Trace und Signalprofil sind ausdrücklich
 optional; sie gehören nicht zur normalen Geschwindigkeitsmessung.
 

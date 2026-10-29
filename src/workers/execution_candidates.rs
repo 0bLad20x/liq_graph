@@ -29,11 +29,12 @@ impl Settings {
             "triangle3"=>Some(SignalRouteKind::Triangle3), "triangle4"=>Some(SignalRouteKind::Triangle4),
             _=>bail!("GRAPH_EXECUTION_ROUTE_KIND must be All, Direct2, Direct3, Triangle3 or Triangle4"),
         };
-        let parameters=match env::var("GRAPH_EXECUTION_PARAMETERS_PATH") {
+        let parameters:ExecutionParameters=match env::var("GRAPH_EXECUTION_PARAMETERS_PATH") {
             Ok(path) if !path.is_empty()=>serde_json::from_slice(&std::fs::read(path)
                 .context("read execution parameters")?).context("decode ExecutionParameters")?,
             _=>ExecutionParameters::default(),
         };
+        ensure!(parameters.use_flashloan,"V10 simulation requires use_flashloan=true; update the execution parameters file");
         Ok(Self {wallet,parameters,limit,kind,capacity})
     }
 }
