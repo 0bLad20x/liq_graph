@@ -295,7 +295,7 @@ impl PoolRegistry {
                         (a, b, pool.completion_validated_slot, pool.execution_manifest.as_ref())
                     else { anyhow::bail!("restored Prepared pool missing identity or proof"); };
                     ensure!(m.pool == pool.address && m.mint_a == a && m.mint_b == b
-                        && pool.vaults.is_none_or(|vaults|vaults.matches_manifest(m))
+                        && pool.vaults.as_deref().is_none_or(|vaults|vaults.matches_manifest(m))
                         && m.validated_slot == slot && !m.base_a.is_empty() && !m.base_b.is_empty()
                         && pool.completion_evidence.as_ref().is_some_and(|e|
                         !e.kind.is_empty() && e.version > 0 && e.payload.is_object())
@@ -726,7 +726,7 @@ impl PoolRegistry {
             pool.completion_state = next_state;
             pool.completion_validated_slot = Some(slot);
             pool.execution_manifest = result.manifest.clone();
-            pool.vaults = result.vaults;
+            pool.vaults = result.vaults.map(Arc::new);
             pool.completion_evidence = result.evidence.clone();
             pool.mint_proofs = result.mints.clone();
             pool.completion_reason = result.reason.clone();

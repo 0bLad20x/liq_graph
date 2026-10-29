@@ -549,7 +549,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                 let matched=previous_creator==Some(layout.creator.to_string().as_str())
                                     && ev.payload["is_mayhem_mode"].as_bool()==Some(layout.mayhem)
                                     && ev.payload["is_cashback_coin"].as_bool()==Some(layout.cashback)
-                                    && p.vaults==Some(crate::core::PoolVaults{vault_a:layout.vaults[0],vault_b:layout.vaults[1]})
+                                    && p.vaults.as_deref().copied()==Some(crate::core::PoolVaults{vault_a:layout.vaults[0],vault_b:layout.vaults[1]})
                                     && p.execution_manifest.as_ref().is_some_and(|cached|{
                                         let wallet=settings.wallet.expect("eligible wallet");
                                         let fresh=manifest(layout,cached.validated_slot,wallet,recipient,

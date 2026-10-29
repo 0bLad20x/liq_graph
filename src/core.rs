@@ -142,7 +142,7 @@ pub struct PoolState {
     pub completion_state: CompletionState,
     pub completion_validated_slot: Option<u64>,
     pub execution_manifest: Option<Arc<ExecutionManifest>>,
-    pub vaults: Option<PoolVaults>,
+    pub vaults: Option<Arc<PoolVaults>>,
     pub completion_evidence: Option<Arc<CompletionEvidence>>,
     pub mint_proofs: Option<[MintProof; 2]>,
     pub completion_reason: Option<String>,

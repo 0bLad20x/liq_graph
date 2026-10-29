@@ -292,7 +292,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
 #[derive(Clone)]enum State{
     Pending{dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>},
     Dlmm{active:i32,step:u16,fee:fees::Dlmm,book:Box<dlmm::Book>},
-    Pump{vquote:i128,base:u64,quote:u64,base_vault:String,quote_vault:String,
+    Pump{vquote:i128,base:u64,quote:u64,vaults:PoolVaults,
          pool_slot:u64,base_slot:u64,quote_slot:u64,fee_pool:fees::PumpPool,
          global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>,liquidity:Option<Arc<PoolLiquidity>>},
     DammV2{sqrt:u128},
@@ -655,29 +655,33 @@ impl Engine{
     // publishes no price; the ordinary post-ACK baseline initializes live state.
     fn prepared(inputs:&[PoolInput],mints:&dyn MintReader,events:broadcast::Sender<Arc<MarketStateEvent>>)->Result<Self> {
         let mut engine=Self::empty(events,0);
+        let dlmm_program:Pubkey=DLMM_PROGRAM.parse()?;let pump_program:Pubkey=PUMP_PROGRAM.parse()?;
+        let global:Pubkey=fees::GLOBAL.parse()?;let fee_program:Pubkey=fees::FEE_PROGRAM.parse()?;
+        let fee_config=fees::config_address();let clock:Pubkey=fees::CLOCK.parse()?;
+        let sysvar_program:Pubkey="Sysvar1111111111111111111111111111111111111".parse()?;
         for p in inputs {
             let venue=Venue::from_core(p.venue)?;
             let a=mints.mint(p.mint_a).and_then(|m|m.onchain).context("prepared mint A proof missing")?;
             let b=mints.mint(p.mint_b).and_then(|m|m.onchain).context("prepared mint B proof missing")?;
             ensure!(a.address==p.mint_a && b.address==p.mint_b,"prepared mint identity mismatch");
             let mut bindings=vec![(if venue==Venue::Dlmm{Field::Dlmm}else{Field::VirtualQuote},p.address,
-                if venue==Venue::Dlmm{DLMM_PROGRAM}else{PUMP_PROGRAM}.parse::<Pubkey>()?)];
+                if venue==Venue::Dlmm{dlmm_program}else{pump_program})];
             match venue {
                 Venue::Dlmm=>{
                     let deps=p.dlmm.context("DLMM Prepared manifest dependencies missing")?;
-                    for (i,&key) in deps.addresses().iter().enumerate() {bindings.push((Field::DlmmArray(i as u8),key,DLMM_PROGRAM.parse()?));}
-                    if let Some(key)=deps.bitmap {bindings.push((Field::DlmmBitmap,key,DLMM_PROGRAM.parse()?));}
+                    for (i,&key) in deps.addresses().iter().enumerate() {bindings.push((Field::DlmmArray(i as u8),key,dlmm_program));}
+                    if let Some(key)=deps.bitmap {bindings.push((Field::DlmmBitmap,key,dlmm_program));}
                 },
                 Venue::Pump=>{
                     let v=p.vaults.context("PumpSwap Prepared vault roles missing")?;
                     bindings.extend([(Field::BaseVault,v.vault_a,a.owner),(Field::QuoteVault,v.vault_b,b.owner),
-                        (Field::PumpGlobal,fees::GLOBAL.parse()?,PUMP_PROGRAM.parse()?),
-                        (Field::PumpFees,fees::config_address(),fees::FEE_PROGRAM.parse()?),
+                        (Field::PumpGlobal,global,pump_program),
+                        (Field::PumpFees,fee_config,fee_program),
                         (Field::PumpSupply,p.mint_a,a.owner)]);
                 },
                 _=>bail!("venue has no direct prepared structure"),
             }
-            bindings.push((Field::Clock,fees::CLOCK.parse()?,"Sysvar1111111111111111111111111111111111111".parse()?));
+            bindings.push((Field::Clock,clock,sysvar_program));
             let (mint_a,mint_b)=(p.mint_a.to_string(),p.mint_b.to_string());
             let (canon_base,canon_quote)=canonical(&mint_a,&mint_b);
             let pi=engine.pools.len();
@@ -1047,7 +1051,7 @@ impl Engine{
                         dlmm.context("prepared DLMM dependencies missing")?,data)?)},
                 Field::VirtualQuote=>{
                     let v=vaults.context("prepared PumpSwap vaults missing")?;
-                    State::Pump{vquote:0,base:0,quote:0,base_vault:v.vault_a.to_string(),quote_vault:v.vault_b.to_string(),
+                    State::Pump{vquote:0,base:0,quote:0,vaults:v,
                         pool_slot:slot,base_slot:0,quote_slot:0,fee_pool:fees::PumpPool::decode(data)?,
                         global:None,config:None,supply:None,liquidity:None}
                 },
@@ -1077,9 +1081,9 @@ impl Engine{
                 book.array(position,self.subs[index].key,data)?;
             },
             (State::Dlmm{book,..},Field::DlmmBitmap)=>{book.bitmap(data)?;},
-            (State::Pump{vquote,pool_slot,fee_pool,base_vault,quote_vault,..},Field::VirtualQuote)=>{
+            (State::Pump{vquote,pool_slot,fee_pool,vaults,..},Field::VirtualQuote)=>{
                 ensure!(key(data,43)?==pool.a&&key(data,75)?==pool.b,"Pump mint identity changed");
-                ensure!(key(data,139)?==*base_vault && key(data,171)?==*quote_vault,"Pump vault identity changed; awaiting Completion");
+                ensure!(bytes(data,139,32)?==vaults.vault_a.as_ref() && bytes(data,171,32)?==vaults.vault_b.as_ref(),"Pump vault identity changed; awaiting Completion");
                 *fee_pool=fees::PumpPool::decode(data)?;
                 *vquote=if data.len()<261{0}else{i128_le(data,245)?};*pool_slot=slot;
             },
@@ -1201,7 +1205,7 @@ impl PoolInput {
         let manifest_digest=if matches!(p.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap) {
             p.execution_manifest.as_ref()?.account_set_digest()
         }else{[0;32]};
-        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm,vaults:p.vaults,manifest_digest})
+        Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {

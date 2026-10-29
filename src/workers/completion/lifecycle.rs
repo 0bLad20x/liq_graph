@@ -355,7 +355,7 @@ impl Scheduler {
             let CompletionOutcome::Proof(result)=response.outcome else{unreachable!()};
             if result.status==CompletionStatus::Retryable {
                 ensure!(result.reason_code==Some(CompletionReason::TransientFailure)
-                    && result.checked_at_ms.is_none() && result.manifest.is_none(),
+                    && result.checked_at_ms.is_none() && result.manifest.is_none() && result.vaults.is_none(),
                     "invalid transient lifecycle response");
                 self.counters.retryable+=1;
                 self.counters.venue(entry.pool.venue).retryable+=1;

@@ -233,7 +233,7 @@ fn encode_descriptor(pool: &PoolState) -> Result<String> {
 fn decode_descriptor(
     address: Pubkey, a: Pubkey, b: Pubkey, slot: u64, payload: &Value
 ) -> Result<(Option<Arc<ExecutionManifest>>, Option<Arc<CompletionEvidence>>,
-             Option<[MintProof;2]>, Option<PoolVaults>, Option<String>, Option<CompletionReason>, Option<u64>)> {
+             Option<[MintProof;2]>, Option<Arc<PoolVaults>>, Option<String>, Option<CompletionReason>, Option<u64>)> {
     let manifest = if payload.get("manifest").is_some_and(|v|!v.is_null()) {
         let value = &payload["manifest"];
         // Upgrade the old persisted wallet context once at the storage boundary.
@@ -248,8 +248,8 @@ fn decode_descriptor(
         }))
     } else { None };
     let vaults=payload.get("vaults").filter(|v|!v.is_null())
-        .map(|value|serde_json::from_value::<PoolVaults>(value.clone())).transpose()?;
-    ensure!(vaults.is_none_or(|v|manifest.as_ref().is_some_and(|m|v.matches_manifest(m))),
+        .map(|value|serde_json::from_value::<PoolVaults>(value.clone()).map(Arc::new)).transpose()?;
+    ensure!(vaults.as_deref().is_none_or(|v|manifest.as_ref().is_some_and(|m|v.matches_manifest(m))),
         "persisted vault roles do not match the execution manifest");
     let evidence = payload.get("evidence").filter(|v| !v.is_null()).map(|v| {
         let kind = v.get("kind").and_then(Value::as_str)
