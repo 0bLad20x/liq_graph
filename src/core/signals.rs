@@ -33,6 +33,8 @@ pub struct SignalPool {
 pub struct SignalPoolPrice {
     /// Independent directed marginal DEX-net weights. No gross fallback.
     pub log_weight_units: [Option<i64>; 2],
+    /// CP9A: eligible / dust / unknown, oriented like log_weight_units.
+    pub direction_liquidity_status: [&'static str; 2],
     pub observation: Arc<PoolPriceObservation>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
