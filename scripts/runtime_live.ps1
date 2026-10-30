@@ -19,6 +19,9 @@ param(
     [switch]$ProfileSignals,
     # Required marginal DEX-net advantage; network/rent costs are separate.
     [ValidateRange(0,1000000)][double]$ThresholdBps = 0,
+    # CP9A: fixed 100 USD/SOL proxy, per-direction notional prequalification.
+    [ValidateRange(0,1000000)][double]$MinDirectionNotionalUsd = 1,
+    [ValidateSet('Off','Shadow','Filter')][string]$DirectionLiquidityMode = 'Filter',
     [string]$WsProviders = 'Configured',
     [ValidateRange(0,2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
@@ -52,6 +55,7 @@ if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidenc
 if ($RequireCalibrationEvidence -and -not $SimulateV10) { throw 'Calibration evidence requires SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
+if ([double]::IsNaN($MinDirectionNotionalUsd) -or [double]::IsInfinity($MinDirectionNotionalUsd)) { throw 'MinDirectionNotionalUsd must be finite.' }
 if ([double]::IsNaN($MinPoolTvlUsd) -or [double]::IsInfinity($MinPoolTvlUsd)) { throw 'MinPoolTvlUsd must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
 
@@ -135,6 +139,8 @@ try {
         RPC_WS_ACCOUNT_BUDGET = "$WsAccountBudget"
         RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
         GRAPH_SIGNALS_THRESHOLD_BPS = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        GRAPH_MIN_DIRECTION_NOTIONAL_USD = $MinDirectionNotionalUsd.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        GRAPH_DIRECTION_LIQUIDITY_MODE = $DirectionLiquidityMode.ToLowerInvariant()
         GRAPH_SIGNALS_TRACE = "$([bool]$TraceSignals)".ToLowerInvariant()
         GRAPH_SIGNALS_PROFILE = "$([bool]$ProfileSignals)".ToLowerInvariant()
         GRAPH_SIGNALS_SAMPLE_LIMIT = '16'
@@ -187,6 +193,8 @@ try {
         minimum_pool_tvl_usd=$MinPoolTvlUsd; execution_detail_limit=$ExecutionDetailLimit
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
         signal_score_basis='marginal_dex_net'; signal_net_threshold_bps=$ThresholdBps
+        direction_liquidity_mode=$DirectionLiquidityMode.ToLowerInvariant()
+        minimum_direction_notional_usd=$MinDirectionNotionalUsd; fixed_wsol_usd_reference=100
         profile_signals=[bool]$ProfileSignals
         require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=@($plan.enabled_venues)
         require_liquidity_evidence=[bool]$RequireLiquidityEvidence
@@ -204,7 +212,7 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
-    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
+    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100" }
     Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
