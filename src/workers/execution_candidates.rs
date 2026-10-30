@@ -108,6 +108,17 @@ impl Selection {
         value["request"]=serde_json::json!({"id":self.request.id,
             "wallet":self.request.wallet.to_string(),"settlement":self.request.settlement.to_string(),
             "parameters":self.request.parameters});
+        let observations=value["pools"].as_array().map(|pools|pools.iter()
+            .map(|pool|pool["observation"].clone()).collect::<Vec<_>>()).unwrap_or_default();
+        if let Some(legs)=value.pointer_mut("/candidate/witness/legs").and_then(serde_json::Value::as_array_mut) {
+            for leg in legs {
+                // Reference only byte-equivalent JSON facts already in this event.
+                // A different witness observation remains complete.
+                if let Some(observation)=observations.iter().find(|o|**o==leg["observation"]) {
+                    leg["observation"]=serde_json::json!({"pool":observation["pool"],"selected_pool_observation":true});
+                }
+            }
+        }
         Ok(value)
     }
 }

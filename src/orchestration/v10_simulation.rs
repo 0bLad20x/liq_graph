@@ -134,6 +134,12 @@ impl ExecutionTasks {
                     if let Some(logs)=simulation.get_mut("logs").and_then(serde_json::Value::as_array_mut) {
                         logs.retain(|line|line.as_str().is_some_and(|s|s.contains("Error")||s.contains("failed:")));
                     }
+                    let wallet=selection.request.wallet.to_string();
+                    for key in ["preTokenBalances","postTokenBalances"] {
+                        if let Some(balances)=simulation.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+                            balances.retain(|balance|balance["owner"].as_str()==Some(wallet.as_str()));
+                        }
+                    }
                 }
                 serde_json::to_writer(&mut events,&serde_json::json!({"schema_version":2,"payload_sha256":hash,
                     "selection":selection.compact_evidence()?,"report":compact}))?;

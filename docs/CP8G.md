@@ -46,7 +46,11 @@ Nicht jeder zugelassene Pool bildet eine Arbitrageroute.
 Keine drei Einzeldateien je Simulation mehr. Dedupliziert werden nur Payload-
 Kopien auf der Platte, keine Ausfuehrungen oder Marktbeobachtungen. Jeder Versuch
 bleibt im Ereignisstrom. Binprofile behalten ihre bestehende kompakte Form mit
-Anzahl/erstem Level. Vollstaendige RPC-Traces, Inner Instructions und Accounts
+Anzahl/erstem Level. Identische Witness-Beobachtungen verweisen auf die vollstaendige
+Poolbeobachtung desselben Ereignisses; abweichende bleiben separat erhalten.
+Token-Salden im Ereignisstrom betreffen die eigene Wallet, native Salden bleiben
+fuer die Kontoeinlagenrechnung erhalten. Vollstaendige RPC-Traces und Fremdtoken-
+Salden, Inner Instructions und Accounts
 bleiben nur fuer Detailfaelle. DEX-Erkennung und Requestvalidierung erfolgen
 weiterhin auf vollstaendigen Originaldaten vor der Verdichtung.
 
