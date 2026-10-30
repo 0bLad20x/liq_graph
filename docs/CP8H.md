@@ -43,6 +43,12 @@ Stackhoehe, mehrdeutige Pools, unaufgeloeste Transfers und nicht unterstuetzte
 Transfererweiterungen bleiben ausdruecklich unvollstaendig. Rueckgerollte
 Transfers belegen einen Versuch, keinen realisierten Gewinn.
 
+Jeder Tokenfluss behaelt Brutto- und Nettobetrag. Die Legquote verwendet die
+tatsaechlich transferierte Bruttoeingabe; Rueckerstattungen werden dadurch nicht
+versehentlich als kleinere Swapmenge modelliert. Ein Settlement-Refund fliesst
+in den beobachteten Routenrueckfluss ein. Nicht weiterverwendete Zwischenmints
+verhindern einen scheinbar geschlossenen Gesamtvergleich.
+
 ExecutionCandidates berechnet nach Ende der Messphase mit seinen bereits
 eingefrorenen vollstaendigen Modellen. Es verwendet die vorhandene `amounts::quote`
 einmal je Leg fuer die beobachtete Menge und fuer die verkettete Routenquote.

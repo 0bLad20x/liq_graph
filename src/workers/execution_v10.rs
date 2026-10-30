@@ -63,13 +63,13 @@ fn mint_program(pool: &ExecutionPool, mint: Pubkey) -> Result<Pubkey> {
     ensure!(proof.unsupported.is_empty(), "input contains an unsupported mint proof");
     Ok(key(if proof.token_2022 { TOKEN_2022 } else { TOKEN }))
 }
-fn append_mint(metas: &mut Vec<Meta>, projections: &mut Vec<Pubkey>,
-    wallet: Pubkey, mint: Pubkey, program: Pubkey) {
-    push(metas,mint,false,false);
-    push(metas,program,false,false);
+fn append_mint(ix:&mut Instruction,wallet:Pubkey,mint:Pubkey,program:Pubkey) {
+    push(&mut ix.metas,mint,false,false);
+    push(&mut ix.metas,program,false,false);
     let address=ata(wallet,mint,program);
-    push(metas,address,true,false);
-    if !projections.contains(&address) { projections.push(address); }
+    push(&mut ix.metas,address,true,false);
+    if !ix.projections.contains(&address) {ix.projections.push(address);}
+    ix.wallet_tokens.insert(address,mint);
 }
 fn block<'a>(pool: &'a ExecutionPool, quote: Pubkey, x: Pubkey, wallet: Pubkey)
     -> Result<&'a [AccountMeta]> {
@@ -155,9 +155,10 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
             ensure!(*program==key(TOKEN),"settlement mint proof has an incorrect token program");
         }
     }
+    let settlement_ata=ata(wallet,s,key(TOKEN));
     let mut ix=Instruction { data:Vec::new(),metas:Vec::new(),programs:HashSet::new(),
-        wallet_tokens:mint_programs.iter().map(|(&mint,&program)|(ata(wallet,mint,program),mint)).collect(),
-        projections:vec![wallet,ata(wallet,s,key(TOKEN))],
+        wallet_tokens:HashMap::from([(settlement_ata,s)]),
+        projections:vec![wallet,settlement_ata],
         metrics:ExecutionMetrics { groups:request.groups.len(),pool_declarations:all_pools.len(),
             unique_accounts:0,account_references:0,instruction_bytes:0,transaction_bytes:0,pools:Vec::new() } };
     let collector=if s==key(USDC) { key("GzVRuLF349u78FHpr8KbqMhrZ1aDxnhSF59JWiZ6tbgt") }
@@ -166,7 +167,7 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
     push(&mut ix.metas,wallet,true,true); push(&mut ix.metas,s,false,false);
     push(&mut ix.metas,collector,true,false);
     if let Some(collector)=p.additional_fee_collector { push(&mut ix.metas,collector,true,false); }
-    push(&mut ix.metas,ata(wallet,s,key(TOKEN)),true,false);
+    push(&mut ix.metas,settlement_ata,true,false);
     push(&mut ix.metas,key(TOKEN),false,false);
     push(&mut ix.metas,Pubkey::default(),false,false);
     push(&mut ix.metas,key(ASSOCIATED),false,false);
@@ -180,7 +181,7 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
     let conversion_count=if let Some(pool)=&request.conversion {
         ensure!(mint_program(pool,q)?==key(TOKEN) && mint_program(pool,s)?==key(TOKEN),
             "invalid settlement token program");
-        append_mint(&mut ix.metas,&mut ix.projections,wallet,q,key(TOKEN));
+        append_mint(&mut ix,wallet,q,key(TOKEN));
         Some(append_pool(&mut ix,pool,s,q,wallet)?)
     } else { None };
     let mut groups_data=Vec::new();
@@ -194,7 +195,7 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
         ensure!(target!=Pubkey::default() && target!=s
             && (request.conversion.is_none() || target!=q),"invalid target role");
         let target_program=*mint_programs.get(&target).context("target token program missing")?;
-        append_mint(&mut ix.metas,&mut ix.projections,wallet,target,target_program);
+        append_mint(&mut ix,wallet,target,target_program);
         match group {
             ExecutionGroup::Direct{pools,..}=>{
                 groups_data.extend([0,pools.len() as u8]);
@@ -213,7 +214,7 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
                 ensure!(*bridge!=Pubkey::default() && *bridge!=s && *bridge!=target
                     && (request.conversion.is_none() || *bridge!=q),"invalid bridge mint role");
                 let program=*mint_programs.get(bridge).context("bridge token program missing")?;
-                append_mint(&mut ix.metas,&mut ix.projections,wallet,*bridge,program);
+                append_mint(&mut ix,wallet,*bridge,program);
                 groups_data.extend([bridges.len() as u8,direct.len() as u8]);
                 groups_data.extend(add(&mut ix,intermediate,*bridge,target)?.to_le_bytes());
                 for pool in bridges {
@@ -295,24 +296,6 @@ fn compile(ix: &mut Instruction, request: &ExecutionRequest, settings: &Settings
     Ok(Signed{bytes:message,keys,signature:signature_text})
 }
 
-fn observed_dex_calls(value: &Value, keys: &[Pubkey], ix: &Instruction) -> Vec<String> {
-    let pools:HashSet<Pubkey>=ix.metrics.pools.iter().map(|p|p.pool).collect();
-    let resolve=|v:&Value|->Option<Pubkey>{v.as_str().and_then(|s|s.parse().ok())
-        .or_else(||v.as_u64().and_then(|i|keys.get(i as usize).copied()))};
-    let mut observed=Vec::new();
-    if let Some(groups)=value.get("innerInstructions").and_then(Value::as_array) {
-        for instruction in groups.iter().filter_map(|g|g.get("instructions").and_then(Value::as_array)).flatten() {
-            let program=instruction.get("programId").or_else(||instruction.get("programIdIndex")).and_then(resolve);
-            if let Some(program)=program.filter(|p|ix.programs.contains(p)) {
-                if instruction.get("accounts").and_then(Value::as_array)
-                    .is_some_and(|accounts|accounts.iter().filter_map(resolve).any(|p|pools.contains(&p))) {
-                    observed.push(program.to_string());
-                }
-            }
-        }
-    }
-    observed
-}
 /// Generic SPL token flows under a declared DEX CPI; no DEX instruction decoding.
 /// Refunds are netted per mint. Missing scope/amounts stay explicit, never guessed.
 fn observed_trace(value:&Value,keys:&[Pubkey],ix:&Instruction)->ExecutionTrace {
@@ -322,6 +305,7 @@ fn observed_trace(value:&Value,keys:&[Pubkey],ix:&Instruction)->ExecutionTrace {
     let resolve=|v:&Value|->Option<Pubkey>{v.as_str().and_then(|s|s.parse().ok())
         .or_else(||v.as_u64().and_then(|i|keys.get(i as usize).copied()))};
     let pools=ix.metrics.pools.iter().map(|p|p.pool).collect::<HashSet<_>>();
+    let token_programs=[key(TOKEN),key(TOKEN_2022)];
     let mut trace=ExecutionTrace{status:"available".into(),calls:Vec::new()};
     let mut moves=Vec::<HashMap<Pubkey,(u128,u128)>>::new();
     for group in groups {
@@ -346,7 +330,7 @@ fn observed_trace(value:&Value,keys:&[Pubkey],ix:&Instruction)->ExecutionTrace {
                 }
             }
             let Some(i)=current else{continue;};
-            if !program.is_some_and(|p|p==key(TOKEN)||p==key(TOKEN_2022)){continue;}
+            if !program.is_some_and(|p|token_programs.contains(&p)){continue;}
             let parsed=instruction.get("parsed");
             let mut transfer:Option<(Pubkey,Pubkey,Option<Pubkey>,u64)>=None;
             if let Some(parsed)=parsed {
@@ -389,9 +373,10 @@ fn observed_trace(value:&Value,keys:&[Pubkey],ix:&Instruction)->ExecutionTrace {
     }
     for (call,flows) in trace.calls.iter_mut().zip(moves) {
         for (mint,(sent,received)) in flows {
-            let (target,amount)=if sent>received{(&mut call.inputs,sent-received)}else{(&mut call.outputs,received-sent)};
+            let (target,amount,gross)=if sent>received{(&mut call.inputs,sent-received,sent)}else{(&mut call.outputs,received-sent,received)};
             if amount==0{continue;}
-            if let Ok(amount_raw)=u64::try_from(amount){target.push(ExecutionAssetAmount{mint:mint.to_string(),amount_raw});}
+            if let (Ok(amount_raw),Ok(gross_amount_raw))=(u64::try_from(amount),u64::try_from(gross)){
+                target.push(ExecutionAssetAmount{mint:mint.to_string(),amount_raw,gross_amount_raw});}
             else{call.issues.push("flow_amount_overflow".into());}
         }
         call.inputs.sort_by(|a,b|a.mint.cmp(&b.mint));call.outputs.sort_by(|a,b|a.mint.cmp(&b.mint));
@@ -454,9 +439,9 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
         }
         report.executor_invoked=value.get("logs").and_then(Value::as_array).is_some_and(|logs|
             logs.iter().filter_map(Value::as_str).any(|s|s.starts_with(&format!("Program {EXECUTOR} invoke ["))));
-        report.dex_invocations=observed_dex_calls(&value,&signed.keys,&ix);
         let trace_started=Instant::now();
         report.trace=observed_trace(&value,&signed.keys,&ix);
+        report.dex_invocations=report.trace.calls.iter().map(|c|c.program.clone()).collect();
         report.trace_us=trace_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         report.outcome=if value.get("err").is_some_and(|e|!e.is_null()) {
             ExecutionOutcome::SimulationFailed

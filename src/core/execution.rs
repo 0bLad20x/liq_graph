@@ -145,7 +145,7 @@ pub struct ExecutionSwapCall {
     pub inputs:Vec<ExecutionAssetAmount>,pub outputs:Vec<ExecutionAssetAmount>,
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
-pub struct ExecutionAssetAmount {pub mint:String,pub amount_raw:u64}
+pub struct ExecutionAssetAmount {pub mint:String,pub amount_raw:u64,pub gross_amount_raw:u64}
 
 pub mod pubkey_json {
     use serde::{Deserialize, Deserializer, Serializer};

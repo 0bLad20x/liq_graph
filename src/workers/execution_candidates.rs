@@ -118,20 +118,25 @@ impl Selection {
         let witness=self.candidate.as_ref().and_then(|c|c.witness.as_ref());
         let original=witness.map(|w|w.legs.iter().map(|l|l.observation.pool.as_str()).collect::<Vec<_>>()).unwrap_or_default();
         let seed=self.pools.iter().take(original.len()).map(|p|p.pool.as_str()).collect::<Vec<_>>();
+        let directions=witness.map(|w|w.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>()).unwrap_or_default();
         let calls=&report.trace.calls;
         let observed=calls.iter().map(|c|c.pool.as_deref()).collect::<Option<Vec<_>>>();
         let relation=|path:&[&str]|match &observed {
             _ if calls.is_empty()=>"no_observed_dex",
             None=>"pool_identity_unresolved",
-            Some(actual) if actual==path=>"same_path",
-            Some(actual) if actual.len()<path.len()&&path.starts_with(actual)=>"attempted_prefix",
+            Some(actual) if actual==path || (actual.len()<path.len()&&path.starts_with(actual))=>{
+                if calls.iter().enumerate().any(|(i,c)|c.status=="complete"&&directions.get(i)
+                    .is_none_or(|d|d.0!=c.inputs[0].mint||d.1!=c.outputs[0].mint)){"different_direction"}
+                else if actual==path && calls.iter().all(|c|c.status=="complete"){"same_path"}
+                else if actual==path{"same_pools_direction_unresolved"}else{"attempted_prefix"}
+            },
             _=>"different_path",
         };
         let committed=matches!(report.outcome,ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved);
         let mut legs=Vec::new();let mut marginal=Some(1.0_f64);
-        for call in calls {
+        for (call_index,call) in calls.iter().enumerate() {
             let complete=call.status=="complete";
-            let quoted=if complete{self.quote_observed_leg(call,call.inputs[0].amount_raw)}else{Err("observed_flow_incomplete")};
+            let quoted=if complete{self.quote_observed_leg(call,call.inputs[0].gross_amount_raw)}else{Err("observed_flow_incomplete")};
             let p=self.pools.iter().find(|p|Some(p.pool.as_str())==call.pool.as_deref());
             let rate=p.and_then(|p|p.observation.liquidity.as_ref()).and_then(|q|q.directions.iter()
                 .find(|d|complete&&d.input_mint==call.inputs[0].mint&&d.output_mint==call.outputs[0].mint))
@@ -139,25 +144,31 @@ impl Selection {
             marginal=marginal.zip(rate).map(|(a,b)|a*b).filter(|r|r.is_finite());
             let actual=complete.then(||call.outputs[0].amount_raw);
             let error=quoted.as_ref().ok().zip(actual).map(|(&model,actual)|i128::from(actual)-i128::from(model));
-            legs.push(json!({"pool":call.pool,"program":call.program,"venue":p.map(|p|p.observation.venue),
-                "flow_status":call.status,"inputs":call.inputs,"outputs":call.outputs,
+            legs.push(json!({"call_index":call_index,"pool":call.pool,"program":call.program,"venue":p.map(|p|p.observation.venue),
+                "flow_status":call.status,"observed_output_raw":actual,
+                "model_input_raw":complete.then(||call.inputs[0].gross_amount_raw),
                 "model_output_raw":quoted.as_ref().ok(),"model_unavailable_reason":quoted.err(),
                 "observed_minus_model_raw":error.map(|e|e.to_string()),
                 "output_error_bps":quoted.as_ref().ok().filter(|&&v|v>0).zip(actual)
                     .map(|(&model,actual)|(actual as f64/model as f64-1.0)*10000.0),
                 "observation_slot":p.map(|p|p.observation.slot),
+                "component_slot_min":p.map(|p|p.observation.component_slot_min),
+                "component_slot_max":p.map(|p|p.observation.component_slot_max),
                 "slots_to_simulation":p.and_then(|p|report.context_slot.and_then(|s|s.checked_sub(p.observation.slot))),
                 "observation_age_at_request_us":p.and_then(|p|self.request_ready_at_us.checked_sub(p.observation.received_at_us))}));
         }
         let full=!calls.is_empty()&&calls.iter().all(|c|c.status=="complete");
         let continuous=full&&calls.windows(2).all(|w|w[0].outputs[0].mint==w[1].inputs[0].mint
-            &&w[0].outputs[0].amount_raw==w[1].inputs[0].amount_raw);
+            &&w[0].outputs[0].amount_raw==w[1].inputs[0].gross_amount_raw
+            &&w[1].inputs[0].amount_raw==w[1].inputs[0].gross_amount_raw);
         let unique=observed.as_ref().is_some_and(|p|p.iter().copied().collect::<HashSet<_>>().len()==p.len());
         let settlement=self.request.settlement.to_string();
-        let cycle=(2..=4).contains(&calls.len())&&full&&continuous&&unique
+        let observed_cycle=(2..=4).contains(&calls.len())&&full&&continuous&&unique
             &&calls[0].inputs[0].mint==settlement&&calls.last().expect("cycle").outputs[0].mint==settlement;
-        let initial=cycle.then(||calls[0].inputs[0].amount_raw).filter(|&v|v>0);
-        let actual_output=cycle.then(||calls.last().expect("cycle").outputs[0].amount_raw);
+        let refund=observed_cycle.then(||calls[0].inputs[0].gross_amount_raw-calls[0].inputs[0].amount_raw);
+        let actual_output=refund.and_then(|refund|calls.last().expect("cycle").outputs[0].amount_raw.checked_add(refund));
+        let cycle=observed_cycle&&actual_output.is_some();
+        let initial=cycle.then(||calls[0].inputs[0].gross_amount_raw).filter(|&v|v>0);
         let model=initial.ok_or("no_complete_single_cycle").and_then(|mut amount|{
             for call in calls{amount=self.quote_observed_leg(call,amount)?;}Ok(amount)
         });
@@ -167,20 +178,23 @@ impl Selection {
         let probe=self.amount_assessment.estimate.as_ref();
         let probe_path=probe.map(|e|e.legs.iter().map(|l|l.pool.as_str()).collect::<Vec<_>>());
         json!({"schema_version":1,"scope":"frozen_dex_model_vs_later_simulation",
-            "marginal_signal_bps":self.estimated_net_return_bps,
+            "marginal_signal_bps":witness.and_then(|w|{
+                let bps=(-(w.log_sum_units as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;bps.is_finite().then_some(bps)}),
+            "packing_marginal_bps":self.estimated_net_return_bps,
             "source_witness_pools":original,"packing_seed_pools":seed,"observed_pools":observed,
             "source_path_relation":relation(&original),"seed_path_relation":relation(&seed),
             "trace_status":report.trace.status,"simulation_committed":committed,
             "legs":legs,"flow_continuous":continuous,"single_cycle":cycle,
             "actual_path_marginal_bps":if cycle{marginal.map(|r|(r-1.0)*10000.0)}else{None},
             "trade_input_raw":initial,"trade_output_raw":actual_output,
+            "settlement_input_refund_raw":refund,
             "attempted_dex_gain_raw":initial.zip(actual_output).map(|(i,o)|(i128::from(o)-i128::from(i)).to_string()),
             "attempted_dex_return_bps":actual_bps,"simulated_dex_return_bps":if committed{actual_bps}else{None},
             "model_route_status":if model.is_ok(){"quoted"}else{"unavailable"},
             "model_route_unavailable_reason":model.err(),"model_route_output_raw":model.as_ref().ok(),
             "model_route_return_bps":model_bps,"actual_minus_model_bps":actual_bps.zip(model_bps).map(|(a,m)|a-m),
             "probe_input_raw":probe.map(|p|p.input_raw),"probe_profit_raw":probe.map(|p|p.profit_raw),
-            "probe_same_path":probe_path.as_ref().zip(observed.as_ref()).map(|(a,b)|a==b),
+            "probe_same_path":probe_path.as_ref().zip(observed.as_ref()).filter(|_|full).map(|(a,b)|a==b),
             "probe_same_amount":probe.zip(initial).map(|(p,i)|p.input_raw==i),"processing_ns":elapsed_ns(started)})
     }
     /// Per-request rate/capacity facts; full manifests are stored once per payload.

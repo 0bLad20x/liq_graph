@@ -148,7 +148,8 @@ def analyze(rows):
                     invalid |= call.get('pool') is not None and call['pool'] not in declared
                     if call['status'] == 'complete':
                         invalid |= (len(call['inputs']) != 1 or len(call['outputs']) != 1 or
-                                    any(x['amount_raw'] <= 0 for x in call['inputs'] + call['outputs']))
+                                    any(x['amount_raw'] <= 0 or x['gross_amount_raw'] < x['amount_raw']
+                                        for x in call['inputs'] + call['outputs']))
                 if not c['simulation_committed']:
                     invalid |= c['simulated_dex_return_bps'] is not None
                 if c['single_cycle']:
