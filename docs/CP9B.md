@@ -46,3 +46,4 @@ Compare request count per minute, completed full unique DEX cycles, amount/retur
 - `GRAPH_V10_SIMULATION_PARALLELISM=1` preserves serial behavior.
 - **Not** implemented: sending transactions, simulating all alternatives in one signal revision, de-duplication/cooldowns, new candidate ranking, dynamic USD oracle, or provider-specific dedicated wallets.
 - RPC response order is naturally nondeterministic under parallelism; request IDs remain the stable join key for diagnostics.
+- The old `successful_simulation` acceptance is deliberately **not** a profitability assertion: report a full continuous DEX cycle, `err=null`, settlement result and wallet cashflow separately. Never call a `Custom(1)` event successful.
