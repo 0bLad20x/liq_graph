@@ -35,6 +35,11 @@ Handelsgroesse. CP8H behaelt deshalb getrennt:
 4. Modellquote derselben beobachteten Poolfolge mit derselben Eingangsmenge.
 5. Simulierten Walletgewinn, Netzwerkgebuehr und Kontoeinlagen aus den bisherigen Salden.
 
+Originalroute und Packing-Seed werden ebenfalls bei dieser Eingangsmenge quotiert,
+soweit ihre Poolmodelle im eingefrorenen Request verfuegbar sind. Ein nicht
+mitgepacktes Originalmodell bleibt unverfuegbar. Damit laesst sich ein Wechsel
+der Poolkombination von Mengeneffekten innerhalb derselben Kombination trennen.
+
 Executor erkennt deklarierte Poolaccounts in DEX-CPIs. SPL Transfer/TransferChecked
 wird ueber parsed JSON oder die Standard-Tokeninstruction gelesen, ohne DEX-
 spezifische Swapdecoder. Wallet-ATAs werden aus den vorhandenen Mintproofs abgeleitet.

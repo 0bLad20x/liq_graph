@@ -102,14 +102,18 @@ pub struct Report {
 }
 impl Selection {
     /// One frozen-model quote at a supplied amount; no search, live state or RPC.
-    fn quote_observed_leg(&self,call:&crate::core::execution::ExecutionSwapCall,amount:u64)->Result<u64,&'static str> {
-        if call.status!="complete"{return Err("observed_flow_incomplete");}
-        let p=self.pools.iter().find(|p|Some(p.pool.as_str())==call.pool.as_deref()).ok_or("pool_not_in_frozen_selection")?;
+    fn quote_frozen_leg(&self,pool:&str,input_mint:&str,output_mint:&str,amount:u64)->Result<u64,&'static str> {
+        let p=self.pools.iter().find(|p|p.pool==pool).ok_or("pool_not_in_frozen_selection")?;
         let profile=p.observation.liquidity.as_ref().ok_or("amount_model_unavailable")?;
-        let direction=profile.directions.iter().position(|d|d.input_mint==call.inputs[0].mint
-            &&d.output_mint==call.outputs[0].mint).ok_or("direction_not_in_model")?;
+        let direction=profile.directions.iter().position(|d|d.input_mint==input_mint
+            &&d.output_mint==output_mint).ok_or("direction_not_in_model")?;
         let input=amounts::Input{slot:p.slot,observation:p.observation.clone(),manifest_matches:p.liquidity_window_checked};
         amounts::quote(&input,direction,amount).map_err(|e|match e{amounts::Issue::Unknown(r)|amounts::Issue::Insufficient(r)=>r})
+    }
+    fn quote_observed_leg(&self,call:&crate::core::execution::ExecutionSwapCall,amount:u64)->Result<u64,&'static str> {
+        if call.status!="complete"{return Err("observed_flow_incomplete");}
+        self.quote_frozen_leg(call.pool.as_deref().ok_or("pool_identity_unresolved")?,
+            &call.inputs[0].mint,&call.outputs[0].mint,amount)
     }
     /// Post-run comparison only. Attempted flows on failure are never realized gains.
     pub fn calibration(&self,report:&ExecutionReport)->serde_json::Value {
@@ -136,7 +140,9 @@ impl Selection {
         let mut legs=Vec::new();let mut marginal=Some(1.0_f64);
         for (call_index,call) in calls.iter().enumerate() {
             let complete=call.status=="complete";
-            let quoted=if complete{self.quote_observed_leg(call,call.inputs[0].gross_amount_raw)}else{Err("observed_flow_incomplete")};
+            let reused=calls[..call_index].iter().any(|c|c.pool.is_some()&&c.pool==call.pool);
+            let quoted=if reused{Err("pool_reused_after_prior_swap")}
+                else if complete{self.quote_observed_leg(call,call.inputs[0].gross_amount_raw)}else{Err("observed_flow_incomplete")};
             let p=self.pools.iter().find(|p|Some(p.pool.as_str())==call.pool.as_deref());
             let rate=p.and_then(|p|p.observation.liquidity.as_ref()).and_then(|q|q.directions.iter()
                 .find(|d|complete&&d.input_mint==call.inputs[0].mint&&d.output_mint==call.outputs[0].mint))
@@ -175,14 +181,27 @@ impl Selection {
         let bps=|output:u64,input:u64|(output as f64/input as f64-1.0)*10000.0;
         let actual_bps=initial.zip(actual_output).map(|(input,output)|bps(output,input));
         let model_bps=initial.zip(model.as_ref().ok()).map(|(input,&output)|bps(output,input));
+        let quote_path=|path:&[&str]|initial.ok_or("no_observed_input_amount").and_then(|mut amount|{
+            if path.is_empty()||path.len()!=directions.len(){return Err("source_direction_unavailable");}
+            for (pool,(input,output)) in path.iter().zip(&directions){amount=self.quote_frozen_leg(pool,input,output,amount)?;}
+            Ok(amount)
+        });
+        let seed_model=if relation(&seed)=="same_path"{model}else{quote_path(&seed)};
+        let source_model=if original==seed{seed_model}
+            else if relation(&original)=="same_path"{model}else{quote_path(&original)};
         let probe=self.amount_assessment.estimate.as_ref();
-        let probe_path=probe.map(|e|e.legs.iter().map(|l|l.pool.as_str()).collect::<Vec<_>>());
         json!({"schema_version":1,"scope":"frozen_dex_model_vs_later_simulation",
             "marginal_signal_bps":witness.and_then(|w|{
                 let bps=(-(w.log_sum_units as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;bps.is_finite().then_some(bps)}),
             "packing_marginal_bps":self.estimated_net_return_bps,
             "source_witness_pools":original,"packing_seed_pools":seed,"observed_pools":observed,
             "source_path_relation":relation(&original),"seed_path_relation":relation(&seed),
+            "source_model_output_at_trade_input_raw":source_model.as_ref().ok(),
+            "source_model_unavailable_reason":source_model.err(),
+            "source_model_return_bps":initial.zip(source_model.as_ref().ok()).map(|(i,&o)|bps(o,i)),
+            "seed_model_output_at_trade_input_raw":seed_model.as_ref().ok(),
+            "seed_model_unavailable_reason":seed_model.err(),
+            "seed_model_return_bps":initial.zip(seed_model.as_ref().ok()).map(|(i,&o)|bps(o,i)),
             "trace_status":report.trace.status,"simulation_committed":committed,
             "legs":legs,"flow_continuous":continuous,"single_cycle":cycle,
             "actual_path_marginal_bps":if cycle{marginal.map(|r|(r-1.0)*10000.0)}else{None},
@@ -194,7 +213,8 @@ impl Selection {
             "model_route_unavailable_reason":model.err(),"model_route_output_raw":model.as_ref().ok(),
             "model_route_return_bps":model_bps,"actual_minus_model_bps":actual_bps.zip(model_bps).map(|(a,m)|a-m),
             "probe_input_raw":probe.map(|p|p.input_raw),"probe_profit_raw":probe.map(|p|p.profit_raw),
-            "probe_same_path":probe_path.as_ref().zip(observed.as_ref()).filter(|_|full).map(|(a,b)|a==b),
+            "probe_same_path":probe.filter(|_|full).map(|p|p.legs.len()==calls.len()&&p.legs.iter().zip(calls)
+                .all(|(l,c)|Some(l.pool.as_str())==c.pool.as_deref()&&l.input_mint==c.inputs[0].mint&&l.output_mint==c.outputs[0].mint)),
             "probe_same_amount":probe.zip(initial).map(|(p,i)|p.input_raw==i),"processing_ns":elapsed_ns(started)})
     }
     /// Per-request rate/capacity facts; full manifests are stored once per payload.

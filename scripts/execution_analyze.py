@@ -157,7 +157,13 @@ def analyze(rows):
                 if c['model_route_status'] == 'quoted':
                     invalid |= (not c['single_cycle'] or c.get('model_route_output_raw') is None or
                                 c.get('model_route_return_bps') is None)
-                for leg in c['legs']:
+                for index, leg in enumerate(c['legs']):
+                    if index < len(calls):
+                        call = calls[index]
+                        invalid |= leg['call_index'] != index or leg['pool'] != call.get('pool')
+                        if leg['model_output_raw'] is not None:
+                            invalid |= (call['status'] != 'complete' or not call['inputs'] or
+                                        leg['model_input_raw'] != call['inputs'][0]['gross_amount_raw'])
                     if leg['model_unavailable_reason']:
                         leg_reasons[leg['model_unavailable_reason']] += 1
                     if leg.get('output_error_bps') is not None:
@@ -168,6 +174,9 @@ def analyze(rows):
                 sample = {'id': identity, 'seed_path_relation': c['seed_path_relation'],
                           'model_route_status': c['model_route_status'], 'simulation_committed': c['simulation_committed'],
                           'marginal_signal_bps': c['marginal_signal_bps'],
+                          'packing_marginal_bps': c['packing_marginal_bps'],
+                          'source_model_return_bps': c['source_model_return_bps'],
+                          'seed_model_return_bps': c['seed_model_return_bps'],
                           'actual_path_marginal_bps': c['actual_path_marginal_bps'],
                           'trade_input_raw': c['trade_input_raw'], 'trade_output_raw': c['trade_output_raw'],
                           'model_route_output_raw': c['model_route_output_raw'],

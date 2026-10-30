@@ -331,7 +331,7 @@ fn observed_trace(value:&Value,keys:&[Pubkey],ix:&Instruction)->ExecutionTrace {
             }
             let Some(i)=current else{continue;};
             if !program.is_some_and(|p|token_programs.contains(&p)){continue;}
-            let parsed=instruction.get("parsed");
+            let parsed=instruction.get("parsed").filter(|p|p.is_object());
             let mut transfer:Option<(Pubkey,Pubkey,Option<Pubkey>,u64)>=None;
             if let Some(parsed)=parsed {
                 if matches!(parsed["type"].as_str(),Some("transfer"|"transferChecked")) {
