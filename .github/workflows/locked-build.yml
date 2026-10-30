@@ -26,6 +26,8 @@ jobs:
           git rev-parse --short HEAD
           git status --short
           git diff --exit-code -- Cargo.lock
+      - name: Run locked Rust unit tests
+        run: cargo test --locked
       - name: Release build without lockfile changes
         run: |
           cargo build --locked --release
