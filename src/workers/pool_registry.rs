@@ -88,7 +88,7 @@ impl AdmissionIndex {
         // It cannot satisfy the non-reference Jupiter qualification rule, yet it
         // is required by V10 Direct3/Triangle4 routes. Admit ONLY this exact
         // canonical reference pair; all other pools retain the Mint qualification
-        // and the same fresh pool-TVL floor, including conversion pools.
+        // and the fresh pool-TVL floor except for PumpSwap.
         let references=reference_mints();
         let conversion_pair=matches!((pool.mint_a,pool.mint_b),
             (Some(a),Some(b)) if a!=b && references.contains(&a) && references.contains(&b));
@@ -101,7 +101,7 @@ impl AdmissionIndex {
             return CompletionAdmission::MissingIdentity;
         }
         if !mint_qualified {return CompletionAdmission::MintNotQualified;}
-        if self.minimum_tvl_usd>0.0 {
+        if pool.venue!=Venue::PumpSwap && self.minimum_tvl_usd>0.0 {
             let Some(tvl)=pool.tvl_usd.filter(|v|v.is_finite() && *v>=0.0) else {
                 return CompletionAdmission::TvlUnavailable;
             };
@@ -190,10 +190,10 @@ impl PoolRegistry {
         Ok(counts)
     }
     /// Final owner counters only; no live observer or copied pool catalogue.
-    pub fn tvl_summary(&self)->Value {
+    pub fn tvl_summary(&self,coverage:Option<&crate::core::market_state::PoolCoverage>)->Value {
         let entries=self.entries.read().expect("pool registry lock poisoned");
         let admission=self.admission.read().expect("admission index lock poisoned");
-        let mut venues=std::collections::BTreeMap::<&str,[u64;9]>::new();
+        let mut venues=std::collections::BTreeMap::<&str,[u64;12]>::new();
         let mut violations=0_u64;
         for p in entries.values() {
             let v=venues.entry(p.venue.name()).or_default();v[0]+=1;
@@ -202,6 +202,9 @@ impl PoolRegistry {
             v[3]+=u64::from(prepared&&p.completion_admission.is_admitted());
             v[4]+=u64::from(p.completion_admission==CompletionAdmission::TvlUnavailable);
             v[5]+=u64::from(p.completion_admission==CompletionAdmission::TvlBelowMinimum);
+            v[9]+=u64::from(p.tvl_usd.is_none());
+            v[10]+=u64::from(p.completion_admission.is_admitted()&&p.tvl_usd.is_none());
+            v[11]+=u64::from(p.completion_admission.is_admitted()&&p.tvl_usd.is_some_and(|t|t<admission.minimum_tvl_usd));
             if prepared && !matches!(p.completion_admission,CompletionAdmission::MissingIdentity|CompletionAdmission::MintNotQualified) {
                 match p.tvl_usd {
                     Some(tvl) if tvl>=500.0=>v[8]+=1,
@@ -210,15 +213,38 @@ impl PoolRegistry {
                     None=>{},
                 }
             }
-            if p.completion_admission.is_admitted() && admission.minimum_tvl_usd>0.0
+            if p.venue!=Venue::PumpSwap && p.completion_admission.is_admitted() && admission.minimum_tvl_usd>0.0
                 && p.tvl_usd.is_none_or(|v|!v.is_finite()||v<admission.minimum_tvl_usd) {violations+=1;}
         }
         let by_venue=venues.into_iter().map(|(venue,v)|(venue,json!({
             "total":v[0],"prepared":v[1],"admitted":v[2],"prepared_admitted":v[3],
             "missing_tvl":v[4],"below_minimum":v[5],
+            "observed_tvl_missing":v[9],"admitted_without_tvl":v[10],"admitted_below_tvl_floor":v[11],
             "prepared_qualified_known_below_100":v[6],"prepared_qualified_100_to_500":v[7],
             "prepared_qualified_at_least_500":v[8]}))).collect::<std::collections::BTreeMap<_,_>>();
-        json!({"minimum_pool_tvl_usd":admission.minimum_tvl_usd,
+        let targets=entries.values().filter(|p|p.venue==Venue::MeteoraDlmm && p.completion_admission.is_admitted())
+            .flat_map(|p|[p.mint_a,p.mint_b]).flatten().filter(|m|!reference_mints().contains(m)).collect::<HashSet<_>>();
+        let mut stages=[HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new()];
+        let mut pump_pools=[0_u64;5];
+        for p in entries.values().filter(|p|p.venue==Venue::PumpSwap) {
+            let matching=[p.mint_a,p.mint_b].into_iter().flatten().filter(|m|targets.contains(m)).collect::<Vec<_>>();
+            if matching.is_empty(){continue;}
+            let admitted=p.completion_admission.is_admitted();
+            let flags=[true,admitted,admitted&&p.completion_state==CompletionState::Prepared,
+                admitted&&p.completion_state==CompletionState::Prepared&&coverage.is_some_and(|c|c.selected.contains(&p.address)),
+                admitted&&p.completion_state==CompletionState::Prepared&&coverage.is_some_and(|c|c.priced.contains(&p.address))];
+            for (i,flag) in flags.into_iter().enumerate() {if flag{pump_pools[i]+=1;stages[i].extend(matching.iter().copied());}}
+        }
+        let mut missing=targets.difference(&stages[0]).map(ToString::to_string).collect::<Vec<_>>();missing.sort();missing.truncate(8);
+        json!({"minimum_pool_tvl_usd":admission.minimum_tvl_usd,"tvl_exempt_venues":["pumpswap"],
+            "dlmm_pumpswap_counterparts":{"dlmm_admitted_target_mints":targets.len(),
+                "target_mints_with_pump_known":stages[0].len(),"target_mints_with_pump_admitted":stages[1].len(),
+                "target_mints_with_pump_prepared":stages[2].len(),
+                "target_mints_with_pump_selected":coverage.map(|_|stages[3].len()),
+                "target_mints_with_pump_priced":coverage.map(|_|stages[4].len()),
+                "pump_pools_known":pump_pools[0],"pump_pools_admitted":pump_pools[1],"pump_pools_prepared":pump_pools[2],
+                "pump_pools_selected":coverage.map(|_|pump_pools[3]),"pump_pools_priced":coverage.map(|_|pump_pools[4]),
+                "missing_known_counterpart_samples":missing},
             "source_max_age_seconds":TVL_SOURCE_MAX_AGE_MS/1000,
             "admission_violations":violations,"by_venue":by_venue})
     }

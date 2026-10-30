@@ -222,6 +222,11 @@ separat sichtbar. `-ExecutionDetailLimit` begrenzt Vollkopien, Standard 16;
 alle Versuche bleiben im JSONL. Die Nachverarbeitung benoetigt Python 3.10+.
 Der Stundenlauf und die Vergleichsregeln stehen im Checkpoint-Dokument.
 
+[CP8H](CP8H.md) nimmt PumpSwap von der eigenen TVL-Bedingung aus. DLMM behaelt
+die 500-USD-Grenze. `-RequireCalibrationEvidence` prueft den kompakten Abgleich
+von Signal, tatsaechlicher CPI-Poolfolge, Menge und eingefrorener Modellquote.
+Nachberechnungen erfolgen nach der Messphase ohne neue RPC-Abfragen.
+
 Im vorgesehenen Simulationslauf müssen `diagnostic_consumers=0`,
 `signal_proof=false`, `orchestration_evidence_passed=true` und
 `candidate_delivery_passed=true` gelten. MarketState-Event/Preis/WS-Zähler müssen

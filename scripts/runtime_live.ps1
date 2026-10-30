@@ -26,6 +26,7 @@ param(
     [switch]$RequireLiquidityEvidence,
     [switch]$RequireAmountEvidence,
     [switch]$RequirePreparedEvidence,
+    [switch]$RequireCalibrationEvidence,
     # Diagnostic raw snapshots only. This does not pin or filter pool selection.
     [string]$LiquidityEvidencePools = '',
     # Overrides the single ENV allowlist for the complete pipeline.
@@ -48,6 +49,7 @@ if ($RequireFeeEvidence -and -not $signals) { throw 'Fee evidence requires Stage
 if (($RequireLiquidityEvidence -or $LiquidityEvidencePools) -and -not $signals) { throw 'Liquidity evidence requires Stage Signals.' }
 if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw 'Amount evidence requires Stage Signals and SimulateV10.' }
 if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidence requires MarketState.' }
+if ($RequireCalibrationEvidence -and -not $SimulateV10) { throw 'Calibration evidence requires SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ([double]::IsNaN($MinPoolTvlUsd) -or [double]::IsInfinity($MinPoolTvlUsd)) { throw 'MinPoolTvlUsd must be finite.' }
@@ -191,6 +193,7 @@ try {
         liquidity_evidence_pools=$LiquidityEvidencePools; liquidity_model='dlmm_execution_window_v2'
         require_amount_evidence=[bool]$RequireAmountEvidence; amount_check='observed_simple_cycles_dex_only'
         require_prepared_evidence=[bool]$RequirePreparedEvidence
+        require_calibration_evidence=[bool]$RequireCalibrationEvidence
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -202,7 +205,7 @@ try {
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
     if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
-    Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD; detail samples <= $ExecutionDetailLimit"
+    Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
         throw 'Prepared evidence currently covers only meteora_dlmm and pumpswap.'
@@ -399,10 +402,21 @@ try {
     $tvl = $runtime.registry_tvl
     $tvlPassed = $null -ne $tvl -and [double]$tvl.minimum_pool_tvl_usd -eq $MinPoolTvlUsd -and
         [long]$tvl.admission_violations -eq 0
+    $calibration = $executionAnalysis.calibration
+    $calibrationPassed = $null
+    if ($RequireCalibrationEvidence) {
+        $calibrationPassed = [long]$execution.schema_version -ge 3 -and $requestCount -gt 0 -and
+            [long]$calibration.counts.records -eq $requestCount -and
+            [long]$calibration.model_route_statuses.quoted -gt 0 -and
+            [long]$executionAnalysis.violation_counts.calibration -eq 0 -and
+            'pumpswap' -in @($tvl.tvl_exempt_venues)
+    }
     $feeSummary = $feeEvidence | Select-Object * -ExcludeProperty samples,invalid_reference_samples,clock_reference_lag_samples
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
         minimum_pool_tvl_usd=$MinPoolTvlUsd; pool_tvl_evidence_passed=[bool]$tvlPassed; registry_tvl=$tvl
+        calibration_evidence_passed=$calibrationPassed; execution_calibration=$calibration
+        dlmm_pumpswap_counterparts=$tvl.dlmm_pumpswap_counterparts
         execution_detail_limit=$ExecutionDetailLimit; settlement_results=$executionAnalysis.settlement_results
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
         runtime_completed=($null -ne $runtime -and $runtime.run_complete -eq $true)
@@ -476,11 +490,15 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     Write-Host "Runtime complete=$($summary.runtime_completed); orchestration=$orchestrationPassed; pool TVL evidence=$tvlPassed"
     Write-Host "Pools selected=$($market.selected_pools), priced=$($market.priced_pools); WS gaps=$($market.metrics.gaps)"
+    if ($RequireCalibrationEvidence) {
+        Write-Host "Calibration: requests=$($calibration.counts.records), quoted routes=$($calibration.model_route_statuses.quoted), passed=$calibrationPassed"
+    }
     foreach ($venue in $tvl.by_venue.PSObject.Properties) {
         $v = $venue.Value
-        Write-Host "TVL $($venue.Name): prepared/admitted=$($v.prepared_admitted), below minimum=$($v.below_minimum), missing TVL=$($v.missing_tvl)"
+        Write-Host "TVL $($venue.Name): prepared/admitted=$($v.prepared_admitted), blocked below minimum=$($v.below_minimum), blocked missing TVL=$($v.missing_tvl), admitted without TVL=$($v.admitted_without_tvl)"
     }
     Write-Host "Summary: $(Join-Path $folder 'summary.json')"
+    if ($RequireCalibrationEvidence -and -not $calibrationPassed) { throw 'CP8H calibration evidence incomplete; inspect execution_analysis.json and execution_events.jsonl.' }
     if (-not $tvlPassed) { throw 'Pool TVL admission evidence incomplete; inspect registry_tvl in summary.json.' }
     if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
     if ($RequirePreparedEvidence -and -not $preparedPassed) { throw "CP8F prepared bootstrap evidence incomplete; inspect $folder." }

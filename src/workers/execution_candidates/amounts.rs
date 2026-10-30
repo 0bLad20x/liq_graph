@@ -145,7 +145,7 @@ pub(super) fn minimum_input(input:&Input,direction:usize,mut output:u64)->Calc<u
     else{Err(Issue::Unknown("liquidity_window_incomplete"))}
 }
 
-fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
+pub(super) fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
     let p=profile(input)?;let dir=&p.directions[direction];
     if dir.status!="available"{return Err(Issue::Unknown("direction_unavailable_for_estimate"));}
     if let Some(c)=&p.reserve_curve {

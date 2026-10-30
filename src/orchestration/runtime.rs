@@ -204,6 +204,7 @@ pub fn plan()->Result<serde_json::Value> {
     plan["discovery_configured_workers"]=serde_json::json!(sources.iter().map(|w|w.label()).collect::<Vec<_>>());
     plan["websocket_plan"]=serde_json::to_value(rpc_transport::settings_from_env()?.websocket_plan()?)?;
     plan["minimum_pool_tvl_usd"]=serde_json::json!(pool_registry::minimum_tvl_from_env()?);
+    plan["tvl_exempt_venues"]=serde_json::json!(["pumpswap"]);
     Ok(plan)
 }
 
@@ -637,8 +638,10 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     }
     if let Some(error)=error{return Err(error);}
     let graph=final_graph.borrow().clone();
-    evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
-        .registry_tvl=registry.tvl_summary();
+    {
+        let mut evidence=evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?;
+        evidence.registry_tvl=registry.tvl_summary(evidence.market.as_ref().map(|m|&m.pool_coverage));
+    }
     evidence.lock().map_err(|_|anyhow!("runtime evidence lock poisoned"))?
         .registry_pools_by_venue=Some(registry.protocol_counts()?);
     let membership=graph_liquidity::compare_registry(&graph,&registry.snapshot(),&graph_audit_settings)?;

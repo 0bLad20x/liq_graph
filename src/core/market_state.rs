@@ -167,3 +167,11 @@ pub enum MarketStateEvent {
 /// Consumers must handle that explicitly and can request a fresh producer baseline on restart.
 pub type PriceEventStream = tokio::sync::broadcast::Receiver<std::sync::Arc<MarketStateEvent>>;
 
+/// Final owner membership, passed by orchestration for Registry coverage evidence.
+/// No copied prices or additional live consumer.
+#[derive(Default)]
+pub struct PoolCoverage {
+    pub selected:std::collections::HashSet<solana_pubkey::Pubkey>,
+    pub priced:std::collections::HashSet<solana_pubkey::Pubkey>,
+}
+

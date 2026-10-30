@@ -7,7 +7,8 @@ use serde_json::Value;
 use solana_pubkey::Pubkey;
 use tokio::sync::mpsc;
 use crate::core::{AccountMeta, execution::{ExecutionGroup, ExecutionMetrics,
-    ExecutionOutcome, ExecutionPool, ExecutionPoolUse, ExecutionReport, ExecutionRequest}};
+    ExecutionOutcome, ExecutionPool, ExecutionPoolUse, ExecutionReport, ExecutionRequest,
+    ExecutionTrace,ExecutionSwapCall,ExecutionAssetAmount}};
 use crate::core::rpc::{AccountView, RpcAnswer, RpcHandle, RpcOperation};
 
 const EXECUTOR: &str = "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz";
@@ -52,6 +53,7 @@ struct Meta { address: Pubkey, writable: bool, signer: bool }
 struct Instruction {
     data: Vec<u8>, metas: Vec<Meta>, programs: HashSet<Pubkey>,
     projections: Vec<Pubkey>, metrics: ExecutionMetrics,
+    wallet_tokens:HashMap<Pubkey,Pubkey>,
 }
 fn push(metas: &mut Vec<Meta>, address: Pubkey, writable: bool, signer: bool) {
     metas.push(Meta { address, writable, signer });
@@ -154,6 +156,7 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
         }
     }
     let mut ix=Instruction { data:Vec::new(),metas:Vec::new(),programs:HashSet::new(),
+        wallet_tokens:mint_programs.iter().map(|(&mint,&program)|(ata(wallet,mint,program),mint)).collect(),
         projections:vec![wallet,ata(wallet,s,key(TOKEN))],
         metrics:ExecutionMetrics { groups:request.groups.len(),pool_declarations:all_pools.len(),
             unique_accounts:0,account_references:0,instruction_bytes:0,transaction_bytes:0,pools:Vec::new() } };
@@ -310,6 +313,93 @@ fn observed_dex_calls(value: &Value, keys: &[Pubkey], ix: &Instruction) -> Vec<S
     }
     observed
 }
+/// Generic SPL token flows under a declared DEX CPI; no DEX instruction decoding.
+/// Refunds are netted per mint. Missing scope/amounts stay explicit, never guessed.
+fn observed_trace(value:&Value,keys:&[Pubkey],ix:&Instruction)->ExecutionTrace {
+    let Some(groups)=value.get("innerInstructions").and_then(Value::as_array) else {
+        return ExecutionTrace{status:"inner_instructions_unavailable".into(),calls:Vec::new()};
+    };
+    let resolve=|v:&Value|->Option<Pubkey>{v.as_str().and_then(|s|s.parse().ok())
+        .or_else(||v.as_u64().and_then(|i|keys.get(i as usize).copied()))};
+    let pools=ix.metrics.pools.iter().map(|p|p.pool).collect::<HashSet<_>>();
+    let mut trace=ExecutionTrace{status:"available".into(),calls:Vec::new()};
+    let mut moves=Vec::<HashMap<Pubkey,(u128,u128)>>::new();
+    for group in groups {
+        let mut current:Option<usize>=None;
+        for instruction in group.get("instructions").and_then(Value::as_array).into_iter().flatten() {
+            let height=instruction.get("stackHeight").and_then(Value::as_u64);
+            if let Some(i)=current {
+                if height.zip(trace.calls[i].stack_height).is_none_or(|(h,parent)|h<=parent) {current=None;}
+            }
+            let program=instruction.get("programId").or_else(||instruction.get("programIdIndex")).and_then(resolve);
+            if let Some(program)=program.filter(|p|ix.programs.contains(p)) {
+                let found=instruction.get("accounts").and_then(Value::as_array).into_iter().flatten()
+                    .filter_map(resolve).filter(|p|pools.contains(p)).collect::<HashSet<_>>();
+                if !found.is_empty() {
+                    let pool=(found.len()==1).then(||found.iter().next().expect("nonempty").to_string());
+                    let mut issues=Vec::new();
+                    if pool.is_none(){issues.push("ambiguous_pool_accounts".into());}
+                    if height.is_none(){issues.push("stack_height_unavailable".into());}
+                    trace.calls.push(ExecutionSwapCall{program:program.to_string(),pool,stack_height:height,
+                        status:"no_complete_swap".into(),issues,inputs:Vec::new(),outputs:Vec::new()});
+                    moves.push(HashMap::new());current=height.map(|_|trace.calls.len()-1);
+                }
+            }
+            let Some(i)=current else{continue;};
+            if !program.is_some_and(|p|p==key(TOKEN)||p==key(TOKEN_2022)){continue;}
+            let parsed=instruction.get("parsed");
+            let mut transfer:Option<(Pubkey,Pubkey,Option<Pubkey>,u64)>=None;
+            if let Some(parsed)=parsed {
+                if matches!(parsed["type"].as_str(),Some("transfer"|"transferChecked")) {
+                    let info=&parsed["info"];
+                    let amount=info.get("amount").or_else(||info.pointer("/tokenAmount/amount"))
+                        .and_then(|n|n.as_str().and_then(|n|n.parse().ok()).or_else(||n.as_u64()));
+                    transfer=resolve(&info["source"]).zip(resolve(&info["destination"])).zip(amount)
+                        .map(|((source,destination),amount)|(source,destination,resolve(&info["mint"]),amount));
+                    if transfer.is_none(){trace.calls[i].issues.push("parsed_transfer_unresolved".into());}
+                } else if parsed["type"].as_str().is_some_and(|t|t.starts_with("transfer")) {
+                    trace.calls[i].issues.push("unsupported_token_transfer".into());
+                }
+            } else if let Some(encoded)=instruction.get("data").and_then(Value::as_str) {
+                if let Ok(data)=bs58::decode(encoded).into_vec() {
+                    if matches!(data.first(),Some(3|12)) {
+                        let checked=data[0]==12;
+                        let accounts=instruction.get("accounts").and_then(Value::as_array);
+                        let account=|index:usize|accounts.and_then(|a|a.get(index)).and_then(resolve);
+                        let amount=data.get(1..9).and_then(|v|v.try_into().ok()).map(u64::from_le_bytes);
+                        transfer=account(0).zip(account(if checked{2}else{1})).zip(amount)
+                            .map(|((source,destination),amount)|(source,destination,if checked{account(1)}else{None},amount));
+                        if transfer.is_none(){trace.calls[i].issues.push("compiled_transfer_unresolved".into());}
+                    } else if data.first()==Some(&26) {
+                        trace.calls[i].issues.push("token_transfer_extension_unresolved".into());
+                    }
+                } else {trace.calls[i].issues.push("token_instruction_encoding_unresolved".into());}
+            }
+            let Some((source,destination,mint,amount))=transfer else{continue;};
+            let sent=ix.wallet_tokens.get(&source);let received=ix.wallet_tokens.get(&destination);
+            if sent.is_none()&&received.is_none(){continue;}
+            let Some(mint)=mint.or_else(||sent.or(received).copied())else{continue;};
+            if [sent,received].into_iter().flatten().any(|m|*m!=mint) {
+                trace.calls[i].issues.push("wallet_transfer_mint_mismatch".into());continue;
+            }
+            let flow=moves[i].entry(mint).or_default();
+            if sent.is_some(){flow.0+=u128::from(amount);}
+            if received.is_some(){flow.1+=u128::from(amount);}
+        }
+    }
+    for (call,flows) in trace.calls.iter_mut().zip(moves) {
+        for (mint,(sent,received)) in flows {
+            let (target,amount)=if sent>received{(&mut call.inputs,sent-received)}else{(&mut call.outputs,received-sent)};
+            if amount==0{continue;}
+            if let Ok(amount_raw)=u64::try_from(amount){target.push(ExecutionAssetAmount{mint:mint.to_string(),amount_raw});}
+            else{call.issues.push("flow_amount_overflow".into());}
+        }
+        call.inputs.sort_by(|a,b|a.mint.cmp(&b.mint));call.outputs.sort_by(|a,b|a.mint.cmp(&b.mint));
+        if call.pool.is_some()&&call.issues.is_empty()&&call.inputs.len()==1&&call.outputs.len()==1
+            &&call.inputs[0].mint!=call.outputs[0].mint {call.status="complete".into();}
+    }
+    trace
+}
 async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionRequest,
     report: &mut ExecutionReport) -> Result<()> {
     let mut ix=instruction(request,settings.wallet())?;
@@ -365,6 +455,9 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
         report.executor_invoked=value.get("logs").and_then(Value::as_array).is_some_and(|logs|
             logs.iter().filter_map(Value::as_str).any(|s|s.starts_with(&format!("Program {EXECUTOR} invoke ["))));
         report.dex_invocations=observed_dex_calls(&value,&signed.keys,&ix);
+        let trace_started=Instant::now();
+        report.trace=observed_trace(&value,&signed.keys,&ix);
+        report.trace_us=trace_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         report.outcome=if value.get("err").is_some_and(|e|!e.is_null()) {
             ExecutionOutcome::SimulationFailed
         } else if report.dex_invocations.is_empty() {
@@ -398,7 +491,7 @@ pub async fn run(settings: Settings, rpc: RpcHandle, mut input: mpsc::Receiver<E
             phase:"validate".into(),error:None,metrics:None,simulated_signature:None,
             blockhash:None,last_valid_block_height:None,context_slot:None,provider:None,
             blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None,
-            build_us:None,simulation_rpc_ms:None,elapsed_ms:0};
+            build_us:None,simulation_rpc_ms:None,elapsed_ms:0,trace_us:0,trace:ExecutionTrace::default()};
         if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
             report.error=Some(format!("{error:#}"));
         }

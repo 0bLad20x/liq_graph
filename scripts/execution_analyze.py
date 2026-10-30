@@ -57,7 +57,11 @@ def analyze(rows):
     positive_cashflow = collections.Counter()
     best = collections.defaultdict(list)
     violation_counts = collections.Counter()
-    violations = {key: [] for key in ('net', 'liquidity', 'amount', 'delivery')}
+    violations = {key: [] for key in ('net', 'liquidity', 'amount', 'delivery', 'calibration')}
+    calibration = collections.Counter()
+    path_relations, model_statuses, leg_reasons = (collections.Counter() for _ in range(3))
+    leg_errors = collections.defaultdict(list)
+    route_errors, comparison_samples = [], []
 
     def bad(kind, identity):
         violation_counts[kind] += 1
@@ -119,7 +123,7 @@ def analyze(rows):
                 r['phase'] != 'complete' or r.get('metrics') != s.get('packing')):
             bad('delivery', identity)
         report_ids.add(r['id'])
-        for key in ('build_us', 'simulation_rpc_ms', 'elapsed_ms'):
+        for key in ('build_us', 'simulation_rpc_ms', 'elapsed_ms', 'trace_us'):
             if r.get(key) is not None:
                 timings[key].append(r[key])
         sim = r.get('simulation')
@@ -127,6 +131,54 @@ def analyze(rows):
             bad('delivery', identity)
             continue
         dex_calls += bool(r['dex_invocations'])
+        c = row.get('calibration')
+        if row.get('schema_version', 0) >= 3:
+            trace = r.get('trace') or {}
+            calls = trace.get('calls') or []
+            invalid = (not c or c.get('schema_version') != 1)
+            if c:
+                calibration['records'] += 1
+                path_relations[c['seed_path_relation']] += 1
+                model_statuses[c['model_route_status']] += 1
+                calibration['committed' if sim['err'] is None else 'rolled_back'] += 1
+                invalid |= (c['simulation_committed'] != (sim['err'] is None) or
+                            c['trace_status'] != trace.get('status') or len(c['legs']) != len(calls))
+                declared = {p['pool'] for p in s['pools']}
+                for call in calls:
+                    invalid |= call.get('pool') is not None and call['pool'] not in declared
+                    if call['status'] == 'complete':
+                        invalid |= (len(call['inputs']) != 1 or len(call['outputs']) != 1 or
+                                    any(x['amount_raw'] <= 0 for x in call['inputs'] + call['outputs']))
+                if not c['simulation_committed']:
+                    invalid |= c['simulated_dex_return_bps'] is not None
+                if c['single_cycle']:
+                    invalid |= c.get('trade_input_raw', 0) <= 0 or c.get('trade_output_raw') is None
+                if c['model_route_status'] == 'quoted':
+                    invalid |= (not c['single_cycle'] or c.get('model_route_output_raw') is None or
+                                c.get('model_route_return_bps') is None)
+                for leg in c['legs']:
+                    if leg['model_unavailable_reason']:
+                        leg_reasons[leg['model_unavailable_reason']] += 1
+                    if leg.get('output_error_bps') is not None:
+                        leg_errors[leg['venue']].append(leg['output_error_bps'])
+                if c.get('actual_minus_model_bps') is not None:
+                    route_errors.append(c['actual_minus_model_bps'])
+                timings['calibration_ns'].append(c['processing_ns'])
+                sample = {'id': identity, 'seed_path_relation': c['seed_path_relation'],
+                          'model_route_status': c['model_route_status'], 'simulation_committed': c['simulation_committed'],
+                          'marginal_signal_bps': c['marginal_signal_bps'],
+                          'actual_path_marginal_bps': c['actual_path_marginal_bps'],
+                          'trade_input_raw': c['trade_input_raw'], 'trade_output_raw': c['trade_output_raw'],
+                          'model_route_output_raw': c['model_route_output_raw'],
+                          'model_route_return_bps': c['model_route_return_bps'],
+                          'attempted_dex_return_bps': c['attempted_dex_return_bps'],
+                          'actual_minus_model_bps': c['actual_minus_model_bps'], 'settlement': q['settlement']}
+                if sample['actual_minus_model_bps'] is not None:
+                    comparison_samples.append(sample)
+                    comparison_samples.sort(key=lambda x: abs(x['actual_minus_model_bps']), reverse=True)
+                    del comparison_samples[8:]
+            if invalid:
+                bad('calibration', identity)
         if sim['err'] is not None:
             error = next((re.search(r'Error Code: ([^.]+)', line)[1]
                           for line in sim.get('logs', []) if 'Error Code: ' in line),
@@ -165,6 +217,10 @@ def analyze(rows):
             'simulation_successes': successes, 'simulation_failures': sum(errors.values()),
             'dex_call_reports': dex_calls, 'errors': dict(errors), 'routes': dict(routes),
             'successful_routes': dict(successful_routes), 'violations': violations,
+            'calibration': {'counts': dict(calibration), 'path_relations': dict(path_relations),
+                            'model_route_statuses': dict(model_statuses), 'leg_unavailable_reasons': dict(leg_reasons),
+                            'leg_output_error_bps_by_venue': {k: durations(v) for k, v in leg_errors.items()},
+                            'actual_minus_model_route_bps': durations(route_errors), 'largest_discrepancy_samples': comparison_samples},
             'violation_counts': dict(violation_counts),
             'timings': {k: durations(v) for k, v in timings.items()},
             'payload_repetition': {'unique_payloads': len(payloads), 'repeated_payload_sets': len(repeated),

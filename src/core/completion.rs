@@ -5,7 +5,7 @@ use solana_pubkey::Pubkey;
 use super::{PoolState,now_unix_ms,execution};
 
 /// Admission is a Registry-owned decision. The Mint Registry supplies qualified
-/// identities; the Registry applies the configured floor to fresh canonical pool TVL.
+/// identities; Registry applies the configured TVL floor except for PumpSwap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionAdmission {
     Admitted,

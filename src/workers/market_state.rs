@@ -2012,6 +2012,9 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
     let hydrated_pools=engine.pools.len();
     let ready_pools=engine.pools.iter().filter(|p|p.ready).count();
     let priced_pools=engine.pools.iter().filter(|p|p.ready&&p.available).count();
+    let pool_coverage=crate::core::market_state::PoolCoverage{
+        selected:selected.iter().map(|p|p.address).collect(),
+        priced:engine.pools.iter().filter(|p|p.ready&&p.available).map(|p|p.key).collect()};
     let final_sample=engine.preparation_sample(&selected,mints.as_ref(),&active,&planned,&in_flight,&retry);
     let preparation=final_sample.stages.clone();engine.metrics.preparation_final=Some(final_sample);
     for p in &selected {engine.sequence+=1;engine.emit(MarketStateEvent::Removed{pool:p.address.to_string(),sequence:engine.sequence,reason:PoolRemovalReason::Shutdown});}
@@ -2021,7 +2024,7 @@ async fn produce(registry:PoolRegistry,mut input:broadcast::Receiver<Arc<PoolUpd
         observations:engine.metrics.baseline_prices+engine.metrics.websocket_prices+engine.metrics.fee_valuation.revaluations,
         websocket_observations:engine.metrics.websocket_prices,
         post_rewatch_websocket_observations:engine.metrics.post_rewatch_websocket_observations,
-        selected_pools,hydrated_pools,ready_pools,priced_pools,preparation,metrics:engine.metrics})
+        selected_pools,hydrated_pools,ready_pools,priced_pools,preparation,metrics:engine.metrics,pool_coverage})
 }
 
 /// Mutually exclusive stages of the selected set at shutdown; no price mirror.
@@ -2042,6 +2045,8 @@ struct PreparationSample {
 /// Counters and timings from the state owner; no diagnostic price mirror.
 #[derive(serde::Serialize)]
 pub struct ProductionReport {
+    #[serde(skip)]
+    pub pool_coverage:crate::core::market_state::PoolCoverage,
     pub events:u64,pub observations:u64,pub websocket_observations:u64,
     pub post_rewatch_websocket_observations:u64,
     selected_pools:usize,hydrated_pools:usize,ready_pools:usize,priced_pools:usize,

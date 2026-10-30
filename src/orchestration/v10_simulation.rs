@@ -97,7 +97,7 @@ impl ExecutionTasks {
             .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r);
         let reports=tokio::time::timeout(Duration::from_secs(10),&mut self.reports.0).await
             .context("V10 report shutdown timeout")??;
-        evidence["schema_version"]=serde_json::json!(2);
+        evidence["schema_version"]=serde_json::json!(3);
         evidence["request_count"]=serde_json::json!(candidates.requests.len());
         evidence["report_count"]=serde_json::json!(reports.len());
         evidence["simulation_successes"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,
@@ -141,8 +141,9 @@ impl ExecutionTasks {
                         }
                     }
                 }
-                serde_json::to_writer(&mut events,&serde_json::json!({"schema_version":2,"payload_sha256":hash,
-                    "selection":selection.compact_evidence()?,"report":compact}))?;
+                serde_json::to_writer(&mut events,&serde_json::json!({"schema_version":3,"payload_sha256":hash,
+                    "selection":selection.compact_evidence()?,"report":compact,
+                    "calibration":report.map(|r|selection.calibration(r))}))?;
                 writeln!(events)?;
                 let class=format!("{:?}:{:?}:{}:{:?}",report.map(|r|r.outcome),report.map(|r|&r.dex_invocations),
                     report.and_then(|r|r.simulation.as_ref()).map_or(serde_json::Value::Null,|s|s["err"].clone()),

@@ -122,13 +122,30 @@ pub struct ExecutionReport {
     pub blockhash_retried: bool,
     pub executor_invoked: bool,
     pub dex_invocations: Vec<String>,
+    /// Actual CPI order and net wallet token flows, including rolled-back attempts.
+    pub trace: ExecutionTrace,
     /// Worker timing, accumulated across signed-mode retries; no queue time.
     pub build_us: Option<u64>,
     pub simulation_rpc_ms: Option<u64>,
     pub elapsed_ms: u64,
+    pub trace_us:u64,
     /// Complete RPC simulation value, including err/logs/innerInstructions/accounts.
     pub simulation: Option<Value>,
 }
+
+#[derive(Clone,Debug,Default,Serialize,Deserialize)]
+pub struct ExecutionTrace {
+    pub status:String,
+    pub calls:Vec<ExecutionSwapCall>,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct ExecutionSwapCall {
+    pub program:String,pub pool:Option<String>,pub stack_height:Option<u64>,
+    pub status:String,pub issues:Vec<String>,
+    pub inputs:Vec<ExecutionAssetAmount>,pub outputs:Vec<ExecutionAssetAmount>,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct ExecutionAssetAmount {pub mint:String,pub amount_raw:u64}
 
 pub mod pubkey_json {
     use serde::{Deserialize, Deserializer, Serializer};
