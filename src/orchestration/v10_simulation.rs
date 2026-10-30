@@ -35,14 +35,17 @@ impl<T> Drop for Task<T> {fn drop(&mut self){self.0.abort();}}
 
 pub(super) struct ExecutionTasks {
     candidates:Task<Result<execution_candidates::Report>>,
-    executor:Task<Result<()>>,
+    executor:Task<Result<execution_v10::ParallelReport>>,
     reports:Task<Vec<ExecutionReport>>,
 }
 impl ExecutionTasks {
     pub(super) fn start(settings:execution_v10::Settings,input:SignalStream,
         registry:pool_registry::PoolRegistry,rpc:crate::core::rpc::RpcHandle)->Result<Self> {
         let cfg=execution_candidates::Settings::from_env(settings.wallet(),execution_v10::validate)?;
-        let (jobs,requests)=mpsc::channel(1);
+        let parallelism:usize=env::var("GRAPH_V10_SIMULATION_PARALLELISM")
+            .unwrap_or_else(|_|"1".into()).parse().context("invalid GRAPH_V10_SIMULATION_PARALLELISM")?;
+        ensure!((1..=64).contains(&parallelism),"GRAPH_V10_SIMULATION_PARALLELISM must be 1..64");
+        let (jobs,requests)=mpsc::channel(parallelism);
         let (output,mut responses)=mpsc::channel(1);
         let reports=Task(tokio::spawn(async move {
             let mut received=Vec::new();
@@ -51,7 +54,7 @@ impl ExecutionTasks {
         }));
         Ok(Self {
             candidates:Task(tokio::spawn(execution_candidates::run(input,registry,jobs,cfg))),
-            executor:Task(tokio::spawn(execution_v10::run(settings,rpc,requests,output))),reports,
+            executor:Task(tokio::spawn(execution_v10::run_parallel(settings,rpc,requests,output,parallelism))),reports,
         })
     }
     /// Production candidates are long-lived consumers. Only drain them after the
@@ -97,6 +100,10 @@ impl ExecutionTasks {
             .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r);
         let reports=tokio::time::timeout(Duration::from_secs(10),&mut self.reports.0).await
             .context("V10 report shutdown timeout")??;
+        let parallel_report=executed?;
+        ensure!(parallel_report.completed_requests==reports.len() as u64,
+            "parallel V10 executor completion/report count mismatch");
+        evidence["v10_parallelism"]=serde_json::to_value(&parallel_report)?;
         evidence["schema_version"]=serde_json::json!(3);
         evidence["request_count"]=serde_json::json!(candidates.requests.len());
         evidence["report_count"]=serde_json::json!(reports.len());
@@ -157,7 +164,6 @@ impl ExecutionTasks {
             evidence["detail_samples"]=serde_json::json!(detail_count);
             evidence["unique_payloads"]=serde_json::json!(seen.len());
         }
-        executed?;
         let handoff=candidates.ensure_handoff(&reports);
         evidence["execution_handoff_observed"]=serde_json::json!(handoff.is_ok());
         let acceptance=handoff.and_then(|_|candidates.ensure_successful_simulation(&reports));
