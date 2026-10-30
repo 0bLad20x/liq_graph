@@ -31,7 +31,7 @@ jobs:
           cargo build --locked --release
           git diff --exit-code -- Cargo.lock
       - name: Live utility Python syntax only
-        run: python -c "import ast,pathlib; ast.parse(pathlib.Path('scripts/graph_live_analyze.py').read_text(encoding='utf-8'))"
+        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
       - name: Live utility PowerShell syntax only
         shell: pwsh
         run: |

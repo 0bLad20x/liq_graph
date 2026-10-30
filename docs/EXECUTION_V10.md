@@ -7,6 +7,9 @@ raw flows. The V10 request parameters and automatic sizing remain unchanged.
 
 The common runtime connects Graph -> Signal Engine -> ExecutionCandidates -> V10.
 See [RUNTIME.md](RUNTIME.md) for launch and dataflow acceptance.
+Long runs use [CP8G](CP8G.md) compact JSONL evidence: every attempt remains,
+complete request payloads are stored once, full RPC details are bounded. Execution
+parameters, validation and the simulation path are unchanged by this projection.
 ExecutionCandidates freezes current Prepared proofs and price observations into
 complete requests. The executor independently validates requests because it also
 accepts manual file input. It owns transaction packing, signing and simulation;

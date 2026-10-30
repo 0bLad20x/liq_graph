@@ -122,6 +122,10 @@ pub struct ExecutionReport {
     pub blockhash_retried: bool,
     pub executor_invoked: bool,
     pub dex_invocations: Vec<String>,
+    /// Worker timing, accumulated across signed-mode retries; no queue time.
+    pub build_us: Option<u64>,
+    pub simulation_rpc_ms: Option<u64>,
+    pub elapsed_ms: u64,
     /// Complete RPC simulation value, including err/logs/innerInstructions/accounts.
     pub simulation: Option<Value>,
 }

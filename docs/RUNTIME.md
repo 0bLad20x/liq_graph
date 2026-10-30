@@ -86,12 +86,13 @@ Die Abnahme benoetigt einen locked Build und echte Laufartefakte auf dem Feature
 
 ## Werkzeuge
 
-Unter `scripts/` bleiben genau drei wiederverwendbare Dateien:
+Unter `scripts/` liegen vier wiederverwendbare Werkzeuge:
 
 | Werkzeug | Zweck |
 |---|---|
 | `runtime_live.ps1` | Ein Starter für Graph-, MarketState-, Signal- und Simulationsläufe |
 | `graph_live_analyze.py` | Offline-Auswertung eines ausdrücklich angeforderten Graphaudits |
+| `execution_analyze.py` | Zeilenweise Auswertung aller Simulationsversuche, auch aus alten Lauf-ZIPs |
 | `v10_simulation_live.ps1` | Eine vollständige eingefrorene Request-Datei erneut simulieren |
 
 Historische Checkpoint-Starter, Flashloan-Presets, DB-Wrapper, SQL-Vergleiche,
@@ -211,8 +212,15 @@ Alle Ergebnisse liegen in `runtime_live/<UTC-Zeitstempel>/`:
 | `market_state.json` | Zähler und Timing des tatsächlichen Preisworkers |
 | `signal_production.json` | Signalproduktion und getrennte Initialisierungs-/WS-Zeiten |
 | `signal_consumer.json` | Ausschließlich beim ausdrücklichen Signalnachweis ohne Execution |
-| `execution.json`, `request-NN.json`, `selection-NN.json`, `simulation-NN.json` | Tatsächliche Übergaben und Simulationen |
+| `execution.json`, `execution_analysis.json` | Kleine Execution-Abschlussberichte und wirtschaftliche Auswertung |
+| `execution_events.jsonl`, `execution_payloads.jsonl`, `execution_details.jsonl` | Alle Versuche kompakt, eindeutige vollständige Requests und begrenzte Detailfälle |
 | Audit-JSONL, `graph_summary.json`, CSV-Dateien | Nur bei angefordertem Graphaudit |
+
+[CP8G](CP8G.md) setzt die gemeinsame Poolzulassung auf aktuelle kanonische TVL
+ab 500 USD (`POOL_MIN_TVL_USD`, Starter: `-MinPoolTvlUsd`). Fehlende TVL bleibt
+separat sichtbar. `-ExecutionDetailLimit` begrenzt Vollkopien, Standard 16;
+alle Versuche bleiben im JSONL. Die Nachverarbeitung benoetigt Python 3.10+.
+Der Stundenlauf und die Vergleichsregeln stehen im Checkpoint-Dokument.
 
 Im vorgesehenen Simulationslauf müssen `diagnostic_consumers=0`,
 `signal_proof=false`, `orchestration_evidence_passed=true` und

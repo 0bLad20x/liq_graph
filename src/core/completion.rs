@@ -5,14 +5,14 @@ use solana_pubkey::Pubkey;
 use super::{PoolState,now_unix_ms,execution};
 
 /// Admission is a Registry-owned decision. The Mint Registry supplies qualified
-/// identities; only a venue-native TVL below the policy floor can veto admission.
-/// DexScreener TVL and the canonical (possibly fallback) TVL are not policy inputs.
+/// identities; the Registry applies the configured floor to fresh canonical pool TVL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionAdmission {
     Admitted,
     MissingIdentity,
     MintNotQualified,
-    NativeTvlBelowMinimum,
+    TvlBelowMinimum,
+    TvlUnavailable,
 }
 
 impl CompletionAdmission {

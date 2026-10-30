@@ -334,6 +334,7 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
         let build_started=Instant::now();
         let signed=compile(&mut ix,request,settings,&blockhash)?;
         let build_us=build_started.elapsed().as_micros();
+        report.build_us=Some(report.build_us.unwrap_or(0).saturating_add(build_us.min(u128::from(u64::MAX)) as u64));
         // A fast simulation uses a replaced blockhash: the local signature is
         // not a signature of the executed message and must not be advertised.
         if !settings.fast {
@@ -350,9 +351,11 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
                 accounts:ix.projections.clone()}
         };
         let simulation_started=Instant::now();
-        let response=rpc.call(operation).await?;
+        let response=rpc.call(operation).await;
         let simulation_ms=simulation_started.elapsed().as_millis();
-        crate::log_event!(Info,"v10 timing request_id={:?} fast={} build_us={build_us} simulation_rpc_ms={simulation_ms} provider={}",
+        report.simulation_rpc_ms=Some(report.simulation_rpc_ms.unwrap_or(0).saturating_add(simulation_ms.min(u128::from(u64::MAX)) as u64));
+        let response=response?;
+        crate::log_event!(Debug,"v10 timing request_id={:?} fast={} build_us={build_us} simulation_rpc_ms={simulation_ms} provider={}",
             request.id,settings.fast,response.provider);
         let RpcAnswer::Simulation{slot,value}=response.answer else {bail!("unexpected simulation response")};
         report.context_slot=Some(slot); report.provider=Some(response.provider);
@@ -394,11 +397,13 @@ pub async fn run(settings: Settings, rpc: RpcHandle, mut input: mpsc::Receiver<E
         let mut report=ExecutionReport{id:request.id.clone(),outcome:ExecutionOutcome::Rejected,
             phase:"validate".into(),error:None,metrics:None,simulated_signature:None,
             blockhash:None,last_valid_block_height:None,context_slot:None,provider:None,
-            blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None};
+            blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None,
+            build_us:None,simulation_rpc_ms:None,elapsed_ms:0};
         if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
             report.error=Some(format!("{error:#}"));
         }
-        crate::log_event!(Info,"v10 result request_id={:?} outcome={:?} phase={} context_slot={:?} dex_calls={} elapsed_ms={}",
+        report.elapsed_ms=started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        crate::log_event!(Debug,"v10 result request_id={:?} outcome={:?} phase={} context_slot={:?} dex_calls={} elapsed_ms={}",
             report.id,report.outcome,report.phase,report.context_slot,report.dex_invocations.len(),started.elapsed().as_millis());
         output.send(report).await.context("V10 report consumer stopped")?;
         count+=1;

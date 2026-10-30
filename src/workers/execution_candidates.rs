@@ -87,7 +87,9 @@ pub struct Selection {
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
-    pub error: Option<String>, pub requests: Vec<Selection>,
+    pub error: Option<String>,
+    #[serde(skip_serializing)]
+    pub requests: Vec<Selection>,
     score_basis:&'static str,
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
@@ -98,7 +100,21 @@ pub struct Report {
     registry_reads:RegistryReads,
     amounts:amounts::Report,
 }
+impl Selection {
+    /// Per-request rate/capacity facts; full manifests are stored once per payload.
+    /// Called after the live loop, never during signal evaluation.
+    pub fn compact_evidence(&self)->Result<serde_json::Value> {
+        let mut value=serde_json::to_value(self)?;
+        value["request"]=serde_json::json!({"id":self.request.id,
+            "wallet":self.request.wallet.to_string(),"settlement":self.request.settlement.to_string(),
+            "parameters":self.request.parameters});
+        Ok(value)
+    }
+}
 impl Report {
+    pub fn take_exclusion_samples(&mut self)->Vec<serde_json::Value> {
+        std::mem::take(&mut self.amounts.excluded_samples)
+    }
     pub fn ensure_complete(&self)->Result<()> {
         ensure!(self.error.is_none(), "execution candidate worker failed: {}", self.error.as_deref().unwrap_or(""));
         ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
@@ -583,7 +599,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     ranked.clear();
                     report.registry_reads.merge(&reads);
                     if let Some(selection)=chosen {
-                        crate::log_event!(Info,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} registry_reads={} registry_wait_ns={} registry_hold_ns={} broadcasts=false",
+                        crate::log_event!(Debug,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} registry_reads={} registry_wait_ns={} registry_hold_ns={} broadcasts=false",
                             selection.request.id,state.generation,state.revision,selection.route_kind,selection.reverse,
                             selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us,
                             selection.registry_reads.calls,selection.registry_reads.wait_ns,selection.registry_reads.hold_ns);

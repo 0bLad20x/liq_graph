@@ -4,6 +4,8 @@ param(
     [ValidateRange(30,86400)][int]$DurationSeconds = 60,
     [ValidateRange(0,2147483647)][int]$PoolLimit = 15000,
     [ValidateRange(0,1000000)][int]$AccountBudget = 25000,
+    [ValidateRange(0,1000000000000)][double]$MinPoolTvlUsd = 500,
+    [ValidateRange(0,256)][int]$ExecutionDetailLimit = 16,
     [ValidateSet('Graph','Signals','MarketState')][string]$Stage = 'Signals',
     [string]$ExpectedBranch = '',
     [switch]$PlanOnly,
@@ -48,25 +50,15 @@ if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw '
 if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidence requires MarketState.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
+if ([double]::IsNaN($MinPoolTvlUsd) -or [double]::IsInfinity($MinPoolTvlUsd)) { throw 'MinPoolTvlUsd must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
 
 function Read-OptionalJson([string]$Path) {
-    if (Test-Path -LiteralPath $Path) { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) }
-    return $null
-}
-function Measure-Durations($Values) {
-    # Exact post-run request samples; signal-owner percentiles remain histogram bounds.
-    $sorted = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [long]$_ } | Sort-Object)
-    $n = $sorted.Count
-    if ($n -eq 0) { return [ordered]@{count=0; min=$null; median=$null; mean=$null; p95=$null; p99=$null; max=$null} }
-    $middle = [int][Math]::Floor($n / 2)
-    $median = if ($n % 2 -eq 0) { ([double]$sorted[$middle - 1] + [double]$sorted[$middle]) / 2 } else { $sorted[$middle] }
-    return [ordered]@{
-        count=$n; min=$sorted[0]; median=$median
-        mean=($sorted | Measure-Object -Average).Average
-        p95=$sorted[[int][Math]::Ceiling($n * 0.95) - 1]
-        p99=$sorted[[int][Math]::Ceiling($n * 0.99) - 1]; max=$sorted[$n - 1]
+    if (Test-Path -LiteralPath $Path) {
+        if ((Get-Item -LiteralPath $Path).Length -gt 16MB) { throw "Expected a compact JSON report: $Path. Analyze legacy execution files with execution_analyze.py." }
+        return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
     }
+    return $null
 }
 function Measure-AmountStage($Report) {
     $n = [long]$Report.attempts
@@ -129,6 +121,8 @@ try {
         GRAPH_SIGNALS_ENABLED = "$signals".ToLowerInvariant()
         CP1_MARKET_ENRICHMENT_ENABLED = 'true'
         MARKET_STATE_POOL_LIMIT = "$PoolLimit"
+        POOL_MIN_TVL_USD = $MinPoolTvlUsd.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        RUN_EXECUTION_DETAIL_LIMIT = "$ExecutionDetailLimit"
         MARKET_STATE_WS_ACCOUNT_BUDGET = "$AccountBudget"
         MARKET_STATE_SELECTION_INTERVAL_MS = '5000'
         MARKET_STATE_HYDRATION_CONCURRENCY = '8'
@@ -168,6 +162,8 @@ try {
     if ($CompletionRefreshSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_REFRESH_SECONDS = "$CompletionRefreshSeconds" }
     if ($CompletionRecheckSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_RECHECK_SECONDS = "$CompletionRecheckSeconds" }
     if ($SimulateV10 -and -not $PlanOnly) {
+        & python -c "import sys; assert sys.version_info >= (3, 10)"
+        if ($LASTEXITCODE -ne 0) { throw 'Python 3.10+ is required for streaming execution evidence.' }
         # Resolve only the public signer. The keypair remains local and is never logged.
         $walletPublicKey = & $binary --v10-wallet $WalletPath
         if ($LASTEXITCODE -ne 0 -or @($walletPublicKey).Count -ne 1) { throw 'Cannot resolve execution wallet public key.' }
@@ -186,6 +182,7 @@ try {
     $checkout = [ordered]@{
         branch=$branch; head=$head; start_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         duration_seconds=$DurationSeconds; pool_limit=$PoolLimit; ws_account_budget=$AccountBudget
+        minimum_pool_tvl_usd=$MinPoolTvlUsd; execution_detail_limit=$ExecutionDetailLimit
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
         signal_score_basis='marginal_dex_net'; signal_net_threshold_bps=$ThresholdBps
         profile_signals=[bool]$ProfileSignals
@@ -205,6 +202,7 @@ try {
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
     if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
+    Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
         throw 'Prepared evidence currently covers only meteora_dlmm and pumpswap.'
@@ -235,6 +233,17 @@ try {
     $runtime = Read-OptionalJson $runtimePath
     $market = Read-OptionalJson $marketPath
     $execution = Read-OptionalJson $executionPath
+    $executionAnalysis = $null
+    if ($SimulateV10 -and (Test-Path -LiteralPath (Join-Path $folder 'execution_events.jsonl'))) {
+        $analysisPath = Join-Path $folder 'execution_analysis.json'
+        & python (Join-Path $PSScriptRoot 'execution_analyze.py') --folder $folder --output $analysisPath
+        if ($LASTEXITCODE -ne 0) { throw "Execution evidence contains delivery or valuation violations; inspect $analysisPath." }
+        $executionAnalysis = Read-OptionalJson $analysisPath
+        if ([long]$executionAnalysis.request_count -ne [long]$execution.request_count -or
+            [long]$executionAnalysis.report_count -ne [long]$execution.report_count) {
+            throw 'Execution summary/event counts differ.'
+        }
+    }
     $production = Read-OptionalJson $producerPath
     $refreshRecord = Select-String -LiteralPath $log -Pattern 'lifecycle stats final=true .*? prepared_refreshes=(\d+)' | Select-Object -Last 1
     $refreshes = if ($null -ne $refreshRecord) { [long]$refreshRecord.Matches[0].Groups[1].Value } else { 0 }
@@ -278,9 +287,9 @@ try {
         & python (Join-Path $PSScriptRoot 'graph_live_analyze.py') @analyzerArgs
         $graphPassed = $LASTEXITCODE -eq 0
     }
-    $requests = if ($null -ne $execution.execution_candidates.requests) { @($execution.execution_candidates.requests) } else { @() }
-    $reports = if ($null -ne $execution.execution_reports) { @($execution.execution_reports) } else { @() }
-    $netViolations = @($requests | Where-Object { $_.candidate.witness.log_sum_units -ge $_.threshold_units -or $_.packing_seed_log_sum_units -ge $_.threshold_units } | ForEach-Object { $_.request.id })
+    $requestCount = [long]$execution.request_count
+    $reportCount = [long]$execution.report_count
+    $netViolations = if ($null -ne $executionAnalysis) { @($executionAnalysis.violations.net) } else { @() }
     $netPassed = $null
     if ($signals) {
         $netPassed = $null -ne $production -and $production.score_basis -eq 'marginal_dex_net' -and
@@ -314,17 +323,11 @@ try {
     }
     $liquidityEvidence = $market.metrics.liquidity
     $liquidityPassed = $null
-    $liquidityViolations = @($requests | ForEach-Object {
-        $id = $_.request.id
-        foreach ($pool in $_.pools) {
-            if ($pool.observation.venue -eq 'meteora_dlmm' -and
-                ($null -eq $pool.observation.liquidity -or -not $pool.liquidity_window_checked)) { $id }
-        }
-    } | Sort-Object -Unique)
+    $liquidityViolations = if ($null -ne $executionAnalysis) { @($executionAnalysis.violations.liquidity) } else { @() }
     $focusRequested = @($LiquidityEvidencePools -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $focusObserved = @($liquidityEvidence.focused.PSObject.Properties | ForEach-Object { $_.Name })
     $focusMissing = @($focusRequested | Where-Object { $_ -notin $focusObserved })
-    if ($null -ne $liquidityEvidence) {
+    if ($null -ne $liquidityEvidence -and ($RequireLiquidityEvidence -or $LiquidityEvidencePools)) {
         $liquidityEvidence | ConvertTo-Json -Depth 40 |
             Set-Content -LiteralPath (Join-Path $folder 'liquidity_evidence.json') -Encoding UTF8
     }
@@ -353,34 +356,14 @@ try {
         request_window_violations=$liquidityViolations
     } }
     $amount = $execution.execution_candidates.amounts
-    $amountViolations = @($requests | ForEach-Object {
-        $r = $_; $a = $r.amount_assessment
-        if ($null -eq $a -or $a.decision -eq 'excluded' -or $a.reason -eq 'not_evaluated') { $r.request.id; return }
-        if ($a.decision -ne 'possible') { return }
-        $estimate = $a.estimate; $legs = @($estimate.legs)
-        $invalid = $null -eq $estimate -or $legs.Count -lt 2 -or
-            [decimal]$estimate.input_raw -le 0 -or [decimal]$estimate.output_raw -le [decimal]$estimate.input_raw -or
-            [decimal]$estimate.profit_raw -ne ([decimal]$estimate.output_raw-[decimal]$estimate.input_raw)
-        if ($legs.Count -ge 2) {
-            $invalid = $invalid -or $legs[0].input_mint -ne $r.request.settlement -or
-                $legs[-1].output_mint -ne $r.request.settlement -or
-                [decimal]$legs[0].input_raw -ne [decimal]$estimate.input_raw -or
-                [decimal]$legs[-1].output_raw -ne [decimal]$estimate.output_raw
-            for ($i = 0; $i -lt $legs.Count; $i++) {
-                $invalid = $invalid -or $legs[$i].pool -notin @($r.pools.pool)
-                if ($i -gt 0) { $invalid = $invalid -or $legs[$i].input_mint -ne $legs[$i-1].output_mint -or
-                    [decimal]$legs[$i].input_raw -ne [decimal]$legs[$i-1].output_raw }
-            }
-        }
-        if ($invalid) { $r.request.id }
-    } | Sort-Object -Unique)
-    if ($null -ne $amount) {
+    $amountViolations = if ($null -ne $executionAnalysis) { @($executionAnalysis.violations.amount) } else { @() }
+    if ($null -ne $amount -and $RequireAmountEvidence) {
         $amount | ConvertTo-Json -Depth 60 | Set-Content -LiteralPath (Join-Path $folder 'amount_evidence.json') -Encoding UTF8
     }
     $amountPassed = $null
     if ($RequireAmountEvidence) {
         $amountPassed = $null -ne $amount -and [long]$amount.possible -gt 0 -and [long]$amount.excluded -gt 0 -and
-            ([long]$amount.possible+[long]$amount.unknown) -eq $requests.Count -and
+            ([long]$amount.possible+[long]$amount.unknown) -eq $requestCount -and
             [long]$amount.attempts -eq ([long]$amount.possible+[long]$amount.unknown+[long]$amount.excluded) -and
             [long]$market.metrics.reserve_curve_observations -gt 0 -and
             [long]$market.metrics.reserve_curve_observations -eq [long]$production.reserve_curve_inputs -and
@@ -412,28 +395,15 @@ try {
         max_elapsed_ns=[long](($registryCycles | Measure-Object -Property elapsed_ns -Maximum).Maximum)
     }
     $registryReads = $execution.execution_candidates.registry_reads
-    # Post-run payload identity only: equal accounts/parameters do not imply
-    # equal pool state, equal liquidity, or the same economic opportunity.
-    $payloads = @{}
-    $hasher = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        foreach ($selection in $requests) {
-            $payload = $selection.request | Select-Object * -ExcludeProperty id | ConvertTo-Json -Depth 40 -Compress
-            $key = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))
-            if (-not $payloads.ContainsKey($key)) { $payloads[$key] = [ordered]@{payload_sha256=$key; request_ids=@()} }
-            $payloads[$key].request_ids += $selection.request.id
-        }
-    } finally { $hasher.Dispose() }
-    $repeated = @($payloads.Values | Where-Object { $_.request_ids.Count -gt 1 } | Sort-Object { $_.request_ids.Count } -Descending)
-    ConvertTo-Json -InputObject $repeated -Depth 10 |
-        Set-Content -LiteralPath (Join-Path $folder 'repeated_request_sets.json') -Encoding UTF8
-    $requestRepetition = [ordered]@{
-        unique_payloads=$payloads.Count; repeated_payload_sets=$repeated.Count
-        requests_in_repeated_sets=[long](($repeated | ForEach-Object { $_.request_ids.Count } | Measure-Object -Sum).Sum)
-        largest_set=[long](($repeated | ForEach-Object { $_.request_ids.Count } | Measure-Object -Maximum).Maximum)
-    }
+    $requestRepetition = $executionAnalysis.payload_repetition
+    $tvl = $runtime.registry_tvl
+    $tvlPassed = $null -ne $tvl -and [double]$tvl.minimum_pool_tvl_usd -eq $MinPoolTvlUsd -and
+        [long]$tvl.admission_violations -eq 0
+    $feeSummary = $feeEvidence | Select-Object * -ExcludeProperty samples,invalid_reference_samples,clock_reference_lag_samples
     $summary = [ordered]@{
         branch=$branch; head=$head; pipeline='runtime'; stage=$Stage; exit_code=$exitCode
+        minimum_pool_tvl_usd=$MinPoolTvlUsd; pool_tvl_evidence_passed=[bool]$tvlPassed; registry_tvl=$tvl
+        execution_detail_limit=$ExecutionDetailLimit; settlement_results=$executionAnalysis.settlement_results
         diagnostic_consumers=$runtime.diagnostic_consumers; signal_proof=$runtime.signal_proof
         runtime_completed=($null -ne $runtime -and $runtime.run_complete -eq $true)
         orchestration_evidence_passed=[bool]$orchestrationPassed; runtime_evidence=$runtime
@@ -457,7 +427,7 @@ try {
         ready_pools=$market.ready_pools; priced_pools=$market.priced_pools
         market_state_observations=$market.observations; websocket_observations=$market.websocket_observations
         post_rewatch_websocket_observations=$market.post_rewatch_websocket_observations
-        fee_evidence_passed=$feePassed; fee_valuation=$feeEvidence
+        fee_evidence_passed=$feePassed; fee_valuation=$feeSummary
         liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
         amount_evidence_passed=$amountPassed; amount_evaluation=$amountSummary
         request_payload_repetition=$requestRepetition
@@ -485,15 +455,18 @@ try {
         signal_revaluation_processing_ns=$production.revaluation_inputs.processing_ns
         frame_to_signal_state_us=$production.steady_state_inputs.frame_to_state_ready_us
         frame_to_signal_complete_us=$production.steady_state_inputs.frame_to_evaluation_complete_us
-        execution_selection_ns=(Measure-Durations @($requests | ForEach-Object { $_.selection_ns }))
-        signal_to_request_us=(Measure-Durations @($requests | ForEach-Object { $_.signal_to_request_us }))
-        frame_to_request_us=(Measure-Durations @($requests | ForEach-Object { $_.frame_to_request_us }))
+        execution_selection_ns=$executionAnalysis.timings.selection_ns
+        signal_to_request_us=$executionAnalysis.timings.signal_to_request_us
+        frame_to_request_us=$executionAnalysis.timings.frame_to_request_us
+        executor_build_us=$executionAnalysis.timings.build_us
+        executor_simulation_rpc_ms=$executionAnalysis.timings.simulation_rpc_ms
+        executor_elapsed_ms=$executionAnalysis.timings.elapsed_ms
         registry_maintenance=$registryMaintenance
         execution_registry_reads=$registryReads
         registry_timing_observed=($registryCycles.Count -ge 2 -and [long]$registryReads.calls -gt 0)
         execution_skipped_busy_revisions=$execution.execution_candidates.skipped_busy_revisions
         candidate_delivery_passed=$candidateDelivery
-        v10_requests=$requests.Count; v10_reports=$reports.Count
+        v10_requests=$requestCount; v10_reports=$reportCount
         v10_simulation_successes=$execution.simulation_successes
         v10_simulation_failures=$execution.simulation_failures
         v10_dex_call_reports=$execution.simulation_dex_calls_observed
@@ -501,7 +474,14 @@ try {
         transactions_sent=0; artifacts=$folder
     }
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
-    $summary | ConvertTo-Json -Depth 10 | Write-Host
+    Write-Host "Runtime complete=$($summary.runtime_completed); orchestration=$orchestrationPassed; pool TVL evidence=$tvlPassed"
+    Write-Host "Pools selected=$($market.selected_pools), priced=$($market.priced_pools); WS gaps=$($market.metrics.gaps)"
+    foreach ($venue in $tvl.by_venue.PSObject.Properties) {
+        $v = $venue.Value
+        Write-Host "TVL $($venue.Name): prepared/admitted=$($v.prepared_admitted), below minimum=$($v.below_minimum), missing TVL=$($v.missing_tvl)"
+    }
+    Write-Host "Summary: $(Join-Path $folder 'summary.json')"
+    if (-not $tvlPassed) { throw 'Pool TVL admission evidence incomplete; inspect registry_tvl in summary.json.' }
     if ($RequireFeeEvidence -and -not $feePassed) { throw "CP8A fee evidence incomplete; inspect $folder." }
     if ($RequirePreparedEvidence -and -not $preparedPassed) { throw "CP8F prepared bootstrap evidence incomplete; inspect $folder." }
     if ($RequireLiquidityEvidence -and -not $liquidityPassed) { throw "CP8B liquidity evidence incomplete; inspect liquidity_evidence.json in $folder." }

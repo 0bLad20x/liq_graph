@@ -1,5 +1,5 @@
 //! File source -> typed channel -> execution worker -> JSON report. No route decisions.
-use std::{collections::HashMap,env,path::Path,time::Duration};
+use std::{collections::{HashMap,HashSet},env,path::Path,time::Duration,io::{BufWriter,Write}};
 use anyhow::{Context, Result, bail, ensure};
 use tokio::{sync::{mpsc,watch},task::JoinHandle};
 use crate::{core::{execution::{ExecutionOutcome,ExecutionReport,ExecutionRequest},signals::SignalStream},
@@ -87,8 +87,9 @@ impl ExecutionTasks {
         }
     }
     pub(super) async fn finish(&mut self,evidence:&mut serde_json::Value)->Result<execution_candidates::Report> {
-        let candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
+        let mut candidates=tokio::time::timeout(Duration::from_secs(30),&mut self.candidates.0).await
             .context("candidate shutdown timeout")???;
+        let exclusions=candidates.take_exclusion_samples();
         // The candidate stream has closed. Let accepted jobs and reports drain
         // while the shared RPC transport remains alive.
         evidence["execution_candidates"]=serde_json::to_value(&candidates)?;
@@ -96,7 +97,9 @@ impl ExecutionTasks {
             .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r);
         let reports=tokio::time::timeout(Duration::from_secs(10),&mut self.reports.0).await
             .context("V10 report shutdown timeout")??;
-        evidence["execution_reports"]=serde_json::to_value(&reports)?;
+        evidence["schema_version"]=serde_json::json!(2);
+        evidence["request_count"]=serde_json::json!(candidates.requests.len());
+        evidence["report_count"]=serde_json::json!(reports.len());
         evidence["simulation_successes"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,
             ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved)).count());
         evidence["simulation_failures"]=serde_json::json!(reports.iter().filter(|r|matches!(r.outcome,ExecutionOutcome::SimulationFailed)).count());
@@ -105,13 +108,47 @@ impl ExecutionTasks {
         if let Ok(path)=env::var("GRAPH_EXECUTION_REPORT_PATH") {
             let folder=std::path::Path::new(&path).parent().context("report directory missing")?;
             let by_id:HashMap<_,_>=reports.iter().map(|r|(r.id.as_str(),r)).collect();
-            for (i,selection) in candidates.requests.iter().enumerate() {
-                std::fs::write(folder.join(format!("request-{:02}.json",i+1)),serde_json::to_vec_pretty(&selection.request)?)?;
-                std::fs::write(folder.join(format!("selection-{:02}.json",i+1)),serde_json::to_vec_pretty(selection)?)?;
-                if let Some(report)=by_id.get(selection.request.id.as_str()) {
-                    std::fs::write(folder.join(format!("simulation-{:02}.json",i+1)),serde_json::to_vec_pretty(report)?)?;
+            let detail_limit:usize=env::var("RUN_EXECUTION_DETAIL_LIMIT").unwrap_or_else(|_|"16".into()).parse()?;
+            ensure!(detail_limit<=256,"RUN_EXECUTION_DETAIL_LIMIT must be 0..256");
+            let mut events=BufWriter::new(std::fs::File::create(folder.join("execution_events.jsonl"))?);
+            let mut payloads=BufWriter::new(std::fs::File::create(folder.join("execution_payloads.jsonl"))?);
+            let mut details=BufWriter::new(std::fs::File::create(folder.join("execution_details.jsonl"))?);
+            let mut seen=HashSet::new();let mut sampled=HashSet::new();let mut detail_count=0;
+            for exclusion in exclusions.iter().take(detail_limit) {
+                serde_json::to_writer(&mut details,&serde_json::json!({"quantity_exclusion":exclusion}))?;
+                writeln!(details)?;detail_count+=1;
+            }
+            for selection in &candidates.requests {
+                let mut payload=serde_json::to_value(&selection.request)?;
+                payload.as_object_mut().context("request is not an object")?.remove("id");
+                let digest=ring::digest::digest(&ring::digest::SHA256,&serde_json::to_vec(&payload)?);
+                let hash=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
+                if seen.insert(hash.clone()) {
+                    serde_json::to_writer(&mut payloads,&serde_json::json!({"payload_sha256":hash,"request":selection.request}))?;
+                    writeln!(payloads)?;
+                }
+                let report=by_id.get(selection.request.id.as_str()).copied();
+                let mut compact=serde_json::to_value(report)?;
+                if let Some(simulation)=compact.get_mut("simulation").and_then(serde_json::Value::as_object_mut) {
+                    simulation.retain(|key,_|matches!(key.as_str(),"err"|"fee"|"unitsConsumed"|"preBalances"|"postBalances"|"preTokenBalances"|"postTokenBalances"|"logs"));
+                    if let Some(logs)=simulation.get_mut("logs").and_then(serde_json::Value::as_array_mut) {
+                        logs.retain(|line|line.as_str().is_some_and(|s|s.contains("Error")||s.contains("failed:")));
+                    }
+                }
+                serde_json::to_writer(&mut events,&serde_json::json!({"schema_version":2,"payload_sha256":hash,
+                    "selection":selection.compact_evidence()?,"report":compact}))?;
+                writeln!(events)?;
+                let class=format!("{:?}:{:?}:{}:{:?}",report.map(|r|r.outcome),report.map(|r|&r.dex_invocations),
+                    report.and_then(|r|r.simulation.as_ref()).map_or(serde_json::Value::Null,|s|s["err"].clone()),
+                    selection.request.settlement);
+                if detail_count<detail_limit && sampled.insert(class) {
+                    serde_json::to_writer(&mut details,&serde_json::json!({"payload_sha256":hash,"selection":selection,"report":report}))?;
+                    writeln!(details)?;detail_count+=1;
                 }
             }
+            events.flush()?;payloads.flush()?;details.flush()?;
+            evidence["detail_samples"]=serde_json::json!(detail_count);
+            evidence["unique_payloads"]=serde_json::json!(seen.len());
         }
         executed?;
         let handoff=candidates.ensure_handoff(&reports);

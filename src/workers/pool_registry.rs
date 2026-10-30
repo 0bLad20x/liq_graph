@@ -8,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Result;
+use anyhow::{Context,Result};
 use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast,watch};
@@ -27,7 +27,12 @@ struct PoolQuotes { protocol:Option<Quote>, dex:Option<Quote>, last_persisted:u6
 const TVL_SOURCE_MAX_AGE_MS: u64 = 3_600_000;
 const TVL_PERSIST_INTERVAL_MS: u64 = 900_000;
 const DEX_SOURCE: &str = "dexscreener_token_pairs";
-const MIN_NATIVE_TVL_USD: f64 = 10.0;
+pub fn minimum_tvl_from_env()->Result<f64> {
+    let value:f64=std::env::var("POOL_MIN_TVL_USD").unwrap_or_else(|_|"500".into())
+        .parse().context("POOL_MIN_TVL_USD must be a nonnegative USD amount")?;
+    anyhow::ensure!(value.is_finite() && value>=0.0,"POOL_MIN_TVL_USD must be finite and nonnegative");
+    Ok(value)
+}
 // Installation granularity, not a limit on pools, refreshes or route coverage.
 const TVL_WRITE_BATCH: usize = 64;
 
@@ -65,12 +70,12 @@ fn reference_mints() -> &'static [Pubkey; 2] {
     ])
 }
 
-/// Private RAM index, native TVL evidence independent of canonical/DexScreener TVL.
+/// Private Mint admission index and one process-wide pool-TVL policy.
 #[derive(Default)]
 struct AdmissionIndex {
     qualified: HashSet<Pubkey>,
     pools_by_mint: HashMap<Pubkey, HashSet<Pubkey>>,
-    native_tvl: HashMap<Pubkey, f64>,
+    minimum_tvl_usd:f64,
 }
 impl AdmissionIndex {
     fn index(&mut self, pool: Pubkey, a: Option<Pubkey>, b: Option<Pubkey>) {
@@ -78,37 +83,17 @@ impl AdmissionIndex {
             self.pools_by_mint.entry(mint).or_default().insert(pool);
         }
     }
-    fn restore_native(&mut self, pool: &PoolState) {
-        let Some(source)=native_source(pool.venue) else {return};
-        let Some(observation)=pool.last_observation.as_deref() else {return};
-        if observation.get("source").and_then(Value::as_str)!=Some(source) {return;}
-        if let Some(value)=observation.get("tvl_usd").and_then(Value::as_f64)
-            .filter(|v|v.is_finite() && *v>=0.0) {
-            self.native_tvl.insert(pool.address,value);
-        }
-    }
-    fn observe_native(&mut self, pool: Pubkey, venue: Venue,
-        source: &str, value: Option<f64>) {
-        if native_source(venue)!=Some(source) {return;}
-        if let Some(value)=value {
-            self.native_tvl.insert(pool,value);
-        } else {
-            self.native_tvl.remove(&pool);
-        }
-    }
     fn admission(&self, pool: &PoolState) -> CompletionAdmission {
         // A WSOL/USDC conversion pool contains only settlement reference mints.
         // It cannot satisfy the non-reference Jupiter qualification rule, yet it
         // is required by V10 Direct3/Triangle4 routes. Admit ONLY this exact
         // canonical reference pair; all other pools retain the Mint qualification
-        // and venue-native minimum-TVL policy.
+        // and the same fresh pool-TVL floor, including conversion pools.
         let references=reference_mints();
         let conversion_pair=matches!((pool.mint_a,pool.mint_b),
             (Some(a),Some(b)) if a!=b && references.contains(&a) && references.contains(&b));
         let mint_qualified=conversion_pair || [pool.mint_a,pool.mint_b].into_iter().flatten()
             .any(|mint| !references.contains(&mint) && self.qualified.contains(&mint));
-        let native_below_minimum=native_source(pool.venue).is_some()
-            && self.native_tvl.get(&pool.address).is_some_and(|v|*v<MIN_NATIVE_TVL_USD);
         let (Some(a),Some(b))=(pool.mint_a,pool.mint_b) else {
             return CompletionAdmission::MissingIdentity;
         };
@@ -116,7 +101,12 @@ impl AdmissionIndex {
             return CompletionAdmission::MissingIdentity;
         }
         if !mint_qualified {return CompletionAdmission::MintNotQualified;}
-        if native_below_minimum {return CompletionAdmission::NativeTvlBelowMinimum;}
+        if self.minimum_tvl_usd>0.0 {
+            let Some(tvl)=pool.tvl_usd.filter(|v|v.is_finite() && *v>=0.0) else {
+                return CompletionAdmission::TvlUnavailable;
+            };
+            if tvl<self.minimum_tvl_usd {return CompletionAdmission::TvlBelowMinimum;}
+        }
         CompletionAdmission::Admitted
     }
 }
@@ -185,7 +175,8 @@ pub struct PoolRegistry {
 impl PoolRegistry {
     pub fn from_env()->Result<Self> {
         Ok(Self{enabled_venues:crate::core::EnabledVenues::from_env()?,
-            entries:Default::default(),quotes:Default::default(),admission:Default::default()})
+            entries:Default::default(),quotes:Default::default(),
+            admission:Arc::new(RwLock::new(AdmissionIndex{minimum_tvl_usd:minimum_tvl_from_env()?,..Default::default()}))})
     }
     /// Owner evidence at shutdown; no diagnostic consumer or copied pool state.
     pub fn protocol_counts(&self)->Result<std::collections::BTreeMap<&'static str,usize>> {
@@ -197,6 +188,39 @@ impl PoolRegistry {
             *counts.entry(pool.venue.name()).or_default()+=1;
         }
         Ok(counts)
+    }
+    /// Final owner counters only; no live observer or copied pool catalogue.
+    pub fn tvl_summary(&self)->Value {
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let admission=self.admission.read().expect("admission index lock poisoned");
+        let mut venues=std::collections::BTreeMap::<&str,[u64;9]>::new();
+        let mut violations=0_u64;
+        for p in entries.values() {
+            let v=venues.entry(p.venue.name()).or_default();v[0]+=1;
+            let prepared=p.completion_state==CompletionState::Prepared;
+            v[1]+=u64::from(prepared);v[2]+=u64::from(p.completion_admission.is_admitted());
+            v[3]+=u64::from(prepared&&p.completion_admission.is_admitted());
+            v[4]+=u64::from(p.completion_admission==CompletionAdmission::TvlUnavailable);
+            v[5]+=u64::from(p.completion_admission==CompletionAdmission::TvlBelowMinimum);
+            if prepared && !matches!(p.completion_admission,CompletionAdmission::MissingIdentity|CompletionAdmission::MintNotQualified) {
+                match p.tvl_usd {
+                    Some(tvl) if tvl>=500.0=>v[8]+=1,
+                    Some(tvl) if tvl>=100.0=>v[7]+=1,
+                    Some(_)=>v[6]+=1,
+                    None=>{},
+                }
+            }
+            if p.completion_admission.is_admitted() && admission.minimum_tvl_usd>0.0
+                && p.tvl_usd.is_none_or(|v|!v.is_finite()||v<admission.minimum_tvl_usd) {violations+=1;}
+        }
+        let by_venue=venues.into_iter().map(|(venue,v)|(venue,json!({
+            "total":v[0],"prepared":v[1],"admitted":v[2],"prepared_admitted":v[3],
+            "missing_tvl":v[4],"below_minimum":v[5],
+            "prepared_qualified_known_below_100":v[6],"prepared_qualified_100_to_500":v[7],
+            "prepared_qualified_at_least_500":v[8]}))).collect::<std::collections::BTreeMap<_,_>>();
+        json!({"minimum_pool_tvl_usd":admission.minimum_tvl_usd,
+            "source_max_age_seconds":TVL_SOURCE_MAX_AGE_MS/1000,
+            "admission_violations":violations,"by_venue":by_venue})
     }
     pub fn snapshot(&self) -> Vec<PoolState> {
         self.entries.read().expect("pool registry lock poisoned")
@@ -234,7 +258,7 @@ impl PoolRegistry {
         let mut admitted=0_usize;
         let mut prepared=0_usize;
         let mut prepared_admitted=0_usize;
-        let mut native_veto=0_usize;
+        let mut tvl_veto=0_usize;
         let mut missing_qualification=0_usize;
         for p in entries.values() {
             let pair=matches!((p.mint_a,p.mint_b),
@@ -246,13 +270,13 @@ impl PoolRegistry {
             if p.completion_admission.is_admitted() && p.completion_state==CompletionState::Prepared {
                 prepared_admitted+=1;
             }
-            if p.completion_admission==CompletionAdmission::NativeTvlBelowMinimum {native_veto+=1;}
+            if matches!(p.completion_admission,CompletionAdmission::TvlBelowMinimum|CompletionAdmission::TvlUnavailable) {tvl_veto+=1;}
             if p.completion_admission==CompletionAdmission::MintNotQualified {missing_qualification+=1;}
         }
         drop(entries);
         crate::log_event!(Info,
-            "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} native_tvl_veto={} mint_not_qualified={} scan_ns={}",
-            known,admitted,prepared,prepared_admitted,native_veto,missing_qualification,elapsed_ns(started));
+            "pool registry reference_conversion_pools={} admitted={} prepared={} prepared_admitted={} tvl_veto={} mint_not_qualified={} scan_ns={}",
+            known,admitted,prepared,prepared_admitted,tvl_veto,missing_qualification,elapsed_ns(started));
     }
 
     /// Bootstrap complete, previously validated state before any producer starts.
@@ -266,7 +290,6 @@ impl PoolRegistry {
         for mut pool in pools {
             if !self.enabled_venues.contains(pool.venue){continue;}
             admission.index(pool.address,pool.mint_a,pool.mint_b);
-            admission.restore_native(&pool);
             pool.completion_admission=admission.admission(&pool);
             ensure!(pool.address != Pubkey::default(), "invalid restored pool address");
             let a = pool.mint_a;
@@ -368,7 +391,7 @@ impl PoolRegistry {
                     .and_then(Value::as_str);
                 if pool.tvl_usd!=selected.map(|q|q.value)
                     || selected.is_some_and(|q|source!=Some(q.source)) {
-                    // DexScreener/canonical TVL expiry must not change native admission.
+                    // A missing fresh quote withdraws admission under a positive floor.
                     let observation=selected.map(|q|Arc::new(json!({
                             "tvl_usd":q.value,"source":q.source,
                             "observed_at_ms":q.at,"first_seen_ms":pool.first_seen_ms
@@ -398,6 +421,7 @@ impl PoolRegistry {
             for patch in chunk {
                 let pool=entries.get_mut(&patch.address).expect("single-writer TVL pool disappeared");
                 pool.tvl_usd=patch.value;
+                pool.completion_admission=self.admission.read().expect("admission index lock poisoned").admission(pool);
                 // Expiry only clears the live value; historical provenance stays.
                 if let Some(observation)=&patch.observation {pool.last_observation=Some(observation.clone());}
                 pool.last_changed_ms=now;
@@ -440,7 +464,7 @@ impl PoolRegistry {
                 if decision!=pool.completion_admission {
                     if audit {
                         AdmissionAudit::capture(&mut stats.audit,pool,pool.completion_admission,decision,
-                            admission.native_tvl.get(&address).copied(),"mint_qualification",now);
+                            "mint_qualification",now);
                     }
                     pool.completion_admission=decision;
                     pool.last_changed_ms=now;
@@ -477,7 +501,6 @@ impl PoolRegistry {
             match entries.get_mut(address) {
                 None => {
                     let metadata=record.config.as_ref().filter(|_|native_source(*venue)==Some(batch.source));
-                    admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
                     let mut state = PoolState {
@@ -532,7 +555,6 @@ impl PoolRegistry {
                         continue;
                     }
                     let metadata=record.config.as_ref().filter(|_|native_source(*venue)==Some(batch.source));
-                    admission.observe_native(*address,*venue,batch.source,observed_tvl);
                     let selected=record_tvl(&mut quotes,*address,batch.source,
                         batch.received_at_ms,observed_tvl);
                     let mut changed = false;
@@ -599,7 +621,7 @@ impl PoolRegistry {
                         stats.admission_updates+=1;
                         if audit {
                             AdmissionAudit::capture(&mut stats.audit,current,previous_admission,current.completion_admission,
-                                admission.native_tvl.get(&current.address).copied(),batch.source,batch.received_at_ms);
+                                batch.source,batch.received_at_ms);
                         }
                     }
                     if changed {
@@ -781,16 +803,15 @@ struct AdmissionAudit {
     at_ms:u64,
     before:CompletionAdmission,
     after:CompletionAdmission,
-    native_tvl:Option<f64>,
     canonical_tvl:Option<f64>,
 }
 impl AdmissionAudit {
     fn capture(events:&mut Vec<Self>,pool:&PoolState,before:CompletionAdmission,after:CompletionAdmission,
-        native_tvl:Option<f64>,source:&'static str,at_ms:u64) {
+        source:&'static str,at_ms:u64) {
         if (before.is_admitted() && !after.is_admitted())
-            || (before==CompletionAdmission::NativeTvlBelowMinimum && after.is_admitted()) {
+            || (matches!(before,CompletionAdmission::TvlBelowMinimum|CompletionAdmission::TvlUnavailable) && after.is_admitted()) {
             events.push(Self{pool:pool.address,venue:pool.venue,source,at_ms,before,after,
-                native_tvl,canonical_tvl:pool.tvl_usd});
+                canonical_tvl:pool.tvl_usd});
         }
     }
     fn emit(self) {
@@ -798,7 +819,7 @@ impl AdmissionAudit {
             "pool":self.pool.to_string(),"venue":format!("{:?}",self.venue),
             "source":self.source,"at_ms":self.at_ms,
             "before":format!("{:?}",self.before),"after":format!("{:?}",self.after),
-            "native_tvl_usd":self.native_tvl,"canonical_tvl_usd":self.canonical_tvl}));
+            "canonical_tvl_usd":self.canonical_tvl}));
     }
 }
 
@@ -1055,8 +1076,8 @@ pub async fn run(
     let prepared_admitted=snapshot.iter().filter(|p|p.completion_admission.is_admitted()
         && p.completion_state==CompletionState::Prepared).count();
     crate::log_event!(Info,
-        "completion_contracts min_native_tvl_usd={} mint_qualification=true admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
-        MIN_NATIVE_TVL_USD);
+        "completion_contracts min_pool_tvl_usd={} mint_qualification=true admitted_pools={admitted} prepared_admitted={prepared_admitted} prepared_total={prepared} incomplete_total={incomplete} refresh_scheduler=external",
+        minimum_tvl_from_env()?);
     crate::log_event!(Info,
         "pool registry complete batches={batches} input_records={input_records} pools_in_ram={} with_tvl={with_tvl} new={inserted} changed={changed} unchanged={unchanged} stale={stale} conflicts={conflicts} lagged_batches={lagged} completion_received={completion_received} completion_applied={completion_applied} completion_prepared={completion_prepared} completion_incomplete={completion_incomplete} completion_retryable={completion_retryable} completion_preserved_retryable={completion_preserved_retryable} completion_rejected={completion_rejected} prepared_in_ram={prepared} incomplete_in_ram={incomplete} manifests_in_ram={manifests} evidences_in_ram={evidences} metadata_skipped={metadata_skipped} metadata_reused={metadata_reused}",
         snapshot.len(),

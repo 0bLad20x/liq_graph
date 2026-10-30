@@ -20,6 +20,11 @@ Persistence is the sole durable writer. Core contains the shared messages and th
 channel-based RPC client. Provider selection, encoding, rate limits and retries stay
 in the RPC transport worker. There is no additional crate or shared protocol engine.
 
+[CP8G](CP8G.md) applies `POOL_MIN_TVL_USD` (default 500 USD) to fresh canonical
+pool TVL for every enabled venue, including conversion pools. Missing current TVL
+waits for enrichment. Persisted Prepared proofs stay intact; admission still
+requires current identity, mint qualification and the TVL gate. No new RPC path.
+
 DLMM no longer has a 16-pool constant in orchestration. Its batch size is
 `RPC_ACCOUNT_BATCH_SIZE / (3 + DLMM_EXECUTION_BELOW + DLMM_EXECUTION_ABOVE)`:
 LbPair, bitmap, active BinArray and neighboring BinArrays. With the defaults
