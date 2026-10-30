@@ -927,3 +927,55 @@ pub async fn observe(mut input:watch::Receiver<Arc<GraphSnapshot>>)->Result<()>{
     crate::log_event!(Info,"graph observer complete generations={generations}");
     Ok(())
 }
+
+#[cfg(test)]
+mod cp9b_tests {
+    use super::*;
+    fn pool(value:u8,a:Pubkey,b:Pubkey)->PreparedPool {
+        PreparedPool{address:Pubkey::new_from_array([value;32]),a,b}
+    }
+    #[test]
+    fn direct2_only_graph_excludes_longer_routes_and_keeps_incremental_births() {
+        let wsol:Pubkey=WSOL.parse().unwrap();
+        let usdc:Pubkey=USDC.parse().unwrap();
+        let x=Pubkey::new_from_array([19_u8;32]);
+        let mut updates=HashMap::new();
+        for (id,a,b) in [(41,wsol,x),(42,wsol,x),(43,x,usdc),(44,usdc,wsol)] {
+            let p=pool(id,a,b);
+            updates.insert(p.address,Some(p));
+        }
+        let first=create(Arc::new(GraphSnapshot::default()),updates,1,true).unwrap();
+        assert!(!first.topologies.is_empty());
+        assert!(first.topologies.iter().all(|t|t.kind==RouteTopologyKind::Direct2));
+        compare_reference(&first,true).unwrap();
+
+        // A new second pool on X/USDC is a Direct2 topology birth; a
+        // longer bridge/triangle is still never published.
+        let mut next=HashMap::new();
+        let p=pool(45,x,usdc);
+        next.insert(p.address,Some(p));
+        let second=create(Arc::new(first),next,2,true).unwrap();
+        assert!(second.topologies.iter().all(|t|t.kind==RouteTopologyKind::Direct2));
+        assert_eq!(second.topologies.len(),2);
+        compare_reference(&second,true).unwrap();
+    }
+    #[test]
+    fn direct2_scope_changes_only_topology_selection_not_pool_membership() {
+        let wsol:Pubkey=WSOL.parse().unwrap();
+        let usdc:Pubkey=USDC.parse().unwrap();
+        let x=Pubkey::new_from_array([29_u8;32]);
+        let mut updates=HashMap::new();
+        for (id,a,b) in [(51,wsol,x),(52,wsol,x),(53,x,usdc),(54,usdc,wsol)] {
+            let p=pool(id,a,b);
+            updates.insert(p.address,Some(p));
+        }
+        let all=create(Arc::new(GraphSnapshot::default()),updates.clone(),1,false).unwrap();
+        let direct=create(Arc::new(GraphSnapshot::default()),updates,1,true).unwrap();
+        assert_eq!(all.pool_pairs,direct.pool_pairs);
+        assert!(all.topologies.iter().any(|t|t.kind==RouteTopologyKind::Direct3));
+        assert!(direct.topologies.iter().all(|t|t.kind==RouteTopologyKind::Direct2));
+        assert!(all.topologies.len()>direct.topologies.len());
+        compare_reference(&all,false).unwrap();
+        compare_reference(&direct,true).unwrap();
+    }
+}
