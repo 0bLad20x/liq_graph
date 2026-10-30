@@ -76,7 +76,7 @@ impl ExecutionTasks {
             },
             result=&mut self.executor.0=>{
                 match result {
-                    Ok(Ok(()))=>bail!("V10 executor exited before runtime shutdown"),
+                    Ok(Ok(_stats))=>bail!("V10 executor exited before runtime shutdown"),
                     Ok(Err(error))=>Err(error).context("V10 executor exited before runtime shutdown"),
                     Err(error)=>Err(error).context("V10 executor task failed before shutdown"),
                 }
