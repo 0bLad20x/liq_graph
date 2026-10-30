@@ -38,6 +38,10 @@ param(
     [string]$WalletPath,
     [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
     [ValidateSet('All','Direct2','Direct3','Triangle3','Triangle4')][string]$RouteKind = 'All',
+    # CP9B: exclude non-Direct2 shapes already in the liquidity graph.
+    [switch]$Direct2Only,
+    # Concurrent in-flight simulateTransaction jobs (1 restores serial baseline).
+    [ValidateRange(1,64)][int]$V10Parallelism = 4,
     [string]$ExecutionParametersPath
 )
 $ErrorActionPreference = 'Stop'
@@ -54,6 +58,7 @@ if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw '
 if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidence requires MarketState.' }
 if ($RequireCalibrationEvidence -and -not $SimulateV10) { throw 'Calibration evidence requires SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
+if ($Direct2Only -and $RouteKind -notin @('All','Direct2')) { throw 'Direct2Only requires RouteKind All or Direct2.' }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ([double]::IsNaN($MinDirectionNotionalUsd) -or [double]::IsInfinity($MinDirectionNotionalUsd)) { throw 'MinDirectionNotionalUsd must be finite.' }
 if ([double]::IsNaN($MinPoolTvlUsd) -or [double]::IsInfinity($MinPoolTvlUsd)) { throw 'MinPoolTvlUsd must be finite.' }
@@ -139,6 +144,7 @@ try {
         RPC_WS_ACCOUNT_BUDGET = "$WsAccountBudget"
         RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
         GRAPH_SIGNALS_THRESHOLD_BPS = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        GRAPH_DIRECT2_ONLY = "$([bool]$Direct2Only)".ToLowerInvariant()
         GRAPH_MIN_DIRECTION_NOTIONAL_USD = $MinDirectionNotionalUsd.ToString([System.Globalization.CultureInfo]::InvariantCulture)
         GRAPH_DIRECTION_LIQUIDITY_MODE = $DirectionLiquidityMode.ToLowerInvariant()
         GRAPH_SIGNALS_TRACE = "$([bool]$TraceSignals)".ToLowerInvariant()
@@ -147,6 +153,7 @@ try {
         GRAPH_RUNTIME_PRODUCTION_REPORT_PATH = $producerPath
         GRAPH_RUNTIME_SIGNAL_REPORT_PATH = $consumerPath
         GRAPH_EXECUTION_SIMULATE = "$([bool]$SimulateV10)".ToLowerInvariant()
+        GRAPH_V10_SIMULATION_PARALLELISM = "$V10Parallelism"
         GRAPH_EXECUTION_WALLET_PATH = $WalletPath
         GRAPH_EXECUTION_MAX_REQUESTS = "$SimulationLimit"
         GRAPH_EXECUTION_ROUTE_KIND = $RouteKind
@@ -203,6 +210,7 @@ try {
         require_prepared_evidence=[bool]$RequirePreparedEvidence
         require_calibration_evidence=[bool]$RequireCalibrationEvidence
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
+        graph_direct2_only=[bool]$Direct2Only; v10_simulation_parallelism=$V10Parallelism
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
         completion_recheck_seconds=$CompletionRecheckSeconds
@@ -212,7 +220,7 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
-    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100" }
+    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 direct2_only=$([bool]$Direct2Only)" }
     Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
@@ -226,7 +234,7 @@ try {
         return
     }
     if ($SimulateV10) {
-        if ($SimulationLimit -eq 0) { Write-Host 'Simulation requests: no total cap; one executor and one queued request, broadcasts=false.' }
+        if ($SimulationLimit -eq 0) { Write-Host "Simulation requests: no total cap; parallel_in_flight=$V10Parallelism queue_capacity=$V10Parallelism broadcasts=false." }
         else { Write-Host "Simulation requests: total cap=$SimulationLimit, broadcasts=false." }
     }
     if ($marketEnabled -and $plan.websocket_plan.account_capacity -le 0) { throw 'No WebSocket account capacity selected.' }
