@@ -66,6 +66,8 @@ struct PoolEvidence {
     observation: Arc<crate::core::market_state::PoolPriceObservation>,
     manifest_validated_slot: u64, manifest_checked_at_ms: Option<u64>,
     liquidity_window_checked:bool,
+    /// CP9A: eligible/dust/unknown at the original directed signal slot.
+    direction_liquidity_status:&'static str,
 }
 #[derive(serde::Serialize)]
 pub struct Selection {
@@ -471,7 +473,8 @@ impl State {
         let evidence=PoolEvidence {pool:identity.address.to_string(),role,slot,
             log_weight_units:self.weight(slot).context("candidate direction unavailable")?,
             observation:price.observation.clone(),manifest_validated_slot:manifest.validated_slot,
-            manifest_checked_at_ms:state.completion_checked_at_ms,liquidity_window_checked};
+            manifest_checked_at_ms:state.completion_checked_at_ms,liquidity_window_checked,
+            direction_liquidity_status:price.direction_liquidity_status[slot%2]};
         Ok((ExecutionPool{manifest,mints},evidence))
     }
     /// Pack an exact CP6A best-witness without rebuilding any route product.
