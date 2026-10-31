@@ -1,6 +1,10 @@
 //! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
+#[cfg(test)]
+mod amounts_reference;
+#[cfg(test)]
+mod amounts_cp11_tests;
 mod diversity;
 use diversity::{Strategy as PackingStrategy,Alternative};
 use std::{collections::{BTreeMap,HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
@@ -99,6 +103,8 @@ struct Preparation {
     capacity_checks:u64,capacity_rejections:u64,coverage_rankings:u64,coverage_key_evaluations:u64,
     pair_index_ns:Timing,alternative_lookup_ns:Timing,ranking_ns:Timing,pool_resolution_ns:Timing,
     capacity_validation_ns:Timing,pack_build_ns:Timing,signal_to_round_start_ns:Timing,round_work_ns:Timing,
+    cp11_packed_assess_ns:Timing,cp11_universe_build_ns:Timing,
+    cp11_global_assess_ns:Timing,cp11_seed_repair_ns:Timing,
 }
 
 #[derive(Clone,Default,serde::Serialize)]
@@ -174,6 +180,7 @@ pub struct Report {
     amounts:amounts::Report,
     preparation:Preparation,
     cp10_capacity_phases:crate::workers::execution_v10::CapacityPhaseProfile,
+    cp11_quantity_phases:amounts::PhaseProfile,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -410,14 +417,20 @@ impl State {
         let started=Instant::now();
         let conversion_other=selection.request.conversion.as_ref().map(|p|
             if p.manifest.mint_a==selection.request.settlement{p.manifest.mint_b}else{p.manifest.mint_a}.to_string());
+        let packed_started=Instant::now();
         let mut assessment=if cfg.parameters.trade_size!=0||cfg.parameters.constant_conversion||cfg.parameters.no_failure {
             amounts::Assessment::unknown("nondefault_execution_mode")
         }else{amounts::assess(&self.packed_amount_inputs(&selection),&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref())};
+        preparation.cp11_packed_assess_ns.record(elapsed_ns(packed_started));
         if assessment.decision==amounts::Decision::Excluded {
             let candidate=selection.candidate.clone().context("quantity candidate missing")?;
             let top=&self.plan.as_ref().context("quantity plan missing")?.compact_topologies[candidate.topology_id];
+            let universe_started=Instant::now();
             let universe=self.amount_universe(top,registry,cfg.wallet,reads);
+            preparation.cp11_universe_build_ns.record(elapsed_ns(universe_started));
+            let global_started=Instant::now();
             let mut global=amounts::assess(&universe,&selection.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
+            preparation.cp11_global_assess_ns.record(elapsed_ns(global_started));
             global.scope="current_prepared_candidate_mint_universe_dex_only";report.global_proofs+=1;
             if global.decision==amounts::Decision::Excluded {
                 global.elapsed_ns=elapsed_ns(started);report.record(&global);
@@ -427,6 +440,7 @@ impl State {
                     "trigger":selection.trigger,"source_witness":candidate.witness
                 }));return Ok(None);
             }
+            let repair_started=Instant::now();
             let witness=candidate.witness.as_ref().context("quantity witness missing")?;
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
             if let Some(preferred)=amounts::seed(&universe,&pairs) {
@@ -444,6 +458,7 @@ impl State {
                     }
                 }
             }
+            preparation.cp11_seed_repair_ns.record(elapsed_ns(repair_started));
             // Unknown alternatives do not change the proof for this packed set.
             // Only an actually rebuilt, re-assessed request can replace it.
             if assessment.decision==amounts::Decision::Excluded {
@@ -1074,6 +1089,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
     }.await;
     report.error=outcome.err().map(|e|format!("{e:#}"));
     report.cp10_capacity_phases=crate::workers::execution_v10::capacity_phase_profile();
+    report.cp11_quantity_phases=amounts::phase_profile();
     crate::log_event!(Info,"execution candidates complete=true requests={} lost={} error={:?}",report.request_count as usize,report.lost_events,report.error);
     Ok(report)
 }
