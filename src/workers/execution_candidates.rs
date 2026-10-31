@@ -869,11 +869,10 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             };
                             let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
                             actual.sort_unstable();
-                            if !sent_sets.entry(*pair).or_default().insert(actual){
-                                // Defensive: quantity-seed repair can alter the pool set.
-                                // This duplicate already passed the amount proof.
-                                report.cp9c_duplicate_packs+=1;continue;
-                            }
+                            // Once the amount assessment has been accounted for,
+                            // dispatch the request; dropping it would violate
+                            // successful-quantity vs request delivery accounting.
+                            sent_sets.entry(*pair).or_default().insert(actual);
                             previous.entry(*pair).or_default().push(
                                 selection.pools.iter().map(|p|p.slot/2).collect());
                             selection.cp9d_source=origin;
