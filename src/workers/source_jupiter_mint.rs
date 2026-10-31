@@ -321,3 +321,29 @@ pub async fn run_backfill(http:Client,settings:Settings,mints:Vec<Pubkey>,
     engine.backfill(mints,&output,None).await
 }
 
+
+#[cfg(test)]
+mod reliable_persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_jupiter_writer_receives_all_batches_in_order() {
+        // More batches than queue capacity; persistence can be slower than
+        // the producer without any Lagged data loss.
+        let (out,_unused)=broadcast::channel::<Arc<DataBatch>>(8);
+        let (writer,mut receiver)=mpsc::channel::<Arc<DataBatch>>(1);
+        let producing=tokio::spawn(async move {
+            for id in 0..256_i64 {
+                Engine::publish(&out,Some(&writer),DataBatch {
+                    source:SOURCE,received_at_ms:id,records:Vec::new(),
+                }).await.unwrap();
+            }
+        });
+        for id in 0..256_i64 {
+            let batch=receiver.recv().await.expect("channel closed early");
+            assert_eq!(batch.received_at_ms,id);
+        }
+        producing.await.unwrap();
+        assert!(receiver.recv().await.is_none());
+    }
+}
