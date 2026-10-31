@@ -1,7 +1,7 @@
 //! Private quantity analysis of typed, frozen observations. No RPC or worker calls.
 //! Proofs use optimistic costs (maximum possible fee rebates); estimates use full
 //! DEX fees. Failed probes are never an exclusion proof. See docs/CP8C.md.
-use std::{collections::{BTreeMap,BTreeSet},sync::Arc,time::Instant};
+use std::{collections::BTreeMap,sync::{Arc,LazyLock,atomic::{AtomicU64,Ordering}},time::Instant};
 use crate::core::market_state::{PoolPriceObservation,PoolLiquidity,LiquidityLevel};
 
 #[derive(Clone)]
@@ -9,6 +9,50 @@ pub(super) struct Input {pub slot:usize,pub observation:Arc<PoolPriceObservation
 #[derive(Clone,Copy,Debug)]
 pub(super) enum Issue {Unknown(&'static str),Insufficient(&'static str)}
 type Calc<T>=Result<T,Issue>;
+
+// Bounded aggregate phase counters. No per-pool or per-revision history.
+static PROFILE_ON:LazyLock<bool>=LazyLock::new(||
+    matches!(std::env::var("GRAPH_SIGNALS_PROFILE").as_deref(),
+        Ok("1"|"true"|"yes")));
+static ASSESS_CALLS:AtomicU64=AtomicU64::new(0);
+static ASSESS_NS:AtomicU64=AtomicU64::new(0);
+static MINIMUM_CALLS:AtomicU64=AtomicU64::new(0);
+static MINIMUM_NS:AtomicU64=AtomicU64::new(0);
+static QUOTE_CALLS:AtomicU64=AtomicU64::new(0);
+static QUOTE_NS:AtomicU64=AtomicU64::new(0);
+static RATIONAL_FAST:AtomicU64=AtomicU64::new(0);
+static RATIONAL_FALLBACK:AtomicU64=AtomicU64::new(0);
+#[derive(Default,serde::Serialize)]
+pub(super) struct PhaseProfile {
+    assess_calls:u64,assess_ns:u64,minimum_calls:u64,minimum_ns:u64,
+    quote_calls:u64,quote_ns:u64,rational_fast:u64,rational_fallback:u64,
+}
+pub(super) fn phase_profile()->PhaseProfile {
+    PhaseProfile{assess_calls:ASSESS_CALLS.load(Ordering::Relaxed),
+        assess_ns:ASSESS_NS.load(Ordering::Relaxed),
+        minimum_calls:MINIMUM_CALLS.load(Ordering::Relaxed),
+        minimum_ns:MINIMUM_NS.load(Ordering::Relaxed),
+        quote_calls:QUOTE_CALLS.load(Ordering::Relaxed),
+        quote_ns:QUOTE_NS.load(Ordering::Relaxed),
+        rational_fast:RATIONAL_FAST.load(Ordering::Relaxed),
+        rational_fallback:RATIONAL_FALLBACK.load(Ordering::Relaxed)}
+}
+struct AssessClock(Option<Instant>);
+impl AssessClock {
+    fn start()->Self {
+        if *PROFILE_ON {ASSESS_CALLS.fetch_add(1,Ordering::Relaxed);Self(Some(Instant::now()))}
+        else {Self(None)}
+    }
+}
+impl Drop for AssessClock {
+    fn drop(&mut self) {
+        if let Some(started)=self.0 {
+            ASSESS_NS.fetch_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed);
+        }
+    }
+}
+fn ns(started:Instant)->u64{started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 #[derive(Clone,Copy,Debug,PartialEq,Eq,serde::Serialize)]
 #[serde(rename_all="snake_case")]
 pub(super) enum Decision {Possible,Unknown,Excluded}
@@ -116,7 +160,15 @@ fn level_cost(l:&LiquidityLevel,gross:u64,optimistic:bool)->Calc<u128> {
 /// An optimistic lower input cost: input fees may refund their entire declared
 /// protocol portion and output fees may all be rebated. Thus rebates cannot make
 /// an excluded model path profitable behind our back.
-pub(super) fn minimum_input(input:&Input,direction:usize,mut output:u64)->Calc<u64> {
+pub(super) fn minimum_input(input:&Input,direction:usize,output:u64)->Calc<u64> {
+    if !*PROFILE_ON {return minimum_input_inner(input,direction,output);}
+    let started=Instant::now();
+    let result=minimum_input_inner(input,direction,output);
+    MINIMUM_CALLS.fetch_add(1,Ordering::Relaxed);
+    MINIMUM_NS.fetch_add(ns(started),Ordering::Relaxed);
+    result
+}
+fn minimum_input_inner(input:&Input,direction:usize,mut output:u64)->Calc<u64> {
     if output==0{return Ok(0);}
     let p=profile(input)?;let dir=&p.directions[direction];
     if let Some(c)=&p.reserve_curve {
@@ -145,7 +197,15 @@ pub(super) fn minimum_input(input:&Input,direction:usize,mut output:u64)->Calc<u
     else{Err(Issue::Unknown("liquidity_window_incomplete"))}
 }
 
-pub(super) fn quote(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
+pub(super) fn quote(input:&Input,direction:usize,amount:u64)->Calc<u64> {
+    if !*PROFILE_ON {return quote_inner(input,direction,amount);}
+    let started=Instant::now();
+    let result=quote_inner(input,direction,amount);
+    QUOTE_CALLS.fetch_add(1,Ordering::Relaxed);
+    QUOTE_NS.fetch_add(ns(started),Ordering::Relaxed);
+    result
+}
+fn quote_inner(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
     let p=profile(input)?;let dir=&p.directions[direction];
     if dir.status!="available"{return Err(Issue::Unknown("direction_unavailable_for_estimate"));}
     if let Some(c)=&p.reserve_curve {
@@ -203,8 +263,19 @@ fn product(values:impl Iterator<Item=u128>)->Vec<u32> {
         while next.len()>1 && next.last()==Some(&0){next.pop();}out=next;
     }out
 }
-fn compare_products(a:impl Iterator<Item=u128>,b:impl Iterator<Item=u128>)->std::cmp::Ordering {
-    let a=product(a);let b=product(b);a.len().cmp(&b.len()).then_with(||a.iter().rev().cmp(b.iter().rev()))
+fn compare_products(a:impl Iterator<Item=u128>+Clone,b:impl Iterator<Item=u128>+Clone)->std::cmp::Ordering {
+    // Exact fast path: when both products fit in u128 we need no heap
+    // allocation or schoolbook multiplication. Overflow must fall back to
+    // the unchanged multiword reference arithmetic, never floating point.
+    let left=a.clone().try_fold(1_u128,|acc,n|acc.checked_mul(n));
+    let right=b.clone().try_fold(1_u128,|acc,n|acc.checked_mul(n));
+    if let (Some(left),Some(right))=(left,right) {
+        if *PROFILE_ON {RATIONAL_FAST.fetch_add(1,Ordering::Relaxed);}
+        return left.cmp(&right);
+    }
+    if *PROFILE_ON {RATIONAL_FALLBACK.fetch_add(1,Ordering::Relaxed);}
+    let left=product(a);let right=product(b);
+    left.len().cmp(&right.len()).then_with(||left.iter().rev().cmp(right.iter().rev()))
 }
 fn no_gross_gain(rates:&[Rate])->bool {
     compare_products(rates.iter().map(|r|r.0),rates.iter().map(|r|r.1))!=std::cmp::Ordering::Greater
@@ -267,6 +338,7 @@ fn estimate(path:&[Edge],inputs:&[Input],initial:u64,minimum_profit:u64)->Option
 }
 
 pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_conversion_other:Option<&str>)->Assessment {
+    let _cp11_clock=AssessClock::start();
     let started=Instant::now();let mut result=Assessment::unknown("no_closed_cycle");result.pool_count=inputs.len();
     // Scratch bounds for this frozen assessment only. A shared pair may occur
     // in several mint cycles; do not rescan all of its levels for each cycle.
@@ -301,9 +373,13 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
             Err(Issue::Insufficient(reason))=>result.cycles.push(Cycle{mints,status:"excluded",reason,minimum_input_lower_bound_raw:None}),
             Err(Issue::Unknown(reason))=>{any_unknown=true;result.cycles.push(Cycle{mints,status:"unknown",reason,minimum_input_lower_bound_raw:None});},
             Ok((minimum,path))=>{
-                let mut probes=BTreeSet::from([minimum]);let mut n=minimum.max(1);
-                while let Some(next)=n.checked_mul(2){probes.insert(next);n=next;}
-                probes.insert(u64::MAX);
+                // Identical probe domain and ascending order as BTreeSet,
+                // but only one allocation, one sort and one dedup.
+                let mut probes=Vec::with_capacity(72);
+                probes.push(minimum);
+                let mut n=minimum.max(1);
+                while let Some(next)=n.checked_mul(2){probes.push(next);n=next;}
+                probes.push(u64::MAX);
                 // Include every representable observed level boundary, projected
                 // backward through optimistic prefix costs. Sampling cannot veto.
                 for (i,e) in path.iter().enumerate(){if let Ok(p)=profile(&inputs[e.pool]){
@@ -312,9 +388,11 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
                         let Some(v)=l.input_raw.and_then(|n|total.checked_add(n))else{break;};total=v;
                         let mut need=total;let mut valid=true;
                         for prior in path[..i].iter().rev(){match minimum_input(&inputs[prior.pool],prior.direction,need){Ok(n)=>need=n,Err(_)=>{valid=false;break;}}}
-                        if valid{probes.insert(need);}
+                        if valid{probes.push(need);}
                     }
                 }}
+                probes.sort_unstable();
+                probes.dedup();
                 let mut found=None;
                 for q in probes {if q==0{continue;}result.probes+=1;
                     if let Some(e)=estimate(&path,inputs,q,minimum_profit){found=Some(e);break;}
