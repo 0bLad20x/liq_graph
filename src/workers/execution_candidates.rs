@@ -225,13 +225,7 @@ impl Selection {
         let source_model=if original==seed{seed_model}
             else if relation(&original)=="same_path"{model}else{quote_path(&original)};
         let probe=self.amount_assessment.estimate.as_ref();
-        json!({"schema_version":1,"scope":"frozen_dex_model_vs_later_simulation",
-            "cp9c_audit_schema":1,
-            "packing_strategy":self.packing_strategy,"packing_revision_variant":self.packing_revision_variant,
-            "simulation_provider":report.provider,
-            "simulation_context_slot":report.context_slot,
-            "state_comparability":"slot_is_not_bank_identity",
-            "request_ready_at_us":self.request_ready_at_us,
+        let mut result=json!({"schema_version":1,"scope":"frozen_dex_model_vs_later_simulation",
             "marginal_signal_bps":witness.and_then(|w|{
                 let bps=(-(w.log_sum_units as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;bps.is_finite().then_some(bps)}),
             "packing_marginal_bps":self.estimated_net_return_bps,
@@ -256,7 +250,16 @@ impl Selection {
             "probe_input_raw":probe.map(|p|p.input_raw),"probe_profit_raw":probe.map(|p|p.profit_raw),
             "probe_same_path":probe.filter(|_|full).map(|p|p.legs.len()==calls.len()&&p.legs.iter().zip(calls)
                 .all(|(l,c)|Some(l.pool.as_str())==c.pool.as_deref()&&l.input_mint==c.inputs[0].mint&&l.output_mint==c.outputs[0].mint)),
-            "probe_same_amount":probe.zip(initial).map(|(p,i)|p.input_raw==i),"processing_ns":elapsed_ns(started)})
+            "probe_same_amount":probe.zip(initial).map(|(p,i)|p.input_raw==i),"processing_ns":elapsed_ns(started)});
+        // Keep the legacy calibration macro small to avoid json! recursion depth.
+        result["cp9c_audit_schema"]=json!(1);
+        result["packing_strategy"]=json!(self.packing_strategy);
+        result["packing_revision_variant"]=json!(self.packing_revision_variant);
+        result["simulation_provider"]=json!(report.provider);
+        result["simulation_context_slot"]=json!(report.context_slot);
+        result["state_comparability"]=json!("slot_is_not_bank_identity");
+        result["request_ready_at_us"]=json!(self.request_ready_at_us);
+        result
     }
     /// Per-request rate/capacity facts; full manifests are stored once per payload.
     /// Called after the live loop, never during signal evaluation.
