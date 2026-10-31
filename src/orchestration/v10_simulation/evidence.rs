@@ -1,8 +1,8 @@
 //! CP9G: bounded, blocking-thread evidence spool. Never called on WS/MarketState task.
 //! Join at most in-flight selections/reports; persist immediately, then release RAM.
-use std::{collections::{HashMap,HashSet,VecDeque},fs::{File,OpenOptions},
+use std::{collections::{HashMap,HashSet,VecDeque},fs::File,
     io::{BufWriter,Write},path::PathBuf,time::Instant};
-use anyhow::{Result,Context,bail,ensure};
+use anyhow::{Result,Context,ensure};
 use serde_json::{json,Value};
 use tokio::sync::mpsc;
 use crate::{core::execution::{ExecutionOutcome,ExecutionReport},
