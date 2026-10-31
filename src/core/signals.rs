@@ -37,7 +37,7 @@ pub struct SignalPoolPrice {
     pub direction_liquidity_status: [&'static str; 2],
     pub observation: Arc<PoolPriceObservation>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalRouteKind { Direct2, Direct3, Triangle3, Triangle4 }
 fn optional_mint<S:serde::Serializer>(v:&Option<Pubkey>,s:S)->Result<S::Ok,S::Error>{
