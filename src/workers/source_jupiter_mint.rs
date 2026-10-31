@@ -333,13 +333,13 @@ mod reliable_persistence_tests {
         let (out,_unused)=broadcast::channel::<Arc<DataBatch>>(8);
         let (writer,mut receiver)=mpsc::channel::<Arc<DataBatch>>(1);
         let producing=tokio::spawn(async move {
-            for id in 0..256_i64 {
+            for id in 0..256_u64 {
                 Engine::publish(&out,Some(&writer),DataBatch {
                     source:SOURCE,received_at_ms:id,records:Vec::new(),
                 }).await.unwrap();
             }
         });
-        for id in 0..256_i64 {
+        for id in 0..256_u64 {
             let batch=receiver.recv().await.expect("channel closed early");
             assert_eq!(batch.received_at_ms,id);
         }
