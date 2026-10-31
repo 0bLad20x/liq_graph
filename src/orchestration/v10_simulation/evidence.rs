@@ -13,7 +13,7 @@ pub(super) struct Summary {
     pub matched:u64,pub unique_payloads:u64,pub snapshots_written:u64,
     pub report_successes:u64,pub report_failures:u64,pub dex_call_reports:u64,
     pub detail_samples:u64,pub max_unmatched:usize,pub max_backlog:usize,
-    pub flushes:u64,pub durable_syncs:u64,pub evidence_queue_failures:u64,
+    pub flushes:u64,pub durable_syncs:u64,
 }
 
 // A deliberately bounded accelerator, not a permanent in-memory payload database.
