@@ -226,14 +226,14 @@ struct RequestResult {
     count_5xx:usize,
     error:Option<String>,
 }
-async fn fetch_one(handle:HttpHandle,mint:Pubkey)->RequestResult {
+async fn fetch_one(handle:HttpHandle,mint:Pubkey,policy:RoutePolicy)->RequestResult {
     let url=format!("https://{HOST}/token-pairs/v1/solana/{mint}");
     let mut result=RequestResult {
         mint,response:None,attempts:0,count_429:0,count_403:0,count_5xx:0,error:None,
     };
     for attempt in 0..MAX_REQUEST_ATTEMPTS {
         result.attempts+=1;
-        let request=match HttpRequest::get(&url,RoutePolicy::ProxyOnly) {
+        let request=match HttpRequest::get(&url,policy) {
             Ok(value)=>value,
             Err(error)=>{result.error=Some(format!("{error:#}"));break;},
         };
@@ -281,7 +281,7 @@ async fn fetch_all(handle:HttpHandle,mints:Vec<Pubkey>,parallel:usize,
     let mut last_report_done=0usize;
     let jobs=stream::iter(mints).map(|mint|{
         let handle=handle.clone();
-        async move {fetch_one(handle,mint).await}
+        async move {fetch_one(handle,mint,RoutePolicy::ProxyOnly).await}
     }).buffer_unordered(parallel);
     tokio::pin!(jobs);
     while let Some(result)=jobs.next().await {
@@ -491,18 +491,27 @@ pub async fn run_live(
         "DEXSCREENER_REFRESH_SECONDS must be 60..86400");
     let mut transport=http_transport::Settings::from_env()?;
     transport.stats_interval=Duration::from_secs(60);
-    transport.host_rps_overrides.insert(HOST.into(),0);
+    let mode=env::var("DEXSCREENER_TRANSPORT_MODE").unwrap_or_else(|_|"proxy".into()).to_ascii_lowercase();
+    ensure!(matches!(mode.as_str(),"proxy"|"direct"),"DEXSCREENER_TRANSPORT_MODE must be proxy or direct");
+    let policy=if mode=="direct"{RoutePolicy::DirectOnly}else{RoutePolicy::ProxyOnly};
+    // Official token-pairs endpoint has a 300/minute limit; direct mode
+    // uses the existing shared host gate at 4 RPS (240/minute).
+    transport.host_rps_overrides.insert(HOST.into(),if mode=="direct"{4}else{0});
     transport.proxy_ip_rpm_overrides.insert(HOST.into(),settings.per_proxy_ip_rpm);
     transport.proxy_latency_ceiling_ms.insert(HOST.into(),settings.max_proxy_latency_ms);
     let (handle,transport_task)=http_transport::spawn(transport)?;
     let mut cycles=handle.subscribe_cycles();
-    tokio::time::timeout(settings.proxy_wait,async {
-        loop {
-            if *cycles.borrow_and_update()>0 {break Ok::<(),anyhow::Error>(());}
-            cycles.changed().await.context("DexScreener proxy discovery closed")?;
-        }
-    }).await.context("DexScreener proxy discovery timeout")??;
-    ensure!(!handle.working_set().is_empty(),"no verified DexScreener HTTP proxies");
+    if mode=="proxy" {
+        tokio::time::timeout(settings.proxy_wait,async {
+            loop {
+                if *cycles.borrow_and_update()>0 {break Ok::<(),anyhow::Error>(());}
+                cycles.changed().await.context("DexScreener proxy discovery closed")?;
+            }
+        }).await.context("DexScreener proxy discovery timeout")??;
+        ensure!(!handle.working_set().is_empty(),"no verified DexScreener HTTP proxies");
+    }
+    crate::log_event!(Info,"dexscreener transport_mode={} direct_host_cap_rps={}",mode,
+        if mode=="direct"{4}else{0});
     let (tx,mut rx)=broadcast::channel::<Arc<DexPairBatch>>(256);
     let publish=tokio::spawn(async move {
         let mut recent=HashMap::<Pubkey,u64>::new();
@@ -582,7 +591,7 @@ pub async fn run_live(
             due.pop_first();
             if !active.contains(&mint) || !inflight.insert(mint) {continue}
             let client=handle.clone();
-            tasks.spawn(async move {fetch_one(client,mint).await});
+            tasks.spawn(async move {fetch_one(client,mint,policy).await});
         }
         if !source_open && tasks.is_empty() {break}
         let next_due=due.first().map(|&(at,_)|at);
