@@ -1,6 +1,8 @@
 //! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
+mod diversity;
+use diversity::{Strategy as PackingStrategy,Alternative};
 use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
@@ -18,6 +20,8 @@ pub struct Settings {
     /// Zero means no lifetime request cap; the output queue remains bounded.
     pub limit: usize,
     pub kind: Option<SignalRouteKind>,
+    /// CP9C: independent alternative-packing strategies for the same signal revision.
+    pub strategies:Vec<PackingStrategy>,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
     pub capacity: fn(&ExecutionRequest) -> Result<ExecutionMetrics>,
 }
@@ -35,7 +39,17 @@ impl Settings {
             _=>ExecutionParameters::default(),
         };
         ensure!(parameters.use_flashloan,"V10 simulation requires use_flashloan=true; update the execution parameters file");
-        Ok(Self {wallet,parameters,limit,kind,capacity})
+        let mode=env::var("GRAPH_CP9C_PACKING_MODE").unwrap_or_else(|_|"baseline".into());
+        let strategies=match mode.to_ascii_lowercase().as_str() {
+            "baseline"=>vec![PackingStrategy::Baseline],
+            "contrarian"=>vec![PackingStrategy::Contrarian],
+            "mixed"=>vec![PackingStrategy::Mixed],
+            "all"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed],
+            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed or all"),
+        };
+        ensure!(strategies==[PackingStrategy::Baseline]||kind==Some(SignalRouteKind::Direct2),
+            "CP9C alternative comparisons require GRAPH_EXECUTION_ROUTE_KIND=Direct2");
+        Ok(Self {wallet,parameters,limit,kind,strategies,capacity})
     }
 }
 fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
@@ -72,6 +86,8 @@ struct PoolEvidence {
 #[derive(serde::Serialize)]
 pub struct Selection {
     pub request: ExecutionRequest,
+    packing_strategy:&'static str,
+    packing_revision_variant:u8,
     graph_generation: u64, revision: u64, topology_id: Option<usize>, route_kind: SignalRouteKind,
     reverse: bool, trigger: Arc<SignalTrigger>, candidate: Option<SignalCandidate>,
     threshold_units: i64, estimated_net_return_bps:Option<f64>,
@@ -96,6 +112,8 @@ pub struct Report {
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
     lost_events: u64, resynchronizations: u64, skipped_busy_revisions: u64,
+    pub cp9c_pack_attempts:u64,pub cp9c_packs_dispatched:u64,pub cp9c_duplicate_packs:u64,
+    pub cp9c_queue_full_packs:u64,pub cp9c_by_strategy:std::collections::BTreeMap<String,u64>,
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
     catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
@@ -344,7 +362,7 @@ impl State {
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
             if let Some(preferred)=amounts::seed(&universe,&pairs) {
                 if let Ok(mut repaired)=self.build_compact(&candidate,selection.threshold_units,selection.trigger.clone(),
-                    registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,Some(&preferred)) {
+                    registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,match selection.packing_strategy { "contrarian"=>PackingStrategy::Contrarian,"mixed"=>PackingStrategy::Mixed,_=>PackingStrategy::Baseline },Some(&preferred)) {
                     if repaired.amount_seed_changed {
                         let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
                         if next.decision!=amounts::Decision::Excluded {
@@ -480,7 +498,7 @@ impl State {
     /// Pack an exact CP6A best-witness without rebuilding any route product.
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
-        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,preferred:Option<&[usize]>)->Result<Selection>{
+        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,strategy:PackingStrategy,preferred:Option<&[usize]>)->Result<Selection>{
         let started=Instant::now();
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
@@ -541,6 +559,7 @@ impl State {
         install_compact(&mut request,top,&pools);
         let mut packing=(cfg.capacity)(&request).context("compact seed does not fit V10")?;
         let mut options=Vec::new();
+        let mut alternative_profiles=Vec::<Alternative>::new();
         // Only direct/partner roles accept parallel alternatives in the current
         // V10 group contract. Intermediate/conversion remain the best chosen pool.
         for (i,&(selected,role_name)) in slots.iter().enumerate(){
@@ -553,16 +572,23 @@ impl State {
                 let slot=2*id+selected%2;
                 if let Some(w)=self.weight(slot){
                     let new_sum=i128::from(seed_sum)-i128::from(original)+i128::from(w);
-                    if new_sum<i128::from(threshold){
+                    if strategy!=PackingStrategy::Baseline || new_sum<i128::from(threshold){
                         options.push((new_sum,slot,role_name,i));
+                        let obs=self.prices.get(id).and_then(Option::as_ref).map(|p|p.observation.as_ref());
+                        let depth=obs.and_then(|o|o.liquidity.as_ref()).and_then(|p|p.directions.iter()
+                            .find(|d|d.input_mint==if slot%2==0{target.mint_a.to_string()}else{target.mint_b.to_string()}))
+                            .and_then(|d|d.input_capacity_raw.as_deref()).and_then(|s|s.parse::<u128>().ok());
+                        alternative_profiles.push(Alternative{slot,role:i,marginal_score:new_sum,
+                            depth_input_raw:depth,venue:obs.map_or("unknown",|o|o.venue)});
                     }
                 }
             }
         }
-        options.sort_unstable_by_key(|(score,slot,_,_)|(*score,*slot));
+        let ranking=diversity::order(strategy,&alternative_profiles);
         let mut considered=0;let mut rejected=0;let mut unavailable=0;
         let mut last_rejection=None;
-        for (_,slot,role_name,_) in options{
+        for index in ranking{
+            let (_,slot,role_name,_)=options[index];
             if used.contains(&(slot/2)){continue;}
             considered+=1;
             let pool=match self.pool(slot,role_name,registry,cfg.wallet,reads){
@@ -582,7 +608,7 @@ impl State {
         let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
         let alternative_pools_added=pools.len()-slots.len();
         let estimated_net_return_bps=(-(seed_sum as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;
-        Ok(Selection{request,graph_generation:self.generation,revision:self.revision,
+        Ok(Selection{request,packing_strategy:strategy.label(),packing_revision_variant:0,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
             estimated_net_return_bps:estimated_net_return_bps.is_finite().then_some(estimated_net_return_bps),
