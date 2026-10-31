@@ -625,3 +625,171 @@ pub async fn run_parallel(settings: Settings,rpc:RpcHandle,mut input:mpsc::Recei
     Ok(ParallelReport{configured_parallelism:parallelism,
         maximum_in_flight:peak,completed_requests:count})
 }
+
+// The pre-CP10 byte compiler is retained *only in tests*. This is an
+// independent reference for ordering, duplicate promotion and exact v1 bytes.
+#[cfg(test)]
+fn legacy_message(ix: &mut Instruction, request: &ExecutionRequest,
+    blockhash: &str) -> Result<(Vec<u8>,Vec<Pubkey>)> {
+    let mut merged:Vec<Meta>=Vec::new();
+    let program_meta=Meta{address:key(EXECUTOR),writable:false,signer:false};
+    for meta in ix.metas.iter().chain(std::iter::once(&program_meta)) {
+        if let Some(old)=merged.iter_mut().find(|a|a.address==meta.address) {
+            old.writable|=meta.writable; old.signer|=meta.signer;
+        } else { merged.push(Meta{address:meta.address,writable:meta.writable,signer:meta.signer}); }
+    }
+    ensure!(merged.iter().filter(|a|a.signer).count()==1 && merged[0].address==request.wallet,
+        "only the configured wallet may sign");
+    let mut keys=vec![request.wallet];
+    keys.extend(merged.iter().filter(|a|!a.signer && a.writable).map(|a|a.address));
+    keys.extend(merged.iter().filter(|a|!a.signer && !a.writable).map(|a|a.address));
+    ensure!(keys.len()<=64,"transaction exceeds configured 64-account boundary; producer must reduce the job");
+    ensure!(ix.metas.len()<=255,"instruction exceeds 255 account references");
+    let index=|address:Pubkey|->u8{keys.iter().position(|k|*k==address).expect("compiled key") as u8};
+    let readonly=merged.iter().filter(|a|!a.signer && !a.writable).count() as u8;
+    let hash:Pubkey=blockhash.parse().context("invalid blockhash bytes")?;
+    let p=&request.parameters;
+    let mask:u32=12 | if p.priority_fee_lamports>0 {3} else {0};
+    let mut message=vec![0x81,1,0,readonly];
+    message.extend(mask.to_le_bytes()); message.extend(hash.to_bytes());
+    message.extend([1,keys.len() as u8]);
+    for address in &keys {message.extend(address.to_bytes());}
+    if p.priority_fee_lamports>0 {message.extend(p.priority_fee_lamports.to_le_bytes());}
+    message.extend(p.transaction_compute_unit_limit.to_le_bytes());
+    message.extend(p.loaded_accounts_data_size_limit.to_le_bytes());
+    message.extend([index(key(EXECUTOR)),ix.metas.len() as u8]);
+    message.extend(u16::try_from(ix.data.len())?.to_le_bytes());
+    for meta in &ix.metas {message.push(index(meta.address));}
+    message.extend(&ix.data);
+    ensure!(message.len()+64<=4096,"v1 transaction exceeds 4096 bytes; producer must reduce the job");
+    ix.metrics.unique_accounts=keys.len(); ix.metrics.transaction_bytes=message.len()+64;
+    Ok((message,keys))
+}
+
+#[cfg(test)]
+mod cp10_tests {
+    use super::*;
+    use crate::core::{ExecutionManifest, MintProof};
+    use crate::core::execution::ExecutionParameters;
+
+    fn sample_pool(number:u8, account_count:usize, wallet:Pubkey,
+        settlement:Pubkey, target:Pubkey, pump:bool) -> ExecutionPool {
+        let pool=Pubkey::new_from_array([number;32]);
+        let program=if pump {key(PUMP)} else {Pubkey::new_from_array([77;32])};
+        let mut account_block=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:settlement,writable:false},
+            AccountMeta{address:pool,writable:true},
+        ];
+        for i in 3..account_count {
+            // Several shared accounts exercise dedup and writable promotion.
+            account_block.push(AccountMeta{
+                address:Pubkey::new_from_array([((number as usize+i)%220+30) as u8;32]),
+                writable:i%3==0,
+            });
+        }
+        let inverse=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:target,writable:false},
+            AccountMeta{address:pool,writable:true},
+        ];
+        ExecutionPool {
+            manifest:Arc::new(ExecutionManifest{pool,mint_a:settlement,mint_b:target,
+                validated_slot:42,bound_signer:pump.then_some(wallet),
+                base_a:Arc::from(account_block),base_b:Arc::from(inverse)}),
+            mints:[
+                MintProof{address:settlement,token_2022:false,extensions:vec![],unsupported:vec![]},
+                MintProof{address:target,token_2022:false,extensions:vec![],unsupported:vec![]},
+            ],
+        }
+    }
+    fn request(n:usize,account_count:usize,settlement:Pubkey,pump:bool)->ExecutionRequest {
+        let wallet=Pubkey::new_from_array([99;32]);
+        let target=Pubkey::new_from_array([88;32]);
+        let pools=(0..n).map(|i|sample_pool((i+1) as u8,account_count,wallet,
+            settlement,target,pump)).collect();
+        ExecutionRequest{id:"cp10-equivalence".into(),wallet,settlement,
+            groups:vec![ExecutionGroup::Direct{target,pools}],
+            conversion:None,parameters:ExecutionParameters::default()}
+    }
+
+    #[test]
+    fn exact_legacy_transaction_compilation() {
+        for settlement in [key(SOL),key(USDC)] {
+            for pump in [false,true] {
+                for count in [2_usize,3,4,8,12,16] {
+                    for width in [3_usize,6,12,24] {
+                        let request=request(count,width,settlement,pump);
+                        let mut old=instruction(&request,request.wallet).unwrap();
+                        let mut new=instruction(&request,request.wallet).unwrap();
+                        let old_result=legacy_message(&mut old,&request,
+                            "11111111111111111111111111111111");
+                        let new_result=message(&mut new,&request,
+                            "11111111111111111111111111111111");
+                        assert_eq!(old_result.is_ok(),new_result.is_ok(),
+                            "settlement={settlement} pump={pump} n={count} width={width}");
+                        match (old_result,new_result) {
+                            (Ok((old_bytes,old_keys)),Ok((new_bytes,new_keys)))=>{
+                                assert_eq!(old_bytes,new_bytes);
+                                assert_eq!(old_keys,new_keys);
+                                let normal=validate(&request).unwrap();
+                                assert_eq!(serde_json::to_value(&normal).unwrap(),
+                                    serde_json::to_value(&new.metrics).unwrap());
+                            },
+                            (Err(old_err),Err(new_err))=>assert_eq!(old_err.to_string(),new_err.to_string()),
+                            _=>unreachable!(),
+                        }
+                        assert_eq!(old.data,new.data);
+                        assert_eq!(serde_json::to_value(&old.metrics).unwrap(),
+                            serde_json::to_value(&new.metrics).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_addresses_equal_cryptographic_reference() {
+        for name in [EXECUTOR,SOL,USDC,TOKEN,TOKEN_2022,ASSOCIATED,PUMP,MAINNET,
+            COLLECTOR_USDC,COLLECTOR_SOL_FLASH,COLLECTOR_SOL_OTHER] {
+            assert_eq!(key(name),name.parse::<Pubkey>().unwrap());
+        }
+        for settlement in [key(SOL),key(USDC)] {
+            let raw=Pubkey::find_program_address(
+                &[b"vault_token_account",settlement.as_ref()],&key(EXECUTOR)).0;
+            let cached=if settlement==key(SOL){*FLASH_VAULT_SOL}else{*FLASH_VAULT_USDC};
+            assert_eq!(raw,cached);
+        }
+        assert_eq!(*FLASH_AUTHORITY,Pubkey::find_program_address(
+            &[b"vault_authority"],&key(EXECUTOR)).0);
+        for seed in 0..64_u8 {
+            let wallet=Pubkey::new_from_array([seed;32]);
+            let mint=Pubkey::new_from_array([seed.wrapping_add(100);32]);
+            let prog=if seed%2==0{key(TOKEN)}else{key(TOKEN_2022)};
+            let original=Pubkey::find_program_address(
+                &[wallet.as_ref(),prog.as_ref(),mint.as_ref()],&key(ASSOCIATED)).0;
+            assert_eq!(ata(wallet,mint,prog),original);
+            assert_eq!(ata(wallet,mint,prog),original);
+        }
+    }
+
+    #[test]
+    #[ignore = "local CPU microbenchmark only; time is not a correctness assertion"]
+    fn compilation_benchmark() {
+        let request=request(8,12,key(SOL),true);
+        let repetitions=20_000;
+        let started=Instant::now();
+        for _ in 0..repetitions {
+            let mut ix=instruction(&request,request.wallet).unwrap();
+            let _=legacy_message(&mut ix,&request,"11111111111111111111111111111111");
+        }
+        let legacy=started.elapsed();
+        let started=Instant::now();
+        for _ in 0..repetitions {
+            let mut ix=instruction(&request,request.wallet).unwrap();
+            let _=message(&mut ix,&request,"11111111111111111111111111111111");
+        }
+        let optimized=started.elapsed();
+        println!("CP10 legacy={legacy:?} optimized={optimized:?} repetitions={repetitions}");
+    }
+}
