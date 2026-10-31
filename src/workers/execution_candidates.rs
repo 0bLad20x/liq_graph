@@ -180,6 +180,21 @@ impl Selection {
                 "observation_slot":p.map(|p|p.observation.slot),
                 "component_slot_min":p.map(|p|p.observation.component_slot_min),
                 "component_slot_max":p.map(|p|p.observation.component_slot_max),
+                // Same-slot does not mean an identical processed bank or a
+                // simultaneously sampled multi-account observation.
+                "same_slot_proven_same_bank":false,
+                "observation_consistency":p.map(|p|p.observation.consistency),
+                "component_received_at_us_min":p.map(|p|p.observation.component_received_at_us_min),
+                "component_received_at_us_max":p.map(|p|p.observation.component_received_at_us_max),
+                "snapshot_content_digest":p.and_then(|p|p.observation.liquidity.as_ref().map(|l|l.content_digest)),
+                "snapshot_account_set_digest":p.and_then(|p|p.observation.liquidity.as_ref().map(|l|l.account_set_digest)),
+                "snapshot_reserve_curve":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|l.reserve_curve.as_ref())),
+                "snapshot_direction":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|
+                    l.directions.iter().find(|d|complete&&d.input_mint==call.inputs[0].mint&&d.output_mint==call.outputs[0].mint)))
+                    .map(|d|json!({"status":d.status,"coverage":d.coverage,
+                        "input_capacity_raw":d.input_capacity_raw,"output_capacity_raw":d.output_capacity_raw,
+                        "first_source_position":d.first_source_position,"marginal_net_rate":d.marginal_net_rate,
+                        "first_level":d.levels.first()})),
                 "slots_to_simulation":p.and_then(|p|report.context_slot.and_then(|s|s.checked_sub(p.observation.slot))),
                 "observation_age_at_request_us":p.and_then(|p|self.request_ready_at_us.checked_sub(p.observation.received_at_us))}));
         }
@@ -211,6 +226,12 @@ impl Selection {
             else if relation(&original)=="same_path"{model}else{quote_path(&original)};
         let probe=self.amount_assessment.estimate.as_ref();
         json!({"schema_version":1,"scope":"frozen_dex_model_vs_later_simulation",
+            "cp9c_audit_schema":1,
+            "packing_strategy":self.packing_strategy,"packing_revision_variant":self.packing_revision_variant,
+            "simulation_provider":report.provider,
+            "simulation_context_slot":report.context_slot,
+            "state_comparability":"slot_is_not_bank_identity",
+            "request_ready_at_us":self.request_ready_at_us,
             "marginal_signal_bps":witness.and_then(|w|{
                 let bps=(-(w.log_sum_units as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;bps.is_finite().then_some(bps)}),
             "packing_marginal_bps":self.estimated_net_return_bps,
