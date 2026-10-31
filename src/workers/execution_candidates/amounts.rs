@@ -22,10 +22,15 @@ static QUOTE_CALLS:AtomicU64=AtomicU64::new(0);
 static QUOTE_NS:AtomicU64=AtomicU64::new(0);
 static RATIONAL_FAST:AtomicU64=AtomicU64::new(0);
 static RATIONAL_FALLBACK:AtomicU64=AtomicU64::new(0);
+static BOUNDS_NS:AtomicU64=AtomicU64::new(0);
+static DOMAINS_NS:AtomicU64=AtomicU64::new(0);
+static PROBE_BUILD_NS:AtomicU64=AtomicU64::new(0);
+static PROBE_VALUES:AtomicU64=AtomicU64::new(0);
 #[derive(Default,serde::Serialize)]
 pub(super) struct PhaseProfile {
     assess_calls:u64,assess_ns:u64,minimum_calls:u64,minimum_ns:u64,
     quote_calls:u64,quote_ns:u64,rational_fast:u64,rational_fallback:u64,
+    bounds_ns:u64,domains_ns:u64,probe_build_ns:u64,probe_values:u64,
 }
 pub(super) fn phase_profile()->PhaseProfile {
     PhaseProfile{assess_calls:ASSESS_CALLS.load(Ordering::Relaxed),
@@ -35,7 +40,11 @@ pub(super) fn phase_profile()->PhaseProfile {
         quote_calls:QUOTE_CALLS.load(Ordering::Relaxed),
         quote_ns:QUOTE_NS.load(Ordering::Relaxed),
         rational_fast:RATIONAL_FAST.load(Ordering::Relaxed),
-        rational_fallback:RATIONAL_FALLBACK.load(Ordering::Relaxed)}
+        rational_fallback:RATIONAL_FALLBACK.load(Ordering::Relaxed),
+        bounds_ns:BOUNDS_NS.load(Ordering::Relaxed),
+        domains_ns:DOMAINS_NS.load(Ordering::Relaxed),
+        probe_build_ns:PROBE_BUILD_NS.load(Ordering::Relaxed),
+        probe_values:PROBE_VALUES.load(Ordering::Relaxed)}
 }
 struct AssessClock(Option<Instant>);
 impl AssessClock {
@@ -342,7 +351,10 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
     let started=Instant::now();let mut result=Assessment::unknown("no_closed_cycle");result.pool_count=inputs.len();
     // Scratch bounds for this frozen assessment only. A shared pair may occur
     // in several mint cycles; do not rescan all of its levels for each cycle.
+    let bound_started=Instant::now();
     let bounds=inputs.iter().map(|i|[upper_rate(i,0),upper_rate(i,1)]).collect::<Vec<_>>();
+    if *PROFILE_ON{BOUNDS_NS.fetch_add(ns(bound_started),Ordering::Relaxed);}
+    let domains_started=Instant::now();
     let mut domains=Domains::new();
     for (i,input) in inputs.iter().enumerate(){let o=&input.observation;
         for (direction,a,b) in [(0,&o.base_mint,&o.quote_mint),(1,&o.quote_mint,&o.base_mint)] {
@@ -350,6 +362,7 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
         }
     }
     let mut paths=Vec::new();cycles(settlement,settlement,&domains,&mut vec![settlement.into()],&mut paths);
+    if *PROFILE_ON{DOMAINS_NS.fetch_add(ns(domains_started),Ordering::Relaxed);}
     let mut any_unknown=false;
     for mints in paths {
         // The typed V10 request supplies only one conversion pool. Two different
@@ -373,6 +386,7 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
             Err(Issue::Insufficient(reason))=>result.cycles.push(Cycle{mints,status:"excluded",reason,minimum_input_lower_bound_raw:None}),
             Err(Issue::Unknown(reason))=>{any_unknown=true;result.cycles.push(Cycle{mints,status:"unknown",reason,minimum_input_lower_bound_raw:None});},
             Ok((minimum,path))=>{
+                let probe_started=Instant::now();
                 // Identical probe domain and ascending order as BTreeSet,
                 // but only one allocation, one sort and one dedup.
                 let mut probes=Vec::with_capacity(72);
@@ -393,6 +407,10 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
                 }}
                 probes.sort_unstable();
                 probes.dedup();
+                if *PROFILE_ON {
+                    PROBE_BUILD_NS.fetch_add(ns(probe_started),Ordering::Relaxed);
+                    PROBE_VALUES.fetch_add(probes.len() as u64,Ordering::Relaxed);
+                }
                 let mut found=None;
                 for q in probes {if q==0{continue;}result.probes+=1;
                     if let Some(e)=estimate(&path,inputs,q,minimum_profit){found=Some(e);break;}
