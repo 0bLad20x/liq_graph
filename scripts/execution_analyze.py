@@ -70,6 +70,12 @@ def analyze(rows):
     strategy_positive_slots = collections.defaultdict(set)
     strategy_positive_path_slots = collections.defaultdict(set)
     same_revision_pools = collections.defaultdict(dict)
+    cp9d_source_counts=collections.defaultdict(collections.Counter)
+    cp9d_pairs=collections.defaultdict(set)
+    cp9d_positive=collections.defaultdict(set)
+    cp9d_packages=collections.defaultdict(set)
+    cp9d_pair_revisions=collections.defaultdict(set)
+    cp9d_thresholds=collections.defaultdict(collections.Counter)
     quote_outliers = []
 
     def bad(kind, identity):
@@ -89,8 +95,15 @@ def analyze(rows):
         routes[route] += 1
         strategy = s.get('packing_strategy', 'baseline')
         strategy_counts[strategy]['requests'] += 1
-        generation_revision = (s.get('graph_generation'), s.get('revision'))
+        pair=tuple(sorted([q['settlement'],q['groups'][0]['target']]))
+        source=s.get('cp9d_source','fresh')
+        generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
+        cp9d_source_counts[source]['requests']+=1
+        cp9d_pairs[source].add(pair)
+        cp9d_pair_revisions[source].add(generation_revision[:2]+(pair,))
+        pool_ids=sorted({p['pool'] for p in s['pools']})
+        cp9d_packages[strategy].update((a,b) for a in pool_ids for b in pool_ids if a!=b)
         digest = row.get('payload_sha256')
         if not digest:
             payload = {k: v for k, v in q.items() if k != 'id'}
@@ -235,6 +248,7 @@ def analyze(rows):
         successes += 1
         successful_routes[route] += 1
         strategy_counts[strategy]['rpc_successes'] += 1
+        cp9d_source_counts[source]['rpc_successes']+=1
         def token_amount(entries):
             return sum(int(b['uiTokenAmount']['amount']) for b in entries
                        if b.get('owner') == q['wallet'] and b['mint'] == q['settlement'])
@@ -252,12 +266,20 @@ def analyze(rows):
             above_fee[asset] += fee is not None and gain > fee
             positive_cashflow[asset] += native_delta is not None and gain + native_delta > 0
             if c and c.get('single_cycle') and fee is not None and gain > fee:
+                cp9d_source_counts[source]['above_network_fee']+=1
+                cp9d_positive[source].add((r.get('context_slot'),pair,tuple(
+                    leg.get('pool') for leg in c.get('legs',()))))
                 strategy_counts[strategy]['above_network_fee'] += 1
                 strategy_positive_slots[strategy].add(r.get('context_slot'))
                 pool_path=tuple((leg.get('pool') or 'unknown') for leg in c.get('legs', ()))
                 strategy_positive_path_slots[strategy].add((r.get('context_slot'),q['settlement'],pool_path))
             if c and c.get('single_cycle') and native_delta is not None and gain + native_delta > 0:
                 strategy_counts[strategy]['positive_native_plus_settlement_cashflow'] += 1
+                cp9d_source_counts[source]['positive_cashflow']+=1
+            if c and c.get('single_cycle') and fee is not None:
+                for minimum in (0,5000,10000,25000):
+                    if gain > minimum:
+                        cp9d_thresholds[strategy][str(minimum)]+=1
         case = {'id': identity, 'route_kind': route, 'context_slot': r['context_slot'],
                 'settlement': asset, 'settlement_gain_raw': gain, 'network_fee_lamports': fee,
                 'after_network_lamports': gain - fee if asset == WSOL and fee is not None else None,
@@ -289,7 +311,19 @@ def analyze(rows):
             name: durations(values) for name, values in sorted(cross_strategy_pools.items())},
         'largest_quote_discrepancies': quote_outliers
     }
+    cp9d={
+        'source_classes':{source:{**dict(counter),
+            'different_token_pairs':len(cp9d_pairs[source]),
+            'different_pair_revision_combinations':len(cp9d_pair_revisions[source]),
+            'different_positive_path_slots':len(cp9d_positive[source])}
+            for source,counter in sorted(cp9d_source_counts.items())},
+        'offered_oriented_pool_pairs_by_strategy':{k:len(v) for k,v in sorted(cp9d_packages.items())},
+        'hypothetical_wsol_settlement_greater_than_lamports':{
+            s:dict(v) for s,v in sorted(cp9d_thresholds.items())},
+        'note':'Observed settlement thresholds are post-simulation diagnostics; minimum_profit was not changed. Offered pool pairings are not guaranteed executable.'
+    }
     return {'schema_version': 2,
+            'cp9d_signal_breadth_and_coverage':cp9d,
             'cp9c_strategy_comparison': cp9c, 'request_count': count, 'report_count': reports,
             'simulation_successes': successes, 'simulation_failures': sum(errors.values()),
             'dex_call_reports': dex_calls, 'errors': dict(errors), 'routes': dict(routes),
