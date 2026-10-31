@@ -5,6 +5,10 @@ mod amounts;
 mod amounts_reference;
 #[cfg(test)]
 mod amounts_cp11_tests;
+#[cfg(test)]
+mod amounts_cp12_reference;
+#[cfg(test)]
+mod amounts_cp12_tests;
 mod diversity;
 use diversity::{Strategy as PackingStrategy,Alternative};
 use std::{collections::{BTreeMap,HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
