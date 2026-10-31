@@ -95,7 +95,20 @@ def analyze(rows):
         routes[route] += 1
         strategy = s.get('packing_strategy', 'baseline')
         strategy_counts[strategy]['requests'] += 1
-        pair=tuple(sorted([q['settlement'],q['groups'][0]['target']]))
+        # The live evidence deliberately stores a compact request (no groups).
+        # Recover the Direct2 physical mint pair from the immutable source
+        # witness, which is present for every qualifying selection.
+        witness_legs=((s.get('candidate') or {}).get('witness') or {}).get('legs') or []
+        if route == 'direct2':
+            if (len(witness_legs) != 2 or
+                    witness_legs[0].get('input_mint') != q['settlement'] or
+                    witness_legs[1].get('output_mint') != q['settlement'] or
+                    witness_legs[0].get('output_mint') != witness_legs[1].get('input_mint')):
+                raise ValueError(f'Invalid compact Direct2 witness for request {identity}')
+            pair=tuple(sorted((q['settlement'],witness_legs[0]['output_mint'])))
+        else:
+            # Legacy Direct3/triangles do not have a CP9D Direct2 pair.
+            pair=(q['settlement'],f'non_direct2:{route}')
         source=s.get('cp9d_source','fresh')
         generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
