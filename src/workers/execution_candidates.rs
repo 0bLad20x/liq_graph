@@ -137,6 +137,7 @@ pub struct Report {
     pub cp9d_fresh_pairs:u64,pub cp9d_active_pairs:u64,pub cp9d_active_candidates_examined:u64,
     pub cp9d_distinct_pairs_dispatched:u64,
     pub cp9d_queue_full_by_strategy:BTreeMap<String,u64>,
+    pub cp9e_direct3_reserved_from_fresh:u64,pub cp9e_direct3_reserved_from_active:u64,
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
     catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
@@ -826,6 +827,50 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 sources.push((candidate.clone(),e.trigger.clone(),state.threshold,"active",pair));
                                 if sources.len()>=cfg.cp9d_max_pairs{break;}
                             }
+                        }
+                    }
+                    // Preserve a comparable Direct3 arm when current positive
+                    // signals exist, even if many Direct2 entries rank ahead.
+                    // Otherwise a 3-source limit could silently starve Direct3.
+                    if cfg.direct2_direct3 && cfg.cp9d_max_pairs>=2
+                        && !sources.iter().any(|s|s.4.0==SignalRouteKind::Direct3) {
+                        let mut reserved=None;
+                        for (_,event,index) in &ranked {
+                            let SignalEvent::Candidates(batch)=event.as_ref() else{continue};
+                            let c=&batch.candidates[*index];
+                            let Some(top)=state.plan.as_ref().and_then(|p|
+                                p.compact_topologies.get(c.topology_id))else{continue};
+                            if top.kind!=SignalRouteKind::Direct3{continue;}
+                            let key=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
+                            if pairs.contains(&key){continue;}
+                            reserved=Some((c.clone(),batch.trigger.clone(),
+                                batch.threshold_units,"fresh",key));
+                            break;
+                        }
+                        if reserved.is_none(){
+                            for (_,c) in state.active_witnesses.iter().take(512){
+                                report.cp9d_active_candidates_examined+=1;
+                                let Some(top)=state.plan.as_ref().and_then(|p|
+                                    p.compact_topologies.get(c.topology_id))else{continue};
+                                if top.kind!=SignalRouteKind::Direct3{continue;}
+                                let key=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
+                                if pairs.contains(&key){continue;}
+                                let Some(w)=c.witness.as_ref()else{continue};
+                                if w.log_sum_units>=state.threshold
+                                    ||state.witness(c.topology_id,c.reverse,w).is_err(){continue;}
+                                reserved=Some((c.clone(),e.trigger.clone(),
+                                    state.threshold,"active",key));
+                                break;
+                            }
+                        }
+                        if let Some(source)=reserved{
+                            if sources.len()>=cfg.cp9d_max_pairs{
+                                if let Some(evicted)=sources.pop(){pairs.remove(&evicted.4);}
+                            }
+                            pairs.insert(source.4);
+                            if source.3=="fresh"{report.cp9e_direct3_reserved_from_fresh+=1;}
+                            else{report.cp9e_direct3_reserved_from_active+=1;}
+                            sources.push(source);
                         }
                     }
                     let mut previous=HashMap::<RoutePair,Vec<Vec<usize>>>::new();
