@@ -36,8 +36,7 @@ const CACHE_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutePolicy {
     ProxyOnly,
-    // Public route-policy option; no direct-request consumer is wired yet.
-    #[allow(dead_code)]
+    // Direct HTTPS route with the same shared destination-host pacing.
     DirectOnly,
 }
 
