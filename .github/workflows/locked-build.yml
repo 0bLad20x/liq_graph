@@ -35,6 +35,8 @@ jobs:
         run: cargo test --locked --release execution_candidates
       - name: CP11 exact evaluator regression suite
         run: cargo test --locked --release cp11_
+      - name: CP11 frozen-reference CPU microbenchmark (informational)
+        run: cargo test --locked --release cp11_frozen_amount_benchmark -- --ignored --nocapture
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
       - name: Live utility PowerShell syntax only
