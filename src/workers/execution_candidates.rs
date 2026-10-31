@@ -721,47 +721,83 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         if e.price_pipeline.is_some_and(|t|t.initialization_replay) {report.initialization_revisions+=1;}
                     }
                     if ranked.is_empty() {continue;}
-                    // Never await simulation capacity or propagate backpressure to calculation.
-                    let permit=match output.try_reserve() {
-                        Ok(permit)=>permit,
-                        Err(mpsc::error::TrySendError::Full(_))=>{report.skipped_busy_revisions+=1;continue;},
-                        Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
-                    };
                     let started=Instant::now();
                     let mut reads=RegistryReads::default();
                     ranked.sort_unstable_by_key(|entry|entry.0);
-                    let mut chosen=None;
+                    let mut sent_pools=HashSet::<Vec<String>>::new();
                     let mut invalid_seed=false;
-                    for (_,event,index) in &ranked {
-                        let selected=match event.as_ref(){
-                            SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
-                                block.threshold_units,block.trigger.clone(),&registry,&cfg,
-                                report.requests.len()+1,&mut reads,None),
-                            _=>bail!("ranked event is not a compact candidate"),
-                        };
-                        match selected {
-                            Ok(selection)=>{
-                                if let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,&mut report.amounts)? {
-                                    selection.selection_ns=elapsed_ns(started);selection.registry_reads=reads.clone();
-                                    selection.request_ready_at_us=now_us();
-                                    selection.frame_to_request_us=selection.price_pipeline.and_then(|t|selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
-                                    selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
-                                    chosen=Some(selection);break;
-                                }
+                    let mut busy_revision=false;
+                    // Rotate strategy order across signal revisions. This prevents
+                    // the reference strategy from always taking a scarce free slot.
+                    let rotation=(state.revision as usize)%cfg.strategies.len();
+                    for step in 0..cfg.strategies.len(){
+                        if cfg.limit>0 && report.requests.len()>=cfg.limit{break;}
+                        let variant=(rotation+step)%cfg.strategies.len();
+                        let strategy=cfg.strategies[variant];
+                        report.cp9c_pack_attempts+=1;
+                        // Never await simulation capacity or backpressure calculation.
+                        let permit=match output.try_reserve() {
+                            Ok(permit)=>permit,
+                            Err(mpsc::error::TrySendError::Full(_))=>{
+                                report.cp9c_queue_full_packs+=1;busy_revision=true;break;
                             },
-                            Err(error)=>{invalid_seed=true;report.skipped_invalid_seed+=1;report.last_rejection=Some(format!("{error:#}"));},
+                            Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
+                        };
+                        let mut chosen=None;
+                        for (_,event,index) in &ranked {
+                            let selected=match event.as_ref(){
+                                SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
+                                    block.threshold_units,block.trigger.clone(),&registry,&cfg,
+                                    report.requests.len()+1,&mut reads,strategy,None),
+                                _=>bail!("ranked event is not a compact candidate"),
+                            };
+                            match selected {
+                                Ok(selection)=>{
+                                    // Same-revision identical pool sets do not test a
+                                    // distinct strategy and waste simulation capacity.
+                                    let mut pool_set=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
+                                    pool_set.sort_unstable();
+                                    if sent_pools.contains(&pool_set){
+                                        report.cp9c_duplicate_packs+=1;
+                                        break;
+                                    }
+                                    if let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,&mut report.amounts)? {
+                                        selection.packing_revision_variant=variant as u8;
+                                        selection.selection_ns=elapsed_ns(started);
+                                        selection.registry_reads=reads.clone();
+                                        selection.request_ready_at_us=now_us();
+                                        selection.frame_to_request_us=selection.price_pipeline.and_then(|t|
+                                            selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
+                                        selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
+                                        // Recompute after amount-seed repair; keep every
+                                        // dispatched request accounted for by the quantity report.
+                                        let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
+                                        actual.sort_unstable();
+                                        sent_pools.insert(actual);
+                                        chosen=Some(selection);break;
+                                    }
+                                },
+                                Err(error)=>{
+                                    invalid_seed=true;report.skipped_invalid_seed+=1;
+                                    report.last_rejection=Some(format!("{error:#}"));
+                                },
+                            }
+                        }
+                        if let Some(selection)=chosen {
+                            crate::log_event!(Debug,"execution candidates request_id={} strategy={} generation={} revision={} kind={:?} pools={} accounts={} selection_ns={} frame_to_request_us={:?} broadcasts=false",
+                                selection.request.id,selection.packing_strategy,state.generation,state.revision,
+                                selection.route_kind,selection.packing.pool_declarations,
+                                selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us);
+                            *report.cp9c_by_strategy.entry(strategy.label().into()).or_default()+=1;
+                            report.cp9c_packs_dispatched+=1;
+                            permit.send(selection.request.clone());report.requests.push(selection);
                         }
                     }
+                    if busy_revision {report.skipped_busy_revisions+=1;}
                     ranked.clear();
                     report.registry_reads.merge(&reads);
-                    if let Some(selection)=chosen {
-                        crate::log_event!(Debug,"execution candidates request_id={} generation={} revision={} kind={:?} reverse={} pools={} accounts={} selection_ns={} frame_to_request_us={:?} registry_reads={} registry_wait_ns={} registry_hold_ns={} broadcasts=false",
-                            selection.request.id,state.generation,state.revision,selection.route_kind,selection.reverse,
-                            selection.packing.pool_declarations,selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us,
-                            selection.registry_reads.calls,selection.registry_reads.wait_ns,selection.registry_reads.hold_ns);
-                        permit.send(selection.request.clone());report.requests.push(selection);
-                    } else if invalid_seed {
-                        crate::log_event!(Warn,"execution candidates no_packable_seed=true generation={} revision={} last_rejection={:?}",
+                    if invalid_seed {
+                        crate::log_event!(Debug,"execution candidates rejected_seed=true generation={} revision={} last_rejection={:?}",
                             state.generation,state.revision,report.last_rejection);
                     }
                 },
