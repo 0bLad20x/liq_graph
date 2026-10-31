@@ -43,7 +43,9 @@ param(
     # Concurrent in-flight simulateTransaction jobs (1 restores serial baseline).
     [ValidateRange(1,64)][int]$V10Parallelism = 4,
     # CP9C: compare same-revision Direct2 V10 payload strategies.
-    [ValidateSet('Baseline','Contrarian','Mixed','All')][string]$CP9CPackingMode = 'Baseline',
+    [ValidateSet('Baseline','Contrarian','Mixed','All','Coverage','AllCoverage')][string]$CP9CPackingMode = 'Baseline',
+    # CP9D: one fresh source plus rotating active, still-positive distinct pairs.
+    [ValidateRange(1,8)][int]$CP9DMaxPairs = 1,
     [string]$ExecutionParametersPath
 )
 $ErrorActionPreference = 'Stop'
@@ -61,9 +63,9 @@ if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidenc
 if ($RequireCalibrationEvidence -and -not $SimulateV10) { throw 'Calibration evidence requires SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
 if ($Direct2Only -and $RouteKind -notin @('All','Direct2')) { throw 'Direct2Only requires RouteKind All or Direct2.' }
-if ($CP9CPackingMode -ne 'Baseline' -and
+if (($CP9CPackingMode -ne 'Baseline' -or $CP9DMaxPairs -gt 1) -and
     (-not $Direct2Only -or $RouteKind -ne 'Direct2' -or -not $SimulateV10 -or -not $signals)) {
-    throw 'CP9C alternative mode requires -Direct2Only -RouteKind Direct2 -SimulateV10 -Stage Signals.'
+    throw 'CP9C/CP9D experiment requires -Direct2Only -RouteKind Direct2 -SimulateV10 -Stage Signals.'
 }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ([double]::IsNaN($MinDirectionNotionalUsd) -or [double]::IsInfinity($MinDirectionNotionalUsd)) { throw 'MinDirectionNotionalUsd must be finite.' }
@@ -160,7 +162,9 @@ try {
         GRAPH_RUNTIME_SIGNAL_REPORT_PATH = $consumerPath
         GRAPH_EXECUTION_SIMULATE = "$([bool]$SimulateV10)".ToLowerInvariant()
         GRAPH_V10_SIMULATION_PARALLELISM = "$V10Parallelism"
-        GRAPH_CP9C_PACKING_MODE = $CP9CPackingMode.ToLowerInvariant()
+        GRAPH_CP9C_PACKING_MODE = $(if ($CP9CPackingMode -eq 'AllCoverage') { 'all_coverage' }
+            else { $CP9CPackingMode.ToLowerInvariant() })
+        GRAPH_CP9D_MAX_DISTINCT_PAIRS = "$CP9DMaxPairs"
         GRAPH_EXECUTION_WALLET_PATH = $WalletPath
         GRAPH_EXECUTION_MAX_REQUESTS = "$SimulationLimit"
         GRAPH_EXECUTION_ROUTE_KIND = $RouteKind
@@ -219,6 +223,7 @@ try {
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
         graph_direct2_only=[bool]$Direct2Only; v10_simulation_parallelism=$V10Parallelism
         cp9c_packing_mode=$CP9CPackingMode.ToLowerInvariant()
+        cp9d_max_distinct_pairs=$CP9DMaxPairs
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
         completion_recheck_seconds=$CompletionRecheckSeconds
@@ -228,7 +233,7 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
-    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 direct2_only=$([bool]$Direct2Only) cp9c_packing=$CP9CPackingMode" }
+    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 direct2_only=$([bool]$Direct2Only) packing=$CP9CPackingMode cp9d_max_pairs=$CP9DMaxPairs" }
     Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
