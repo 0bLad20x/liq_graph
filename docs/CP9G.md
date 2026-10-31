@@ -57,8 +57,15 @@ Do not interpret CPU latency improvement unless **Meteora DLMM TVL
 admission is nonzero**. The previous CP9F five-minute sample had
 \`meteora_dlmm prepared/admitted=0\` because the DexScreener enrichment
 worker repeatedly reported \`no verified DexScreener HTTP proxies\`.
-Do not bypass the TVL>=500 gate to make this test look faster. Check the
-DexScreener source and availability before judging DLMM hotpath.
+Do not bypass the TVL>=500 gate to make this test look faster. The
+new explicit `DEXSCREENER_TRANSPORT_MODE=direct` uses the already-existing
+HTTP transport DirectOnly request policy with a shared 4 RPS (240/minute)
+destination host budget, below DexScreener's published 300 requests/minute
+limit for `/token-pairs/v1`. It avoids the public-proxy availability
+dependency while retaining all TVL identity/qualification checks. It makes
+no guarantee that the upstream provider will succeed in a particular
+15-minute run. Use the scripted environment override below and restore
+the previous mode in `finally`.
 
 Use prior CP9F settings, changing just the branch and duration to 900:
 
@@ -75,8 +82,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed' }
 python -m unittest discover -s scripts/tests -p 'test_*.py'
 if ($LASTEXITCODE -ne 0) { throw 'Python tests failed' }
 $previousCommitment=$env:RPC_COMMITMENT
+$previousDexMode=$env:DEXSCREENER_TRANSPORT_MODE
 try {
     $env:RPC_COMMITMENT='confirmed'
+    $env:DEXSCREENER_TRANSPORT_MODE='direct'
     .\scripts\runtime_live.ps1 \`
         -ExpectedBranch cp9g-streaming-evidence \`
         -EnabledVenues 'meteora_dlmm,pumpswap' \`
@@ -92,6 +101,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'CP9G live test failed' }
 } finally {
     $env:RPC_COMMITMENT=$previousCommitment
+    $env:DEXSCREENER_TRANSPORT_MODE=$previousDexMode
 }
 \`\`\`
 
