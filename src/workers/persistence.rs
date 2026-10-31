@@ -5,7 +5,7 @@ use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use anyhow::{Context, Result, ensure, bail};
 use serde_json::{Value, json};
 use solana_pubkey::Pubkey;
-use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
+use tokio::{sync::{broadcast,mpsc}, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
@@ -635,7 +635,7 @@ impl Persistence {
         self.run_with_mints(rx,None,None).await
     }
     pub async fn run_with_mints(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-        mut mint_rx:Option<broadcast::Receiver<Arc<DataBatch>>>,
+        mut mint_rx:Option<mpsc::Receiver<Arc<DataBatch>>>,
         mut onchain_rx:Option<broadcast::Receiver<Arc<crate::core::MintOnchainBatch>>>) -> Result<()> {
         use std::collections::HashSet;
         let mut pending_identity=HashMap::with_capacity(BATCH_SIZE);
@@ -662,10 +662,8 @@ impl Persistence {
                     Err(broadcast::error::RecvError::Closed)=>{onchain_rx=None;},
                 },
                 event=async {mint_rx.as_mut().expect("mint channel").recv().await},if mint_open=>match event {
-                    Ok(batch)=>{self.save_mint_batch(&batch).await?;},
-                    Err(broadcast::error::RecvError::Lagged(n))=>
-                        bail!("mint persistence lost {n} Jupiter batches"),
-                    Err(broadcast::error::RecvError::Closed)=>{mint_rx=None;},
+                    Some(batch)=>{self.save_mint_batch(&batch).await?;},
+                    None=>{mint_rx=None;},
                 },
                 event=rx.recv(),if pool_open=>match event {
                     Ok(batch)=>{
