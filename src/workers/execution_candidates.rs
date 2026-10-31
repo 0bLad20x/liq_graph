@@ -824,16 +824,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     // The first round tests each token pair before allowing any
                     // pair to consume more queue slots with its second strategy.
                     // Coverage always runs after comparison packages.
-                    let base_len=cfg.strategies.iter()
-                        .filter(|&&s|s!=PackingStrategy::Coverage).count();
-                    let rotation=if base_len>0{(state.revision as usize)%base_len}else{0};
-                    let mut ordered=Vec::new();
-                    for step in 0..base_len {
-                        ordered.push(cfg.strategies[(rotation+step)%base_len]);
-                    }
-                    if cfg.strategies.contains(&PackingStrategy::Coverage){
-                        ordered.push(PackingStrategy::Coverage);
-                    }
+                    let ordered=diversity::strategy_schedule(&cfg.strategies,state.revision);
                     'packages: for (variant,strategy) in ordered.into_iter().enumerate(){
                         for (pair_index,(candidate,trigger,threshold,origin,pair)) in sources.iter().enumerate(){
                             if cfg.limit>0 && report.requests.len()>=cfg.limit{break 'packages;}
