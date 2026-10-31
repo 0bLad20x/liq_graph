@@ -60,13 +60,17 @@ impl Book {
         Ok(Self{pool,dependencies,raw_pair:Arc::from(raw),arrays:std::array::from_fn(|_|None),
             extension:None,profile:None})
     }
-    pub fn pair(&mut self,raw:&[u8])->Result<()> {
+    /// No state mutation is needed when the full account payload equals the
+    /// last validated payload. Slot metadata is owned by MarketState, not Book.
+    pub fn pair(&mut self,raw:&[u8])->Result<bool> {
+        if self.raw_pair.as_ref()==raw{return Ok(false);}
         ensure!(raw.len()==904 && raw.starts_with(&DLMM_DISC),"invalid depth LbPair update");
-        self.raw_pair=Arc::from(raw);Ok(())
+        self.raw_pair=Arc::from(raw);Ok(true)
     }
-    pub fn array(&mut self,position:u8,address:Pubkey,raw:&[u8])->Result<()> {
+    pub fn array(&mut self,position:u8,address:Pubkey,raw:&[u8])->Result<bool> {
         let position=usize::from(position);
         ensure!(self.dependencies.addresses().get(position)==Some(&address),"unexpected DLMM array address");
+        if self.arrays[position].as_ref().is_some_and(|array|array.raw.as_ref()==raw){return Ok(false);}
         ensure!(raw.len()==56+70*144 && raw.starts_with(&ARRAY_DISC),"invalid DLMM BinArray layout");
         ensure!(key(raw,24)?==self.pool.to_string(),"DLMM BinArray parent changed");
         let index=i64::from_le_bytes(bytes(raw,8,8)?.try_into()?);
@@ -85,12 +89,13 @@ impl Book {
             ensure!(price>0 || (x==0&&y==0&&processed==0&&open==0),"DLMM nonempty bin has zero price");
             bins.push(Bin{id:index*70+i as i32,x,y,price,processed,open,ask:raw[p+140]!=0});
         }
-        self.arrays[position]=Some(Arc::new(Array{index,version,bins,raw:Arc::from(raw)}));Ok(())
+        self.arrays[position]=Some(Arc::new(Array{index,version,bins,raw:Arc::from(raw)}));Ok(true)
     }
-    pub fn bitmap(&mut self,raw:&[u8])->Result<()> {
+    pub fn bitmap(&mut self,raw:&[u8])->Result<bool> {
+        if self.extension.as_ref().is_some_and(|value|value.as_ref()==raw){return Ok(false);}
         ensure!(raw.len()==1576 && raw.starts_with(&BITMAP_DISC) && key(raw,8)?==self.pool.to_string(),
             "invalid DLMM bitmap extension");
-        self.extension=Some(Arc::from(raw));Ok(())
+        self.extension=Some(Arc::from(raw));Ok(true)
     }
     fn initialized(&self)->Result<Vec<i32>> {
         let mut out=Vec::new();
