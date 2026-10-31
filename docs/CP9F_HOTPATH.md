@@ -10,6 +10,8 @@ Parent: `cp9e-jupiter-reliable-direct3`. Draft experimental branch, **no broadca
 - `market_state.metrics.queue`: 10.281 s mean and 98.8 s max, receiver buffer peak 4096; 137 Account inputs lost through broadcast lag. `SignalEvent` delivery loss remained zero.
 - DLMM-specific triggers were 42,368 `dlmm_bin_array`, 9,216 `dlmm_bitmap`, 15,520 `dlmm_lbpair`, plus clock revaluation. Profile changes 24,950 vs 69,481 complete profile builds – unchanged resulting profiles are common, but **unchanged output does not prove unchanged input**.
 - Market selection `all_fit` (~1943 pools, ~8664 accounts of WS capacity 11500). Provider disconnects and failed reconnect handshakes near end are a separate stability concern, not necessarily caused by one internal CPU defect.
+- PumpSwap's common global-fee account resulted in 329,795 field-attributed observations, and 394,613 published fee valuations had unchanged net rates. A high shared-account fanout can generate repeated publication without newly actionable economic state; this is a **next profiling target**, not yet changed in CP9F. Clock updates and profile work must be separated by origin in a measured run.
+- The one-hour test's 44 WS gaps (including provider HTTP 429s) remain independent failure modes. No amount of quote-computation optimization guarantees recovery from external rate limits.
 
 ## Isolated code change
 
