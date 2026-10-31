@@ -722,11 +722,7 @@ impl State {
             pools.push(pool);
             let inserted_at=if top.kind==SignalRouteKind::Direct2 {
                 let new_pool=&pools.last().expect("candidate just appended").0;
-                let Some(ExecutionGroup::Direct{pools:group_pools,..})=request.groups.first_mut()
-                    else{bail!("Direct2 request missing direct group")};
-                let index=if role_name=="direct"{direct_before}else{group_pools.len()};
-                group_pools.insert(index,new_pool.clone());
-                Some(index)
+                Some(insert_direct2_pool(&mut request,new_pool,role_name,direct_before)?)
             }else{
                 install_compact(&mut request,top,&pools);
                 None
@@ -747,9 +743,7 @@ impl State {
                 Err(error)=>{
                     pools.pop();
                     if let Some(index)=inserted_at {
-                        let Some(ExecutionGroup::Direct{pools:group_pools,..})=request.groups.first_mut()
-                            else{bail!("Direct2 request missing direct group after rejection")};
-                        group_pools.remove(index);
+                        remove_direct2_pool(&mut request,index)?;
                     }
                     rejected+=1;last_rejection=Some(format!("{error:#}"));
                 },
@@ -782,6 +776,26 @@ impl State {
 
 }
 
+
+// CP10: exact in-place analogue of install_compact for one Direct2 alternative.
+// The insertion index is returned so a rejected trial can undo only its delta.
+fn insert_direct2_pool(request:&mut ExecutionRequest,next:&ExecutionPool,
+    role:&str,direct_before:usize)->Result<usize> {
+    ensure!(role=="direct"||role=="partner","invalid Direct2 alternative role");
+    let [ExecutionGroup::Direct{pools,..}]=request.groups.as_mut_slice()
+        else{bail!("Direct2 request requires one direct group")};
+    let at=if role=="direct"{direct_before}else{pools.len()};
+    ensure!(at<=pools.len(),"Direct2 insert position outside group");
+    pools.insert(at,next.clone());
+    Ok(at)
+}
+fn remove_direct2_pool(request:&mut ExecutionRequest,index:usize)->Result<()> {
+    let [ExecutionGroup::Direct{pools,..}]=request.groups.as_mut_slice()
+        else{bail!("Direct2 request requires one direct group")};
+    ensure!(index<pools.len(),"Direct2 removal position outside group");
+    pools.remove(index);
+    Ok(())
+}
 
 fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
     pools:&[(ExecutionPool,PoolEvidence)]){
@@ -1062,4 +1076,86 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
     report.cp10_capacity_phases=crate::workers::execution_v10::capacity_phase_profile();
     crate::log_event!(Info,"execution candidates complete=true requests={} lost={} error={:?}",report.request_count as usize,report.lost_events,report.error);
     Ok(report)
+}
+
+#[cfg(test)]
+mod cp10_packing_tests {
+    use super::*;
+    use crate::core::{AccountMeta,ExecutionManifest,MintProof};
+
+    fn sample_pool(number:u8,settlement:Pubkey,target:Pubkey)->ExecutionPool {
+        let address=Pubkey::new_from_array([number;32]);
+        let program=Pubkey::new_from_array([77;32]);
+        let accounts=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:settlement,writable:false},
+            AccountMeta{address,writable:true},
+        ];
+        let reverse=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:target,writable:false},
+            AccountMeta{address,writable:true},
+        ];
+        ExecutionPool {
+            manifest:Arc::new(ExecutionManifest{
+                pool:address,mint_a:settlement,mint_b:target,
+                validated_slot:42,bound_signer:None,
+                base_a:Arc::from(accounts),base_b:Arc::from(reverse),
+            }),
+            mints:[
+                MintProof{address:settlement,token_2022:false,
+                    extensions:vec![],unsupported:vec![]},
+                MintProof{address:target,token_2022:false,
+                    extensions:vec![],unsupported:vec![]},
+            ],
+        }
+    }
+    #[test]
+    fn cp10_direct2_insertion_and_rollback_preserve_request_bytes() {
+        for settlement in [
+            "So11111111111111111111111111111111111111112".parse::<Pubkey>().unwrap(),
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse::<Pubkey>().unwrap(),
+        ] {
+            let target=Pubkey::new_from_array([88;32]);
+            let wallet=Pubkey::new_from_array([99;32]);
+            let d1=sample_pool(1,settlement,target);
+            let p1=sample_pool(2,settlement,target);
+            let d2=sample_pool(3,settlement,target);
+            let p2=sample_pool(4,settlement,target);
+            let mut current=ExecutionRequest{
+                id:"cp10-direct2".into(),wallet,settlement,
+                groups:vec![ExecutionGroup::Direct{target,pools:vec![d1.clone(),p1.clone()]}],
+                conversion:None,parameters:ExecutionParameters::default(),
+            };
+            let original=serde_json::to_vec(&current).unwrap();
+            let initial=crate::workers::execution_v10::validate(&current).unwrap();
+            let at_direct=insert_direct2_pool(&mut current,&d2,"direct",1).unwrap();
+            assert_eq!(at_direct,1);
+            let expected=ExecutionRequest{
+                groups:vec![ExecutionGroup::Direct{
+                    target,pools:vec![d1.clone(),d2.clone(),p1.clone()]}],
+                ..current.clone()
+            };
+            assert_eq!(serde_json::to_vec(&current).unwrap(),serde_json::to_vec(&expected).unwrap());
+            assert_eq!(
+                serde_json::to_value(crate::workers::execution_v10::validate(&current).unwrap()).unwrap(),
+                serde_json::to_value(crate::workers::execution_v10::validate(&expected).unwrap()).unwrap()
+            );
+            let at_partner=insert_direct2_pool(&mut current,&p2,"partner",2).unwrap();
+            assert_eq!(at_partner,3);
+            let expected=ExecutionRequest{
+                groups:vec![ExecutionGroup::Direct{
+                    target,pools:vec![d1.clone(),d2,p1.clone(),p2]}],
+                ..current.clone()
+            };
+            assert_eq!(serde_json::to_vec(&current).unwrap(),serde_json::to_vec(&expected).unwrap());
+            remove_direct2_pool(&mut current,at_partner).unwrap();
+            remove_direct2_pool(&mut current,at_direct).unwrap();
+            assert_eq!(serde_json::to_vec(&current).unwrap(),original);
+            assert_eq!(
+                serde_json::to_value(crate::workers::execution_v10::validate(&current).unwrap()).unwrap(),
+                serde_json::to_value(initial).unwrap()
+            );
+        }
+    }
 }
