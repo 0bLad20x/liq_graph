@@ -29,6 +29,10 @@ jobs:
         run: |
           cargo build --locked --release
           git diff --exit-code -- Cargo.lock
+      - name: CP10 byte-exact V10 compiler regression tests
+        run: cargo test --locked --release cp10_tests
+      - name: CP10 Direct2 packing regression tests
+        run: cargo test --locked --release execution_candidates
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
       - name: Live utility PowerShell syntax only
@@ -36,7 +40,7 @@ jobs:
         run: |
           $tokens = $null
           $errors = $null
-          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1')) {
+          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)

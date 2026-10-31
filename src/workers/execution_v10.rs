@@ -1,6 +1,6 @@
 //! Complete typed execution job -> signed V10/Solana-v1 simulation -> typed report.
 //! No DB, Registry, graph lookup, pool selection, protocol decoding or broadcasting.
-use std::{collections::{HashMap, HashSet}, path::Path, time::Instant, sync::Arc};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, path::Path, time::Instant, sync::{Arc, LazyLock, atomic::{AtomicU64, Ordering}}};
 use anyhow::{Context, Result, bail, ensure};
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde_json::Value;
@@ -57,10 +57,58 @@ const ASSOCIATED: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const PUMP: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const MAINNET: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
-fn key(value: &str) -> Pubkey { value.parse().expect("fixed public key") }
-fn ata(wallet: Pubkey, mint: Pubkey, program: Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[wallet.as_ref(), program.as_ref(), mint.as_ref()], &key(ASSOCIATED)).0
+// CP10: decode fixed program addresses exactly once. Do not parse base58 on every
+// capacity trial. Unknown values remain validated by the original parser.
+static EXECUTOR_KEY: LazyLock<Pubkey> = LazyLock::new(|| EXECUTOR.parse().expect("executor key"));
+static SOL_KEY: LazyLock<Pubkey> = LazyLock::new(|| SOL.parse().expect("WSOL key"));
+static USDC_KEY: LazyLock<Pubkey> = LazyLock::new(|| USDC.parse().expect("USDC key"));
+static TOKEN_KEY: LazyLock<Pubkey> = LazyLock::new(|| TOKEN.parse().expect("token program"));
+static TOKEN_2022_KEY: LazyLock<Pubkey> = LazyLock::new(|| TOKEN_2022.parse().expect("token-2022 program"));
+static ASSOCIATED_KEY: LazyLock<Pubkey> = LazyLock::new(|| ASSOCIATED.parse().expect("ATA program"));
+static PUMP_KEY: LazyLock<Pubkey> = LazyLock::new(|| PUMP.parse().expect("PumpSwap program"));
+static MAINNET_KEY: LazyLock<Pubkey> = LazyLock::new(|| MAINNET.parse().expect("mainnet genesis"));
+const COLLECTOR_USDC:&str="GzVRuLF349u78FHpr8KbqMhrZ1aDxnhSF59JWiZ6tbgt";
+const COLLECTOR_SOL_FLASH:&str="6AGB9kqgSp2mQXwYpdrV4QVV8urvCaDS35U1wsLssy6H";
+const COLLECTOR_SOL_OTHER:&str="GPpkDpzCDmYJY5qNhYmM14c7rct1zmkjWc2CjR5g7RZ1";
+static COLLECTOR_USDC_KEY: LazyLock<Pubkey> = LazyLock::new(|| COLLECTOR_USDC.parse().expect("USDC collector"));
+static COLLECTOR_SOL_FLASH_KEY: LazyLock<Pubkey> = LazyLock::new(|| COLLECTOR_SOL_FLASH.parse().expect("flashloan collector"));
+static COLLECTOR_SOL_OTHER_KEY: LazyLock<Pubkey> = LazyLock::new(|| COLLECTOR_SOL_OTHER.parse().expect("SOL collector"));
+fn key(value: &str) -> Pubkey {
+    match value {
+        EXECUTOR => *EXECUTOR_KEY, SOL => *SOL_KEY, USDC => *USDC_KEY,
+        TOKEN => *TOKEN_KEY, TOKEN_2022 => *TOKEN_2022_KEY,
+        ASSOCIATED => *ASSOCIATED_KEY, PUMP => *PUMP_KEY,
+        MAINNET => *MAINNET_KEY,
+        COLLECTOR_USDC => *COLLECTOR_USDC_KEY,
+        COLLECTOR_SOL_FLASH => *COLLECTOR_SOL_FLASH_KEY,
+        COLLECTOR_SOL_OTHER => *COLLECTOR_SOL_OTHER_KEY,
+        _ => value.parse().expect("fixed public key"),
+    }
 }
+// Bound the per-worker-thread ATA cache: no global lock on 436k capacity trials,
+// no unbounded growth, and no cached pool/bin-array state.
+const ATA_CACHE_LIMIT:usize=4096;
+std::thread_local! {
+    static ATA_CACHE: RefCell<HashMap<(Pubkey,Pubkey,Pubkey),Pubkey>> =
+        RefCell::new(HashMap::new());
+}
+fn ata(wallet: Pubkey, mint: Pubkey, program: Pubkey) -> Pubkey {
+    ATA_CACHE.with(|cache| {
+        if let Some(&address)=cache.borrow().get(&(wallet,mint,program)) {return address;}
+        let address=Pubkey::find_program_address(
+            &[wallet.as_ref(), program.as_ref(), mint.as_ref()], &key(ASSOCIATED)).0;
+        let mut cache=cache.borrow_mut();
+        if cache.len()>=ATA_CACHE_LIMIT {cache.clear();}
+        cache.insert((wallet,mint,program),address);
+        address
+    })
+}
+static FLASH_AUTHORITY:LazyLock<Pubkey> = LazyLock::new(||
+    Pubkey::find_program_address(&[b"vault_authority"], &key(EXECUTOR)).0);
+static FLASH_VAULT_SOL:LazyLock<Pubkey> = LazyLock::new(||
+    Pubkey::find_program_address(&[b"vault_token_account", key(SOL).as_ref()], &key(EXECUTOR)).0);
+static FLASH_VAULT_USDC:LazyLock<Pubkey> = LazyLock::new(||
+    Pubkey::find_program_address(&[b"vault_token_account", key(USDC).as_ref()], &key(EXECUTOR)).0);
 
 /// Signer is a startup resource, never part of an execution request or its logs.
 pub struct Settings { signer: Ed25519KeyPair, fast: bool }
@@ -198,9 +246,9 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
         projections:vec![wallet,settlement_ata],
         metrics:ExecutionMetrics { groups:request.groups.len(),pool_declarations:all_pools.len(),
             unique_accounts:0,account_references:0,instruction_bytes:0,transaction_bytes:0,pools:Vec::new() } };
-    let collector=if s==key(USDC) { key("GzVRuLF349u78FHpr8KbqMhrZ1aDxnhSF59JWiZ6tbgt") }
-        else if p.use_flashloan { key("6AGB9kqgSp2mQXwYpdrV4QVV8urvCaDS35U1wsLssy6H") }
-        else { key("GPpkDpzCDmYJY5qNhYmM14c7rct1zmkjWc2CjR5g7RZ1") };
+    let collector=if s==key(USDC) { key(COLLECTOR_USDC) }
+        else if p.use_flashloan { key(COLLECTOR_SOL_FLASH) }
+        else { key(COLLECTOR_SOL_OTHER) };
     push(&mut ix.metas,wallet,true,true); push(&mut ix.metas,s,false,false);
     push(&mut ix.metas,collector,true,false);
     if let Some(collector)=p.additional_fee_collector { push(&mut ix.metas,collector,true,false); }
@@ -209,9 +257,8 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
     push(&mut ix.metas,Pubkey::default(),false,false);
     push(&mut ix.metas,key(ASSOCIATED),false,false);
     if p.use_flashloan {
-        let program=key(EXECUTOR);
-        let authority=Pubkey::find_program_address(&[b"vault_authority"],&program).0;
-        let vault=Pubkey::find_program_address(&[b"vault_token_account",s.as_ref()],&program).0;
+        let authority=*FLASH_AUTHORITY;
+        let vault=if s==key(SOL){*FLASH_VAULT_SOL}else{*FLASH_VAULT_USDC};
         push(&mut ix.metas,authority,false,false); push(&mut ix.metas,vault,true,false);
         ix.projections.push(vault);
     }
@@ -280,12 +327,19 @@ fn instruction(request: &ExecutionRequest, wallet: Pubkey) -> Result<Instruction
 struct Signed { bytes:Vec<u8>, keys:Vec<Pubkey>, signature:String }
 fn message(ix: &mut Instruction, request: &ExecutionRequest,
     blockhash: &str) -> Result<(Vec<u8>,Vec<Pubkey>)> {
-    let mut merged:Vec<Meta>=Vec::new();
+    let mut merged:Vec<Meta>=Vec::with_capacity(ix.metas.len()+1);
+    // CP10: O(1) expected lookup; Vec retains the original first-seen
+    // account ordering, and writable/signer promotion remains unchanged.
+    let mut merged_positions=HashMap::<Pubkey,usize>::with_capacity(ix.metas.len()+1);
     let program_meta=Meta{address:key(EXECUTOR),writable:false,signer:false};
     for meta in ix.metas.iter().chain(std::iter::once(&program_meta)) {
-        if let Some(old)=merged.iter_mut().find(|a|a.address==meta.address) {
+        if let Some(&position)=merged_positions.get(&meta.address) {
+            let old=&mut merged[position];
             old.writable|=meta.writable; old.signer|=meta.signer;
-        } else { merged.push(Meta{address:meta.address,writable:meta.writable,signer:meta.signer}); }
+        } else {
+            merged_positions.insert(meta.address,merged.len());
+            merged.push(Meta{address:meta.address,writable:meta.writable,signer:meta.signer});
+        }
     }
     ensure!(merged.iter().filter(|a|a.signer).count()==1 && merged[0].address==request.wallet,
         "only the configured wallet may sign");
@@ -294,7 +348,9 @@ fn message(ix: &mut Instruction, request: &ExecutionRequest,
     keys.extend(merged.iter().filter(|a|!a.signer && !a.writable).map(|a|a.address));
     ensure!(keys.len()<=64,"transaction exceeds configured 64-account boundary; producer must reduce the job");
     ensure!(ix.metas.len()<=255,"instruction exceeds 255 account references");
-    let index=|address:Pubkey|->u8{keys.iter().position(|k|*k==address).expect("compiled key") as u8};
+    let positions:HashMap<Pubkey,u8>=keys.iter().enumerate()
+        .map(|(index,&address)|(address,index as u8)).collect();
+    let index=|address:Pubkey|->u8{*positions.get(&address).expect("compiled key")};
     let readonly=merged.iter().filter(|a|!a.signer && !a.writable).count() as u8;
     let hash:Pubkey=blockhash.parse().context("invalid blockhash bytes")?;
     let p=&request.parameters;
@@ -315,10 +371,51 @@ fn message(ix: &mut Instruction, request: &ExecutionRequest,
     Ok((message,keys))
 }
 
+/// CP10 phases are aggregate, bounded atomic counters; no per-request event buffer.
+#[derive(Default,Debug,serde::Serialize)]
+pub struct CapacityPhaseProfile {
+    pub calls:u64, pub instruction_ns:u64, pub message_ns:u64,
+    pub instruction_failures:u64, pub message_failures:u64,
+}
+static CAP_PROFILE_ENABLED: LazyLock<bool> = LazyLock::new(||
+    matches!(std::env::var("GRAPH_SIGNALS_PROFILE").as_deref(),
+        Ok("true"|"1"|"yes")));
+static CAP_CALLS:AtomicU64=AtomicU64::new(0);
+static CAP_INSTRUCTION_NS:AtomicU64=AtomicU64::new(0);
+static CAP_MESSAGE_NS:AtomicU64=AtomicU64::new(0);
+static CAP_INSTRUCTION_FAILURES:AtomicU64=AtomicU64::new(0);
+static CAP_MESSAGE_FAILURES:AtomicU64=AtomicU64::new(0);
+
+pub fn capacity_phase_profile()->CapacityPhaseProfile {
+    CapacityPhaseProfile {
+        calls:CAP_CALLS.load(Ordering::Relaxed),
+        instruction_ns:CAP_INSTRUCTION_NS.load(Ordering::Relaxed),
+        message_ns:CAP_MESSAGE_NS.load(Ordering::Relaxed),
+        instruction_failures:CAP_INSTRUCTION_FAILURES.load(Ordering::Relaxed),
+        message_failures:CAP_MESSAGE_FAILURES.load(Ordering::Relaxed),
+    }
+}
 /// Exact existing packing/validation boundary. No signing, RPC or pool selection.
+/// The timed phases are recorded only when GRAPH_SIGNALS_PROFILE is enabled.
 pub fn validate(request: &ExecutionRequest) -> Result<ExecutionMetrics> {
-    let mut ix=instruction(request,request.wallet)?;
-    let _=message(&mut ix,request,"11111111111111111111111111111111")?;
+    let measure=*CAP_PROFILE_ENABLED;
+    let started=Instant::now();
+    let constructed=instruction(request,request.wallet);
+    if measure {
+        CAP_CALLS.fetch_add(1,Ordering::Relaxed);
+        CAP_INSTRUCTION_NS.fetch_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed);
+        if constructed.is_err() {CAP_INSTRUCTION_FAILURES.fetch_add(1,Ordering::Relaxed);}
+    }
+    let mut ix=constructed?;
+    let started=Instant::now();
+    let checked=message(&mut ix,request,"11111111111111111111111111111111");
+    if measure {
+        CAP_MESSAGE_NS.fetch_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed);
+        if checked.is_err(){CAP_MESSAGE_FAILURES.fetch_add(1,Ordering::Relaxed);}
+    }
+    let _=checked?;
     Ok(ix.metrics)
 }
 
@@ -568,4 +665,172 @@ pub async fn run_parallel(settings: Settings,rpc:RpcHandle,mut input:mpsc::Recei
     crate::log_event!(Info,"v10 complete requests={count} peak_in_flight={peak} parallelism={parallelism} broadcasts=0");
     Ok(ParallelReport{configured_parallelism:parallelism,
         maximum_in_flight:peak,completed_requests:count})
+}
+
+// The pre-CP10 byte compiler is retained *only in tests*. This is an
+// independent reference for ordering, duplicate promotion and exact v1 bytes.
+#[cfg(test)]
+fn legacy_message(ix: &mut Instruction, request: &ExecutionRequest,
+    blockhash: &str) -> Result<(Vec<u8>,Vec<Pubkey>)> {
+    let mut merged:Vec<Meta>=Vec::new();
+    let program_meta=Meta{address:key(EXECUTOR),writable:false,signer:false};
+    for meta in ix.metas.iter().chain(std::iter::once(&program_meta)) {
+        if let Some(old)=merged.iter_mut().find(|a|a.address==meta.address) {
+            old.writable|=meta.writable; old.signer|=meta.signer;
+        } else { merged.push(Meta{address:meta.address,writable:meta.writable,signer:meta.signer}); }
+    }
+    ensure!(merged.iter().filter(|a|a.signer).count()==1 && merged[0].address==request.wallet,
+        "only the configured wallet may sign");
+    let mut keys=vec![request.wallet];
+    keys.extend(merged.iter().filter(|a|!a.signer && a.writable).map(|a|a.address));
+    keys.extend(merged.iter().filter(|a|!a.signer && !a.writable).map(|a|a.address));
+    ensure!(keys.len()<=64,"transaction exceeds configured 64-account boundary; producer must reduce the job");
+    ensure!(ix.metas.len()<=255,"instruction exceeds 255 account references");
+    let index=|address:Pubkey|->u8{keys.iter().position(|k|*k==address).expect("compiled key") as u8};
+    let readonly=merged.iter().filter(|a|!a.signer && !a.writable).count() as u8;
+    let hash:Pubkey=blockhash.parse().context("invalid blockhash bytes")?;
+    let p=&request.parameters;
+    let mask:u32=12 | if p.priority_fee_lamports>0 {3} else {0};
+    let mut message=vec![0x81,1,0,readonly];
+    message.extend(mask.to_le_bytes()); message.extend(hash.to_bytes());
+    message.extend([1,keys.len() as u8]);
+    for address in &keys {message.extend(address.to_bytes());}
+    if p.priority_fee_lamports>0 {message.extend(p.priority_fee_lamports.to_le_bytes());}
+    message.extend(p.transaction_compute_unit_limit.to_le_bytes());
+    message.extend(p.loaded_accounts_data_size_limit.to_le_bytes());
+    message.extend([index(key(EXECUTOR)),ix.metas.len() as u8]);
+    message.extend(u16::try_from(ix.data.len())?.to_le_bytes());
+    for meta in &ix.metas {message.push(index(meta.address));}
+    message.extend(&ix.data);
+    ensure!(message.len()+64<=4096,"v1 transaction exceeds 4096 bytes; producer must reduce the job");
+    ix.metrics.unique_accounts=keys.len(); ix.metrics.transaction_bytes=message.len()+64;
+    Ok((message,keys))
+}
+
+#[cfg(test)]
+mod cp10_tests {
+    use super::*;
+    use crate::core::{ExecutionManifest, MintProof};
+    use crate::core::execution::ExecutionParameters;
+
+    fn sample_pool(number:u8, account_count:usize, wallet:Pubkey,
+        settlement:Pubkey, target:Pubkey, pump:bool) -> ExecutionPool {
+        let pool=Pubkey::new_from_array([number;32]);
+        let program=if pump {key(PUMP)} else {Pubkey::new_from_array([77;32])};
+        let mut account_block=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:settlement,writable:false},
+            AccountMeta{address:pool,writable:true},
+        ];
+        for i in 3..account_count {
+            // Several shared accounts exercise dedup and writable promotion.
+            account_block.push(AccountMeta{
+                address:Pubkey::new_from_array([((number as usize+i)%220+30) as u8;32]),
+                writable:i%3==0,
+            });
+        }
+        let inverse=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:target,writable:false},
+            AccountMeta{address:pool,writable:true},
+        ];
+        ExecutionPool {
+            manifest:Arc::new(ExecutionManifest{pool,mint_a:settlement,mint_b:target,
+                validated_slot:42,bound_signer:pump.then_some(wallet),
+                base_a:Arc::from(account_block),base_b:Arc::from(inverse)}),
+            mints:[
+                MintProof{address:settlement,token_2022:false,extensions:vec![],unsupported:vec![]},
+                MintProof{address:target,token_2022:false,extensions:vec![],unsupported:vec![]},
+            ],
+        }
+    }
+    fn request(n:usize,account_count:usize,settlement:Pubkey,pump:bool)->ExecutionRequest {
+        let wallet=Pubkey::new_from_array([99;32]);
+        let target=Pubkey::new_from_array([88;32]);
+        let pools=(0..n).map(|i|sample_pool((i+1) as u8,account_count,wallet,
+            settlement,target,pump)).collect();
+        ExecutionRequest{id:"cp10-equivalence".into(),wallet,settlement,
+            groups:vec![ExecutionGroup::Direct{target,pools}],
+            conversion:None,parameters:ExecutionParameters::default()}
+    }
+
+    #[test]
+    fn exact_legacy_transaction_compilation() {
+        for settlement in [key(SOL),key(USDC)] {
+            for pump in [false,true] {
+                for count in [2_usize,3,4,8,12,16] {
+                    for width in [3_usize,6,12,24] {
+                        let request=request(count,width,settlement,pump);
+                        let mut old=instruction(&request,request.wallet).unwrap();
+                        let mut new=instruction(&request,request.wallet).unwrap();
+                        let old_result=legacy_message(&mut old,&request,
+                            "11111111111111111111111111111111");
+                        let new_result=message(&mut new,&request,
+                            "11111111111111111111111111111111");
+                        assert_eq!(old_result.is_ok(),new_result.is_ok(),
+                            "settlement={settlement} pump={pump} n={count} width={width}");
+                        match (old_result,new_result) {
+                            (Ok((old_bytes,old_keys)),Ok((new_bytes,new_keys)))=>{
+                                assert_eq!(old_bytes,new_bytes);
+                                assert_eq!(old_keys,new_keys);
+                                let normal=validate(&request).unwrap();
+                                assert_eq!(serde_json::to_value(&normal).unwrap(),
+                                    serde_json::to_value(&new.metrics).unwrap());
+                            },
+                            (Err(old_err),Err(new_err))=>assert_eq!(old_err.to_string(),new_err.to_string()),
+                            _=>unreachable!(),
+                        }
+                        assert_eq!(old.data,new.data);
+                        assert_eq!(serde_json::to_value(&old.metrics).unwrap(),
+                            serde_json::to_value(&new.metrics).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_addresses_equal_cryptographic_reference() {
+        for name in [EXECUTOR,SOL,USDC,TOKEN,TOKEN_2022,ASSOCIATED,PUMP,MAINNET,
+            COLLECTOR_USDC,COLLECTOR_SOL_FLASH,COLLECTOR_SOL_OTHER] {
+            assert_eq!(key(name),name.parse::<Pubkey>().unwrap());
+        }
+        for settlement in [key(SOL),key(USDC)] {
+            let raw=Pubkey::find_program_address(
+                &[b"vault_token_account",settlement.as_ref()],&key(EXECUTOR)).0;
+            let cached=if settlement==key(SOL){*FLASH_VAULT_SOL}else{*FLASH_VAULT_USDC};
+            assert_eq!(raw,cached);
+        }
+        assert_eq!(*FLASH_AUTHORITY,Pubkey::find_program_address(
+            &[b"vault_authority"],&key(EXECUTOR)).0);
+        for seed in 0..64_u8 {
+            let wallet=Pubkey::new_from_array([seed;32]);
+            let mint=Pubkey::new_from_array([seed.wrapping_add(100);32]);
+            let prog=if seed%2==0{key(TOKEN)}else{key(TOKEN_2022)};
+            let original=Pubkey::find_program_address(
+                &[wallet.as_ref(),prog.as_ref(),mint.as_ref()],&key(ASSOCIATED)).0;
+            assert_eq!(ata(wallet,mint,prog),original);
+            assert_eq!(ata(wallet,mint,prog),original);
+        }
+    }
+
+    #[test]
+    #[ignore = "local CPU microbenchmark only; time is not a correctness assertion"]
+    fn compilation_benchmark() {
+        let request=request(8,12,key(SOL),true);
+        let repetitions=20_000;
+        let started=Instant::now();
+        for _ in 0..repetitions {
+            let mut ix=instruction(&request,request.wallet).unwrap();
+            let _=legacy_message(&mut ix,&request,"11111111111111111111111111111111");
+        }
+        let legacy=started.elapsed();
+        let started=Instant::now();
+        for _ in 0..repetitions {
+            let mut ix=instruction(&request,request.wallet).unwrap();
+            let _=message(&mut ix,&request,"11111111111111111111111111111111");
+        }
+        let optimized=started.elapsed();
+        println!("CP10 legacy={legacy:?} optimized={optimized:?} repetitions={repetitions}");
+    }
 }
