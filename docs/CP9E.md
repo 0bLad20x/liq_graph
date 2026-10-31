@@ -20,6 +20,7 @@ In CP9E, the Orchestrator wires a separate `tokio::sync::mpsc::channel::<Arc<Dat
 - **Direct3**: direct S→T, quoted pool T→Q, converter Q→S (S=WSOL or USDC; Q=other anchor); V10 receives two direct group pools plus the fixed conversion pool.
 - Baseline / Contrarian / Mixed / Coverage remain, built from current prepared V10 manifests and kept within exact 64-key, byte and 16-pool V10 limits.
 - `-CP9DMaxPairs 3` now means up to three distinct **(route kind, settlement, target)** source variants per revision, allowing Direct2 and Direct3 for the same target to be compared. They are not mixed together into one package.
+- The dual-route experiment **reserves one of those three candidate slots for Direct3** when a current threshold-qualified, weight-consistent Direct3 witness exists. This prevents Direct3 being fully displaced by more numerous Direct2 price events. No fabricated positive witness or unconditional Direct3 simulation is permitted. Counters: `cp9e_direct3_reserved_from_fresh`, `cp9e_direct3_reserved_from_active`.
 - Active signal witnesses are revalidated against current directed marginal rates. No false assumption that an old active positive source has a new independent profitable trade.
 - V10 continues to choose trade size with `trade_size=0`; `minimum_profit=0`. No additional economic veto introduced.
 
