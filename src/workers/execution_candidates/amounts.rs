@@ -27,11 +27,27 @@ static BOUNDS_NS:AtomicU64=AtomicU64::new(0);
 static DOMAINS_NS:AtomicU64=AtomicU64::new(0);
 static PROBE_BUILD_NS:AtomicU64=AtomicU64::new(0);
 static PROBE_VALUES:AtomicU64=AtomicU64::new(0);
+// CP12: aggregate-only quote cost evidence, no per-pool or per-revision buffers.
+static QUOTE_LEVEL_CALLS:AtomicU64=AtomicU64::new(0);
+static QUOTE_RESERVE_CALLS:AtomicU64=AtomicU64::new(0);
+static QUOTE_LEVEL_NS:AtomicU64=AtomicU64::new(0);
+static QUOTE_RESERVE_NS:AtomicU64=AtomicU64::new(0);
+static QUOTE_FULL_COST_HITS:AtomicU64=AtomicU64::new(0);
+static QUOTE_FULL_COST_MISSES:AtomicU64=AtomicU64::new(0);
+static QUOTE_RESERVE_FEE_HITS:AtomicU64=AtomicU64::new(0);
+static QUOTE_RESERVE_FEE_MISSES:AtomicU64=AtomicU64::new(0);
+static MUL_DIV_U128:AtomicU64=AtomicU64::new(0);
+static MUL_DIV_WIDE:AtomicU64=AtomicU64::new(0);
 #[derive(Default,serde::Serialize)]
 pub(super) struct PhaseProfile {
     assess_calls:u64,assess_ns:u64,minimum_calls:u64,minimum_ns:u64,
     quote_calls:u64,quote_ns:u64,rational_fast:u64,rational_stack:u64,rational_fallback:u64,
     bounds_ns:u64,domains_ns:u64,probe_build_ns:u64,probe_values:u64,
+    cp12_quote_level_calls:u64,cp12_quote_reserve_calls:u64,
+    cp12_quote_level_ns:u64,cp12_quote_reserve_ns:u64,
+    cp12_full_cost_cache_hits:u64,cp12_full_cost_cache_misses:u64,
+    cp12_reserve_fee_cache_hits:u64,cp12_reserve_fee_cache_misses:u64,
+    cp12_mul_div_u128:u64,cp12_mul_div_wide:u64,
 }
 pub(super) fn phase_profile()->PhaseProfile {
     PhaseProfile{assess_calls:ASSESS_CALLS.load(Ordering::Relaxed),
@@ -46,7 +62,17 @@ pub(super) fn phase_profile()->PhaseProfile {
         bounds_ns:BOUNDS_NS.load(Ordering::Relaxed),
         domains_ns:DOMAINS_NS.load(Ordering::Relaxed),
         probe_build_ns:PROBE_BUILD_NS.load(Ordering::Relaxed),
-        probe_values:PROBE_VALUES.load(Ordering::Relaxed)}
+        probe_values:PROBE_VALUES.load(Ordering::Relaxed),
+        cp12_quote_level_calls:QUOTE_LEVEL_CALLS.load(Ordering::Relaxed),
+        cp12_quote_reserve_calls:QUOTE_RESERVE_CALLS.load(Ordering::Relaxed),
+        cp12_quote_level_ns:QUOTE_LEVEL_NS.load(Ordering::Relaxed),
+        cp12_quote_reserve_ns:QUOTE_RESERVE_NS.load(Ordering::Relaxed),
+        cp12_full_cost_cache_hits:QUOTE_FULL_COST_HITS.load(Ordering::Relaxed),
+        cp12_full_cost_cache_misses:QUOTE_FULL_COST_MISSES.load(Ordering::Relaxed),
+        cp12_reserve_fee_cache_hits:QUOTE_RESERVE_FEE_HITS.load(Ordering::Relaxed),
+        cp12_reserve_fee_cache_misses:QUOTE_RESERVE_FEE_MISSES.load(Ordering::Relaxed),
+        cp12_mul_div_u128:MUL_DIV_U128.load(Ordering::Relaxed),
+        cp12_mul_div_wide:MUL_DIV_WIDE.load(Ordering::Relaxed)}
 }
 struct AssessClock(Option<Instant>);
 impl AssessClock {
@@ -135,7 +161,11 @@ fn included(amount:u128,level:&LiquidityLevel,optimistic:bool)->Calc<u128> {
 // The long division fallback has a fixed integer bit width, not a search budget.
 fn mul_div(a:u64,b:u128,d:u128,up:bool)->Calc<u128> {
     if d==0{return Err(Issue::Unknown("zero_price_denominator"));}
-    if let Some(n)=u128::from(a).checked_mul(b){return Ok(if up{n.div_ceil(d)}else{n/d});}
+    if let Some(n)=u128::from(a).checked_mul(b){
+        if *PROFILE_ON {MUL_DIV_U128.fetch_add(1,Ordering::Relaxed);}
+        return Ok(if up{n.div_ceil(d)}else{n/d});
+    }
+    if *PROFILE_ON {MUL_DIV_WIDE.fetch_add(1,Ordering::Relaxed);}
     let low=u128::from(a)*u128::from(b as u64);let high=u128::from(a)*(b>>64);
     let shifted=high<<64;let tail=shifted.wrapping_add(low);
     let head=(high>>64)+u128::from(tail<shifted);
@@ -208,15 +238,46 @@ fn minimum_input_inner(input:&Input,direction:usize,mut output:u64)->Calc<u64> {
     else{Err(Issue::Unknown("liquidity_window_incomplete"))}
 }
 
-pub(super) fn quote(input:&Input,direction:usize,amount:u64)->Calc<u64> {
-    if !*PROFILE_ON {return quote_inner(input,direction,amount);}
+// No cache survives a frozen assessment: entries are indexed by the input slice
+// and direction, which makes cross-revision or cross-window reuse impossible.
+#[derive(Default)]
+struct QuoteEntry {
+    full_component_costs:Option<Vec<[Option<Calc<u128>>;3]>>,
+    reserve_fee_total:Option<Calc<u64>>,
+}
+struct FrozenQuoteScratch {entries:Vec<[QuoteEntry;2]>}
+impl FrozenQuoteScratch {
+    fn new(pool_count:usize)->Self {
+        Self{entries:(0..pool_count).map(|_|
+            std::array::from_fn(|_|QuoteEntry::default())).collect()}
+    }
+    fn quote(&mut self,inputs:&[Input],edge:Edge,amount:u64)->Calc<u64> {
+        let input=&inputs[edge.pool];
+        timed_quote(input,||quote_inner(input,edge.direction,amount,
+            Some(&mut self.entries[edge.pool][edge.direction])))
+    }
+}
+fn timed_quote(input:&Input, f:impl FnOnce()->Calc<u64>)->Calc<u64> {
+    if !*PROFILE_ON {return f();}
+    let reserve=input.observation.liquidity.as_ref().is_some_and(|p|p.reserve_curve.is_some());
     let started=Instant::now();
-    let result=quote_inner(input,direction,amount);
+    let result=f();
+    let elapsed=ns(started);
     QUOTE_CALLS.fetch_add(1,Ordering::Relaxed);
-    QUOTE_NS.fetch_add(ns(started),Ordering::Relaxed);
+    QUOTE_NS.fetch_add(elapsed,Ordering::Relaxed);
+    if reserve {
+        QUOTE_RESERVE_CALLS.fetch_add(1,Ordering::Relaxed);
+        QUOTE_RESERVE_NS.fetch_add(elapsed,Ordering::Relaxed);
+    }else{
+        QUOTE_LEVEL_CALLS.fetch_add(1,Ordering::Relaxed);
+        QUOTE_LEVEL_NS.fetch_add(elapsed,Ordering::Relaxed);
+    }
     result
 }
-fn quote_inner(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
+pub(super) fn quote(input:&Input,direction:usize,amount:u64)->Calc<u64> {
+    timed_quote(input,||quote_inner(input,direction,amount,None))
+}
+fn quote_inner(input:&Input,direction:usize,mut amount:u64,mut cache:Option<&mut QuoteEntry>)->Calc<u64> {
     let p=profile(input)?;let dir=&p.directions[direction];
     if dir.status!="available"{return Err(Issue::Unknown("direction_unavailable_for_estimate"));}
     if let Some(c)=&p.reserve_curve {
@@ -228,7 +289,21 @@ fn quote_inner(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
             if gross.saturating_sub(lp)>c.spendable_quote_reserve_raw{return Err(Issue::Unknown("physical_quote_limit"));}
             return Ok(gross.saturating_sub(fee(gross)?));
         }
-        let total=c.fee_bps.iter().try_fold(0_u64,|n,&r|n.checked_add(r)).ok_or(Issue::Unknown("fee_overflow"))?;
+        // Only the buy branch evaluates the fee total, preserving the
+        // existing evaluation order and error precedence on every quote.
+        let calculate_total=||c.fee_bps.iter().try_fold(0_u64,|n,&r|n.checked_add(r))
+            .ok_or(Issue::Unknown("fee_overflow"));
+        let total=if let Some(entry)=cache.as_mut(){
+            if let Some(value)=entry.reserve_fee_total {
+                if *PROFILE_ON {QUOTE_RESERVE_FEE_HITS.fetch_add(1,Ordering::Relaxed);}
+                value?
+            }else{
+                let value=calculate_total();
+                entry.reserve_fee_total=Some(value);
+                if *PROFILE_ON {QUOTE_RESERVE_FEE_MISSES.fetch_add(1,Ordering::Relaxed);}
+                value?
+            }
+        }else{calculate_total()?};
         if total>=10000{return Err(Issue::Unknown("invalid_fee_fraction"));}
         let net=(u128::from(amount)*10000/u128::from(10000+total)) as u64;
         let over=u128::from(net)+u128::from(fee(net)?);
@@ -236,13 +311,30 @@ fn quote_inner(input:&Input,direction:usize,mut amount:u64)->Calc<u64> {
         let net=net.saturating_sub(c.buy_input_padding_raw);
         return Ok((u128::from(c.base_reserve_raw)*u128::from(net)/(u128::from(c.effective_quote_reserve_raw)+u128::from(net))) as u64);
     }
+    // Allocate an empty per-level scratch only for actually quoted directed
+    // level data. Component costs are computed lazily on first use. Cached
+    // Result values include errors, preserving the original first error seen.
+    let mut full_costs=cache.as_mut().map(|entry|
+        entry.full_component_costs.get_or_insert_with(||
+            vec![[None;3];dir.levels.len()]));
     let mut output=0_u64;
-    for l in &dir.levels {
+    for (level_index,l) in dir.levels.iter().enumerate() {
         if amount==0{break;}
         let excluded=if l.fees_on_input{amount-ceil_fee(amount,l.fee_numerator,l.fee_denominator)?}else{amount};
         let mut left=u128::from(excluded);let mut raw_out=0_u64;
-        for capacity in l.output_parts_raw {
-            let cost=mul_div(capacity,l.rate_denominator,l.rate_numerator,true)?;
+        for (part_index,capacity) in l.output_parts_raw.into_iter().enumerate() {
+            let cost=if let Some(costs)=full_costs.as_mut() {
+                let entry=&mut costs[level_index][part_index];
+                if let Some(value)=*entry {
+                    if *PROFILE_ON {QUOTE_FULL_COST_HITS.fetch_add(1,Ordering::Relaxed);}
+                    value?
+                }else{
+                    let value=mul_div(capacity,l.rate_denominator,l.rate_numerator,true);
+                    *entry=Some(value);
+                    if *PROFILE_ON {QUOTE_FULL_COST_MISSES.fetch_add(1,Ordering::Relaxed);}
+                    value?
+                }
+            }else{mul_div(capacity,l.rate_denominator,l.rate_numerator,true)?};
             let (spent,out)=if left>=cost{(cost,capacity)}else{
                 let n=u64::try_from(left).map_err(|_|Issue::Unknown("amount_overflow"))?;
                 (left,u64::try_from(mul_div(n,l.rate_numerator,l.rate_denominator,false)?).map_err(|_|Issue::Unknown("amount_overflow"))?)
@@ -365,11 +457,12 @@ fn minimum_path(domains:&[Vec<Edge>],inputs:&[Input],mut need:u64,allow_unknown_
     if !allow_unknown_options {if let Some(reason)=uncertain{return Err(Issue::Unknown(reason));}}
     Ok((need,chosen))
 }
-fn estimate(path:&[Edge],inputs:&[Input],initial:u64,minimum_profit:u64)->Option<Estimate> {
+fn estimate(path:&[Edge],inputs:&[Input],initial:u64,minimum_profit:u64,
+    scratch:&mut FrozenQuoteScratch)->Option<Estimate> {
     let mut amount=initial;let mut legs=Vec::new();
     for &e in path {
         let input=&inputs[e.pool];let p=profile(input).ok()?;let d=&p.directions[e.direction];
-        let output=quote(input,e.direction,amount).ok()?;
+        let output=scratch.quote(inputs,e,amount).ok()?;
         if output==0{return None;}
         legs.push(Leg{pool:input.observation.pool.clone(),input_mint:d.input_mint.clone(),output_mint:d.output_mint.clone(),input_raw:amount,output_raw:output});amount=output;
     }
@@ -394,6 +487,8 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
     }
     let mut paths=Vec::new();cycles(settlement,settlement,&domains,&mut vec![settlement.into()],&mut paths);
     if *PROFILE_ON{DOMAINS_NS.fetch_add(ns(domains_started),Ordering::Relaxed);}
+    // Fresh cache per frozen assessment; no MarketState, Graph or worker state.
+    let mut quote_scratch=FrozenQuoteScratch::new(inputs.len());
     let mut any_unknown=false;
     for mints in paths {
         // The typed V10 request supplies only one conversion pool. Two different
@@ -444,7 +539,7 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
                 }
                 let mut found=None;
                 for q in probes {if q==0{continue;}result.probes+=1;
-                    if let Some(e)=estimate(&path,inputs,q,minimum_profit){found=Some(e);break;}
+                    if let Some(e)=estimate(&path,inputs,q,minimum_profit,&mut quote_scratch){found=Some(e);break;}
                 }
                 if let Some(e)=found {
                     result.estimate=Some(e);result.decision=Decision::Possible;result.reason="positive_amount_estimate";
