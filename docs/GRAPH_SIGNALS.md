@@ -7,7 +7,10 @@ Execution boundary: [EXECUTION_V10.md](EXECUTION_V10.md).
 
 Registry admission and Prepared proofs determine the graph universe. GraphLiquidity
 owns mint pairs, alternatives, closed compact topologies and one published inverse
-pair-to-topology index. Direct2, Direct3, Triangle3 and Triangle4 remain represented;
+pair-to-topology index. `GRAPH_ENABLED_ROUTES` enables Direct2, Direct3, Triangle3
+and Triangle4 independently; the current default enables only `direct2`.
+Graph, signals and execution use this same allowlist. Disabled route shapes are
+not built, and the optional reference comparison uses the same scope;
 pool alternatives are not expanded into a full route product. Changes to alternative
 counts reuse existing topology identities; structural mint-pair changes discover or
 remove the affected topologies. No discarded builder index is returned.

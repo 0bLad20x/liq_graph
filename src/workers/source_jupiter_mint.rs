@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result, ensure};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use solana_pubkey::Pubkey;
-use tokio::{sync::{broadcast, watch}, task::JoinSet, time::{Instant, sleep_until}};
+use tokio::{sync::{broadcast, mpsc, watch}, task::JoinSet, time::{Instant, sleep_until}};
 
 use crate::core::{DataBatch, DataRecord, RecordIdentity, now_unix_ms};
 
@@ -157,13 +157,23 @@ impl Engine {
         self.lanes.iter().filter(|lane|!lane.in_flight)
             .map(|lane|lane.next_due).min()
     }
-    fn broadcast(output:&broadcast::Sender<Arc<DataBatch>>,batch:DataBatch) {
-        let _=output.send(Arc::new(batch));
+    /// Enqueue before publishing. The bounded durable writer applies
+    /// backpressure rather than dropping Jupiter batches under DB load.
+    async fn publish(output:&broadcast::Sender<Arc<DataBatch>>,
+        persistence:Option<&mpsc::Sender<Arc<DataBatch>>>,batch:DataBatch)->Result<()> {
+        let batch=Arc::new(batch);
+        if let Some(writer)=persistence {
+            writer.send(batch.clone()).await
+                .context("Jupiter mint persistence channel closed before durable handoff")?;
+        }
+        let _=output.send(batch);
+        Ok(())
     }
     /// Finite source-only full scan. The orchestrator supplies known pool mints
     /// and Persistence independently subscribes to the published mint batches.
     async fn backfill(&mut self,mints:Vec<Pubkey>,
-        output:&broadcast::Sender<Arc<DataBatch>>)->Result<()> {
+        output:&broadcast::Sender<Arc<DataBatch>>,
+        persistence:Option<&mpsc::Sender<Arc<DataBatch>>>)->Result<()> {
         ensure!(self.pending.is_empty(),"Jupiter backfill overlaps active requests");
         let started=Instant::now();
         let mut queued=VecDeque::from(mints);
@@ -190,7 +200,7 @@ impl Engine {
                         Outcome::Success(decoded)=>{
                             found+=decoded.found as u64;
                             not_found+=(finished.work.mints.len()-decoded.found) as u64;
-                            Self::broadcast(output,decoded.batch);
+                            Self::publish(output,persistence,decoded.batch).await?;
                         },
                         Outcome::Retry{reason,delay} if finished.work.retry<MAX_RETRIES=>{
                             retry_count+=1;
@@ -214,7 +224,8 @@ impl Engine {
         Ok(())
     }
     async fn watch_until(&mut self,input:&mut watch::Receiver<Arc<[Pubkey]>>,
-        output:&broadcast::Sender<Arc<DataBatch>>,deadline:Instant)->Result<()> {
+        output:&broadcast::Sender<Arc<DataBatch>>,
+        persistence:Option<&mpsc::Sender<Arc<DataBatch>>>,deadline:Instant)->Result<()> {
         ensure!(self.pending.is_empty(),"Jupiter watch overlaps backfill");
         let mut cursor=0_usize;
         let mut source_open=true;
@@ -260,7 +271,7 @@ impl Engine {
                         Outcome::Success(decoded)=>{
                             let returned=decoded.found;
                             fetched+=returned as u64;
-                            Self::broadcast(output,decoded.batch);
+                            Self::publish(output,persistence,decoded.batch).await?;
                             crate::log_event!(Debug,
                                 "jupiter mode=watch lane={} requested={} returned={} rejected={} delivered_total={fetched}",
                                 finished.lane,finished.work.mints.len(),
@@ -287,11 +298,12 @@ impl Engine {
 /// The dedicated --jupiter-mint-backfill command remains available separately.
 pub async fn run_targeted(http:Client,settings:Settings,
     mut input:watch::Receiver<Arc<[Pubkey]>>,
-    output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {
+    output:broadcast::Sender<Arc<DataBatch>>,
+    persistence:Option<mpsc::Sender<Arc<DataBatch>>>)->Result<()> {
     let mut engine=Engine::new(http,settings).await?;
     loop {
         let deadline=Instant::now()+engine.settings.backfill_interval;
-        engine.watch_until(&mut input,&output,deadline).await?;
+        engine.watch_until(&mut input,&output,persistence.as_ref(),deadline).await?;
     }
 }
 
@@ -299,13 +311,39 @@ pub async fn run_targeted(http:Client,settings:Settings,
 /// Mint Registry, not a hidden SQL cursor or Graph-owned backfill.
 pub async fn run(http:Client,settings:Settings,input:watch::Receiver<Arc<[Pubkey]>>,
     output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {
-    run_targeted(http,settings,input,output).await
+    run_targeted(http,settings,input,output,None).await
 }
 /// Explicit finite source: caller supplies pool inventory and persists the
 /// independent output via the single Persistence worker.
 pub async fn run_backfill(http:Client,settings:Settings,mints:Vec<Pubkey>,
     output:broadcast::Sender<Arc<DataBatch>>)->Result<()> {
     let mut engine=Engine::new(http,settings).await?;
-    engine.backfill(mints,&output).await
+    engine.backfill(mints,&output,None).await
 }
 
+
+#[cfg(test)]
+mod reliable_persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_jupiter_writer_receives_all_batches_in_order() {
+        // More batches than queue capacity; persistence can be slower than
+        // the producer without any Lagged data loss.
+        let (out,_unused)=broadcast::channel::<Arc<DataBatch>>(8);
+        let (writer,mut receiver)=mpsc::channel::<Arc<DataBatch>>(1);
+        let producing=tokio::spawn(async move {
+            for id in 0..256_u64 {
+                Engine::publish(&out,Some(&writer),DataBatch {
+                    source:SOURCE,received_at_ms:id,records:Vec::new(),
+                }).await.unwrap();
+            }
+        });
+        for id in 0..256_u64 {
+            let batch=receiver.recv().await.expect("channel closed early");
+            assert_eq!(batch.received_at_ms,id);
+        }
+        producing.await.unwrap();
+        assert!(receiver.recv().await.is_none());
+    }
+}

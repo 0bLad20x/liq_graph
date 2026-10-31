@@ -535,6 +535,9 @@ struct Metrics {
     prepared_structures_by_venue:BTreeMap<&'static str,u64>,prepared_structure_build:Latency,
     prepared_to_first_baseline:Latency,structure_rpc:RpcReads,baseline_rpc:RpcReads,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,decode_errors:u64,
+    dlmm_identical_account_events_elided:BTreeMap<&'static str,u64>,
+    processing_by_account_field:BTreeMap<&'static str,Latency>,
+    account_bindings_max_per_event:usize,
     post_rewatch_websocket_observations:u64,removals:u64,
     fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
     reserve_curve_observations:u64,reserve_curve_build:Latency,
@@ -1070,6 +1073,7 @@ impl Engine{
             (field==Field::VirtualQuote && data.is_empty()),
             "slice length mismatch: {} expected {} got {}",field.label(),expected_len,data.len());
         let prior_clock=self.pools[pi].clock;let prior_epoch=self.pools[pi].epoch;
+        let mut payload_changed=true;
         let newest=self.pool_subs[pi].iter().map(|&i|self.subs[i].slot).max().unwrap_or(slot);
         let shared=if matches!(field,Field::PumpGlobal|Field::PumpFees) {
             let address=self.subs[index].key;
@@ -1112,12 +1116,12 @@ impl Engine{
                 let next_step=u16_le(data,80)?;
                 ensure!(next_step>0,"DLMM step zero");
                 *active=next_active;*step=next_step;
-                book.pair(data)?;
+                payload_changed=book.pair(data)?;
             },
             (State::Dlmm{book,..},Field::DlmmArray(position))=>{
-                book.array(position,self.subs[index].key,data)?;
+                payload_changed=book.array(position,self.subs[index].key,data)?;
             },
-            (State::Dlmm{book,..},Field::DlmmBitmap)=>{book.bitmap(data)?;},
+            (State::Dlmm{book,..},Field::DlmmBitmap)=>{payload_changed=book.bitmap(data)?;},
             (State::Pump{vquote,pool_slot,fee_pool,vaults,..},Field::VirtualQuote)=>{
                 ensure!(key(data,43)?==pool.a&&key(data,75)?==pool.b,"Pump mint identity changed");
                 ensure!(bytes(data,139,32)?==vaults.vault_a.as_ref() && bytes(data,171,32)?==vaults.vault_b.as_ref(),"Pump vault identity changed; awaiting Completion");
@@ -1170,6 +1174,15 @@ impl Engine{
         if let Some(reason)=unavailable_reason {
             pool.available=false;
             if emit {self.publish_unavailable(pi,slot,recv_us,reason);}
+            return Ok(());
+        }
+        // A later slot containing the very same already-validated bytes is
+        // not a new swap price or depth state. Keep subscription slot and
+        // received-at provenance above, but avoid expensive DLMM profile rebuild,
+        // repeated valuation and a duplicate downstream signal evaluation.
+        // Do not elide while an unavailable pool is recovering its baseline.
+        if !payload_changed && was_available {
+            *self.metrics.dlmm_identical_account_events_elided.entry(field.label()).or_default()+=1;
             return Ok(());
         }
         if field==Field::Clock && prior_epoch==pool.epoch && pool.last_valuation.is_some() {
@@ -1647,6 +1660,8 @@ impl Engine {
         }else{self.metrics.replayed+=1;}
         if active.get(address)!=Some(provider){if !replay{self.metrics.inactive+=1;}return false;}
         let Some(range)=self.account_ranges.get(address).cloned() else{if !replay{self.metrics.unmapped+=1;}return false;};
+        self.metrics.account_bindings_max_per_event=self.metrics.account_bindings_max_per_event.max(range.len());
+        let first_field=self.subs[self.account_bindings[range.start]].field.label();
         let mut initializing=false;
         for position in range {
             let index=self.account_bindings[position];let pi=self.subs[index].pool;
@@ -1690,7 +1705,11 @@ impl Engine {
                 self.publish_unavailable(pi,*slot,*frame_received_at_us,format!("account update: {error:#}"));
             }
         }
-        if !replay{self.metrics.processing.add(nanos(started));}
+        if !replay {
+            let elapsed=nanos(started);
+            self.metrics.processing.add(elapsed);
+            self.metrics.processing_by_account_field.entry(first_field).or_default().add(elapsed);
+        }
         initializing
     }
 }

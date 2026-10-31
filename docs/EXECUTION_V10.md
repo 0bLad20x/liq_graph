@@ -7,11 +7,12 @@ raw flows. The V10 request parameters and automatic sizing remain unchanged.
 
 The common runtime connects Graph -> Signal Engine -> ExecutionCandidates -> V10.
 See [RUNTIME.md](RUNTIME.md) for launch and dataflow acceptance.
-Long runs use [CP8G](CP8G.md) compact JSONL evidence: every attempt remains,
-complete request payloads are stored once, full RPC details are bounded. Execution
+Long runs use the [CP9G](CP9G.md) result journal: every attempt remains, with a
+once-per-file column schema and bounded complete request/RPC examples. Raw balance
+arrays and complete frozen models are not copied into every result. Execution
 parameters, validation and the simulation path are unchanged by this projection.
 
-[CP8H](CP8H.md) adds generic SPL token-flow/CPI evidence and post-run frozen-model
+[CP8H](CP8H.md) adds generic SPL token-flow/CPI evidence and frozen-model
 calibration. Attempted transfers from failed simulations are marked rolled back.
 Marginal return, finite-amount DEX return and wallet gain after executor fees remain
 separate; no request parameter or signal threshold is changed by calibration.

@@ -96,14 +96,15 @@ pub async fn cp1_live() -> Result<()> {
     let registry_task=tokio::spawn(pool_registry::run(
         source_rx,None,registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone())));
     let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
-    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe()),None));
+    let (jupiter_persist_tx,jupiter_persist_rx)=tokio::sync::mpsc::channel::<Arc<DataBatch>>(256);
+    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_persist_rx),None));
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let qualification=tokio::spawn(mint_qualification::run(
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx,
         None,None,None,None));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
     let jupiter=tokio::spawn(source_jupiter_mint::run_targeted(
-        core::http_client()?,settings,target_rx,jupiter_out.clone()));
+        core::http_client()?,settings,target_rx,jupiter_out.clone(),Some(jupiter_persist_tx)));
     let qualification_evidence=qualified_rx.clone();
     let dex=tokio::spawn(source_dexscreener::run_live(
         qualified_rx,registry.clone(),source.clone()));
@@ -141,14 +142,14 @@ fn ensure_duration(n:u64)->Result<()> {
 
 #[derive(Clone,Copy)]
 struct RunSettings {
-    venues:core::EnabledVenues,
+    venues:core::EnabledVenues, routes:core::EnabledRoutes,
     duration:u64,full_scan:bool,hydration_only:bool,
     market:bool,signals:bool,simulate:bool,rewatch:bool,signal_proof:bool,
 }
 impl RunSettings {
     fn from_env()->Result<Self> {
         let settings=Self {
-            venues:core::EnabledVenues::from_env()?,
+            venues:core::EnabledVenues::from_env()?,routes:core::EnabledRoutes::from_env()?,
             duration:number("RUN_DURATION_SECONDS",0)?,
             full_scan:enabled("RUN_FULL_SCAN")?,
             hydration_only:enabled("IDENTITY_HYDRATION_ONLY")?,
@@ -173,7 +174,7 @@ impl RunSettings {
     }
     fn describe(self)->serde_json::Value {
         serde_json::json!({"pipeline":"runtime","duration_seconds":self.duration,
-            "enabled_venues":self.venues.names(),
+            "enabled_venues":self.venues.names(),"enabled_routes":self.routes.names(),
             "completion_protocols":if self.hydration_only {Vec::new()}else{
                 completion::protocols(self.venues).map(|v|format!("{v:?}")).collect::<Vec<_>>()},
             "market_state_enabled":self.market,"signals_enabled":self.signals,
@@ -398,13 +399,14 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     let registry_qualified=qualified_rx.clone();
     let mut tasks=JoinSet::<Result<()>>::new();
     let (jupiter_out,_)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (jupiter_persist_tx,jupiter_persist_rx)=tokio::sync::mpsc::channel::<Arc<DataBatch>>(256);
     let (onchain_tx,onchain_rx)=tokio::sync::mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
     let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
     let (mint_revision_tx,mint_revision_rx)=watch::channel(0_u64);
     let (selected_mints_tx,selected_mints_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let mint_reader:Arc<dyn core::MintReader>=Arc::new(mint_registry.clone());
     critical(&mut tasks,"persistence",database.run_with_mints(
-        updates.subscribe(),Some(jupiter_out.subscribe()),Some(onchain_persist.subscribe())));
+        updates.subscribe(),Some(jupiter_persist_rx),Some(onchain_persist.subscribe())));
     critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
         updates.subscribe(),graph_tx,graph_settings));
     critical(&mut tasks,"mint_extensions",crate::workers::mint_extensions::run(
@@ -523,12 +525,14 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     if jupiter_settings()?.is_some() {
         let client=http.clone();
         let jupiter_publisher=jupiter_out.clone();
+        let durable_publisher=jupiter_persist_tx.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
             let client=client.clone();let targets=target_rx.clone();
             let output=jupiter_publisher.clone();
+            let durable=durable_publisher.clone();
             async move{
                 let settings=jupiter_settings()?.context("Jupiter keys disappeared")?;
-                source_jupiter_mint::run_targeted(client,settings,targets,output).await
+                source_jupiter_mint::run_targeted(client,settings,targets,output,Some(durable)).await
             }
         }));
     }
@@ -569,7 +573,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     if full_scan {discovery::spawn_bootstrap(&mut tasks,discovery_resources.clone())?;}
     drop(discovery_resources);
     crate::log_event!(Info,"runtime ready=true workers_completion={completion_count} v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
-    drop(jupiter_out);drop(source);drop(updates);drop(rpc);
+    drop(jupiter_persist_tx);drop(jupiter_out);drop(source);drop(updates);drop(rpc);
 
     // Operator termination uses q + Enter; finite RUN_DURATION_SECONDS supports
     // an automatic graceful live run without adding dependencies or lockfile changes.

@@ -11,13 +11,15 @@ use crate::core::{
         SignalPlan,SignalPool,SignalPoolPrice,SignalPriceChange,
         SignalRangeChange,SignalRouteKind,SignalSnapshot,SignalStateUpdate,SignalStream,
         SignalTopology,SignalTrigger,SignalWitness,SIGNAL_LOG_SCALE,SIGNAL_SCORE_BASIS}};
-use super::graph_liquidity::{GraphSnapshot,RouteTopologyKind};
+use super::graph_liquidity::GraphSnapshot;
+mod direction_gate;
 
 const OUTPUT_LAYOUT:&str="versioned_net_amount_state_cp8c";
 pub const OUTPUT_CAPACITY:usize=16384;
 
 #[derive(Clone,Copy)]
-pub struct Settings {pub threshold_bps:f64,pub sample_limit:usize,pub trace:bool,pub profile:bool}
+pub struct Settings {pub threshold_bps:f64,pub sample_limit:usize,pub trace:bool,pub profile:bool,
+    gate:direction_gate::Settings,routes:crate::core::EnabledRoutes}
 impl Settings {
     pub fn from_env()->Result<Self>{
         let threshold_bps:f64=env::var("GRAPH_SIGNALS_THRESHOLD_BPS")
@@ -30,7 +32,8 @@ impl Settings {
             _=>bail!("{name} must be true or false"),
         }};
         Ok(Self{threshold_bps,sample_limit,trace:flag("GRAPH_SIGNALS_TRACE")?,
-            profile:flag("GRAPH_SIGNALS_PROFILE")?})
+            profile:flag("GRAPH_SIGNALS_PROFILE")?,gate:direction_gate::Settings::from_env()?,
+            routes:crate::core::EnabledRoutes::from_env()?})
     }
 }
 fn now_us()->u64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
@@ -68,7 +71,8 @@ impl Prices {
         self.values.push(None);
         Ok(id)
     }
-    fn observe(&mut self, p: &PoolPriceObservation) -> Result<(Pubkey, Previous)> {
+    fn observe(&mut self, p: &PoolPriceObservation,gate:direction_gate::Settings)
+        -> Result<(Pubkey, Previous,[direction_gate::Verdict;2])> {
         let address: Pubkey = p.pool.parse().context("signal pool address")?;
         let id = match self.index.get(&address).copied() {
             Some(id) => id, None => self.bind(address, p.mint_a.parse()?, p.mint_b.parse()?)?,
@@ -79,8 +83,14 @@ impl Prices {
             else if &p.base_mint == b && &p.quote_mint == a { 1 }
             else { bail!("price orientation mismatch"); };
         let mut weights=[None;2];
+        let mut liquidity_status=["unknown";2];
+        let mut decisions=[direction_gate::Verdict::Unknown;2];
         if let Some(v)=&p.valuation {
             for (direction,rate) in v.estimated_net_rates.iter().enumerate(){
+                let eligibility=direction_gate::classify(p,direction,gate);
+                decisions[direction]=eligibility;
+                liquidity_status[forward^direction]=eligibility.label();
+                if gate.mode==direction_gate::Mode::Filter && eligibility==direction_gate::Verdict::Dust {continue;}
                 if let Some(rate)=rate.filter(|r|r.is_finite()&&*r>0.0) {
                     let n=(-rate.ln()*SIGNAL_LOG_SCALE as f64).round();
                     ensure!(n.is_finite()&&n>=i64::MIN as f64&&n<i64::MAX as f64,"net weight overflow");
@@ -89,9 +99,10 @@ impl Prices {
             }
         }
         let old = self.values[id].replace(Arc::new(SignalPoolPrice {
-            log_weight_units:weights, observation:Arc::new(p.clone()),
+            log_weight_units:weights, direction_liquidity_status:liquidity_status,
+            observation:Arc::new(p.clone()),
         }));
-        Ok((address, Previous { pool: id, price: old }))
+        Ok((address, Previous { pool: id, price: old }, decisions))
     }
     fn price<'a>(&'a self, pool: usize, previous: Option<&'a Previous>) -> Option<&'a Arc<SignalPoolPrice>> {
         if let Some(p) = previous { if p.pool == pool { return p.price.as_ref(); } }
@@ -304,19 +315,14 @@ impl CompactIndex {
         let mut transitions=[0;3];
         for &id in ids {
             let top=&self.graph.topologies[id as usize];
-            let kind=match top.kind {
-                RouteTopologyKind::Direct2=>SignalRouteKind::Direct2,
-                RouteTopologyKind::Direct3=>SignalRouteKind::Direct3,
-                RouteTopologyKind::Triangle3=>SignalRouteKind::Triangle3,
-                RouteTopologyKind::Triangle4=>SignalRouteKind::Triangle4,
-            };
+            let kind=top.kind;
             let definition=SignalTopology{kind,settlement:top.settlement,target:top.target,
                 bridge:top.bridge,roles:top.roles,length:top.length};
             stats.groups_visited+=1;
             stats.logical_routes_affected=stats.logical_routes_affected
                 .saturating_add(top.route_options);
             for reverse in [false,true] {
-                if kind==SignalRouteKind::Direct2 && reverse{continue;}
+                if top.kind==SignalRouteKind::Direct2 && reverse{continue;}
                 stats.range_queries+=1;
                 let best=self.best(&definition,reverse)?;
                 if best.is_some(){stats.ready_anchors[kind_id(kind)]+=1;}
@@ -451,10 +457,7 @@ impl Engine {
     }
     fn install(&mut self,graph:Arc<GraphSnapshot>)->CatalogInstall{
         let compact=graph.topologies.iter().map(|t|SignalTopology{
-            kind:match t.kind{RouteTopologyKind::Direct2=>SignalRouteKind::Direct2,
-                RouteTopologyKind::Direct3=>SignalRouteKind::Direct3,
-                RouteTopologyKind::Triangle3=>SignalRouteKind::Triangle3,
-                RouteTopologyKind::Triangle4=>SignalRouteKind::Triangle4},
+            kind:t.kind,
             settlement:t.settlement,target:t.target,bridge:t.bridge,
             roles:t.roles,length:t.length}).collect::<Vec<_>>();
         let installed=self.index.install(graph.clone(),&self.prices);
@@ -510,7 +513,8 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
     let mut e=Engine{prices:Prices::default(),plan:initial,index:CompactIndex::default(),
         output,sequence:0,revision:0,
         threshold:(-(settings.threshold_bps/10_000.0).ln_1p()*SIGNAL_LOG_SCALE as f64).round() as i64,
-        production:ProductionReport{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}};
+        production:ProductionReport{score_basis:SIGNAL_SCORE_BASIS,
+            direction_gate:direction_gate::Report::new(settings.gate),..Default::default()}};
     let outcome:Result<()>=async{
         let started=Instant::now();let received=now_us();
         let mut work=e.begin(SignalTrigger::Catalog{generation:0},started,received,None,input.len());
@@ -530,6 +534,8 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         e.prices.bind(pool,a,b)?;
                     }
                 }
+                ensure!(graph.topologies.iter().all(|t|settings.routes.contains(t.kind)),
+                    "graph contains a route outside GRAPH_ENABLED_ROUTES");
                 let installed=e.install(graph.clone());
                 let mut work=e.begin(SignalTrigger::Catalog{generation:graph.generation},
                     started,received,None,input.len());
@@ -545,7 +551,8 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                     match event.as_ref(){
                     MarketStateEvent::Price(p)=>{
                         let started=Instant::now();let received=now_us();let preparing=Instant::now();
-                        let (address,old)=e.prices.observe(p)?;
+                        let (address,old,liquidity_decisions)=e.prices.observe(p,settings.gate)?;
+                        e.production.direction_gate.record(p,liquidity_decisions,settings.gate);
                         let known=e.prices.values[old.pool].as_ref().unwrap().log_weight_units.iter().flatten().count();
                         e.production.observations_by_known_net_directions[known]+=1;
                         let preparation_ns=nanos(preparing);
@@ -814,6 +821,7 @@ pub struct ProductionReport {
     error: Option<String>, counts: Counts,pub input_events:u64,
     observations_by_known_net_directions:[u64;3],candidate_windows:CandidateWindows,
     liquidity_inputs:u64,liquidity_only_updates:u64,reserve_curve_inputs:u64,
+    direction_gate:direction_gate::Report,
     all_inputs: ProductionTimings, websocket_inputs: ProductionTimings,
     steady_state_inputs: ProductionTimings, initialization_inputs: ProductionTimings,
     revaluation_inputs:ProductionTimings,

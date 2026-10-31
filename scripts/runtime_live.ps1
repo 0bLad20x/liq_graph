@@ -19,6 +19,9 @@ param(
     [switch]$ProfileSignals,
     # Required marginal DEX-net advantage; network/rent costs are separate.
     [ValidateRange(0,1000000)][double]$ThresholdBps = 0,
+    # CP9A: fixed 100 USD/SOL proxy, per-direction notional prequalification.
+    [ValidateRange(0,1000000)][double]$MinDirectionNotionalUsd = 1,
+    [ValidateSet('Off','Shadow','Filter')][string]$DirectionLiquidityMode = 'Filter',
     [string]$WsProviders = 'Configured',
     [ValidateRange(0,2147483647)][int]$WsAccountBudget = 0,
     [ValidateRange(0,64)][int]$WsConnectionsPerProvider = 0,
@@ -34,7 +37,14 @@ param(
     [switch]$SimulateV10,
     [string]$WalletPath,
     [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
-    [ValidateSet('All','Direct2','Direct3','Triangle3','Triangle4')][string]$RouteKind = 'All',
+    # One allowlist shared by graph, signal and execution; empty uses ENV/default direct2.
+    [string]$EnabledRoutes = '',
+    # Concurrent in-flight simulateTransaction jobs (1 restores serial baseline).
+    [ValidateRange(1,64)][int]$V10Parallelism = 4,
+    # CP9C: compare same-revision Direct2 V10 payload strategies.
+    [ValidateSet('Baseline','Contrarian','Mixed','All','Coverage','AllCoverage')][string]$CP9CPackingMode = 'Baseline',
+    # CP9D: one fresh source plus rotating active, still-positive distinct pairs.
+    [ValidateRange(1,8)][int]$CP9DMaxPairs = 1,
     [string]$ExecutionParametersPath
 )
 $ErrorActionPreference = 'Stop'
@@ -51,7 +61,12 @@ if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw '
 if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidence requires MarketState.' }
 if ($RequireCalibrationEvidence -and -not $SimulateV10) { throw 'Calibration evidence requires SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
+if (($CP9CPackingMode -ne 'Baseline' -or $CP9DMaxPairs -gt 1) -and
+    (-not $SimulateV10 -or -not $signals)) {
+    throw 'Alternative packing comparisons require Stage Signals and SimulateV10.'
+}
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
+if ([double]::IsNaN($MinDirectionNotionalUsd) -or [double]::IsInfinity($MinDirectionNotionalUsd)) { throw 'MinDirectionNotionalUsd must be finite.' }
 if ([double]::IsNaN($MinPoolTvlUsd) -or [double]::IsInfinity($MinPoolTvlUsd)) { throw 'MinPoolTvlUsd must be finite.' }
 if ($SimulateV10 -and -not $PlanOnly -and -not $WalletPath) { throw 'SimulateV10 requires WalletPath.' }
 
@@ -135,15 +150,20 @@ try {
         RPC_WS_ACCOUNT_BUDGET = "$WsAccountBudget"
         RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
         GRAPH_SIGNALS_THRESHOLD_BPS = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        GRAPH_MIN_DIRECTION_NOTIONAL_USD = $MinDirectionNotionalUsd.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        GRAPH_DIRECTION_LIQUIDITY_MODE = $DirectionLiquidityMode.ToLowerInvariant()
         GRAPH_SIGNALS_TRACE = "$([bool]$TraceSignals)".ToLowerInvariant()
         GRAPH_SIGNALS_PROFILE = "$([bool]$ProfileSignals)".ToLowerInvariant()
         GRAPH_SIGNALS_SAMPLE_LIMIT = '16'
         GRAPH_RUNTIME_PRODUCTION_REPORT_PATH = $producerPath
         GRAPH_RUNTIME_SIGNAL_REPORT_PATH = $consumerPath
         GRAPH_EXECUTION_SIMULATE = "$([bool]$SimulateV10)".ToLowerInvariant()
+        GRAPH_V10_SIMULATION_PARALLELISM = "$V10Parallelism"
+        GRAPH_CP9C_PACKING_MODE = $(if ($CP9CPackingMode -eq 'AllCoverage') { 'all_coverage' }
+            else { $CP9CPackingMode.ToLowerInvariant() })
+        GRAPH_CP9D_MAX_DISTINCT_PAIRS = "$CP9DMaxPairs"
         GRAPH_EXECUTION_WALLET_PATH = $WalletPath
         GRAPH_EXECUTION_MAX_REQUESTS = "$SimulationLimit"
-        GRAPH_EXECUTION_ROUTE_KIND = $RouteKind
         GRAPH_EXECUTION_PARAMETERS_PATH = $ExecutionParametersPath
         GRAPH_EXECUTION_REPORT_PATH = $executionPath
         GRAPH_DIAGNOSTIC_JSONL_PATH = $(if ($GraphAudit) { $auditPath } else { $null })
@@ -161,6 +181,7 @@ try {
         ) -join ',')
     }
     if ($EnabledVenues) { $values.GRAPH_ENABLED_VENUES = $EnabledVenues }
+    if ($EnabledRoutes) { $values.GRAPH_ENABLED_ROUTES = $EnabledRoutes }
     if ($CompletionRefreshSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_REFRESH_SECONDS = "$CompletionRefreshSeconds" }
     if ($CompletionRecheckSeconds -gt 0) { $values.COMPLETION_LIFECYCLE_RECHECK_SECONDS = "$CompletionRecheckSeconds" }
     if ($SimulateV10 -and -not $PlanOnly) {
@@ -179,6 +200,10 @@ try {
     $planText = & $binary --run-plan
     if ($LASTEXITCODE -ne 0) { throw 'Invalid runtime plan; no live run started.' }
     $plan = ($planText -join [Environment]::NewLine) | ConvertFrom-Json
+    if (($CP9CPackingMode -ne 'Baseline' -or $CP9DMaxPairs -gt 1) -and
+        @($plan.enabled_routes | Where-Object { $_ -notin @('direct2','direct3') }).Count -gt 0) {
+        throw 'Alternative packing comparisons currently support only direct2 and/or direct3.'
+    }
     $plan | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $folder 'plan.json') -Encoding UTF8
     $plan.websocket_plan | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'websocket_plan.json') -Encoding UTF8
     $checkout = [ordered]@{
@@ -187,6 +212,8 @@ try {
         minimum_pool_tvl_usd=$MinPoolTvlUsd; execution_detail_limit=$ExecutionDetailLimit
         stage=$Stage; rewatch=[bool]$Rewatch; simulation_enabled=[bool]$SimulateV10
         signal_score_basis='marginal_dex_net'; signal_net_threshold_bps=$ThresholdBps
+        direction_liquidity_mode=$DirectionLiquidityMode.ToLowerInvariant()
+        minimum_direction_notional_usd=$MinDirectionNotionalUsd; fixed_wsol_usd_reference=100
         profile_signals=[bool]$ProfileSignals
         require_fee_evidence=[bool]$RequireFeeEvidence; enabled_venues=@($plan.enabled_venues)
         require_liquidity_evidence=[bool]$RequireLiquidityEvidence
@@ -194,7 +221,10 @@ try {
         require_amount_evidence=[bool]$RequireAmountEvidence; amount_check='observed_simple_cycles_dex_only'
         require_prepared_evidence=[bool]$RequirePreparedEvidence
         require_calibration_evidence=[bool]$RequireCalibrationEvidence
-        simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
+        simulation_limit=$SimulationLimit; enabled_routes=@($plan.enabled_routes); graph_audit=[bool]$GraphAudit
+        v10_simulation_parallelism=$V10Parallelism
+        cp9c_packing_mode=$CP9CPackingMode.ToLowerInvariant()
+        cp9d_max_distinct_pairs=$CP9DMaxPairs
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
         completion_recheck_seconds=$CompletionRecheckSeconds
@@ -204,7 +234,7 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
-    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false" }
+    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 routes=$($plan.enabled_routes -join ',') packing=$CP9CPackingMode cp9d_max_pairs=$CP9DMaxPairs" }
     Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
@@ -218,7 +248,7 @@ try {
         return
     }
     if ($SimulateV10) {
-        if ($SimulationLimit -eq 0) { Write-Host 'Simulation requests: no total cap; one executor and one queued request, broadcasts=false.' }
+        if ($SimulationLimit -eq 0) { Write-Host "Simulation requests: no total cap; parallel_in_flight=$V10Parallelism queue_capacity=$V10Parallelism broadcasts=false." }
         else { Write-Host "Simulation requests: total cap=$SimulationLimit, broadcasts=false." }
     }
     if ($marketEnabled -and $plan.websocket_plan.account_capacity -le 0) { throw 'No WebSocket account capacity selected.' }
@@ -427,6 +457,7 @@ try {
         graph_membership_passed=$runtime.graph_membership_passed
         graph_membership=$runtime.graph_membership
         protocol_scope_passed=[bool]$protocolScopePassed; enabled_venues=@($plan.enabled_venues)
+        enabled_routes=@($plan.enabled_routes)
         registry_pools_by_venue=$runtime.registry_pools_by_venue
         expected_completion_protocols=$expectedProtocols
         unexpected_completion_protocols=$unexpectedProtocols; missing_completion_protocols=$missingProtocols
@@ -445,6 +476,9 @@ try {
         liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
         amount_evidence_passed=$amountPassed; amount_evaluation=$amountSummary
         request_payload_repetition=$requestRepetition
+        execution_preparation=$execution.execution_candidates.preparation
+        execution_baseline_path_coverage=$executionAnalysis.cp9c_strategy_comparison.baseline_path_coverage
+        streaming_execution_evidence=$execution.streaming_evidence
         signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
         net_evidence_passed=$netPassed; net_witness_violations=$netViolations
         observations_by_known_net_directions=$production.observations_by_known_net_directions
@@ -469,7 +503,7 @@ try {
         signal_revaluation_processing_ns=$production.revaluation_inputs.processing_ns
         frame_to_signal_state_us=$production.steady_state_inputs.frame_to_state_ready_us
         frame_to_signal_complete_us=$production.steady_state_inputs.frame_to_evaluation_complete_us
-        execution_selection_ns=$executionAnalysis.timings.selection_ns
+        execution_round_elapsed_ns=$executionAnalysis.timings.round_elapsed_ns
         signal_to_request_us=$executionAnalysis.timings.signal_to_request_us
         frame_to_request_us=$executionAnalysis.timings.frame_to_request_us
         executor_build_us=$executionAnalysis.timings.build_us
@@ -490,6 +524,16 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     Write-Host "Runtime complete=$($summary.runtime_completed); orchestration=$orchestrationPassed; pool TVL evidence=$tvlPassed"
     Write-Host "Pools selected=$($market.selected_pools), priced=$($market.priced_pools); WS gaps=$($market.metrics.gaps)"
+    if ($null -ne $execution.streaming_evidence) {
+        $stream=$execution.streaming_evidence
+        Write-Host "Streaming evidence: matched=$($stream.matched), event_bytes=$($stream.event_bytes), detail_bytes=$($stream.detail_bytes), samples=$($stream.detail_samples), max_queue=$($stream.max_backlog), max_unmatched=$($stream.max_unmatched)"
+    }
+    if ($null -ne $execution.execution_candidates.preparation) {
+        $prep = $execution.execution_candidates.preparation
+        $packMs = [Math]::Round([double]$prep.pack_build_ns.mean_ns / 1000000,3)
+        $amountMs = [Math]::Round([double]$amountSummary.processing_ns.mean_ns / 1000000,3)
+        Write-Host "Candidate preparation: packs=$($prep.pack_build_ns.count), indexed_pool_visits=$($prep.indexed_pool_visits), full_scan_equivalent=$($prep.full_scan_pool_visits_equivalent), pack_mean_ms=$packMs, amount_mean_ms=$amountMs"
+    }
     if ($RequireCalibrationEvidence) {
         Write-Host "Calibration: requests=$($calibration.counts.records), quoted routes=$($calibration.model_route_statuses.quoted), passed=$calibrationPassed"
     }

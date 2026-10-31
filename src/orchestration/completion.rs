@@ -193,6 +193,7 @@ pub(super) async fn live(args:&[String])->Result<()> {
     let (done,_)=watch::channel(false);
     let (qualified_tx,qualified_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let (jupiter_out,jupiter_rx)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (jupiter_persist_tx,jupiter_persist_rx)=tokio::sync::mpsc::channel::<Arc<DataBatch>>(256);
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let mut tasks=JoinSet::new();
     critical(&mut tasks,"pool_registry",pool_registry::run(source_rx,Some(result_rx),
@@ -200,14 +201,20 @@ pub(super) async fn live(args:&[String])->Result<()> {
     // One explicit stateless output proof; no extra consumer in production.
     critical(&mut tasks,"proof.completion_registry",pool_registry::observe_updates(updates.subscribe(),true,true));
     if persist {
-        critical(&mut tasks,"persistence",database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe()),None));
+        critical(&mut tasks,"persistence",database.run_with_mints(
+            updates.subscribe(),Some(jupiter_persist_rx),None));
+    }else{
+        drop(jupiter_persist_rx);
     }
     critical(&mut tasks,"mint_qualification",mint_qualification::run(registry.snapshot(),mints,
         updates.subscribe(),jupiter_rx,qualified_tx,target_tx,None,None,None,Some(stop_rx.clone())));
     if let Some(settings)=enrichment {
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
-            crate::workers::source_jupiter_mint::run_targeted(core::http_client()?,settings,target_rx,jupiter_out.clone())));
+            crate::workers::source_jupiter_mint::run_targeted(
+                core::http_client()?,settings,target_rx,jupiter_out.clone(),
+                if persist{Some(jupiter_persist_tx.clone())}else{None})));
     }
+    drop(jupiter_persist_tx);
     let (report_tx,report_rx)=oneshot::channel();
     start(&mut tasks,&registry,&updates,results,(stop.clone(),stop_rx.clone()),
         rpc.clone(),workers,settings,Some(report_tx))?;

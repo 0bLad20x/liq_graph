@@ -1,5 +1,12 @@
 # Gemeinsame Runtime und Live-Nachweis
 
+Der Nachlauf [CP9H.md](CP9H.md) beschleunigt die Kandidatenaufbereitung bei
+gleicher Auswahl und trennt Packzeiten von kumulativen Rundenzeiten.
+
+Der aktuelle Einstieg steht in [CP9G.md](CP9G.md): kompakte laufende
+Execution-Evidenz und eine gemeinsame Routenfreigabe mit `direct2` als Standard.
+Die folgenden CP8-Verweise dokumentieren die einzelnen fachlichen Nachweise.
+
 Der Vorbereitungscheckpoint [CP8F.md](CP8F.md) entfernt fuer DLMM/PumpSwap die
 RPC-Strukturermittlung vor dem Watch-Aufbau. `-RequirePreparedEvidence` prueft
 den direkten Strukturpfad und die frische dynamische Baseline. Der bestehende
@@ -191,7 +198,11 @@ dieselbe Runtime ohne `SimulateV10` und genau einen ausgewiesenen Prüfkonsument
 
 `Stage` ist Graph, MarketState oder Signals. Graph verlangt `GraphAudit`; bei Signals
 kann `SimulateV10` zugeschaltet werden. `PlanOnly` löst Einstellungen ohne DB/RPC auf.
-`RouteKind` begrenzt nur Execution-Auswahl. `ExecutionParametersPath` übernimmt die
+`GRAPH_ENABLED_ROUTES` ist die gemeinsame Routenfreigabe fuer Graph, Signal und
+Execution. Standard ist `direct2`; weitere Werte sind `direct3`, `triangle3`,
+`triangle4`, kommagetrennt. `-EnabledRoutes` ueberschreibt diese Liste fuer einen
+Lauf. Die frueheren getrennten Schalter `RouteKind`, `Direct2Only` und
+`Direct2Direct3Only` entfallen. `ExecutionParametersPath` übernimmt die
 vorhandene Parameter-JSON. Simulationen verwenden verpflichtend `use_flashloan=true`;
 ein ausdrückliches `false` wird abgewiesen. Das Handelskapital stammt aus dem
 Settlement-Flashloan-Vault, native SOL auf der Wallet bezahlt Gebühren und nötige
@@ -213,7 +224,7 @@ Alle Ergebnisse liegen in `runtime_live/<UTC-Zeitstempel>/`:
 | `signal_production.json` | Signalproduktion und getrennte Initialisierungs-/WS-Zeiten |
 | `signal_consumer.json` | Ausschließlich beim ausdrücklichen Signalnachweis ohne Execution |
 | `execution.json`, `execution_analysis.json` | Kleine Execution-Abschlussberichte und wirtschaftliche Auswertung |
-| `execution_events.jsonl`, `execution_payloads.jsonl`, `execution_details.jsonl` | Alle Versuche kompakt, eindeutige vollständige Requests und begrenzte Detailfälle |
+| `execution_events.jsonl`, `execution_details.jsonl` | Ergebnisjournal mit einmaligem Spaltenschema fuer jeden Versuch; begrenzte vollstaendige Detailfaelle |
 | Audit-JSONL, `graph_summary.json`, CSV-Dateien | Nur bei angefordertem Graphaudit |
 
 [CP8G](CP8G.md) setzt die gemeinsame Poolzulassung auf aktuelle kanonische TVL
@@ -225,7 +236,11 @@ Der Stundenlauf und die Vergleichsregeln stehen im Checkpoint-Dokument.
 [CP8H](CP8H.md) nimmt PumpSwap von der eigenen TVL-Bedingung aus. DLMM behaelt
 die 500-USD-Grenze. `-RequireCalibrationEvidence` prueft den kompakten Abgleich
 von Signal, tatsaechlicher CPI-Poolfolge, Menge und eingefrorener Modellquote.
-Nachberechnungen erfolgen nach der Messphase ohne neue RPC-Abfragen.
+Der aktuelle [CP9G](CP9G.md)-Schreiber vergleicht Modelle auf einem separaten
+Evidenzthread waehrend des Laufs, ohne neue RPC-Abfragen oder Dateiarbeit im
+Signalpfad. Vollstaendige Kontobalanzen, Manifeste und eingefrorene Modelle bleiben
+auf die begrenzten Detailfaelle beschraenkt. Es werden keine dauerhaften
+Payload-/Snapshot-Sammlungen fuer jeden Request aufgebaut.
 
 Im vorgesehenen Simulationslauf müssen `diagnostic_consumers=0`,
 `signal_proof=false`, `orchestration_evidence_passed=true` und
@@ -261,7 +276,8 @@ Einzellogging unter Schreibsperren. Der optionale Graph-Audit behaelt seine
 Membership-Uebergaenge; normale Laeufe verwenden Zusammenfassungen.
 
 `SimulationLimit=0` ist der Standard und bedeutet kein Gesamtlimit. Die reale
-Parallelitaet bleibt bei einer Simulation plus einem wartenden Request. Positive
+Parallelitaet wird mit `V10Parallelism` eingestellt; genau so viele Jobs duerfen
+gleichzeitig laufen und zusaetzlich warten. Positive
 Limits bleiben fuer gezielte Kurzlaeufe moeglich. Das begrenzte Eingangsangebot
 bleibt erhalten; ausgelastete Revisionen werden gezaehlt und uebersprungen.
 

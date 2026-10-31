@@ -5,7 +5,7 @@ use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use anyhow::{Context, Result, ensure, bail};
 use serde_json::{Value, json};
 use solana_pubkey::Pubkey;
-use tokio::{sync::broadcast, time::{interval, MissedTickBehavior}};
+use tokio::{sync::{broadcast,mpsc}, time::{interval, MissedTickBehavior}};
 use tokio_postgres::{Client, NoTls};
 
 use crate::{
@@ -635,7 +635,7 @@ impl Persistence {
         self.run_with_mints(rx,None,None).await
     }
     pub async fn run_with_mints(self,mut rx:broadcast::Receiver<Arc<PoolUpdateBatch>>,
-        mut mint_rx:Option<broadcast::Receiver<Arc<DataBatch>>>,
+        mut mint_rx:Option<mpsc::Receiver<Arc<DataBatch>>>,
         mut onchain_rx:Option<broadcast::Receiver<Arc<crate::core::MintOnchainBatch>>>) -> Result<()> {
         use std::collections::HashSet;
         let mut pending_identity=HashMap::with_capacity(BATCH_SIZE);
@@ -644,6 +644,9 @@ impl Persistence {
         let mut completions_seen=0_usize;
         let mut written_identity=0_usize;
         let mut written_completion=0_usize;
+        let mut jupiter_batches_written=0_u64;
+        let mut jupiter_rows_upserted=0_u64;
+        let mut jupiter_max_age_ms=0_u64;
         let mut ticker=interval(WRITE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut pool_open=true;
@@ -662,10 +665,20 @@ impl Persistence {
                     Err(broadcast::error::RecvError::Closed)=>{onchain_rx=None;},
                 },
                 event=async {mint_rx.as_mut().expect("mint channel").recv().await},if mint_open=>match event {
-                    Ok(batch)=>{self.save_mint_batch(&batch).await?;},
-                    Err(broadcast::error::RecvError::Lagged(n))=>
-                        bail!("mint persistence lost {n} Jupiter batches"),
-                    Err(broadcast::error::RecvError::Closed)=>{mint_rx=None;},
+                    Some(batch)=>{
+                        let written=self.save_mint_batch(&batch).await?;
+                        jupiter_batches_written+=1;
+                        jupiter_rows_upserted=jupiter_rows_upserted.saturating_add(written);
+                        let age=crate::core::now_unix_ms().unwrap_or(0)
+                            .saturating_sub(batch.received_at_ms);
+                        jupiter_max_age_ms=jupiter_max_age_ms.max(age);
+                        if jupiter_batches_written%256==0{
+                            crate::log_event!(Info,"persistence Jupiter reliable batches_written={} rows_upserted={} max_age_ms={} pending={}",
+                                jupiter_batches_written,jupiter_rows_upserted,
+                                jupiter_max_age_ms,mint_rx.as_ref().map_or(0,mpsc::Receiver::len));
+                        }
+                    },
+                    None=>{mint_rx=None;},
                 },
                 event=rx.recv(),if pool_open=>match event {
                     Ok(batch)=>{
@@ -717,7 +730,7 @@ impl Persistence {
         }
         self.flush(&mut pending_identity,WriteKind::Identity,&mut written_identity).await?;
         self.flush(&mut pending_completion,WriteKind::Completion,&mut written_completion).await?;
-        crate::log_event!(Info,"persistence complete identities_seen={identities_seen} completions_seen={completions_seen} identities_upserted={written_identity} completions_upserted={written_completion} table={TABLE}");
+        crate::log_event!(Info,"persistence complete identities_seen={identities_seen} completions_seen={completions_seen} identities_upserted={written_identity} completions_upserted={written_completion} jupiter_batches_written={jupiter_batches_written} jupiter_rows_upserted={jupiter_rows_upserted} jupiter_max_age_ms={jupiter_max_age_ms} table={TABLE}");
         Ok(())
     }
 }

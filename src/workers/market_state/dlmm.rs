@@ -60,13 +60,17 @@ impl Book {
         Ok(Self{pool,dependencies,raw_pair:Arc::from(raw),arrays:std::array::from_fn(|_|None),
             extension:None,profile:None})
     }
-    pub fn pair(&mut self,raw:&[u8])->Result<()> {
+    /// No state mutation is needed when the full account payload equals the
+    /// last validated payload. Slot metadata is owned by MarketState, not Book.
+    pub fn pair(&mut self,raw:&[u8])->Result<bool> {
+        if self.raw_pair.as_ref()==raw{return Ok(false);}
         ensure!(raw.len()==904 && raw.starts_with(&DLMM_DISC),"invalid depth LbPair update");
-        self.raw_pair=Arc::from(raw);Ok(())
+        self.raw_pair=Arc::from(raw);Ok(true)
     }
-    pub fn array(&mut self,position:u8,address:Pubkey,raw:&[u8])->Result<()> {
+    pub fn array(&mut self,position:u8,address:Pubkey,raw:&[u8])->Result<bool> {
         let position=usize::from(position);
         ensure!(self.dependencies.addresses().get(position)==Some(&address),"unexpected DLMM array address");
+        if self.arrays[position].as_ref().is_some_and(|array|array.raw.as_ref()==raw){return Ok(false);}
         ensure!(raw.len()==56+70*144 && raw.starts_with(&ARRAY_DISC),"invalid DLMM BinArray layout");
         ensure!(key(raw,24)?==self.pool.to_string(),"DLMM BinArray parent changed");
         let index=i64::from_le_bytes(bytes(raw,8,8)?.try_into()?);
@@ -85,12 +89,13 @@ impl Book {
             ensure!(price>0 || (x==0&&y==0&&processed==0&&open==0),"DLMM nonempty bin has zero price");
             bins.push(Bin{id:index*70+i as i32,x,y,price,processed,open,ask:raw[p+140]!=0});
         }
-        self.arrays[position]=Some(Arc::new(Array{index,version,bins,raw:Arc::from(raw)}));Ok(())
+        self.arrays[position]=Some(Arc::new(Array{index,version,bins,raw:Arc::from(raw)}));Ok(true)
     }
-    pub fn bitmap(&mut self,raw:&[u8])->Result<()> {
+    pub fn bitmap(&mut self,raw:&[u8])->Result<bool> {
+        if self.extension.as_ref().is_some_and(|value|value.as_ref()==raw){return Ok(false);}
         ensure!(raw.len()==1576 && raw.starts_with(&BITMAP_DISC) && key(raw,8)?==self.pool.to_string(),
             "invalid DLMM bitmap extension");
-        self.extension=Some(Arc::from(raw));Ok(())
+        self.extension=Some(Arc::from(raw));Ok(true)
     }
     fn initialized(&self)->Result<Vec<i32>> {
         let mut out=Vec::new();
@@ -253,4 +258,45 @@ fn included_fee(excluded:u64,fee:u64)->Option<u64> {
 }
 fn excluded_fee(included:u64,fee:u64)->u64 {
     (u128::from(included)*u128::from(fee)).div_ceil(PRECISION) as u64
+}
+
+#[cfg(test)]
+mod hotpath_tests {
+    use super::*;
+
+    #[test]
+    fn identical_dlmm_payload_does_not_reparse_or_replace_state() {
+        let pool=Pubkey::new_from_array([23_u8;32]);
+        let program:Pubkey=DLMM_PROGRAM.parse().unwrap();
+        let array_address=Pubkey::find_program_address(
+            &[b"bin_array",pool.as_ref(),&0_i64.to_le_bytes()],&program).0;
+        let mut arrays=[Pubkey::default();6];
+        arrays[0]=array_address;
+        let deps=Dependencies{arrays,count:1,bitmap:None,digest:[0;32]};
+        let mut pair=vec![0_u8;904];
+        pair[..8].copy_from_slice(&DLMM_DISC);
+        let mut book=Book::new(pool,deps,&pair).unwrap();
+        assert!(!book.pair(&pair).unwrap());
+        pair[40]=1;
+        assert!(book.pair(&pair).unwrap());
+        assert!(!book.pair(&pair).unwrap());
+
+        let mut array=vec![0_u8;56+70*144];
+        array[..8].copy_from_slice(&ARRAY_DISC);
+        array[24..56].copy_from_slice(pool.as_ref());
+        assert!(book.array(0,array_address,&array).unwrap());
+        assert!(!book.array(0,array_address,&array).unwrap());
+        array[56+16]=1; // valid nonzero bin price, all reserves zero
+        assert!(book.array(0,array_address,&array).unwrap());
+        assert!(!book.array(0,array_address,&array).unwrap());
+
+        let mut bitmap=vec![0_u8;1576];
+        bitmap[..8].copy_from_slice(&BITMAP_DISC);
+        bitmap[8..40].copy_from_slice(pool.as_ref());
+        assert!(book.bitmap(&bitmap).unwrap());
+        assert!(!book.bitmap(&bitmap).unwrap());
+        bitmap[40]=1;
+        assert!(book.bitmap(&bitmap).unwrap());
+        assert!(!book.bitmap(&bitmap).unwrap());
+    }
 }

@@ -1,15 +1,52 @@
 //! Complete typed execution job -> signed V10/Solana-v1 simulation -> typed report.
 //! No DB, Registry, graph lookup, pool selection, protocol decoding or broadcasting.
-use std::{collections::{HashMap, HashSet}, path::Path, time::Instant};
+use std::{collections::{HashMap, HashSet}, path::Path, time::Instant, sync::Arc};
 use anyhow::{Context, Result, bail, ensure};
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde_json::Value;
 use solana_pubkey::Pubkey;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc,task::JoinSet};
 use crate::core::{AccountMeta, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionPool, ExecutionPoolUse, ExecutionReport, ExecutionRequest,
-    ExecutionTrace,ExecutionSwapCall,ExecutionAssetAmount}};
+    ExecutionTrace,ExecutionSwapCall,ExecutionAssetAmount,ExecutionBalanceChanges}};
 use crate::core::rpc::{AccountView, RpcAnswer, RpcHandle, RpcOperation};
+
+/// Compact observed changes from the executor's own successful RPC result.
+/// The evidence thread calls this; no RPC, pricing or on-chain action is involved.
+pub fn balance_changes(request:&ExecutionRequest,report:&ExecutionReport)->Result<Option<ExecutionBalanceChanges>> {
+    let Some(sim)=report.simulation.as_ref().filter(|s|s["err"].is_null()) else{return Ok(None);};
+    let wallet=request.wallet.to_string();let settlement=request.settlement.to_string();
+    let tokens=|field:&str|->Result<Option<i128>> {
+        let Some(entries)=sim.get(field).and_then(Value::as_array) else{return Ok(None);};
+        let mut total=0_i128;
+        for balance in entries {
+            if balance["owner"].as_str()!=Some(wallet.as_str())||balance["mint"].as_str()!=Some(settlement.as_str()){continue;}
+            let amount=balance["uiTokenAmount"]["amount"].as_str().context("simulation token amount missing")?
+                .parse::<u64>().context("invalid simulation token amount")?;
+            total=total.checked_add(i128::from(amount)).context("simulation token balance overflow")?;
+        }
+        Ok(Some(total))
+    };
+    let gain=tokens("preTokenBalances")?.zip(tokens("postTokenBalances")?).map(|(a,b)|b-a);
+    let settlement_gain_raw=gain.map(|n|n.to_string());
+    let above_network_fee=(settlement==SOL).then_some(gain).flatten()
+        .zip(sim.get("fee").and_then(Value::as_u64)).map(|(gain,fee)|gain>i128::from(fee));
+    let pre=sim.get("preBalances").and_then(Value::as_array);
+    let post=sim.get("postBalances").and_then(Value::as_array);
+    let mut native_wallet_change_lamports=None;let mut new_account_lamports=None;
+    if let Some((pre,post))=pre.zip(post).filter(|(a,b)|!a.is_empty()&&a.len()==b.len()) {
+        native_wallet_change_lamports=pre[0].as_u64().zip(post[0].as_u64())
+            .map(|(a,b)|(i128::from(b)-i128::from(a)).to_string());
+        let mut funded=0_u64;
+        for (a,b) in pre.iter().zip(post) {
+            let a=a.as_u64().context("invalid pre-simulation lamports")?;
+            let b=b.as_u64().context("invalid post-simulation lamports")?;
+            if a==0&&b>0{funded=funded.checked_add(b).context("account funding overflow")?;}
+        }
+        new_account_lamports=Some(funded);
+    }
+    Ok(Some(ExecutionBalanceChanges{settlement_gain_raw,native_wallet_change_lamports,new_account_lamports,above_network_fee}))
+}
 
 const EXECUTOR: &str = "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz";
 const SOL: &str = "So11111111111111111111111111111111111111112";
@@ -454,8 +491,24 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
     bail!("simulation retry exhausted")
 }
 
-pub async fn run(settings: Settings, rpc: RpcHandle, mut input: mpsc::Receiver<ExecutionRequest>,
+/// Single-worker compatibility path for standalone V10 probes.
+pub async fn run(settings: Settings, rpc: RpcHandle, input: mpsc::Receiver<ExecutionRequest>,
     output: mpsc::Sender<ExecutionReport>) -> Result<()> {
+    run_parallel(settings,rpc,input,output,1).await.map(|_|())
+}
+
+/// CP9B: bounded concurrent read-only V10 simulations, sharing the single RPC
+/// scheduler and signer. Completion order is intentionally not request order;
+/// correlation is by request id. No transaction is ever broadcast.
+#[derive(Debug,serde::Serialize)]
+pub struct ParallelReport {
+    pub configured_parallelism:usize,
+    pub maximum_in_flight:usize,
+    pub completed_requests:u64,
+}
+pub async fn run_parallel(settings: Settings,rpc:RpcHandle,mut input:mpsc::Receiver<ExecutionRequest>,
+    output:mpsc::Sender<ExecutionReport>,parallelism:usize)->Result<ParallelReport>{
+    ensure!((1..=64).contains(&parallelism),"GRAPH_V10_SIMULATION_PARALLELISM must be 1..64");
     // Check static chain/program identity once at worker startup only in signed mode.
     if !settings.fast {
         match rpc.call(RpcOperation::GenesisHash).await?.answer {
@@ -467,25 +520,52 @@ pub async fn run(settings: Settings, rpc: RpcHandle, mut input: mpsc::Receiver<E
             _=>bail!("V10 executor program account missing"),
         }
     }
-    crate::log_event!(Info,"v10 started wallet={} mode={} broadcasts=false",settings.wallet(),
-        if settings.fast {"simulation_fast"}else{"simulation_signed"});
+    crate::log_event!(Info,"v10 started wallet={} mode={} parallelism={} broadcasts=false",
+        settings.wallet(),if settings.fast {"simulation_fast"}else{"simulation_signed"},parallelism);
+    let settings=Arc::new(settings);
+    let mut tasks=JoinSet::<Result<()>>::new();
     let mut count=0_u64;
-    while let Some(request)=input.recv().await {
-        let started=Instant::now();
-        let mut report=ExecutionReport{id:request.id.clone(),outcome:ExecutionOutcome::Rejected,
-            phase:"validate".into(),error:None,metrics:None,simulated_signature:None,
-            blockhash:None,last_valid_block_height:None,context_slot:None,provider:None,
-            blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None,
-            build_us:None,simulation_rpc_ms:None,elapsed_ms:0,trace_us:0,trace:ExecutionTrace::default()};
-        if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
-            report.error=Some(format!("{error:#}"));
+    let mut peak=0_usize;
+    let mut input_closed=false;
+    loop {
+        if input_closed && tasks.is_empty(){break;}
+        tokio::select! {
+            completed=tasks.join_next(),if !tasks.is_empty()=>{
+                completed.context("V10 concurrent task completion missing")?
+                    .context("V10 concurrent simulation task panicked")??;
+                count+=1;
+            },
+            request=input.recv(),if !input_closed && tasks.len()<parallelism=>{
+                if let Some(request)=request{
+                    let settings=settings.clone();
+                    let rpc=rpc.clone();
+                    let output=output.clone();
+                    tasks.spawn(async move{
+                        let started=Instant::now();
+                        let mut report=ExecutionReport{id:request.id.clone(),outcome:ExecutionOutcome::Rejected,
+                            phase:"validate".into(),error:None,metrics:None,simulated_signature:None,
+                            blockhash:None,last_valid_block_height:None,context_slot:None,provider:None,
+                            blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None,
+                            build_us:None,simulation_rpc_ms:None,elapsed_ms:0,trace_us:0,trace:ExecutionTrace::default()};
+                        if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
+                            report.error=Some(format!("{error:#}"));
+                        }
+                        report.elapsed_ms=started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        crate::log_event!(Debug,"v10 result request_id={:?} outcome={:?} phase={} context_slot={:?} dex_calls={} elapsed_ms={} broadcasts=false",
+                            report.id,report.outcome,report.phase,report.context_slot,
+                            report.dex_invocations.len(),report.elapsed_ms);
+                        output.send(report).await.context("V10 report consumer stopped")?;
+                        Ok(())
+                    });
+                    peak=peak.max(tasks.len());
+                }else{
+                    input_closed=true;
+                }
+            }
         }
-        report.elapsed_ms=started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        crate::log_event!(Debug,"v10 result request_id={:?} outcome={:?} phase={} context_slot={:?} dex_calls={} elapsed_ms={}",
-            report.id,report.outcome,report.phase,report.context_slot,report.dex_invocations.len(),started.elapsed().as_millis());
-        output.send(report).await.context("V10 report consumer stopped")?;
-        count+=1;
     }
-    crate::log_event!(Info,"v10 complete requests={count} broadcasts=0");
-    Ok(())
+    drop(output);
+    crate::log_event!(Info,"v10 complete requests={count} peak_in_flight={peak} parallelism={parallelism} broadcasts=0");
+    Ok(ParallelReport{configured_parallelism:parallelism,
+        maximum_in_flight:peak,completed_requests:count})
 }

@@ -7,6 +7,7 @@ pub mod signals;
 pub mod account_stream;
 pub mod completion;
 pub mod rpc;
+pub use signals::EnabledRoutes;
 pub use completion::{CompletionAdmission,CompletionReason,CompletionStatus,AccountMeta,PoolVaults,ExecutionManifest,CompletionEvidence,MintProof,CompletionResult,CompletionResultBatch,CompletionWork,CompletionRequest,CompletionRequestBatch,CompletionUnchanged,CompletionOutcome,CompletionResponse,CompletionResponseBatch,CompletionState};
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 

@@ -33,11 +33,46 @@ pub struct SignalPool {
 pub struct SignalPoolPrice {
     /// Independent directed marginal DEX-net weights. No gross fallback.
     pub log_weight_units: [Option<i64>; 2],
+    /// CP9A: eligible / dust / unknown, oriented like log_weight_units.
+    pub direction_liquidity_status: [&'static str; 2],
     pub observation: Arc<PoolPriceObservation>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalRouteKind { Direct2, Direct3, Triangle3, Triangle4 }
+impl SignalRouteKind {
+    pub const ALL:[Self;4]=[Self::Direct2,Self::Direct3,Self::Triangle3,Self::Triangle4];
+    pub fn name(self)->&'static str {match self {
+        Self::Direct2=>"direct2",Self::Direct3=>"direct3",
+        Self::Triangle3=>"triangle3",Self::Triangle4=>"triangle4",
+    }}
+}
+/// One operational route scope for graph publication and all consumers.
+#[derive(Clone,Copy,Debug)]
+pub struct EnabledRoutes {mask:u8}
+impl EnabledRoutes {
+    pub fn from_env()->anyhow::Result<Self> {
+        let configured=match std::env::var("GRAPH_ENABLED_ROUTES") {
+            Ok(value)=>value,Err(std::env::VarError::NotPresent)=>"direct2".into(),
+            Err(error)=>return Err(error.into()),
+        };
+        Self::parse(&configured)
+    }
+    pub fn parse(configured:&str)->anyhow::Result<Self> {
+        let mut routes=Self{mask:0};
+        for name in configured.split(',').map(str::trim) {
+            let kind=SignalRouteKind::ALL.into_iter().find(|k|k.name()==name)
+                .ok_or_else(||anyhow::anyhow!("unknown GRAPH_ENABLED_ROUTES entry '{name}'; use direct2,direct3,triangle3,triangle4"))?;
+            anyhow::ensure!(!routes.contains(kind),"duplicate GRAPH_ENABLED_ROUTES entry '{name}'");
+            routes.mask|=1_u8<<(kind as u8);
+        }
+        Ok(routes)
+    }
+    pub fn contains(self,kind:SignalRouteKind)->bool {self.mask&(1_u8<<(kind as u8))!=0}
+    pub fn names(self)->Vec<&'static str> {
+        SignalRouteKind::ALL.into_iter().filter(|&kind|self.contains(kind)).map(SignalRouteKind::name).collect()
+    }
+}
 fn optional_mint<S:serde::Serializer>(v:&Option<Pubkey>,s:S)->Result<S::Ok,S::Error>{
     serde::Serialize::serialize(&v.map(|x|x.to_string()),s)
 }
