@@ -212,8 +212,9 @@ pub(super) async fn live(args:&[String])->Result<()> {
         critical(&mut tasks,"source_jupiter_mint",until_stop(stop_rx.clone(),
             crate::workers::source_jupiter_mint::run_targeted(
                 core::http_client()?,settings,target_rx,jupiter_out.clone(),
-                if persist{Some(jupiter_persist_tx)}else{None})));
+                if persist{Some(jupiter_persist_tx.clone())}else{None})));
     }
+    drop(jupiter_persist_tx);
     let (report_tx,report_rx)=oneshot::channel();
     start(&mut tasks,&registry,&updates,results,(stop.clone(),stop_rx.clone()),
         rpc.clone(),workers,settings,Some(report_tx))?;
