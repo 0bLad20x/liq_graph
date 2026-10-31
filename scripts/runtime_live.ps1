@@ -37,9 +37,11 @@ param(
     [switch]$SimulateV10,
     [string]$WalletPath,
     [ValidateRange(0,2147483647)][int]$SimulationLimit = 0,
-    [ValidateSet('All','Direct2','Direct3','Triangle3','Triangle4')][string]$RouteKind = 'All',
+    [ValidateSet('All','Direct2','Direct3','Direct2Direct3','Triangle3','Triangle4')][string]$RouteKind = 'All',
     # CP9B: exclude non-Direct2 shapes already in the liquidity graph.
     [switch]$Direct2Only,
+    # CP9E: graph/selector admit exactly Direct2 + Direct3, not Triangle3/4.
+    [switch]$Direct2Direct3Only,
     # Concurrent in-flight simulateTransaction jobs (1 restores serial baseline).
     [ValidateRange(1,64)][int]$V10Parallelism = 4,
     # CP9C: compare same-revision Direct2 V10 payload strategies.
@@ -62,10 +64,19 @@ if ($RequireAmountEvidence -and (-not $signals -or -not $SimulateV10)) { throw '
 if ($RequirePreparedEvidence -and -not $marketEnabled) { throw 'Prepared evidence requires MarketState.' }
 if ($RequireCalibrationEvidence -and -not $SimulateV10) { throw 'Calibration evidence requires SimulateV10.' }
 if ($RequireCatalogReconciliation -and -not $GraphAudit) { throw 'RequireCatalogReconciliation requires GraphAudit.' }
+if ($Direct2Only -and $Direct2Direct3Only) { throw 'Choose Direct2Only or Direct2Direct3Only, not both.' }
 if ($Direct2Only -and $RouteKind -notin @('All','Direct2')) { throw 'Direct2Only requires RouteKind All or Direct2.' }
+if ($Direct2Direct3Only -and $RouteKind -ne 'Direct2Direct3') {
+    throw 'Direct2Direct3Only requires RouteKind Direct2Direct3.'
+}
+if ($RouteKind -eq 'Direct2Direct3' -and -not $Direct2Direct3Only) {
+    throw 'RouteKind Direct2Direct3 requires -Direct2Direct3Only (graph restriction).'
+}
 if (($CP9CPackingMode -ne 'Baseline' -or $CP9DMaxPairs -gt 1) -and
-    (-not $Direct2Only -or $RouteKind -ne 'Direct2' -or -not $SimulateV10 -or -not $signals)) {
-    throw 'CP9C/CP9D experiment requires -Direct2Only -RouteKind Direct2 -SimulateV10 -Stage Signals.'
+    (-not (($Direct2Only -and $RouteKind -eq 'Direct2') -or
+       ($Direct2Direct3Only -and $RouteKind -eq 'Direct2Direct3')) -or
+       -not $SimulateV10 -or -not $signals)) {
+    throw 'CP9D/CP9E comparisons require restricted Direct2 or Direct2Direct3 graph and V10 simulation.'
 }
 if ([double]::IsNaN($ThresholdBps) -or [double]::IsInfinity($ThresholdBps)) { throw 'ThresholdBps must be finite.' }
 if ([double]::IsNaN($MinDirectionNotionalUsd) -or [double]::IsInfinity($MinDirectionNotionalUsd)) { throw 'MinDirectionNotionalUsd must be finite.' }
@@ -153,6 +164,7 @@ try {
         RPC_WS_CONNECTIONS_PER_PROVIDER = "$WsConnectionsPerProvider"
         GRAPH_SIGNALS_THRESHOLD_BPS = $ThresholdBps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
         GRAPH_DIRECT2_ONLY = "$([bool]$Direct2Only)".ToLowerInvariant()
+        GRAPH_DIRECT2_DIRECT3_ONLY = "$([bool]$Direct2Direct3Only)".ToLowerInvariant()
         GRAPH_MIN_DIRECTION_NOTIONAL_USD = $MinDirectionNotionalUsd.ToString([System.Globalization.CultureInfo]::InvariantCulture)
         GRAPH_DIRECTION_LIQUIDITY_MODE = $DirectionLiquidityMode.ToLowerInvariant()
         GRAPH_SIGNALS_TRACE = "$([bool]$TraceSignals)".ToLowerInvariant()
@@ -221,7 +233,9 @@ try {
         require_prepared_evidence=[bool]$RequirePreparedEvidence
         require_calibration_evidence=[bool]$RequireCalibrationEvidence
         simulation_limit=$SimulationLimit; route_kind=$RouteKind; graph_audit=[bool]$GraphAudit
-        graph_direct2_only=[bool]$Direct2Only; v10_simulation_parallelism=$V10Parallelism
+        graph_direct2_only=[bool]$Direct2Only
+        graph_direct2_direct3_only=[bool]$Direct2Direct3Only
+        v10_simulation_parallelism=$V10Parallelism
         cp9c_packing_mode=$CP9CPackingMode.ToLowerInvariant()
         cp9d_max_distinct_pairs=$CP9DMaxPairs
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
@@ -233,7 +247,7 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
-    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 direct2_only=$([bool]$Direct2Only) packing=$CP9CPackingMode cp9d_max_pairs=$CP9DMaxPairs" }
+    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 direct2_only=$([bool]$Direct2Only) direct2_direct3_only=$([bool]$Direct2Direct3Only) packing=$CP9CPackingMode cp9d_max_pairs=$CP9DMaxPairs" }
     Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
