@@ -127,7 +127,7 @@ pub struct Selection {
 pub struct Report {
     pub error: Option<String>,
     #[serde(skip_serializing)]
-    pub requests: Vec<Selection>,
+    pub request_count: u64,
     score_basis:&'static str,
     pub events:u64,pub state_updates:u64,pub candidate_batches:u64,pub candidates:u64,pub evaluations:u64,
     websocket_revisions: u64, initialization_revisions: u64, qualifying_ranges: u64,
@@ -144,6 +144,7 @@ pub struct Report {
     registry_reads:RegistryReads,
     amounts:amounts::Report,
 }
+pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
     /// One frozen-model quote at a supplied amount; no search, live state or RPC.
     fn quote_frozen_leg(&self,pool:&str,input_mint:&str,output_mint:&str,amount:u64)->Result<u64,&'static str> {
@@ -313,43 +314,13 @@ impl Report {
         std::mem::take(&mut self.amounts.excluded_samples)
     }
     pub fn ensure_complete(&self)->Result<()> {
-        ensure!(self.error.is_none(), "execution candidate worker failed: {}", self.error.as_deref().unwrap_or(""));
+        ensure!(self.error.is_none(), "execution candidate worker failed: {}",self.error.as_deref().unwrap_or(""));
         ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
         ensure!(self.amounts.attempts==self.amounts.possible+self.amounts.unknown+self.amounts.excluded
-            &&self.amounts.possible+self.amounts.unknown==self.requests.len() as u64,
+            && self.amounts.possible+self.amounts.unknown==self.request_count,
             "quantity decision accounting mismatch");
-        ensure!(self.requests.iter().all(|r|r.amount_assessment.decision!=amounts::Decision::Excluded),"excluded quantity request dispatched");
-        Ok(())
-    }
-    pub fn ensure_handoff(&self, reports:&[ExecutionReport])->Result<()> {
-        self.ensure_complete()?;
-        ensure!(!self.requests.is_empty(), "no qualifying live request was produced; inspect coverage, threshold and candidate rejections");
-        ensure!(self.requests.len()==reports.len(), "candidate/request report counts differ");
-        let mut by_id=HashMap::with_capacity(reports.len());
-        for report in reports {
-            ensure!(by_id.insert(report.id.as_str(),report).is_none(),
-                "duplicate execution report for {}",report.id);
-        }
-        let mut requested=HashSet::with_capacity(self.requests.len());
-        for selection in &self.requests {
-            ensure!(requested.insert(selection.request.id.as_str()),
-                "duplicate execution request {}",selection.request.id);
-            let report=by_id.get(selection.request.id.as_str())
-                .with_context(||format!("missing execution report for {}",selection.request.id))?;
-            ensure!(report.error.is_none() && report.phase=="complete" && report.executor_invoked
-                && report.simulation.is_some(), "request {} did not reach an executor simulation",report.id);
-            ensure!(serde_json::to_value(&selection.packing)?==serde_json::to_value(&report.metrics)?,
-                "selected/simulated packing differs for {}",report.id);
-        }
-        Ok(())
-    }
-    /// Additional execution criterion, evaluated after ensure_handoff succeeds.
-    pub fn ensure_successful_simulation(&self, reports:&[ExecutionReport])->Result<()> {
-        ensure!(reports.iter().any(|r|matches!(r.outcome,
-            ExecutionOutcome::SimulatedNoDexCallObserved|ExecutionOutcome::SimulatedDexCallsObserved)),
-            "handoff observed, but no successful simulation; on-chain errors remain unclassified");
         Ok(())
     }
 }
@@ -716,7 +687,8 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
     }];
 }
 
-pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>, cfg:Settings)->Result<Report> {
+pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>,
+    evidence:mpsc::Sender<EvidenceItem>, cfg:Settings)->Result<Report> {
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
@@ -756,7 +728,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     ensure!(pending&&b.revision==state.revision&&b.graph_generation==state.generation,
                         "candidate batch references wrong state");
                     for candidate in &b.candidates {state.candidate(b,candidate)?;}
-                    if (cfg.limit>0 && report.requests.len()>=cfg.limit)
+                    if (cfg.limit>0 && report.request_count as usize>=cfg.limit)
                         ||!matches!(b.trigger.as_ref(),SignalTrigger::Price{origin:PriceOrigin::Websocket|PriceOrigin::Revaluation,..})
                         ||b.price_pipeline.is_some_and(|t|t.initialization_replay){continue;}
                     for (index,candidate) in b.candidates.iter().enumerate(){
@@ -884,7 +856,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     let ordered=diversity::strategy_schedule(&cfg.strategies,state.revision);
                     'packages: for (variant,strategy) in ordered.into_iter().enumerate(){
                         for (pair_index,(candidate,trigger,threshold,origin,pair)) in sources.iter().enumerate(){
-                            if cfg.limit>0 && report.requests.len()>=cfg.limit{break 'packages;}
+                            if cfg.limit>0 && report.request_count as usize>=cfg.limit{break 'packages;}
                             report.cp9c_pack_attempts+=1;
                             // No awaiting capacity: prices and signal decisions must
                             // never be blocked by slower RPC simulation responses.
@@ -899,7 +871,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             };
                             let references=previous.get(pair).map(Vec::as_slice).unwrap_or(&[]);
                             let selected=state.build_compact(candidate,*threshold,trigger.clone(),
-                                &registry,&cfg,report.requests.len()+1,&mut reads,strategy,references,None);
+                                &registry,&cfg,report.request_count as usize+1,&mut reads,strategy,references,None);
                             let selection=match selected{
                                 Ok(selection)=>selection,
                                 Err(error)=>{
@@ -943,7 +915,12 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 selection.request.id,selection.packing_strategy,selection.cp9d_source,selection.cp9d_pair_index,
                                 state.generation,state.revision,selection.packing.pool_declarations,
                                 selection.packing.unique_accounts,selection.selection_ns);
-                            permit.send(selection.request.clone());report.requests.push(selection);
+                            // Evidence is queued without awaiting filesystem I/O.
+                            // On overload, fail explicitly rather than claiming a complete audit.
+                            let request=selection.request.clone();
+                            evidence.try_send(EvidenceItem::Selection(Box::new(selection)))
+                                .map_err(|err|anyhow::anyhow!("V10 evidence queue unavailable (nonblocking): {err}"))?;
+                            permit.send(request);report.request_count+=1;
                         }
                     }
                     if busy_revision{report.skipped_busy_revisions+=1;}
@@ -960,6 +937,6 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
         Ok(())
     }.await;
     report.error=outcome.err().map(|e|format!("{e:#}"));
-    crate::log_event!(Info,"execution candidates complete=true requests={} lost={} error={:?}",report.requests.len(),report.lost_events,report.error);
+    crate::log_event!(Info,"execution candidates complete=true requests={} lost={} error={:?}",report.request_count as usize,report.lost_events,report.error);
     Ok(report)
 }
