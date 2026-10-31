@@ -9,9 +9,13 @@ Push-Location -LiteralPath $repo
 $oldCommitment=[Environment]::GetEnvironmentVariable('RPC_COMMITMENT','Process')
 $oldDexMode=[Environment]::GetEnvironmentVariable('DEXSCREENER_TRANSPORT_MODE','Process')
 try {
-    $dirty=@(& git status --porcelain)
-    if ($LASTEXITCODE -ne 0 -or $dirty.Count -gt 0) {
-        throw 'Local checkout is not clean. Commit or save changes before CP10.'
+    # Match runtime_live.ps1: only tracked modifications can invalidate the
+    # reproducible build. Preserve untracked live reports, snapshots and files.
+    $dirty=@(& git status --porcelain --untracked-files=no)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect tracked Git changes.' }
+    if ($dirty.Count -gt 0) {
+        $dirty | ForEach-Object { Write-Warning "Tracked change: $_" }
+        throw 'Tracked changes exist. Commit or save them before CP10.'
     }
     git fetch origin
     if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
