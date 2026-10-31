@@ -315,7 +315,8 @@ impl CompactIndex {
         let mut transitions=[0;3];
         for &id in ids {
             let top=&self.graph.topologies[id as usize];
-            let definition=SignalTopology{kind:top.kind,settlement:top.settlement,target:top.target,
+            let kind=top.kind;
+            let definition=SignalTopology{kind,settlement:top.settlement,target:top.target,
                 bridge:top.bridge,roles:top.roles,length:top.length};
             stats.groups_visited+=1;
             stats.logical_routes_affected=stats.logical_routes_affected
