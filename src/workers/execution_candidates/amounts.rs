@@ -22,6 +22,7 @@ static QUOTE_CALLS:AtomicU64=AtomicU64::new(0);
 static QUOTE_NS:AtomicU64=AtomicU64::new(0);
 static RATIONAL_FAST:AtomicU64=AtomicU64::new(0);
 static RATIONAL_FALLBACK:AtomicU64=AtomicU64::new(0);
+static RATIONAL_STACK:AtomicU64=AtomicU64::new(0);
 static BOUNDS_NS:AtomicU64=AtomicU64::new(0);
 static DOMAINS_NS:AtomicU64=AtomicU64::new(0);
 static PROBE_BUILD_NS:AtomicU64=AtomicU64::new(0);
@@ -29,7 +30,7 @@ static PROBE_VALUES:AtomicU64=AtomicU64::new(0);
 #[derive(Default,serde::Serialize)]
 pub(super) struct PhaseProfile {
     assess_calls:u64,assess_ns:u64,minimum_calls:u64,minimum_ns:u64,
-    quote_calls:u64,quote_ns:u64,rational_fast:u64,rational_fallback:u64,
+    quote_calls:u64,quote_ns:u64,rational_fast:u64,rational_stack:u64,rational_fallback:u64,
     bounds_ns:u64,domains_ns:u64,probe_build_ns:u64,probe_values:u64,
 }
 pub(super) fn phase_profile()->PhaseProfile {
@@ -40,6 +41,7 @@ pub(super) fn phase_profile()->PhaseProfile {
         quote_calls:QUOTE_CALLS.load(Ordering::Relaxed),
         quote_ns:QUOTE_NS.load(Ordering::Relaxed),
         rational_fast:RATIONAL_FAST.load(Ordering::Relaxed),
+        rational_stack:RATIONAL_STACK.load(Ordering::Relaxed),
         rational_fallback:RATIONAL_FALLBACK.load(Ordering::Relaxed),
         bounds_ns:BOUNDS_NS.load(Ordering::Relaxed),
         domains_ns:DOMAINS_NS.load(Ordering::Relaxed),
@@ -272,16 +274,45 @@ fn product(values:impl Iterator<Item=u128>)->Vec<u32> {
         while next.len()>1 && next.last()==Some(&0){next.pop();}out=next;
     }out
 }
+/// Exact 32-bit-limb schoolbook product on bounded stack scratch. The old
+/// allocation-based implementation remains the fallback for arbitrary lengths.
+fn product_stack(values:impl Iterator<Item=u128>)->Option<([u32;32],usize)> {
+    let mut out=[0_u32;32];out[0]=1;let mut len=1_usize;
+    for n in values {
+        // No overflowing writes, and never truncate large cycle products.
+        if len+4>out.len(){return None;}
+        let parts=[n as u32,(n>>32) as u32,(n>>64) as u32,(n>>96) as u32];
+        let mut next=[0_u32;32];
+        for (i,&a) in out[..len].iter().enumerate(){
+            let mut carry=0_u64;
+            for (j,&b) in parts.iter().enumerate(){
+                let value=u64::from(a)*u64::from(b)+u64::from(next[i+j])+carry;
+                next[i+j]=value as u32;carry=value>>32;
+            }
+            next[i+4]=carry as u32;
+        }
+        len+=4;
+        while len>1 && next[len-1]==0{len-=1;}
+        out=next;
+    }
+    Some((out,len))
+}
 fn compare_products(a:impl Iterator<Item=u128>+Clone,b:impl Iterator<Item=u128>+Clone)->std::cmp::Ordering {
-    // Exact fast path: when both products fit in u128 we need no heap
-    // allocation or schoolbook multiplication. Overflow must fall back to
-    // the unchanged multiword reference arithmetic, never floating point.
+    // Exact fast path for small products, no allocations.
     let left=a.clone().try_fold(1_u128,|acc,n|acc.checked_mul(n));
     let right=b.clone().try_fold(1_u128,|acc,n|acc.checked_mul(n));
     if let (Some(left),Some(right))=(left,right) {
         if *PROFILE_ON {RATIONAL_FAST.fetch_add(1,Ordering::Relaxed);}
         return left.cmp(&right);
     }
+    // Normal large 2-4-leg price products fit within 1024 bits. Even when
+    // the 128-bit shortcut overflows, keep multiplication on the stack.
+    if let (Some((left,ln)),Some((right,rn)))=(product_stack(a.clone()),product_stack(b.clone())){
+        if *PROFILE_ON {RATIONAL_STACK.fetch_add(1,Ordering::Relaxed);}
+        return ln.cmp(&rn).then_with(||left[..ln].iter().rev().cmp(right[..rn].iter().rev()));
+    }
+    // If there are more factors, the original unlimited exact arithmetic
+    // is authoritative. No new size bound on cycles or candidates.
     if *PROFILE_ON {RATIONAL_FALLBACK.fetch_add(1,Ordering::Relaxed);}
     let left=product(a);let right=product(b);
     left.len().cmp(&right.len()).then_with(||left.iter().rev().cmp(right.iter().rev()))
@@ -439,4 +470,41 @@ pub(super) fn seed(inputs:&[Input],pairs:&[(String,String)])->Option<Vec<usize>>
     }).collect::<Vec<_>>()).collect::<Vec<_>>();
     let (_,path)=minimum_path(&domains,inputs,1,true).ok()?;
     Some(path.iter().map(|e|inputs[e.pool].slot^e.direction).collect())
+}
+
+
+#[cfg(test)]
+mod cp11_product_tests {
+    use super::*;
+    #[test]
+    fn cp11_stack_product_matches_unbounded_reference() {
+        for len in 0..=12 {
+            for variant in 0..100_u128 {
+                let a=(0..len).map(|i|{
+                    let i=i as u128;
+                    match (variant+i)%7 {
+                        0=>0,1=>1,2=>u128::MAX,3=>1_u128<<127,
+                        4=>(variant+i+3)*(1_u128<<70),
+                        5=>((variant+i+7)<<64)|((i+1)<<32)|100,
+                        _=>2_u128.pow((variant%65) as u32),
+                    }
+                }).collect::<Vec<_>>();
+                let b=(0..len).map(|i|{
+                    let i=i as u128;
+                    match (variant*3+i)%6 {
+                        0=>u128::MAX,1=>0,2=>1,
+                        3=>(variant+i+17)*(1_u128<<60),
+                        4=>1_u128<<127,
+                        _=>(i+2)*((variant+1)<<64),
+                    }
+                }).collect::<Vec<_>>();
+                let old_a=product(a.iter().copied());
+                let old_b=product(b.iter().copied());
+                let expected=old_a.len().cmp(&old_b.len())
+                    .then_with(||old_a.iter().rev().cmp(old_b.iter().rev()));
+                let actual=compare_products(a.iter().copied(),b.iter().copied());
+                assert_eq!(expected,actual,"len={len} variant={variant}");
+            }
+        }
+    }
 }
