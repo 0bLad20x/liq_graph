@@ -103,8 +103,9 @@ impl Writer {
         ensure!(r.id==s.request.id,"evidence handoff id mismatch");
         ensure!(r.error.is_none()&&r.phase=="complete"&&r.executor_invoked&&r.simulation.is_some(),
             "request {} did not reach a complete V10 simulation",r.id);
-        ensure!(serde_json::to_value(&r.metrics)?==serde_json::to_value(
-            &s.compact_evidence()?["packing"])?, "packing differs for {}",r.id);
+        let mut compact=s.compact_evidence()?;
+        ensure!(serde_json::to_value(&r.metrics)?==compact["packing"],
+            "packing differs for {}",r.id);
         let mut payload=serde_json::to_value(&s.request)?;
         payload.as_object_mut().context("request must be an object")?.remove("id");
         let hash=sha(&serde_json::to_vec(&payload)?);
@@ -113,7 +114,6 @@ impl Writer {
             self.stats.unique_payloads+=1;
         }
         let calibration=s.calibration(&r);
-        let mut compact=s.compact_evidence()?;
         store_snapshots(&mut compact,&mut self.seen_snapshots,&mut self.snapshots,&mut self.stats)?;
         let compact_report=compact_simulation(&r)?;
         jsonline(&mut self.events,&json!({
