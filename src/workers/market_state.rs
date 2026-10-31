@@ -536,6 +536,8 @@ struct Metrics {
     prepared_to_first_baseline:Latency,structure_rpc:RpcReads,baseline_rpc:RpcReads,
     processing:Latency,queue:Latency,install:Latency,watch_plan:Latency,decode_errors:u64,
     dlmm_identical_account_events_elided:BTreeMap<&'static str,u64>,
+    processing_by_account_field:BTreeMap<&'static str,Latency>,
+    account_bindings_max_per_event:usize,
     post_rewatch_websocket_observations:u64,removals:u64,
     fee_valuation:FeeEvidence,liquidity:LiquidityEvidence,
     reserve_curve_observations:u64,reserve_curve_build:Latency,
@@ -1658,6 +1660,8 @@ impl Engine {
         }else{self.metrics.replayed+=1;}
         if active.get(address)!=Some(provider){if !replay{self.metrics.inactive+=1;}return false;}
         let Some(range)=self.account_ranges.get(address).cloned() else{if !replay{self.metrics.unmapped+=1;}return false;};
+        self.metrics.account_bindings_max_per_event=self.metrics.account_bindings_max_per_event.max(range.len());
+        let first_field=self.subs[self.account_bindings[range.start]].field.label();
         let mut initializing=false;
         for position in range {
             let index=self.account_bindings[position];let pi=self.subs[index].pool;
@@ -1701,7 +1705,11 @@ impl Engine {
                 self.publish_unavailable(pi,*slot,*frame_received_at_us,format!("account update: {error:#}"));
             }
         }
-        if !replay{self.metrics.processing.add(nanos(started));}
+        if !replay {
+            let elapsed=nanos(started);
+            self.metrics.processing.add(elapsed);
+            self.metrics.processing_by_account_field.entry(first_field).or_default().add(elapsed);
+        }
         initializing
     }
 }
