@@ -34,7 +34,9 @@ execution evidence archive. Large JSONL evidence is **not ordinary
   represents *distinct payloads written under bounded-cache semantics*.
   The JSONL consumer can deduplicate by stable digest offline.
 - Write buffers flush every 64 paired records or after 5 seconds on the
-  next completed pair. Successful graceful shutdown explicitly syncs data.
+  next completed pair, and files are explicitly synced every 256 paired
+  records and at graceful shutdown. This is done off the hotpath.
+  Abnormal process termination may still lose records after the last sync.
 - Summary \`execution.json.streaming_evidence\` reports matched, report
   successes/failures, written snapshots and payloads, maximum unmatched
   entries and max evidence queue depth.
