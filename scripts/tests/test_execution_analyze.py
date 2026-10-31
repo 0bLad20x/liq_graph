@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from execution_analyze import compact_direct2_pair
+from execution_analyze import compact_direct2_pair, compact_route_identity
 
 
 def sample():
@@ -19,6 +19,24 @@ def sample():
 class CompactPairRegression(unittest.TestCase):
     def test_compact_record_without_groups(self):
         self.assertEqual(compact_direct2_pair(sample()), ('SOL', 'TOKEN'))
+
+    def test_direct3_has_distinct_route_identity_and_closing_conversion(self):
+        value=sample()
+        value['route_kind']='direct3'
+        value['candidate']['witness']['legs']=[
+            {'input_mint':'SOL','output_mint':'TOKEN'},
+            {'input_mint':'TOKEN','output_mint':'USDC'},
+            {'input_mint':'USDC','output_mint':'SOL'}]
+        self.assertEqual(compact_route_identity(value),('direct3','SOL','TOKEN'))
+        value['candidate']['witness']['legs'][2]['output_mint']='TOKEN'
+        with self.assertRaisesRegex(ValueError,'Invalid compact Direct3 witness'):
+            compact_route_identity(value)
+
+    def test_direct2_and_direct3_never_share_comparison_key(self):
+        value=sample()
+        value['route_kind']='direct2'
+        self.assertEqual(compact_route_identity(value),('direct2','SOL','TOKEN'))
+        self.assertNotEqual(compact_route_identity(value)[0], 'direct3')
 
     def test_invalid_nonclosing_witness_fails_explicitly(self):
         value = sample()
