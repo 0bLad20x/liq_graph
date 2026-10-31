@@ -57,7 +57,7 @@ impl ExecutionTasks {
         let detail_limit:usize=env::var("RUN_EXECUTION_DETAIL_LIMIT")
             .unwrap_or_else(|_|"16".into()).parse().context("invalid RUN_EXECUTION_DETAIL_LIMIT")?;
         let (jobs,requests)=mpsc::channel(parallelism);
-        let (output,mut responses)=mpsc::channel(parallelism*2);
+        let (output,mut responses)=mpsc::channel::<ExecutionReport>(parallelism*2);
         // The entire evidence pipeline has bounded memory, with one writer
         // running on a blocking thread. No file or JSON work in the candidate
         // or WS/MarketState tasks; never await evidence channel capacity.
