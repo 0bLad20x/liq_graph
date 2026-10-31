@@ -13,7 +13,7 @@ pub(super) struct Summary {
     pub matched:u64,pub unique_payloads:u64,pub snapshots_written:u64,
     pub report_successes:u64,pub report_failures:u64,pub dex_call_reports:u64,
     pub detail_samples:u64,pub max_unmatched:usize,pub max_backlog:usize,
-    pub flushes:u64,pub evidence_queue_failures:u64,
+    pub flushes:u64,pub durable_syncs:u64,pub evidence_queue_failures:u64,
 }
 
 // A deliberately bounded accelerator, not a permanent in-memory payload database.
@@ -136,6 +136,13 @@ impl Writer {
         }
         self.stats.matched+=1;
         if self.stats.matched%64==0 || self.last_flush.elapsed().as_secs()>=5{self.flush()?;}
+        if self.stats.matched%256==0 {
+            self.events.get_ref().sync_data()?;
+            self.payloads.get_ref().sync_data()?;
+            self.snapshots.get_ref().sync_data()?;
+            self.details.get_ref().sync_data()?;
+            self.stats.durable_syncs+=1;
+        }
         Ok(())
     }
     fn finish(mut self)->Result<Summary>{
