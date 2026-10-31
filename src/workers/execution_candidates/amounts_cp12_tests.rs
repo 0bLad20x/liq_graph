@@ -208,3 +208,35 @@ fn cp12_frozen_quote_benchmark() {
     assert_eq!(legacy,new);
     println!("CP12 frozen assessment: iterations={loops} cp11_ns={old_ns} cp12_ns={new_ns} ratio={:.3}",old_ns as f64/new_ns.max(1) as f64);
 }
+
+
+#[test]
+#[ignore="CP12 repeated frozen-quote benchmark; equal input sequences, informational"]
+fn cp12_repeated_quote_benchmark() {
+    // Include partial fills and exhausted levels; the same frozen observation
+    // and direction receive many different integer quantities per assessment.
+    let observations=vec![pool(1,0,24,"exhausted_bitmap",true)];
+    let modern=vec![amounts::Input{slot:0,observation:observations[0].clone(),manifest_matches:true}];
+    let previous=vec![amounts_cp12_reference::Input{slot:0,observation:observations[0].clone(),manifest_matches:true}];
+    let mut quantities=Vec::new();
+    for i in 0..256_u64 {quantities.push((i*983+1)%120_000);}
+    let iterations=1000_u64;
+    let start=std::time::Instant::now();
+    let mut old_checksum=0_u64;
+    for _ in 0..iterations {
+        let values=quantities.iter().map(|&q|amounts_cp12_reference::quote(&previous[0],0,q))
+            .collect::<Vec<_>>();
+        for result in values {old_checksum=old_checksum.wrapping_add(result.unwrap_or(0));}
+    }
+    let old_ns=start.elapsed().as_nanos();
+    let start=std::time::Instant::now();
+    let mut new_checksum=0_u64;
+    for _ in 0..iterations {
+        let values=amounts::cp12_cached_quote_trace(&modern,0,0,&quantities);
+        for result in values {new_checksum=new_checksum.wrapping_add(result.unwrap_or(0));}
+    }
+    let new_ns=start.elapsed().as_nanos();
+    assert_eq!(new_checksum,old_checksum);
+    println!("CP12 repeated frozen quotes: calls={} cp11_ns={} cp12_ns={} speedup={:.3}",
+        iterations*quantities.len() as u64,old_ns,new_ns,old_ns as f64/new_ns.max(1) as f64);
+}
