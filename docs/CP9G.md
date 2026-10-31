@@ -1,5 +1,9 @@
 # CP9G – schlanke Streaming-Evidenz und gemeinsame Routenfreigabe
 
+Der darauf aufbauende [CP9H](CP9H.md) benennt die kumulative `selection_ns`
+korrekt in `round_elapsed_ns` um (Journal-Schema 5). Der Analyzer liest beide
+Formate; exklusive Packzeiten kommen aus dem aggregierten Workerbericht.
+
 Basis des Nachlaufs: `06e8f033668902386baf6e71d4da645b3f75b280`.
 Der Checkpoint bleibt simulationsbasiert; es wird nichts gesendet.
 

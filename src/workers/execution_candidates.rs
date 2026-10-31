@@ -62,6 +62,45 @@ fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
     .as_micros().min(u128::from(u64::MAX)) as u64}
 fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 
+// Fixed-memory phase timings, serialized only in the final worker report.
+#[derive(Default)]
+struct Timing {count:u64,total_ns:u64,max_ns:u64,bins:Vec<u64>}
+impl Timing {
+    fn record(&mut self,ns:u64) {
+        if self.bins.is_empty(){self.bins.resize(64,0);}
+        self.count+=1;self.total_ns=self.total_ns.saturating_add(ns);self.max_ns=self.max_ns.max(ns);
+        self.bins[if ns==0{0}else{63-ns.leading_zeros() as usize}]+=1;
+    }
+    fn percentile(&self,p:u64)->Option<u64> {
+        if self.count==0{return None;}
+        let rank=(self.count*p).div_ceil(100);let mut seen=0;
+        for (i,&n) in self.bins.iter().enumerate() {
+            seen+=n;
+            if seen>=rank {
+                let upper=if i==63{u64::MAX}else{(1_u64<<(i+1))-1};
+                return Some(upper.min(self.max_ns));
+            }
+        }
+        None
+    }
+}
+impl serde::Serialize for Timing {
+    fn serialize<S:serde::Serializer>(&self,s:S)->std::result::Result<S::Ok,S::Error> {
+        serde::Serialize::serialize(&serde_json::json!({"count":self.count,"total_ns":self.total_ns,
+            "mean_ns":(self.count>0).then(||self.total_ns as f64/self.count as f64),
+            "max_ns":(self.count>0).then_some(self.max_ns),"p50_upper_ns":self.percentile(50),
+            "p95_upper_ns":self.percentile(95),"p99_upper_ns":self.percentile(99)}),s)
+    }
+}
+#[derive(Default,serde::Serialize)]
+struct Preparation {
+    pair_index_rebuilds:u64,pair_index_appends:u64,indexed_pools:usize,indexed_pairs:usize,
+    alternative_scans:u64,indexed_pool_visits:u64,full_scan_pool_visits_equivalent:u64,alternative_options:u64,
+    capacity_checks:u64,capacity_rejections:u64,coverage_rankings:u64,coverage_key_evaluations:u64,
+    pair_index_ns:Timing,alternative_lookup_ns:Timing,ranking_ns:Timing,pool_resolution_ns:Timing,
+    capacity_validation_ns:Timing,pack_build_ns:Timing,signal_to_round_start_ns:Timing,round_work_ns:Timing,
+}
+
 #[derive(Clone,Default,serde::Serialize)]
 struct RegistryReads {
     calls:u64,wait_ns:u64,hold_ns:u64,max_wait_ns:u64,max_hold_ns:u64,
@@ -105,7 +144,7 @@ pub struct Selection {
     signal_ready_at_us: u64, candidate_received_at_us: u64, request_ready_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
     frame_to_request_us: Option<u64>, signal_to_request_us: u64,
-    selection_ns: u64, alternatives_considered: u64, packing_rejections: u64,
+    round_elapsed_ns: u64, alternatives_considered: u64, packing_rejections: u64,
     registry_reads:RegistryReads,
     unavailable_alternatives: u64, last_alternative_rejection: Option<String>,
     alternative_pools_added: usize,
@@ -133,6 +172,7 @@ pub struct Report {
     catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
     registry_reads:RegistryReads,
     amounts:amounts::Report,
+    preparation:Preparation,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -305,7 +345,7 @@ impl Selection {
                 self.packing.account_references,self.packing.instruction_bytes,self.packing.transaction_bytes],
             "request_ready_at_us":self.request_ready_at_us
         });
-        value["selection_ns"]=serde_json::json!(self.selection_ns);
+        value["round_elapsed_ns"]=serde_json::json!(self.round_elapsed_ns);
         value["frame_to_request_us"]=serde_json::json!(self.frame_to_request_us);
         value["signal_to_request_us"]=serde_json::json!(self.signal_to_request_us);
         Ok(value)
@@ -332,6 +372,8 @@ impl Report {
 #[derive(Default)]
 struct State {
     plan: Option<Arc<SignalPlan>>, pools: Vec<SignalPool>,
+    // Identities only. Price revisions never rebuild this consumer-owned index.
+    pair_pools:HashMap<(Pubkey,Pubkey),Vec<usize>>,
     prices: Vec<Option<Arc<SignalPoolPrice>>>, revision: u64, generation: u64,
     ready_at_us: u64, received_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
@@ -363,7 +405,7 @@ impl State {
         s.pools.iter().filter_map(|p|self.amount_input(p.slot/2,p.liquidity_window_checked)).collect()
     }
     fn assess_selection(&self,mut selection:Selection,registry:&PoolRegistry,cfg:&Settings,
-        reads:&mut RegistryReads,report:&mut amounts::Report)->Result<Option<Selection>> {
+        reads:&mut RegistryReads,report:&mut amounts::Report,preparation:&mut Preparation)->Result<Option<Selection>> {
         let started=Instant::now();
         let conversion_other=selection.request.conversion.as_ref().map(|p|
             if p.manifest.mint_a==selection.request.settlement{p.manifest.mint_b}else{p.manifest.mint_a}.to_string());
@@ -392,7 +434,7 @@ impl State {
                     match selection.packing_strategy {
                         "contrarian"=>PackingStrategy::Contrarian,"mixed"=>PackingStrategy::Mixed,
                         "coverage"=>PackingStrategy::Coverage,_=>PackingStrategy::Baseline
-                    },&[],Some(&preferred)) {
+                    },&[],Some(&preferred),preparation) {
                     if repaired.amount_seed_changed {
                         let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
                         if next.decision!=amounts::Decision::Excluded {
@@ -418,7 +460,7 @@ impl State {
         assessment.elapsed_ns=elapsed_ns(started);report.record(&assessment);
         selection.amount_assessment=assessment;Ok(Some(selection))
     }
-    fn apply(&mut self, s:&SignalStateUpdate, recovering:bool)->Result<()> {
+    fn apply(&mut self, s:&SignalStateUpdate, recovering:bool,preparation:&mut Preparation)->Result<()> {
         self.received_at_us=now_us();
         ensure!(recovering || s.revision==self.revision+1, "candidate state revision gap");
         if let Some(snapshot)=&s.snapshot {
@@ -427,6 +469,12 @@ impl State {
                 && snapshot.plan.score_basis==SIGNAL_SCORE_BASIS
                 && snapshot.pools.len()==snapshot.prices.len(), "invalid candidate snapshot");
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
+            let started=Instant::now();self.pair_pools.clear();
+            for (id,pool) in self.pools.iter().enumerate() {
+                self.pair_pools.entry((pool.mint_a,pool.mint_b)).or_default().push(id);
+            }
+            preparation.pair_index_rebuilds+=1;
+            preparation.pair_index_ns.record(elapsed_ns(started));
             self.generation=s.graph_generation;
             self.threshold=snapshot.threshold_units;
             self.active.clear();self.active_witnesses.clear();
@@ -441,10 +489,18 @@ impl State {
         } else {ensure!(self.plan.is_some() && s.graph_generation==self.generation, "candidate delta without snapshot");}
         if s.clear {self.prices.fill(None);self.active.clear();self.active_witnesses.clear();}
         for change in &s.changes {
-            if change.pool_id==self.pools.len() {self.pools.push(change.identity.clone()); self.prices.push(None);}
+            if change.pool_id==self.pools.len() {
+                let started=Instant::now();
+                self.pair_pools.entry((change.identity.mint_a,change.identity.mint_b))
+                    .or_default().push(change.pool_id);
+                self.pools.push(change.identity.clone()); self.prices.push(None);
+                preparation.pair_index_appends+=1;
+                preparation.pair_index_ns.record(elapsed_ns(started));
+            }
             ensure!(self.pools.get(change.pool_id)==Some(&change.identity), "candidate pool identity mismatch");
             self.prices[change.pool_id]=change.price.clone();
         }
+        preparation.indexed_pools=self.pools.len();preparation.indexed_pairs=self.pair_pools.len();
         self.revision=s.revision; self.ready_at_us=s.ready_at_us; self.price_pipeline=s.price_pipeline;
         self.prepared_logarithms=if matches!(s.trigger.as_ref(),SignalTrigger::Price{..}) {
             s.changes.iter().filter_map(|c|c.price.as_ref())
@@ -536,8 +592,9 @@ impl State {
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
         registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,strategy:PackingStrategy,
-        reference_packs:&[Vec<usize>],preferred:Option<&[usize]>)->Result<Selection>{
+        reference_packs:&[Vec<usize>],preferred:Option<&[usize]>,preparation:&mut Preparation)->Result<Selection>{
         let started=Instant::now();
+        let result=(||->Result<Selection>{
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
             .context("compact topology missing")?;
@@ -592,10 +649,16 @@ impl State {
             parameters:cfg.parameters.clone()};
         let mut pools=Vec::new();
         for &(slot,r) in &slots{
-            pools.push(self.pool(slot,r,registry,cfg.wallet,reads)?);
+            let resolving=Instant::now();let next=self.pool(slot,r,registry,cfg.wallet,reads);
+            preparation.pool_resolution_ns.record(elapsed_ns(resolving));
+            pools.push(next?);
         }
         install_compact(&mut request,top,&pools);
-        let mut packing=(cfg.capacity)(&request).context("compact seed does not fit V10")?;
+        let checking=Instant::now();let checked=(cfg.capacity)(&request);
+        preparation.capacity_checks+=1;preparation.capacity_rejections+=u64::from(checked.is_err());
+        preparation.capacity_validation_ns.record(elapsed_ns(checking));
+        let mut packing=checked.context("compact seed does not fit V10")?;
+        let lookup=Instant::now();
         let mut options=Vec::new();
         let mut alternative_profiles=Vec::<Alternative>::new();
         // Only direct/partner roles accept parallel alternatives in the current
@@ -605,8 +668,12 @@ impl State {
             let target=self.pools.get(selected/2).context("candidate identity missing")?;
             let (a,b)=(target.mint_a,target.mint_b);
             let original=self.weight(selected).context("seed weight missing")?;
-            for (id,p) in self.pools.iter().enumerate(){
-                if p.mint_a!=a||p.mint_b!=b||used.contains(&id){continue;}
+            let matching=self.pair_pools.get(&(a,b)).context("candidate mint pair absent from identity index")?;
+            preparation.alternative_scans+=1;
+            preparation.indexed_pool_visits+=matching.len() as u64;
+            preparation.full_scan_pool_visits_equivalent+=self.pools.len() as u64;
+            for &id in matching {
+                if used.contains(&id){continue;}
                 let slot=2*id+selected%2;
                 if let Some(w)=self.weight(slot){
                     let new_sum=i128::from(seed_sum)-i128::from(original)+i128::from(w);
@@ -622,24 +689,35 @@ impl State {
                 }
             }
         }
+        preparation.alternative_options+=alternative_profiles.len() as u64;
+        preparation.alternative_lookup_ns.record(elapsed_ns(lookup));
+        let ranking_started=Instant::now();
         let ranking=if strategy==PackingStrategy::Coverage {
+            preparation.coverage_rankings+=1;
+            preparation.coverage_key_evaluations+=alternative_profiles.len() as u64;
             diversity::coverage_order(&alternative_profiles,&slots.iter().map(|(s,_)|s/2).collect::<Vec<_>>(),
                 reference_packs)
         } else {diversity::order(strategy,&alternative_profiles)};
+        preparation.ranking_ns.record(elapsed_ns(ranking_started));
         let mut considered=0;let mut rejected=0;let mut unavailable=0;
         let mut last_rejection=None;
         for index in ranking{
             let (_,slot,role_name,_)=options[index];
             if used.contains(&(slot/2)){continue;}
             considered+=1;
-            let pool=match self.pool(slot,role_name,registry,cfg.wallet,reads){
+            let resolving=Instant::now();let next=self.pool(slot,role_name,registry,cfg.wallet,reads);
+            preparation.pool_resolution_ns.record(elapsed_ns(resolving));
+            let pool=match next{
                 Ok(pool)=>pool,Err(error)=>{
                     unavailable+=1;last_rejection=Some(format!("{error:#}"));continue;
                 }
             };
             pools.push(pool);
             install_compact(&mut request,top,&pools);
-            match (cfg.capacity)(&request){
+            let checking=Instant::now();let checked=(cfg.capacity)(&request);
+            preparation.capacity_checks+=1;preparation.capacity_rejections+=u64::from(checked.is_err());
+            preparation.capacity_validation_ns.record(elapsed_ns(checking));
+            match checked{
                 Ok(metrics)=>{packing=metrics;used.insert(slot/2);},
                 Err(error)=>{pools.pop();rejected+=1;last_rejection=Some(format!("{error:#}"));}
             }
@@ -658,12 +736,15 @@ impl State {
             signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
             frame_to_request_us:frame.and_then(|at|ready.checked_sub(at)),
-            signal_to_request_us:ready.saturating_sub(self.ready_at_us),selection_ns:elapsed_ns(started),
+            signal_to_request_us:ready.saturating_sub(self.ready_at_us),round_elapsed_ns:0,
             registry_reads:reads.clone(),
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added,packing_seed_log_sum_units:seed_sum,
             amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed})
+        })();
+        preparation.pack_build_ns.record(elapsed_ns(started));
+        result
     }
 
 }
@@ -716,7 +797,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                 SignalEvent::State(s)=>{
                     report.state_updates+=1;
                     ensure!(!pending,"candidate state replaced before evaluation completed");
-                    state.apply(s,report.awaiting_snapshot)?;
+                    state.apply(s,report.awaiting_snapshot,&mut report.preparation)?;
                     if matches!(s.trigger.as_ref(),SignalTrigger::Catalog{..}) {
                         if let Some(snapshot)=&s.snapshot {
                             report.catalog_snapshots+=1;
@@ -765,6 +846,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     }
                     if ranked.is_empty() {continue;}
                     let started=Instant::now();
+                    report.preparation.signal_to_round_start_ns.record(
+                        now_us().saturating_sub(state.ready_at_us).saturating_mul(1000));
                     let mut reads=RegistryReads::default();
                     ranked.sort_unstable_by_key(|entry|entry.0);
                     // CP9D: one source candidate per distinct physical token pair.
@@ -874,7 +957,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             };
                             let references=previous.get(pair).map(Vec::as_slice).unwrap_or(&[]);
                             let selected=state.build_compact(candidate,*threshold,trigger.clone(),
-                                &registry,&cfg,report.request_count as usize+1,&mut reads,strategy,references,None);
+                                &registry,&cfg,report.request_count as usize+1,&mut reads,strategy,references,None,
+                                &mut report.preparation);
                             let selection=match selected{
                                 Ok(selection)=>selection,
                                 Err(error)=>{
@@ -887,7 +971,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             if sent_sets.get(pair).is_some_and(|sent|sent.contains(&pool_set)){
                                 report.cp9c_duplicate_packs+=1;continue;
                             }
-                            let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,&mut report.amounts)? else{
+                            let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,
+                                &mut report.amounts,&mut report.preparation)? else{
                                 continue;
                             };
                             let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
@@ -901,7 +986,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             selection.cp9d_source=*origin;
                             selection.cp9d_pair_index=pair_index as u8;
                             selection.packing_revision_variant=variant as u8;
-                            selection.selection_ns=elapsed_ns(started);
+                            selection.round_elapsed_ns=elapsed_ns(started);
                             selection.registry_reads=reads.clone();
                             selection.request_ready_at_us=now_us();
                             selection.frame_to_request_us=selection.price_pipeline.and_then(|t|
@@ -914,10 +999,10 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 if *origin=="fresh"{report.cp9d_fresh_pairs+=1;}
                                 else{report.cp9d_active_pairs+=1;}
                             }
-                            crate::log_event!(Debug,"execution candidates request_id={} strategy={} source={} pair_rank={} generation={} revision={} pools={} accounts={} selection_ns={} broadcasts=false",
+                            crate::log_event!(Debug,"execution candidates request_id={} strategy={} source={} pair_rank={} generation={} revision={} pools={} accounts={} round_elapsed_ns={} broadcasts=false",
                                 selection.request.id,selection.packing_strategy,selection.cp9d_source,selection.cp9d_pair_index,
                                 state.generation,state.revision,selection.packing.pool_declarations,
-                                selection.packing.unique_accounts,selection.selection_ns);
+                                selection.packing.unique_accounts,selection.round_elapsed_ns);
                             // Evidence is queued without awaiting filesystem I/O.
                             // On overload, fail explicitly rather than claiming a complete audit.
                             let request=selection.request.clone();
@@ -927,6 +1012,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         }
                     }
                     if busy_revision{report.skipped_busy_revisions+=1;}
+                    report.preparation.round_work_ns.record(elapsed_ns(started));
                     ranked.clear();
                     report.registry_reads.merge(&reads);
                     if invalid_seed {

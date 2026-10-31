@@ -52,29 +52,32 @@ fn round_robin(lanes:Vec<Vec<usize>>,len:usize)->Vec<usize>{
     }
     result
 }
-/// Count new oriented pool pairings offered by adding a candidate. This is
-/// a coverage metric only, not a profitability or executable-size prediction.
-pub(super) fn novelty(candidate_pool:usize, seed_pools:&[usize],
-    reference_packs:&[Vec<usize>])->usize {
+/// Shared coverage of the reference packages, prepared once per ranking.
+fn existing_pairings(reference_packs:&[Vec<usize>])->HashSet<(usize,usize)> {
     let mut existing=HashSet::<(usize,usize)>::new();
     for pack in reference_packs {
         for &a in pack {for &b in pack {
             if a!=b {existing.insert((a,b));}
         }}
     }
+    existing
+}
+/// Coverage only, not a profitability or executable-size prediction.
+fn novelty(candidate_pool:usize, seed_pools:&[usize],existing:&HashSet<(usize,usize)>)->usize {
     seed_pools.iter().filter(|&&other|other!=candidate_pool)
         .map(|&other|usize::from(!existing.contains(&(candidate_pool,other)))
             +usize::from(!existing.contains(&(other,candidate_pool)))).sum()
 }
 pub(super) fn coverage_order(alternatives:&[Alternative],seed_pools:&[usize],
     reference_packs:&[Vec<usize>])->Vec<usize> {
-    let mut result=(0..alternatives.len()).collect::<Vec<_>>();
-    result.sort_unstable_by_key(|&i|{
-        let a=&alternatives[i];
-        (std::cmp::Reverse(novelty(a.slot/2,seed_pools,reference_packs)),
-            a.marginal_score,a.slot,a.role)
-    });
-    result
+    // Same sort keys and tie-breaks. Build shared coverage once and evaluate
+    // novelty once per alternative, never from the sorting comparator.
+    let existing=existing_pairings(reference_packs);
+    let mut keyed=alternatives.iter().enumerate().map(|(i,a)|
+        ((std::cmp::Reverse(novelty(a.slot/2,seed_pools,&existing)),
+            a.marginal_score,a.slot,a.role),i)).collect::<Vec<_>>();
+    keyed.sort_unstable_by_key(|&(key,_)|key);
+    keyed.into_iter().map(|(_,i)|i).collect()
 }
 /// Rotate the reference strategies by signal revision, but run complementary
 /// coverage last once the reference packs of the same token pair are known.
@@ -167,8 +170,9 @@ mod tests {
     #[test]
     fn complementary_pack_novelty_favors_uncovered_pairs() {
         let previous=vec![vec![1,2,3]];
-        assert_eq!(novelty(3,&[1,2],&previous),0);
-        assert_eq!(novelty(4,&[1,2],&previous),4);
+        let existing=existing_pairings(&previous);
+        assert_eq!(novelty(3,&[1,2],&existing),0);
+        assert_eq!(novelty(4,&[1,2],&existing),4);
         let alternatives=vec![
             Alternative{slot:6,role:0,marginal_score:0,depth_input_raw:None,venue:"x"},
             Alternative{slot:8,role:0,marginal_score:100,depth_input_raw:None,venue:"x"},

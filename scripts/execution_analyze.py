@@ -23,9 +23,13 @@ def decode_compact(header, row):
         raise ValueError('Invalid compact execution row')
     digest, selected, reported, calibrated, timing = row
     s, facts, times = fields('selection', selected), fields('report', reported), fields('timing', timing)
+    # Schema 4 called this cumulative round age selection_ns. It was never
+    # an exclusive single-package duration. Normalize legacy input once.
+    if 'round_elapsed_ns' not in times:
+        times['round_elapsed_ns'] = times.pop('selection_ns')
     config = header['configuration']
     s['request'] = {'id': s['id'], 'settlement': s['settlement'], **config}
-    s.update({k: times[k] for k in ('selection_ns', 'frame_to_request_us', 'signal_to_request_us')})
+    s.update({k: times[k] for k in ('round_elapsed_ns', 'frame_to_request_us', 'signal_to_request_us')})
     s['pools'] = [{'pool': p} for p in s['pools']]
     estimate = s.pop('amount_estimate')
     s['amount_assessment'] = {'decision': s.pop('amount_decision'),
@@ -77,7 +81,7 @@ def decode_compact(header, row):
               'processing_ns': times['calibration_ns']})
     for key in ('trade_input_raw', 'trade_output_raw', 'model_route_output_raw', 'actual_path_marginal_bps'):
         c.setdefault(key, None)
-    return {'schema_version': 4, 'compact': True, 'payload_sha256': digest,
+    return {'schema_version': header['schema_version'], 'compact': True, 'payload_sha256': digest,
             'selection': s, 'report': r, 'calibration': c}
 
 
@@ -87,7 +91,7 @@ def stream_records(stream):
         if not line.strip():
             continue
         row = json.loads(line)
-        if isinstance(row, dict) and row.get('schema_version') == 4 and 'selection_columns' in row:
+        if isinstance(row, dict) and row.get('schema_version') in (4, 5) and 'selection_columns' in row:
             if header is not None:
                 raise ValueError('Duplicate compact journal header')
             header = row
@@ -202,6 +206,10 @@ def analyze(rows):
     strategy_positive_slots = collections.defaultdict(set)
     strategy_positive_path_slots = collections.defaultdict(set)
     same_revision_pools = collections.defaultdict(dict)
+    # Compact offline facts only. Pair comparisons also require the same
+    # settlement, since a physical WSOL/USDC pair has two settlement views.
+    baseline_pools = {}
+    completed_paths = []
     cp9d_source_counts=collections.defaultdict(collections.Counter)
     cp9d_pairs=collections.defaultdict(set)
     cp9d_positive=collections.defaultdict(set)
@@ -237,6 +245,9 @@ def analyze(rows):
         source=s.get('cp9d_source','fresh')
         generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
+        comparison_key = generation_revision + (q['settlement'],)
+        if strategy == 'baseline':
+            baseline_pools[comparison_key] = same_revision_pools[generation_revision][strategy]
         cp9d_source_counts[source]['requests']+=1
         cp9d_pairs[source].add(pair)
         cp9d_pair_revisions[source].add(generation_revision[:2]+(pair,))
@@ -280,7 +291,10 @@ def analyze(rows):
                                     leg['input_raw'] != legs[i - 1]['output_raw'])
         if invalid:
             bad('amount', identity)
-        for key in ('selection_ns', 'frame_to_request_us', 'signal_to_request_us'):
+        round_elapsed = s.get('round_elapsed_ns', s.get('selection_ns'))
+        if round_elapsed is not None:
+            timings['round_elapsed_ns'].append(round_elapsed)
+        for key in ('frame_to_request_us', 'signal_to_request_us'):
             if s.get(key) is not None:
                 timings[key].append(s[key])
         r = row.get('report')
@@ -393,6 +407,12 @@ def analyze(rows):
         strategy_counts[strategy]['rpc_successes'] += 1
         cp9d_source_counts[source]['rpc_successes']+=1
         cp9e_route_counts[route]['rpc_successes']+=1
+        path_case = None
+        if c and c.get('single_cycle'):
+            path_case = {'id': identity, 'strategy': strategy, 'settlement': q['settlement'],
+                         'slot': r.get('context_slot'), 'path': tuple(leg['pool'] for leg in c['legs']),
+                         'above_network_fee': False, 'positive_cashflow': False}
+            completed_paths.append((comparison_key, path_case))
         def token_amount(entries):
             return sum(int(b['uiTokenAmount']['amount']) for b in entries
                        if b.get('owner') == q['wallet'] and b['mint'] == q['settlement'])
@@ -416,6 +436,9 @@ def analyze(rows):
         gains[asset].append(gain)
         fee = sim.get('fee')
         if asset == WSOL:
+            if path_case is not None:
+                path_case['above_network_fee'] = fee is not None and gain > fee
+                path_case['positive_cashflow'] = native_delta is not None and gain + native_delta > 0
             above_fee[asset] += fee is not None and gain > fee
             positive_cashflow[asset] += native_delta is not None and gain + native_delta > 0
             if c and c.get('single_cycle') and fee is not None and gain > fee:
@@ -455,6 +478,32 @@ def analyze(rows):
         best[asset].sort(key=lambda v: v['settlement_gain_raw'], reverse=True)
         del best[asset][10:]
     repeated = [n for n in payloads.values() if n > 1]
+    baseline_comparison = collections.defaultdict(collections.Counter)
+    baseline_path_sets = collections.defaultdict(set)
+    baseline_examples = []
+    for key, case in completed_paths:
+        reference = baseline_pools.get(key)
+        status = ('baseline_not_dispatched' if reference is None else
+                  'path_present' if set(case['path']) <= reference else 'path_absent')
+        counts = baseline_comparison[case['strategy']]
+        counts['successful_cycles'] += 1
+        counts[status] += 1
+        baseline_path_sets[case['strategy'], status].add((case['settlement'], case['path']))
+        if case['above_network_fee']:
+            counts['above_network_fee_' + status] += 1
+        if case['positive_cashflow']:
+            counts['positive_cashflow_' + status] += 1
+            if status == 'path_absent' and len(baseline_examples) < 8:
+                baseline_examples.append({**case, 'path': list(case['path']),
+                                          'graph_generation': key[0], 'revision': key[1]})
+    baseline_coverage = {
+        'by_strategy': {strategy: {**dict(counts), 'distinct_paths_by_status': {
+            status: len(baseline_path_sets[strategy, status])
+            for status in ('path_present', 'path_absent', 'baseline_not_dispatched')}}
+            for strategy, counts in sorted(baseline_comparison.items())},
+        'positive_cashflow_absent_examples': baseline_examples,
+        'note': 'Compare actual successful pool paths with dispatched baseline pool membership in the same graph generation, signal revision, route identity and settlement. Missing baseline means unpaired, not a baseline failure. Membership does not prove that baseline would execute the same path or earn the same gain. These are repeated simulation observations, not independent realized trades.'
+    }
     cross_strategy_pools = collections.defaultdict(list)
     for payload_sets in same_revision_pools.values():
         names = sorted(payload_sets)
@@ -474,6 +523,7 @@ def analyze(rows):
         } for name, counts in sorted(strategy_counts.items())},
         'same_revision_pool_jaccard': {
             name: durations(values) for name, values in sorted(cross_strategy_pools.items())},
+        'baseline_path_coverage': baseline_coverage,
         'largest_quote_discrepancies': quote_outliers
     }
     cp9d={

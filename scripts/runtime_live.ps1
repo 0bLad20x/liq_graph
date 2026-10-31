@@ -476,6 +476,8 @@ try {
         liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
         amount_evidence_passed=$amountPassed; amount_evaluation=$amountSummary
         request_payload_repetition=$requestRepetition
+        execution_preparation=$execution.execution_candidates.preparation
+        execution_baseline_path_coverage=$executionAnalysis.cp9c_strategy_comparison.baseline_path_coverage
         streaming_execution_evidence=$execution.streaming_evidence
         signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
         net_evidence_passed=$netPassed; net_witness_violations=$netViolations
@@ -501,7 +503,7 @@ try {
         signal_revaluation_processing_ns=$production.revaluation_inputs.processing_ns
         frame_to_signal_state_us=$production.steady_state_inputs.frame_to_state_ready_us
         frame_to_signal_complete_us=$production.steady_state_inputs.frame_to_evaluation_complete_us
-        execution_selection_ns=$executionAnalysis.timings.selection_ns
+        execution_round_elapsed_ns=$executionAnalysis.timings.round_elapsed_ns
         signal_to_request_us=$executionAnalysis.timings.signal_to_request_us
         frame_to_request_us=$executionAnalysis.timings.frame_to_request_us
         executor_build_us=$executionAnalysis.timings.build_us
@@ -525,6 +527,12 @@ try {
     if ($null -ne $execution.streaming_evidence) {
         $stream=$execution.streaming_evidence
         Write-Host "Streaming evidence: matched=$($stream.matched), event_bytes=$($stream.event_bytes), detail_bytes=$($stream.detail_bytes), samples=$($stream.detail_samples), max_queue=$($stream.max_backlog), max_unmatched=$($stream.max_unmatched)"
+    }
+    if ($null -ne $execution.execution_candidates.preparation) {
+        $prep = $execution.execution_candidates.preparation
+        $packMs = [Math]::Round([double]$prep.pack_build_ns.mean_ns / 1000000,3)
+        $amountMs = [Math]::Round([double]$amountSummary.processing_ns.mean_ns / 1000000,3)
+        Write-Host "Candidate preparation: packs=$($prep.pack_build_ns.count), indexed_pool_visits=$($prep.indexed_pool_visits), full_scan_equivalent=$($prep.full_scan_pool_visits_equivalent), pack_mean_ms=$packMs, amount_mean_ms=$amountMs"
     }
     if ($RequireCalibrationEvidence) {
         Write-Host "Calibration: requests=$($calibration.counts.records), quoted routes=$($calibration.model_route_statuses.quoted), passed=$calibrationPassed"

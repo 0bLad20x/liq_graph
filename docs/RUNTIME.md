@@ -1,5 +1,8 @@
 # Gemeinsame Runtime und Live-Nachweis
 
+Der Nachlauf [CP9H.md](CP9H.md) beschleunigt die Kandidatenaufbereitung bei
+gleicher Auswahl und trennt Packzeiten von kumulativen Rundenzeiten.
+
 Der aktuelle Einstieg steht in [CP9G.md](CP9G.md): kompakte laufende
 Execution-Evidenz und eine gemeinsame Routenfreigabe mit `direct2` als Standard.
 Die folgenden CP8-Verweise dokumentieren die einzelnen fachlichen Nachweise.

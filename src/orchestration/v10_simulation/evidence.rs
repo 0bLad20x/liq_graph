@@ -21,7 +21,7 @@ const LEG:&[&str]=&["pool","program","venue","flow_status","input_mint","output_
     "input_net_raw","observed_output_raw","model_output_raw","model_unavailable_reason",
     "snapshot_content_digest","observation_slot","component_slot_min","component_slot_max",
     "observation_age_at_request_us","observation_consistency","issues"];
-const TIMING:&[&str]=&["selection_ns","frame_to_request_us","signal_to_request_us","build_us",
+const TIMING:&[&str]=&["round_elapsed_ns","frame_to_request_us","signal_to_request_us","build_us",
     "simulation_rpc_ms","elapsed_ms","trace_us","calibration_ns"];
 
 #[derive(Default,serde::Serialize)]
@@ -65,7 +65,7 @@ impl Writer {
             ensure!(previous==&configuration,"execution evidence configuration changed within one run");
         }else{
             self.stats.event_bytes+=jsonline(&mut self.events,&json!({
-                "schema_version":4,"row":["payload_sha256","selection","report","calibration","timing"],
+                "schema_version":5,"row":["payload_sha256","selection","report","calibration","timing"],
                 "selection_columns":SELECTION,"report_columns":REPORT,"calibration_columns":CALIBRATION,
                 "leg_columns":LEG,"timing_columns":TIMING,"configuration":configuration,
                 "scope":"complete_simulations_with_bounded_full_examples"
@@ -104,7 +104,7 @@ impl Writer {
             }
             *legs=rows;
         }
-        let timing=json!({"selection_ns":compact["selection_ns"],"frame_to_request_us":compact["frame_to_request_us"],
+        let timing=json!({"round_elapsed_ns":compact["round_elapsed_ns"],"frame_to_request_us":compact["frame_to_request_us"],
             "signal_to_request_us":compact["signal_to_request_us"],"build_us":r.build_us,
             "simulation_rpc_ms":r.simulation_rpc_ms,"elapsed_ms":r.elapsed_ms,"trace_us":r.trace_us,
             "calibration_ns":calibration.as_ref().map_or(json!(0),|c|c["processing_ns"].clone())});
