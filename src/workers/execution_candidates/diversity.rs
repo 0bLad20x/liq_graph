@@ -5,10 +5,10 @@ use std::collections::{HashSet,VecDeque};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq,serde::Serialize)]
 #[serde(rename_all="snake_case")]
-pub(super) enum Strategy {Baseline,Contrarian,Mixed}
+pub(super) enum Strategy {Baseline,Contrarian,Mixed,Coverage}
 impl Strategy {
     pub(super) fn label(self)->&'static str {
-        match self {Self::Baseline=>"baseline",Self::Contrarian=>"contrarian",Self::Mixed=>"mixed"}
+        match self {Self::Baseline=>"baseline",Self::Contrarian=>"contrarian",Self::Mixed=>"mixed",Self::Coverage=>"coverage"}
     }
 }
 
@@ -52,6 +52,30 @@ fn round_robin(lanes:Vec<Vec<usize>>,len:usize)->Vec<usize>{
     }
     result
 }
+/// Count new oriented pool pairings offered by adding a candidate. This is
+/// a coverage metric only, not a profitability or executable-size prediction.
+pub(super) fn novelty(candidate_pool:usize, seed_pools:&[usize],
+    reference_packs:&[Vec<usize>])->usize {
+    let mut existing=HashSet::<(usize,usize)>::new();
+    for pack in reference_packs {
+        for &a in pack {for &b in pack {
+            if a!=b {existing.insert((a,b));}
+        }}
+    }
+    seed_pools.iter().filter(|&&other|other!=candidate_pool)
+        .map(|&other|usize::from(!existing.contains(&(candidate_pool,other)))
+            +usize::from(!existing.contains(&(other,candidate_pool)))).sum()
+}
+pub(super) fn coverage_order(alternatives:&[Alternative],seed_pools:&[usize],
+    reference_packs:&[Vec<usize>])->Vec<usize> {
+    let mut result=(0..alternatives.len()).collect::<Vec<_>>();
+    result.sort_unstable_by_key(|&i|{
+        let a=&alternatives[i];
+        (std::cmp::Reverse(novelty(a.slot/2,seed_pools,reference_packs)),
+            a.marginal_score,a.slot,a.role)
+    });
+    result
+}
 pub(super) fn order(strategy:Strategy,alternatives:&[Alternative])->Vec<usize> {
     let mut baseline=(0..alternatives.len()).collect::<Vec<_>>();
     baseline.sort_unstable_by_key(|&i|(alternatives[i].marginal_score,alternatives[i].slot,alternatives[i].role));
@@ -65,6 +89,7 @@ pub(super) fn order(strategy:Strategy,alternatives:&[Alternative])->Vec<usize> {
         indices.sort_unstable_by_key(|&i|(alternatives[i].marginal_score,alternatives[i].slot));
         lanes.push(spread_indices(&indices));
     }
+    if strategy==Strategy::Coverage {return baseline;}
     if strategy==Strategy::Contrarian {
         return round_robin(lanes,alternatives.len());
     }
@@ -106,7 +131,7 @@ mod tests {
     #[test]
     fn rankings_cover_every_candidate_once_and_are_deterministic() {
         let values=alternatives();
-        for mode in [Strategy::Baseline,Strategy::Contrarian,Strategy::Mixed] {
+        for mode in [Strategy::Baseline,Strategy::Contrarian,Strategy::Mixed,Strategy::Coverage] {
             let order=order(mode,&values);
             assert_eq!(order.len(),values.len());
             assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(),values.len());
@@ -118,6 +143,17 @@ mod tests {
         let values=alternatives();let ranks=order(Strategy::Contrarian,&values);
         let first_four=ranks[..4].iter().map(|&i|values[i].slot).collect::<HashSet<_>>();
         assert_eq!(first_four,HashSet::from([0,8,1,9]));
+    }
+    #[test]
+    fn complementary_pack_novelty_favors_uncovered_pairs() {
+        let previous=vec![vec![1,2,3]];
+        assert_eq!(novelty(3,&[1,2],&previous),0);
+        assert_eq!(novelty(4,&[1,2],&previous),4);
+        let alternatives=vec![
+            Alternative{slot:6,role:0,marginal_score:0,depth_input_raw:None,venue:"x"},
+            Alternative{slot:8,role:0,marginal_score:100,depth_input_raw:None,venue:"x"},
+        ];
+        assert_eq!(coverage_order(&alternatives,&[1,2],&previous),vec![1,0]);
     }
     #[test]
     fn mixed_prioritizes_distinct_profiles_not_only_best_marginal() {
