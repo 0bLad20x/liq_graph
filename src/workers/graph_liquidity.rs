@@ -968,6 +968,30 @@ mod cp9b_tests {
         compare_reference(&second,true,false).unwrap();
     }
     #[test]
+    fn direct2_direct3_scope_adds_conversion_but_never_triangles() {
+        let wsol:Pubkey=WSOL.parse().unwrap();
+        let usdc:Pubkey=USDC.parse().unwrap();
+        let x=Pubkey::new_from_array([37_u8;32]);
+        let b=Pubkey::new_from_array([38_u8;32]);
+        let mut update=HashMap::new();
+        for (id,a,z) in [(61,wsol,x),(62,wsol,x),(63,x,usdc),
+            (64,usdc,wsol),(65,x,b),(66,b,wsol)] {
+            let p=pool(id,a,z);update.insert(p.address,Some(p));
+        }
+        let scoped=create(Arc::new(GraphSnapshot::default()),update,1,false,true).unwrap();
+        assert!(scoped.topologies.iter().any(|t|t.kind==RouteTopologyKind::Direct2));
+        assert!(scoped.topologies.iter().any(|t|t.kind==RouteTopologyKind::Direct3));
+        assert!(scoped.topologies.iter().all(|t|matches!(t.kind,
+            RouteTopologyKind::Direct2|RouteTopologyKind::Direct3)));
+        compare_reference(&scoped,false,true).unwrap();
+        let mut delta=HashMap::new();let p=pool(67,usdc,x);
+        delta.insert(p.address,Some(p));
+        let next=create(Arc::new(scoped),delta,2,false,true).unwrap();
+        assert!(next.topologies.iter().all(|t|matches!(t.kind,
+            RouteTopologyKind::Direct2|RouteTopologyKind::Direct3)));
+        compare_reference(&next,false,true).unwrap();
+    }
+    #[test]
     fn direct2_scope_changes_only_topology_selection_not_pool_membership() {
         let wsol:Pubkey=WSOL.parse().unwrap();
         let usdc:Pubkey=USDC.parse().unwrap();
