@@ -875,7 +875,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             sent_sets.entry(*pair).or_default().insert(actual);
                             previous.entry(*pair).or_default().push(
                                 selection.pools.iter().map(|p|p.slot/2).collect());
-                            selection.cp9d_source=origin;
+                            selection.cp9d_source=*origin;
                             selection.cp9d_pair_index=pair_index as u8;
                             selection.packing_revision_variant=variant as u8;
                             selection.selection_ns=elapsed_ns(started);
