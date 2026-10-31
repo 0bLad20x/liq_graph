@@ -29,6 +29,10 @@ jobs:
         run: |
           cargo build --locked --release
           git diff --exit-code -- Cargo.lock
+      - name: CP10 byte-exact V10 compiler regression tests
+        run: cargo test --locked --release cp10_tests
+      - name: CP10 Direct2 packing regression tests
+        run: cargo test --locked --release execution_candidates
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
       - name: Live utility PowerShell syntax only
