@@ -64,6 +64,32 @@ def compact_direct2_pair(selection):
         raise ValueError(f"Invalid compact Direct2 witness: {request['id']}")
     return tuple(sorted((settlement, legs[0]['output_mint'])))
 
+def compact_route_identity(selection):
+    """Compare physical token pairs *within* route kind: Direct2 != Direct3.
+
+    The persisted compact request deliberately excludes full manifest/groups.
+    For Direct3, the third witness leg is settlement conversion (Q -> S).
+    """
+    route=selection['route_kind']
+    if route=='direct2':
+        s,t=compact_direct2_pair(selection)
+        return (route,s,t)
+    if route!='direct3':
+        return (route,selection['request']['settlement'],f'other:{route}')
+    request=selection['request']
+    settlement=request['settlement']
+    legs=(((selection.get('candidate') or {}).get('witness') or {}).get('legs') or [])
+    if (len(legs)!=3 or legs[0].get('input_mint')!=settlement or
+            legs[0].get('output_mint')!=legs[1].get('input_mint') or
+            legs[1].get('output_mint')!=legs[2].get('input_mint') or
+            legs[2].get('output_mint')!=settlement or
+            legs[0].get('output_mint')==settlement or
+            legs[1].get('output_mint')==settlement or
+            legs[1].get('output_mint')==legs[0].get('output_mint')):
+        raise ValueError(f"Invalid compact Direct3 witness: {request['id']}")
+    return (route,settlement,legs[0]['output_mint'])
+
+
 def analyze(rows):
     count = reports = successes = dex_calls = 0
     ids, report_ids = set(), set()
@@ -95,6 +121,9 @@ def analyze(rows):
     cp9d_packages=collections.defaultdict(set)
     cp9d_pair_revisions=collections.defaultdict(set)
     cp9d_thresholds=collections.defaultdict(collections.Counter)
+    cp9e_route_counts=collections.defaultdict(collections.Counter)
+    cp9e_route_positive_states=collections.defaultdict(set)
+    cp9e_route_positive_slots=collections.defaultdict(set)
     quote_outliers = []
 
     def bad(kind, identity):
@@ -114,8 +143,8 @@ def analyze(rows):
         routes[route] += 1
         strategy = s.get('packing_strategy', 'baseline')
         strategy_counts[strategy]['requests'] += 1
-        pair=(compact_direct2_pair(s) if route == 'direct2'
-              else (q['settlement'],f'non_direct2:{route}'))
+        pair=compact_route_identity(s)
+        cp9e_route_counts[route]['requests']+=1
         source=s.get('cp9d_source','fresh')
         generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
@@ -269,6 +298,7 @@ def analyze(rows):
         successful_routes[route] += 1
         strategy_counts[strategy]['rpc_successes'] += 1
         cp9d_source_counts[source]['rpc_successes']+=1
+        cp9e_route_counts[route]['rpc_successes']+=1
         def token_amount(entries):
             return sum(int(b['uiTokenAmount']['amount']) for b in entries
                        if b.get('owner') == q['wallet'] and b['mint'] == q['settlement'])
@@ -287,6 +317,7 @@ def analyze(rows):
             positive_cashflow[asset] += native_delta is not None and gain + native_delta > 0
             if c and c.get('single_cycle') and fee is not None and gain > fee:
                 cp9d_source_counts[source]['above_network_fee']+=1
+                cp9e_route_counts[route]['above_network_fee']+=1
                 cp9d_positive[source].add((r.get('context_slot'),pair,tuple(
                     leg.get('pool') for leg in c.get('legs',()))))
                 # Distinct simulation slots are not distinct price states.
@@ -297,6 +328,8 @@ def analyze(rows):
                     for leg in c.get('legs',()))
                 cp9d_positive_states[source].add((pair,executed_path,frozen_state))
                 cp9d_positive_path_states[strategy].add((pair,executed_path,frozen_state))
+                cp9e_route_positive_states[route].add((pair,executed_path,frozen_state))
+                cp9e_route_positive_slots[route].add((r.get('context_slot'),pair,executed_path))
                 strategy_counts[strategy]['above_network_fee'] += 1
                 strategy_positive_slots[strategy].add(r.get('context_slot'))
                 pool_path=tuple((leg.get('pool') or 'unknown') for leg in c.get('legs', ()))
@@ -353,7 +386,14 @@ def analyze(rows):
             s:dict(v) for s,v in sorted(cp9d_thresholds.items())},
         'note':'Observed settlement thresholds are post-simulation diagnostics; minimum_profit was not changed. Offered pool pairings are not guaranteed executable. Different simulation slots may share exactly the same frozen pool content digest; count them separately from distinct observed market states.'
     }
+    cp9e={'by_route':{
+        route:{**dict(counter),
+            'different_positive_frozen_states':len(cp9e_route_positive_states[route]),
+            'different_positive_path_slots':len(cp9e_route_positive_slots[route])}
+        for route,counter in sorted(cp9e_route_counts.items())},
+        'note':'Direct2 and Direct3 source identities and economic outcomes are tracked separately. A simulation slot is not an independent trade.'}
     return {'schema_version': 2,
+            'cp9e_direct_route_comparison':cp9e,
             'cp9d_signal_breadth_and_coverage':cp9d,
             'cp9c_strategy_comparison': cp9c, 'request_count': count, 'report_count': reports,
             'simulation_successes': successes, 'simulation_failures': sum(errors.values()),
