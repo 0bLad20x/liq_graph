@@ -76,6 +76,18 @@ pub(super) fn coverage_order(alternatives:&[Alternative],seed_pools:&[usize],
     });
     result
 }
+/// Rotate the reference strategies by signal revision, but run complementary
+/// coverage last once the reference packs of the same token pair are known.
+pub(super) fn strategy_schedule(strategies:&[Strategy],revision:u64)->Vec<Strategy>{
+    let refs=strategies.iter().copied().filter(|s|*s!=Strategy::Coverage).collect::<Vec<_>>();
+    let mut order=Vec::with_capacity(strategies.len());
+    if !refs.is_empty(){
+        let start=(revision as usize)%refs.len();
+        for i in 0..refs.len(){order.push(refs[(start+i)%refs.len()]);}
+    }
+    if strategies.contains(&Strategy::Coverage){order.push(Strategy::Coverage);}
+    order
+}
 pub(super) fn order(strategy:Strategy,alternatives:&[Alternative])->Vec<usize> {
     let mut baseline=(0..alternatives.len()).collect::<Vec<_>>();
     baseline.sort_unstable_by_key(|&i|(alternatives[i].marginal_score,alternatives[i].slot,alternatives[i].role));
@@ -143,6 +155,14 @@ mod tests {
         let values=alternatives();let ranks=order(Strategy::Contrarian,&values);
         let first_four=ranks[..4].iter().map(|&i|values[i].slot).collect::<HashSet<_>>();
         assert_eq!(first_four,HashSet::from([0,8,1,9]));
+    }
+    #[test]
+    fn round_robin_reference_schedule_does_not_preempt_coverage() {
+        let input=[Strategy::Baseline,Strategy::Contrarian,Strategy::Mixed,Strategy::Coverage];
+        assert_eq!(strategy_schedule(&input,0),input);
+        assert_eq!(strategy_schedule(&input,1),
+            vec![Strategy::Contrarian,Strategy::Mixed,Strategy::Baseline,Strategy::Coverage]);
+        assert_eq!(strategy_schedule(&[Strategy::Coverage],17),vec![Strategy::Coverage]);
     }
     #[test]
     fn complementary_pack_novelty_favors_uncovered_pairs() {
