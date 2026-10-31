@@ -60,6 +60,30 @@ try {
 
 The script itself handles `cargo build --locked --release`, exact checkout/dirty-tree integrity, full evidence generation, run summary and ZIP packaging. Use its final ZIP for comparison.
 
+## Reanalyze an already completed run after an analyzer-only failure
+
+The compact `selection.request` intentionally omits the full V10 `groups`
+manifests; CP9D token pair reconstruction uses the frozen
+`selection.candidate.witness.legs`. A failure of the post-run Python
+analysis does **not** imply that the 300-second V10 simulation failed.
+
+```powershell
+Set-Location C:\\dev_projects\\liq_graph
+git pull --ff-only origin cp9d-signal-breadth-pool-coverage
+if ($LASTEXITCODE -ne 0) { throw "Git pull failed" }
+python -m unittest discover -s scripts/tests -p 'test_*.py'
+if ($LASTEXITCODE -ne 0) { throw "Analyzer tests failed" }
+$run = Join-Path (Get-Location) 'runtime_live\\20261031T063803524Z'
+python .\\scripts\\execution_analyze.py --folder $run --output (Join-Path $run 'execution_analysis.json')
+if ($LASTEXITCODE -ne 0) { throw "Post-run analyzer failed; inspect execution_analysis.json" }
+```
+
+No RPC queries, on-chain execution, V10 replay or new live run are required.
+The CP9D report also distinguishes positive *pool-path + simulation-slot*
+combinations from *pool-path + frozen content-digest* states; an unchanged
+source state across different simulated slots is not an independent discovered
+price opportunity. A matching digest is not proof of equal bank state.
+
 ## Evidence and decision rules
 
 From `execution.json` inspect `execution_candidates.cp9d_fresh_pairs`, `cp9d_active_pairs`, `cp9d_active_candidates_examined`, `cp9d_queue_full_by_strategy` and `cp9c_by_strategy`. Confirm V10 parallel report max and RPC provider failures independently.
