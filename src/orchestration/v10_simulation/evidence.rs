@@ -180,3 +180,45 @@ pub(super) fn run(mut input:mpsc::Receiver<EvidenceItem>,folder:PathBuf,
         "V10 evidence missing pairs: selections={} reports={}",selections.len(),reports.len());
     writer.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recent_digest_cache_is_bounded_without_losing_reference_identity() {
+        let mut recent=Recent::new(2);
+        assert!(recent.first_recent("a".into()));
+        assert!(!recent.first_recent("a".into()));
+        assert!(recent.first_recent("b".into()));
+        assert!(recent.first_recent("c".into()));
+        assert_eq!(recent.keys.len(),2);
+        assert!(recent.first_recent("a".into())); // old hash may be re-emitted
+        assert_eq!(recent.keys.len(),2);
+    }
+    #[test]
+    fn snapshot_compaction_preserves_venue_and_liquidity_gate() {
+        let root=std::env::temp_dir().join(format!("liq_graph_cp9g_test_{}",std::process::id()));
+        let _=std::fs::create_dir_all(&root);
+        let file=root.join("snapshots.jsonl");
+        let mut writer=BufWriter::new(File::create(&file).unwrap());
+        let mut cache=Recent::new(2);
+        let mut stats=Summary::default();
+        let mut selection=json!({"pools":[{"pool":"X","observation":{
+            "pool":"X","venue":"meteora_dlmm",
+            "liquidity":{"content_digest":[1,2,3],"directions":[{"levels":[{"output_raw":1}]}]},
+            "price_quote_per_base":1.2
+        }}]});
+        store_snapshots(&mut selection,&mut cache,&mut writer,&mut stats).unwrap();
+        writer.flush().unwrap();
+        let reference=selection["pools"][0]["observation_ref"].as_str().unwrap();
+        assert_eq!(selection["pools"][0]["observation"]["venue"],"meteora_dlmm");
+        assert!(!selection["pools"][0]["observation"]["liquidity"].is_null());
+        assert!(selection["pools"][0]["observation"].get("price_quote_per_base").is_none());
+        let saved=std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains(reference));
+        assert!(saved.contains("price_quote_per_base"));
+        assert_eq!(stats.snapshots_written,1);
+        drop(writer);
+        let _=std::fs::remove_dir_all(root);
+    }
+}
