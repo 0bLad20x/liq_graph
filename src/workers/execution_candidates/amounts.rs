@@ -603,3 +603,12 @@ mod cp11_product_tests {
         }
     }
 }
+
+
+#[cfg(test)]
+pub(super) fn cp12_cached_quote_trace(
+    inputs:&[Input],pool:usize,direction:usize,amounts:&[u64]
+)->Vec<Calc<u64>>{
+    let mut scratch=FrozenQuoteScratch::new(inputs.len());
+    amounts.iter().map(|&amount|scratch.quote(inputs,Edge{pool,direction},amount)).collect()
+}
