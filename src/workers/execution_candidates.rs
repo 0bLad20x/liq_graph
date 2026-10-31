@@ -713,14 +713,46 @@ impl State {
                     unavailable+=1;last_rejection=Some(format!("{error:#}"));continue;
                 }
             };
+            // CP10: Direct2 can insert only the new pool into the already
+            // materialized group. Keep all direct pools before partner pools,
+            // matching install_compact exactly even if ranking interleaves roles.
+            let direct_before=if top.kind==SignalRouteKind::Direct2 {
+                pools.iter().filter(|(_,e)|e.role=="direct").count()
+            }else{0};
             pools.push(pool);
-            install_compact(&mut request,top,&pools);
+            let inserted_at=if top.kind==SignalRouteKind::Direct2 {
+                let new_pool=&pools.last().expect("candidate just appended").0;
+                let Some(ExecutionGroup::Direct{pools:group_pools,..})=request.groups.first_mut()
+                    else{bail!("Direct2 request missing direct group")};
+                let index=if role_name=="direct"{direct_before}else{group_pools.len()};
+                group_pools.insert(index,new_pool.clone());
+                Some(index)
+            }else{
+                install_compact(&mut request,top,&pools);
+                None
+            };
+            #[cfg(test)]
+            if inserted_at.is_some() {
+                let mut reference=request.clone();
+                install_compact(&mut reference,top,&pools);
+                assert_eq!(serde_json::to_value(&request).unwrap(),
+                    serde_json::to_value(&reference).unwrap(),
+                    "CP10 Direct2 incremental packing must match reference");
+            }
             let checking=Instant::now();let checked=(cfg.capacity)(&request);
             preparation.capacity_checks+=1;preparation.capacity_rejections+=u64::from(checked.is_err());
             preparation.capacity_validation_ns.record(elapsed_ns(checking));
             match checked{
                 Ok(metrics)=>{packing=metrics;used.insert(slot/2);},
-                Err(error)=>{pools.pop();rejected+=1;last_rejection=Some(format!("{error:#}"));}
+                Err(error)=>{
+                    pools.pop();
+                    if let Some(index)=inserted_at {
+                        let Some(ExecutionGroup::Direct{pools:group_pools,..})=request.groups.first_mut()
+                            else{bail!("Direct2 request missing direct group after rejection")};
+                        group_pools.remove(index);
+                    }
+                    rejected+=1;last_rejection=Some(format!("{error:#}"));
+                },
             }
         }
         install_compact(&mut request,top,&pools);
