@@ -43,6 +43,7 @@ jobs:
         run: |
           cargo test --locked --release cp12_frozen_quote_benchmark -- --ignored --nocapture
           cargo test --locked --release cp12_frozen_amount_benchmark -- --ignored --nocapture
+          cargo test --locked --release cp12_repeated_quote_benchmark -- --ignored --nocapture
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
       - name: Live utility PowerShell syntax only
