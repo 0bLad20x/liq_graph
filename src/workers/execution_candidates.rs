@@ -21,7 +21,7 @@ pub struct Settings {
     pub limit: usize,
     pub kind: Option<SignalRouteKind>,
     /// CP9C: independent alternative-packing strategies for the same signal revision.
-    pub strategies:Vec<PackingStrategy>,
+    strategies:Vec<PackingStrategy>,
     pub cp9d_max_pairs:usize,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
     pub capacity: fn(&ExecutionRequest) -> Result<ExecutionMetrics>,
