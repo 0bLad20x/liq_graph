@@ -644,6 +644,9 @@ impl Persistence {
         let mut completions_seen=0_usize;
         let mut written_identity=0_usize;
         let mut written_completion=0_usize;
+        let mut jupiter_batches_written=0_u64;
+        let mut jupiter_rows_upserted=0_u64;
+        let mut jupiter_max_age_ms=0_u64;
         let mut ticker=interval(WRITE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut pool_open=true;
@@ -662,7 +665,19 @@ impl Persistence {
                     Err(broadcast::error::RecvError::Closed)=>{onchain_rx=None;},
                 },
                 event=async {mint_rx.as_mut().expect("mint channel").recv().await},if mint_open=>match event {
-                    Some(batch)=>{self.save_mint_batch(&batch).await?;},
+                    Some(batch)=>{
+                        let written=self.save_mint_batch(&batch).await?;
+                        jupiter_batches_written+=1;
+                        jupiter_rows_upserted=jupiter_rows_upserted.saturating_add(written);
+                        let age=crate::core::now_unix_ms().unwrap_or(0)
+                            .saturating_sub(batch.received_at_ms);
+                        jupiter_max_age_ms=jupiter_max_age_ms.max(age);
+                        if jupiter_batches_written%256==0{
+                            crate::log_event!(Info,"persistence Jupiter reliable batches_written={} rows_upserted={} max_age_ms={} pending={}",
+                                jupiter_batches_written,jupiter_rows_upserted,
+                                jupiter_max_age_ms,mint_rx.as_ref().map_or(0,mpsc::Receiver::len));
+                        }
+                    },
                     None=>{mint_rx=None;},
                 },
                 event=rx.recv(),if pool_open=>match event {
@@ -715,7 +730,7 @@ impl Persistence {
         }
         self.flush(&mut pending_identity,WriteKind::Identity,&mut written_identity).await?;
         self.flush(&mut pending_completion,WriteKind::Completion,&mut written_completion).await?;
-        crate::log_event!(Info,"persistence complete identities_seen={identities_seen} completions_seen={completions_seen} identities_upserted={written_identity} completions_upserted={written_completion} table={TABLE}");
+        crate::log_event!(Info,"persistence complete identities_seen={identities_seen} completions_seen={completions_seen} identities_upserted={written_identity} completions_upserted={written_completion} jupiter_batches_written={jupiter_batches_written} jupiter_rows_upserted={jupiter_rows_upserted} jupiter_max_age_ms={jupiter_max_age_ms} table={TABLE}");
         Ok(())
     }
 }
