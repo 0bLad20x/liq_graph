@@ -96,14 +96,15 @@ pub async fn cp1_live() -> Result<()> {
     let registry_task=tokio::spawn(pool_registry::run(
         source_rx,None,registry.clone(),updates.clone(),done,true,Some(qualified_rx.clone())));
     let (jupiter_out,_) =broadcast::channel::<Arc<DataBatch>>(256);
-    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_out.subscribe()),None));
+    let (jupiter_persist_tx,jupiter_persist_rx)=tokio::sync::mpsc::channel::<Arc<DataBatch>>(256);
+    let writer=tokio::spawn(database.run_with_mints(updates.subscribe(),Some(jupiter_persist_rx),None));
     let (target_tx,target_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let qualification=tokio::spawn(mint_qualification::run(
         registry.snapshot(),mint_registry,updates.subscribe(),jupiter_out.subscribe(),qualified_tx,target_tx,
         None,None,None,None));
     let settings=jupiter_settings()?.context("CP1 requires JUPITER_SEARCH_API_KEYS")?;
     let jupiter=tokio::spawn(source_jupiter_mint::run_targeted(
-        core::http_client()?,settings,target_rx,jupiter_out.clone()));
+        core::http_client()?,settings,target_rx,jupiter_out.clone(),Some(jupiter_persist_tx)));
     let qualification_evidence=qualified_rx.clone();
     let dex=tokio::spawn(source_dexscreener::run_live(
         qualified_rx,registry.clone(),source.clone()));
@@ -398,13 +399,14 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     let registry_qualified=qualified_rx.clone();
     let mut tasks=JoinSet::<Result<()>>::new();
     let (jupiter_out,_)=broadcast::channel::<Arc<DataBatch>>(256);
+    let (jupiter_persist_tx,jupiter_persist_rx)=tokio::sync::mpsc::channel::<Arc<DataBatch>>(256);
     let (onchain_tx,onchain_rx)=tokio::sync::mpsc::channel::<Arc<core::MintOnchainBatch>>(64);
     let (onchain_persist,_)=broadcast::channel::<Arc<core::MintOnchainBatch>>(256);
     let (mint_revision_tx,mint_revision_rx)=watch::channel(0_u64);
     let (selected_mints_tx,selected_mints_rx)=watch::channel(Arc::<[solana_pubkey::Pubkey]>::from([]));
     let mint_reader:Arc<dyn core::MintReader>=Arc::new(mint_registry.clone());
     critical(&mut tasks,"persistence",database.run_with_mints(
-        updates.subscribe(),Some(jupiter_out.subscribe()),Some(onchain_persist.subscribe())));
+        updates.subscribe(),Some(jupiter_persist_rx),Some(onchain_persist.subscribe())));
     critical(&mut tasks,"graph_liquidity",graph_liquidity::run(
         updates.subscribe(),graph_tx,graph_settings));
     critical(&mut tasks,"mint_extensions",crate::workers::mint_extensions::run(
@@ -523,12 +525,14 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     if jupiter_settings()?.is_some() {
         let client=http.clone();
         let jupiter_publisher=jupiter_out.clone();
+        let durable_publisher=jupiter_persist_tx.clone();
         tasks.spawn(supervise("source_jupiter_mint",stop_rx.clone(),move||{
             let client=client.clone();let targets=target_rx.clone();
             let output=jupiter_publisher.clone();
+            let durable=durable_publisher.clone();
             async move{
                 let settings=jupiter_settings()?.context("Jupiter keys disappeared")?;
-                source_jupiter_mint::run_targeted(client,settings,targets,output).await
+                source_jupiter_mint::run_targeted(client,settings,targets,output,Some(durable)).await
             }
         }));
     }
@@ -569,7 +573,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
     if full_scan {discovery::spawn_bootstrap(&mut tasks,discovery_resources.clone())?;}
     drop(discovery_resources);
     crate::log_event!(Info,"runtime ready=true workers_completion={completion_count} v10_simulation={} execution_mode=simulateTransaction_only",simulation_enabled);
-    drop(jupiter_out);drop(source);drop(updates);drop(rpc);
+    drop(jupiter_persist_tx);drop(jupiter_out);drop(source);drop(updates);drop(rpc);
 
     // Operator termination uses q + Enter; finite RUN_DURATION_SECONDS supports
     // an automatic graceful live run without adding dependencies or lockfile changes.
