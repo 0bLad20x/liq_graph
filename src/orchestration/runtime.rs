@@ -142,14 +142,14 @@ fn ensure_duration(n:u64)->Result<()> {
 
 #[derive(Clone,Copy)]
 struct RunSettings {
-    venues:core::EnabledVenues,
+    venues:core::EnabledVenues, routes:core::EnabledRoutes,
     duration:u64,full_scan:bool,hydration_only:bool,
     market:bool,signals:bool,simulate:bool,rewatch:bool,signal_proof:bool,
 }
 impl RunSettings {
     fn from_env()->Result<Self> {
         let settings=Self {
-            venues:core::EnabledVenues::from_env()?,
+            venues:core::EnabledVenues::from_env()?,routes:core::EnabledRoutes::from_env()?,
             duration:number("RUN_DURATION_SECONDS",0)?,
             full_scan:enabled("RUN_FULL_SCAN")?,
             hydration_only:enabled("IDENTITY_HYDRATION_ONLY")?,
@@ -174,7 +174,7 @@ impl RunSettings {
     }
     fn describe(self)->serde_json::Value {
         serde_json::json!({"pipeline":"runtime","duration_seconds":self.duration,
-            "enabled_venues":self.venues.names(),
+            "enabled_venues":self.venues.names(),"enabled_routes":self.routes.names(),
             "completion_protocols":if self.hydration_only {Vec::new()}else{
                 completion::protocols(self.venues).map(|v|format!("{v:?}")).collect::<Vec<_>>()},
             "market_state_enabled":self.market,"signals_enabled":self.signals,

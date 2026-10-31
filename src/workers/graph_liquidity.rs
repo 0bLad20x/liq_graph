@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch, mpsc}, task::JoinSet, time::{Instant as TokioInstant, sleep_until}};
 
-use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue};
+use crate::core::{CompletionState, PoolState, PoolUpdateBatch, Venue, EnabledRoutes};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -23,23 +23,14 @@ pub type Pair = (Pubkey, Pubkey);
 
 /// The graph uses the same protocol scope as Discovery, Registry and Completion.
 #[derive(Clone, Debug)]
-pub struct Settings { enabled_venues: crate::core::EnabledVenues, direct2_only:bool, direct2_direct3_only:bool }
+pub struct Settings { enabled_venues: crate::core::EnabledVenues, routes:EnabledRoutes }
 impl Settings {
     pub fn from_env() -> Result<Self> {
         if std::env::var_os("GRAPH_MIN_TVL_USD").is_some() {
             crate::log_event!(Warn,"GRAPH_MIN_TVL_USD is ignored; Registry completion admission owns the common TVL gate");
         }
         let enabled_venues=crate::core::EnabledVenues::from_env()?;
-        let direct2_only=match std::env::var("GRAPH_DIRECT2_ONLY").as_deref() {
-            Ok("1"|"true")=>true,Ok("0"|"false")|Err(std::env::VarError::NotPresent)=>false,
-            _=>anyhow::bail!("GRAPH_DIRECT2_ONLY must be true or false"),
-        };
-        let direct2_direct3_only=match std::env::var("GRAPH_DIRECT2_DIRECT3_ONLY").as_deref() {
-            Ok("1"|"true")=>true,Ok("0"|"false")|Err(std::env::VarError::NotPresent)=>false,
-            _=>anyhow::bail!("GRAPH_DIRECT2_DIRECT3_ONLY must be true or false"),
-        };
-        ensure!(!(direct2_only && direct2_direct3_only),"graph route restrictions are mutually exclusive");
-        Ok(Self { enabled_venues,direct2_only,direct2_direct3_only })
+        Ok(Self { enabled_venues,routes:EnabledRoutes::from_env()? })
     }
     fn allows(&self, venue: Venue) -> bool {
         self.enabled_venues.contains(venue)
@@ -223,8 +214,7 @@ fn pair(a: Pubkey, b: Pubkey) -> Pair {
     if a < b { (a, b) } else { (b, a) }
 }
 
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash,PartialOrd,Ord)]
-pub enum RouteTopologyKind { Direct2, Direct3, Triangle3, Triangle4 }
+pub use crate::core::signals::SignalRouteKind as RouteTopologyKind;
 
 /// One mathematical route shape, never one particular choice of pools.
 /// Reverse direction is implicit; each role resolves through pair_pools.
@@ -248,7 +238,7 @@ fn build_topologies(
     pairs:&HashMap<Pair,Arc<[Pubkey]>>,
     adjacency:&HashMap<Pubkey,HashSet<Pubkey>>,
     wsol:Pubkey, usdc:Pubkey, target_filter:Option<&HashSet<(Pubkey,Pubkey)>>,
-    direct2_only:bool,direct2_direct3_only:bool,
+    routes:EnabledRoutes,
 ) -> Result<Vec<RouteTopology>> {
     let mut result=Vec::<RouteTopology>::new();
     let mut push=|kind,settlement,target,bridge,roles:&[(Pubkey,Pubkey)],options:u64| -> Result<()> {
@@ -265,12 +255,11 @@ fn build_topologies(
         for &t in adjacency.get(&s).into_iter().flatten() {
             if t==s || target_filter.is_some_and(|f|!f.contains(&(s,t))) { continue; }
             let direct=count(s,t);
-            if direct>=2 {
+            if routes.contains(RouteTopologyKind::Direct2) && direct>=2 {
                 push(RouteTopologyKind::Direct2,s,t,None,&[(s,t),(t,s)],
                     direct.saturating_mul(direct-1))?;
             }
-            if direct2_only {continue;}
-            if t!=q && direct>0 {
+            if routes.contains(RouteTopologyKind::Direct3) && t!=q && direct>0 {
                 let quoted=count(t,q);let conversions=count(q,s);
                 if quoted>0 && conversions>0 {
                     let options=2_u64.saturating_mul(direct)
@@ -278,17 +267,17 @@ fn build_topologies(
                     push(RouteTopologyKind::Direct3,s,t,None,&[(s,t),(t,q),(q,s)],options)?;
                 }
             }
-            if direct2_direct3_only {continue;}
+            if !routes.contains(RouteTopologyKind::Triangle3) && !routes.contains(RouteTopologyKind::Triangle4) {continue;}
             for &b in adjacency.get(&t).into_iter().flatten() {
                 if b==s || b==t { continue; }
                 let middle=count(t,b);
                 let back=count(b,s);
-                if direct>0 && middle>0 && back>0 {
+                if routes.contains(RouteTopologyKind::Triangle3) && direct>0 && middle>0 && back>0 {
                     let options=2_u64.saturating_mul(direct)
                         .saturating_mul(middle).saturating_mul(back);
                     push(RouteTopologyKind::Triangle3,s,t,Some(b),&[(s,t),(t,b),(b,s)],options)?;
                 }
-                if t!=q && b!=q && direct>0 && middle>0 {
+                if routes.contains(RouteTopologyKind::Triangle4) && t!=q && b!=q && direct>0 && middle>0 {
                     let back_q=count(b,q);let conversions=count(q,s);
                     if back_q>0 && conversions>0 {
                         let options=2_u64.saturating_mul(direct)
@@ -521,7 +510,7 @@ fn new_edge_targets(new_edges:&HashSet<Pair>,adj:&HashMap<Pubkey,HashSet<Pubkey>
 /// Live comparison against the *unchanged* original full route enumerator.
 /// It checks exact identity, directed roles, option multiplicities and
 /// the corresponding pair pools. No price or simulated input is involved.
-fn compare_reference(graph:&GraphSnapshot,direct2_only:bool,direct2_direct3_only:bool)->Result<u128>{
+fn compare_reference(graph:&GraphSnapshot,routes:EnabledRoutes)->Result<u128>{
     let started=Instant::now();
     let mut adj=HashMap::<Pubkey,HashSet<Pubkey>>::new();
     for &(a,b) in graph.pair_pools.keys(){
@@ -530,7 +519,7 @@ fn compare_reference(graph:&GraphSnapshot,direct2_only:bool,direct2_direct3_only
     }
     let wsol:Pubkey=WSOL.parse()?;
     let usdc:Pubkey=USDC.parse()?;
-    let full=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None,direct2_only,direct2_direct3_only)?;
+    let full=build_topologies(&graph.pair_pools,&adj,wsol,usdc,None,routes)?;
     // The optional reference derives its own expected mapping from the full
     // enumeration. Do not reuse the production index or its construction loop.
     let mut reference_index=HashMap::<Pair,Vec<u32>>::new();
@@ -558,7 +547,7 @@ fn compare_reference(graph:&GraphSnapshot,direct2_only:bool,direct2_direct3_only
 
 fn create(
     old:Arc<GraphSnapshot>, updates:HashMap<Pubkey,Option<PreparedPool>>,generation:u64,
-    direct2_only:bool,direct2_direct3_only:bool,
+    routes:EnabledRoutes,
 )->Result<GraphSnapshot>{
     let mut pool_pairs=old.pool_pairs.clone();
     let mut changed_pairs=HashSet::<Pair>::new();
@@ -606,7 +595,7 @@ fn create(
     let mut recounted_count=0_usize;
     let mut removed_count=0_usize;
     if initial {
-        topologies=build_topologies(&pairs,&adjacency,wsol,usdc,None,direct2_only,direct2_direct3_only)?;
+        topologies=build_topologies(&pairs,&adjacency,wsol,usdc,None,routes)?;
     } else {
         // Fast path: existing cycle shapes survive pool alternative changes.
         // Recompute multiplicities only for shapes that use a changed pair.
@@ -630,10 +619,10 @@ fn create(
         let existing=old.topologies.iter().map(topology_identity).collect::<HashSet<_>>();
         // Only new *mint connections* can introduce previously impossible
         // Direct3/Triangle3/Triangle4 shapes. No global target traversal.
-        if !direct2_only && !new_edges.is_empty(){
+        if (routes.contains(RouteTopologyKind::Direct3)||routes.contains(RouteTopologyKind::Triangle3)||routes.contains(RouteTopologyKind::Triangle4)) && !new_edges.is_empty(){
             let targets=new_edge_targets(&new_edges,&adjacency,wsol,usdc);
             if !targets.is_empty(){
-                let discovered=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&targets),false,direct2_direct3_only)?;
+                let discovered=build_topologies(&pairs,&adjacency,wsol,usdc,Some(&targets),routes)?;
                 for t in discovered {
                     if t.kind==RouteTopologyKind::Direct2{continue;}
                     if existing.contains(&topology_identity(&t)){continue;}
@@ -649,7 +638,7 @@ fn create(
         for &(a,b) in &changed_pairs{
             let old_n=old.pair_pools.get(&pair(a,b)).map_or(0,|v|v.len());
             let new_n=pairs.get(&pair(a,b)).map_or(0,|v|v.len());
-            if old_n>=2||new_n<2{continue;}
+            if !routes.contains(RouteTopologyKind::Direct2)||old_n>=2||new_n<2{continue;}
             for &settlement in &[wsol,usdc]{
                 let target=if a==settlement{b}else if b==settlement{a}else{continue};
                 let candidate=direct2_shape(settlement,target,new_n as u64)?;
@@ -737,9 +726,8 @@ pub async fn run(
     output:watch::Sender<Arc<GraphSnapshot>>,
     settings:Settings,
 )->Result<()>{
-    crate::log_event!(Info,"graph venue_filter enabled={:?} allowed={} scope=runtime direct2_only={} direct2_direct3_only={}",
-        settings.enabled_venues.names(),settings.enabled_venues.iter().count(),settings.direct2_only,
-        settings.direct2_direct3_only);
+    crate::log_event!(Info,"graph venue_filter enabled={:?} allowed={} scope=runtime enabled_routes={:?}",
+        settings.enabled_venues.names(),settings.enabled_venues.iter().count(),settings.routes.names());
     let mut prepared=HashMap::<Pubkey,PreparedPool>::new();
     let mut dirty=HashMap::<Pubkey,Option<PreparedPool>>::new();
     let mut pending_traces=Vec::<ObservedTransition>::new();
@@ -897,14 +885,13 @@ pub async fn run(
                 }
                 generation=generation.checked_add(1).context("graph generation overflow")?;
                 let verify=reference_every>0 && (generation==1 || generation%reference_every==0);
-                let direct2_only=settings.direct2_only;
-                let direct2_direct3_only=settings.direct2_direct3_only;
+                let routes=settings.routes;
                 builds.spawn_blocking(move||{
                     let started=Instant::now();
                     let bootstrap=old.generation==0;
-                    let next=create(old,diff,generation,direct2_only,direct2_direct3_only)?;
+                    let next=create(old,diff,generation,routes)?;
                     let build_us=started.elapsed().as_micros();
-                    let comparison=if verify {Some(compare_reference(&next,direct2_only,direct2_direct3_only)?)}else{None};
+                    let comparison=if verify {Some(compare_reference(&next,routes)?)}else{None};
                     Ok((next,build_us,count,batches,source,
                         traces,before_pairs,bootstrap,comparison))
                 });
@@ -952,20 +939,20 @@ mod cp9b_tests {
             let p=pool(id,a,b);
             updates.insert(p.address,Some(p));
         }
-        let first=create(Arc::new(GraphSnapshot::default()),updates,1,true,false).unwrap();
+        let first=create(Arc::new(GraphSnapshot::default()),updates,1,EnabledRoutes::parse("direct2").unwrap()).unwrap();
         assert!(!first.topologies.is_empty());
         assert!(first.topologies.iter().all(|t|t.kind==RouteTopologyKind::Direct2));
-        compare_reference(&first,true,false).unwrap();
+        compare_reference(&first,EnabledRoutes::parse("direct2").unwrap()).unwrap();
 
         // A new second pool on X/USDC is a Direct2 topology birth; a
         // longer bridge/triangle is still never published.
         let mut next=HashMap::new();
         let p=pool(45,x,usdc);
         next.insert(p.address,Some(p));
-        let second=create(Arc::new(first),next,2,true,false).unwrap();
+        let second=create(Arc::new(first),next,2,EnabledRoutes::parse("direct2").unwrap()).unwrap();
         assert!(second.topologies.iter().all(|t|t.kind==RouteTopologyKind::Direct2));
         assert_eq!(second.topologies.len(),2);
-        compare_reference(&second,true,false).unwrap();
+        compare_reference(&second,EnabledRoutes::parse("direct2").unwrap()).unwrap();
     }
     #[test]
     fn direct2_direct3_scope_adds_conversion_but_never_triangles() {
@@ -978,18 +965,18 @@ mod cp9b_tests {
             (64,usdc,wsol),(65,x,b),(66,b,wsol)] {
             let p=pool(id,a,z);update.insert(p.address,Some(p));
         }
-        let scoped=create(Arc::new(GraphSnapshot::default()),update,1,false,true).unwrap();
+        let scoped=create(Arc::new(GraphSnapshot::default()),update,1,EnabledRoutes::parse("direct2,direct3").unwrap()).unwrap();
         assert!(scoped.topologies.iter().any(|t|t.kind==RouteTopologyKind::Direct2));
         assert!(scoped.topologies.iter().any(|t|t.kind==RouteTopologyKind::Direct3));
         assert!(scoped.topologies.iter().all(|t|matches!(t.kind,
             RouteTopologyKind::Direct2|RouteTopologyKind::Direct3)));
-        compare_reference(&scoped,false,true).unwrap();
+        compare_reference(&scoped,EnabledRoutes::parse("direct2,direct3").unwrap()).unwrap();
         let mut delta=HashMap::new();let p=pool(67,usdc,x);
         delta.insert(p.address,Some(p));
-        let next=create(Arc::new(scoped),delta,2,false,true).unwrap();
+        let next=create(Arc::new(scoped),delta,2,EnabledRoutes::parse("direct2,direct3").unwrap()).unwrap();
         assert!(next.topologies.iter().all(|t|matches!(t.kind,
             RouteTopologyKind::Direct2|RouteTopologyKind::Direct3)));
-        compare_reference(&next,false,true).unwrap();
+        compare_reference(&next,EnabledRoutes::parse("direct2,direct3").unwrap()).unwrap();
     }
     #[test]
     fn direct2_scope_changes_only_topology_selection_not_pool_membership() {
@@ -1001,13 +988,13 @@ mod cp9b_tests {
             let p=pool(id,a,b);
             updates.insert(p.address,Some(p));
         }
-        let all=create(Arc::new(GraphSnapshot::default()),updates.clone(),1,false,false).unwrap();
-        let direct=create(Arc::new(GraphSnapshot::default()),updates,1,true,false).unwrap();
+        let all=create(Arc::new(GraphSnapshot::default()),updates.clone(),1,EnabledRoutes::parse("direct2,direct3,triangle3,triangle4").unwrap()).unwrap();
+        let direct=create(Arc::new(GraphSnapshot::default()),updates,1,EnabledRoutes::parse("direct2").unwrap()).unwrap();
         assert_eq!(all.pool_pairs,direct.pool_pairs);
         assert!(all.topologies.iter().any(|t|t.kind==RouteTopologyKind::Direct3));
         assert!(direct.topologies.iter().all(|t|t.kind==RouteTopologyKind::Direct2));
         assert!(all.topologies.len()>direct.topologies.len());
-        compare_reference(&all,false,false).unwrap();
-        compare_reference(&direct,true,false).unwrap();
+        compare_reference(&all,EnabledRoutes::parse("direct2,direct3,triangle3,triangle4").unwrap()).unwrap();
+        compare_reference(&direct,EnabledRoutes::parse("direct2").unwrap()).unwrap();
     }
 }

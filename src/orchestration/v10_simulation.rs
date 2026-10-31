@@ -131,7 +131,7 @@ impl ExecutionTasks {
             .context("V10 simulation shutdown timeout").and_then(|r|r.context("V10 worker panicked")).and_then(|r|r)?;
         let received=tokio::time::timeout(Duration::from_secs(30),&mut self.reports.0).await
             .context("V10 report collector shutdown timeout")???;
-        let streamed=tokio::time::timeout(Duration::from_secs(60),&mut self.writer.0).await
+        let mut streamed=tokio::time::timeout(Duration::from_secs(60),&mut self.writer.0).await
             .context("V10 evidence writer shutdown timeout")???;
         ensure!(executed.completed_requests==received.count,
             "parallel V10 executor completion/report count mismatch");
@@ -144,15 +144,18 @@ impl ExecutionTasks {
                 let path=std::path::Path::new(&path).parent()
                     .context("V10 report directory missing")?.join("execution_details.jsonl");
                 let mut details=BufWriter::new(OpenOptions::new().append(true).open(&path)?);
-                for exclusion in exclusions.iter().take(detail_limit_from_env()?) {
+                let remaining=detail_limit_from_env()?.saturating_sub(streamed.detail_samples as usize);
+                for exclusion in exclusions.iter().take(remaining) {
                     serde_json::to_writer(&mut details,&serde_json::json!({"quantity_exclusion":exclusion}))?;
                     writeln!(details)?;
+                    streamed.detail_samples+=1;
                 }
                 details.flush()?;
+                streamed.detail_bytes=details.get_ref().metadata()?.len();
             }
         }
         evidence["v10_parallelism"]=serde_json::to_value(&executed)?;
-        evidence["schema_version"]=serde_json::json!(4);
+        evidence["schema_version"]=serde_json::json!(5);
         evidence["request_count"]=serde_json::json!(candidates.request_count);
         evidence["report_count"]=serde_json::json!(received.count);
         evidence["simulation_successes"]=serde_json::json!(received.successes);
@@ -160,7 +163,6 @@ impl ExecutionTasks {
         evidence["simulation_dex_calls_observed"]=serde_json::json!(received.dex_calls);
         evidence["streaming_evidence"]=serde_json::to_value(&streamed)?;
         evidence["detail_samples"]=serde_json::json!(streamed.detail_samples);
-        evidence["unique_payloads"]=serde_json::json!(streamed.unique_payloads);
         evidence["execution_handoff_observed"]=serde_json::json!(candidates.request_count>0);
         evidence["execution_integration_passed"]=serde_json::json!(received.successes>0);
         evidence["execution_integration_error"]=serde_json::json!(

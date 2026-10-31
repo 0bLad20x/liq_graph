@@ -8,8 +8,45 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc,task::JoinSet};
 use crate::core::{AccountMeta, execution::{ExecutionGroup, ExecutionMetrics,
     ExecutionOutcome, ExecutionPool, ExecutionPoolUse, ExecutionReport, ExecutionRequest,
-    ExecutionTrace,ExecutionSwapCall,ExecutionAssetAmount}};
+    ExecutionTrace,ExecutionSwapCall,ExecutionAssetAmount,ExecutionBalanceChanges}};
 use crate::core::rpc::{AccountView, RpcAnswer, RpcHandle, RpcOperation};
+
+/// Compact observed changes from the executor's own successful RPC result.
+/// The evidence thread calls this; no RPC, pricing or on-chain action is involved.
+pub fn balance_changes(request:&ExecutionRequest,report:&ExecutionReport)->Result<Option<ExecutionBalanceChanges>> {
+    let Some(sim)=report.simulation.as_ref().filter(|s|s["err"].is_null()) else{return Ok(None);};
+    let wallet=request.wallet.to_string();let settlement=request.settlement.to_string();
+    let tokens=|field:&str|->Result<Option<i128>> {
+        let Some(entries)=sim.get(field).and_then(Value::as_array) else{return Ok(None);};
+        let mut total=0_i128;
+        for balance in entries {
+            if balance["owner"].as_str()!=Some(wallet.as_str())||balance["mint"].as_str()!=Some(settlement.as_str()){continue;}
+            let amount=balance["uiTokenAmount"]["amount"].as_str().context("simulation token amount missing")?
+                .parse::<u64>().context("invalid simulation token amount")?;
+            total=total.checked_add(i128::from(amount)).context("simulation token balance overflow")?;
+        }
+        Ok(Some(total))
+    };
+    let gain=tokens("preTokenBalances")?.zip(tokens("postTokenBalances")?).map(|(a,b)|b-a);
+    let settlement_gain_raw=gain.map(|n|n.to_string());
+    let above_network_fee=(settlement==SOL).then_some(gain).flatten()
+        .zip(sim.get("fee").and_then(Value::as_u64)).map(|(gain,fee)|gain>i128::from(fee));
+    let pre=sim.get("preBalances").and_then(Value::as_array);
+    let post=sim.get("postBalances").and_then(Value::as_array);
+    let mut native_wallet_change_lamports=None;let mut new_account_lamports=None;
+    if let Some((pre,post))=pre.zip(post).filter(|(a,b)|!a.is_empty()&&a.len()==b.len()) {
+        native_wallet_change_lamports=pre[0].as_u64().zip(post[0].as_u64())
+            .map(|(a,b)|(i128::from(b)-i128::from(a)).to_string());
+        let mut funded=0_u64;
+        for (a,b) in pre.iter().zip(post) {
+            let a=a.as_u64().context("invalid pre-simulation lamports")?;
+            let b=b.as_u64().context("invalid post-simulation lamports")?;
+            if a==0&&b>0{funded=funded.checked_add(b).context("account funding overflow")?;}
+        }
+        new_account_lamports=Some(funded);
+    }
+    Ok(Some(ExecutionBalanceChanges{settlement_gain_raw,native_wallet_change_lamports,new_account_lamports,above_network_fee}))
+}
 
 const EXECUTOR: &str = "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz";
 const SOL: &str = "So11111111111111111111111111111111111111112";

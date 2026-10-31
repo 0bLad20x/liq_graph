@@ -1,121 +1,147 @@
-# CP9G – bounded streaming V10 evidence (Direct2 + Direct3)
+# CP9G – schlanke Streaming-Evidenz und gemeinsame Routenfreigabe
 
-Base: \`cp9f-market-state-hotpath\`. **No trading broadcasts**.
+Basis des Nachlaufs: `06e8f033668902386baf6e71d4da645b3f75b280`.
+Der Checkpoint bleibt simulationsbasiert; es wird nichts gesendet.
 
-## Motivation
-The prior CP9E/CP9F orchestration accumulated both full \`Vec<Selection>\`
-and \`Vec<ExecutionReport>\` until exit, then serialized large overlapping
-evidence into \`execution_events.jsonl\`. This created RAM proportional to
-completed simulation count; a crash before shutdown could lose the entire
-execution evidence archive. Large JSONL evidence is **not ordinary
-\`runtime.log\`** and was written mainly after the live interval.
+## Eine Routenfreigabe
 
-## Runtime design
-- Candidate producer still uses \`try_reserve()\` on the V10 request channel.
-  After creating a valid selection, it uses **\`try_send()\`** to a bounded
-  1,024-item evidence queue. Never performs filesystem I/O and never awaits
-  file writer capacity in the Signal worker. Each report is sent through this
-  same bounded evidence channel without awaiting disk.
-- Dedicated blocking-thread writer pairs Selection and V10 Report by request
-  id, validates metrics/hand-off, generates the frozen calibration, writes the
-  joined record *during* the run and immediately releases both objects.
-  Unmatched join maps are bounded to 1,024 entries.
-- Four files: \`execution_events.jsonl\` (compact full outcome + calibration),
-  \`execution_payloads.jsonl\` (content-addressed complete V10 manifests),
-  \`execution_snapshots.jsonl\` (full unique pool observations by digest),
-  and \`execution_details.jsonl\` (bounded audited full examples).
-- Repeated selected pool observations in events are replaced with stable
-  content-addressed refs, retaining inline venue and presence of liquidity
-  for the existing Python invariants. Full frozen observations remain in
-  \`execution_snapshots.jsonl\`; the existing per-leg calibration is computed
-  **before** compaction.
-- A bounded 32,768-digest cache accelerates dedup; after a cache eviction
-  the same digest can legally be emitted again, so \`unique_payloads\`
-  represents *distinct payloads written under bounded-cache semantics*.
-  The JSONL consumer can deduplicate by stable digest offline.
-- Write buffers flush every 64 paired records or after 5 seconds on the
-  next completed pair, and files are explicitly synced every 256 paired
-  records and at graceful shutdown. This is done off the hotpath.
-  Abnormal process termination may still lose records after the last sync.
-- Summary \`execution.json.streaming_evidence\` reports matched, report
-  successes/failures, written snapshots and payloads, maximum unmatched
-  entries and max evidence queue depth.
+```dotenv
+GRAPH_ENABLED_VENUES=meteora_dlmm,pumpswap
+GRAPH_ENABLED_ROUTES=direct2
+```
 
-## Failure policy, important limitation
-No bounded system can guarantee all three simultaneously under arbitrary
-disk slowdown: (a) exact lossless evidence, (b) never blocking the
-producer and (c) never failing. CP9G chooses **fail visibly** if the
-writer cannot keep pace, rather than quietly lose audit records or stall
-MarketState/Signals. A nonblocking queue overflow produces a fatal candidate
-or collector error; runtime does not declare complete handoff. Successfully
-flushed records survive a later process failure; some buffered entries may
-still be lost before OS flush/sync, so this is **not** database durability,
-exactly-once transactional persistence or crash-safe WAL.
+`GRAPH_ENABLED_ROUTES` erlaubt beliebige nichtleere Kombinationen aus `direct2`,
+`direct3`, `triangle3`, `triangle4`. Unbekannte und doppelte Eintraege werden vor
+Workerstart abgewiesen. Ohne Einstellung gilt `direct2`. Zum Hinzuschalten die
+Liste aendern und den Prozess neu starten; keine Codeaenderung erforderlich.
 
-All V10 strategies, thresholds, quantity rules and graph scope are untouched.
+Der Graph erstellt nur freigegebene Topologien, einschliesslich Delta-Neubildung
+und optionalem Referenzvergleich. Signal und Execution lesen denselben Core-Vertrag.
+Der Signalworker weist einen Graph ausserhalb dieser Freigabe ab; Execution
+uebergibt nur freigegebene Quellkandidaten. Der konfigurierte Umfang steht in
+`plan.json`, `checkout.json`, `runtime.json` und `summary.json`.
 
-## 15-minute live test
-Do not interpret CPU latency improvement unless **Meteora DLMM TVL
-admission is nonzero**. The previous CP9F five-minute sample had
-\`meteora_dlmm prepared/admitted=0\` because the DexScreener enrichment
-worker repeatedly reported \`no verified DexScreener HTTP proxies\`.
-Do not bypass the TVL>=500 gate to make this test look faster. The
-new explicit `DEXSCREENER_TRANSPORT_MODE=direct` uses the already-existing
-HTTP transport DirectOnly request policy with a shared 4 RPS (240/minute)
-destination host budget, below DexScreener's published 300 requests/minute
-limit for `/token-pairs/v1`. It avoids the public-proxy availability
-dependency while retaining all TVL identity/qualification checks. It makes
-no guarantee that the upstream provider will succeed in a particular
-15-minute run. Use the scripted environment override below and restore
-the previous mode in `finally`.
+Die alten separaten Einstellungen `GRAPH_DIRECT2_ONLY`,
+`GRAPH_DIRECT2_DIRECT3_ONLY`, `GRAPH_EXECUTION_ROUTE_KIND` haben keine Funktion mehr.
+Die Starterparameter `Direct2Only`, `Direct2Direct3Only`, `RouteKind` entfallen.
+Einziger optionaler Override: `-EnabledRoutes 'direct2'`.
 
-Use prior CP9F settings, changing just the branch and duration to 900:
+Die Route bezeichnet den Quellkandidaten, nicht zwingend die vom Executor gewaehlte
+Poolfolge. Der Analyzer zaehlt die tatsaechliche Anzahl ausgefuehrter Swaps separat.
+Rueckwaerts gerichtete historische Direct3-Witnesses werden korrekt zugeordnet:
+bei Umrechnung am Anfang ist der Zielmint die Ausgabe der zweiten Swap-Stufe.
+Neue Evidenz speichert den typisierten Topologie-Zielmint direkt.
 
-\`\`\`powershell
+## Was dauerhaft geschrieben wird
+
+- `execution_events.jsonl`: genau ein kompaktes Ergebnis pro angenommenem Request.
+  Die erste Zeile enthaelt Schema 4, Spaltennamen und unveraenderliche Wallet-/
+  Request-Parameter. Jede weitere Zeile enthaelt fuenf Felder: Payload-Hash,
+  Selection, Report, Kalibrierung und Timing. Namen werden nicht pro Zelle wiederholt.
+- `execution_details.jsonl`: begrenzte komplette Selection-/RPC-Beispiele,
+  einschliesslich Manifeste, eingefrorener Beobachtungen und Rohbalanzen.
+  `ExecutionDetailLimit` (Standard 16, maximal 256) gilt fuer die gesamte Datei,
+  auch fuer Mengen-Ausschlussbeispiele. Ab Limit 4 wird ein Viertel der Plaetze
+  fuer erstmals beobachtete WSOL-Ergebnisse oberhalb der Netzwerkgebuehr reserviert.
+- `execution.json`: kleiner Abschlussbericht (Schema 5), Zaehler und Writer-Metriken.
+  Der bestehende Python-Analyzer schreibt `execution_analysis.json`.
+
+Die separaten unbegrenzten Dateien `execution_payloads.jsonl` und
+`execution_snapshots.jsonl` entfallen. Ein Payload-Hash dient weiterhin zum
+Gruppieren identischer Requests; er verspricht keinen gespeicherten vollstaendigen
+Replay fuer jeden Versuch. Komplette Requests gibt es nur in den Detailbeispielen.
+Wer mehr Rohdaten benoetigt, erhoeht gezielt deren Limit; Standardlaeufe bewahren
+nicht jede RPC-Kontobalanz und jedes Modell immer wieder auf.
+
+Erhalten bleiben fuer jeden Versuch: exakte Identitaet, Quellroute/Zielmint,
+Paketstrategie und Poolauswahl, Mengenentscheidung, marginale Bewertung,
+RPC-Fehler/Programmfehlername, Provider/Slot/CU, Netzgebuehr, beobachtete
+Wallet-Differenzen und neue Accountfinanzierung sowie getrennte Zeiten.
+Bei beobachteten DEX-Aufrufen bleiben deren Reihenfolge, gerichtete Rohmengen,
+Modellausgaben, Zustandsfingerprints und Slot-/Zeitbezug erhalten.
+
+Native SOL und Token-Rohmengen werden niemals ungeprueft addiert. Fehlende
+Balance-Evidenz bleibt unbekannt. Fehlgeschlagene Simulationen erhalten keinen
+realisierten Wallet-Gewinn. Marginale Rendite, mengenbezogener DEX-Ueberschuss,
+Executor-Abzuege, Netzwerkgebuehr und Accountfinanzierung bleiben getrennt.
+
+## Laufende Verarbeitung und Grenzen
+
+Der Producer stellt Selection und Report mit `try_send()` in eine Queue von 1024
+Eintraegen. Ein eigener Blocking-Thread fuehrt sie anhand der Request-ID zusammen,
+prueft die originalen Packing-Metriken, kalibriert vorhandene DEX-Aufrufe,
+schreibt das Ergebnis und gibt beide Objekte frei. Keine unbeschraenkten
+Request-/Report-Historien und keine Payload-/Snapshot-Digest-Caches.
+
+Der Writer haelt maximal 1024 noch nicht zusammengefuehrte Objekte. Queue- oder
+Dateifehler fuehren sichtbar zum Laufabbruch; sie werden weder verborgen noch
+mit Warten im Preis-/Signalpfad abgearbeitet. Die beiden Dateien werden nach
+64 Ergebnissen beziehungsweise nach 5 Sekunden beim naechsten Ergebnis geflusht,
+nach 256 Ergebnissen und beim sauberen Abschluss synchronisiert. Dies ist kein
+transaktionales WAL; ein Prozess-/Systemabbruch kann den letzten ungesicherten
+Abschnitt verlieren. Bereits geschriebene Zeilen sind ohne normalen Shutdown lesbar.
+
+`streaming_evidence` zaehlt `matched`, Ergebnisarten, `detail_samples`,
+`event_bytes`, `detail_bytes`, `max_backlog`, `max_unmatched`, Flushes und Syncs.
+Die Python-Auswertung liest alte und neue Formate zeilenweise. Exakte Distinct-
+Mengen und Verteilungen fuer die Offline-Auswertung bleiben datenmengenabhaengig;
+sie sind keine Zustaende der laufenden Rust-Pipeline.
+
+## Vorliegender Nachweis
+
+Der echte 900-Sekunden-Lauf `20261031T141111325Z` wurde offline in das neue
+Schema uebertragen und mit demselben Analyzer erneut ausgewertet:
+
+- 35.123 Requests und Berichte, 3.874 Erfolge, 31.249 Fehlschlaege.
+- Gleiche Gebuehren-/Wallet-Ergebnisse, Fehler, Routen-/Strategieauswertung,
+  Payload-Gruppierung und komplette Kalibrierstatistiken; keine Vertragsverletzung.
+- Ereignisdatei 37.784.894 statt 731.339.270 Bytes: 94,83 % weniger.
+- Historische Direct3-Zuordnung korrigiert: 227 aktive und 180 frische
+  unterschiedliche Quellrouten-Identitaeten statt 184 beziehungsweise 133.
+
+Dieser Replay prueft Datenprojektion und Auswertung anhand realer Ergebnisse.
+Er ersetzt keinen neuen Live-Nachweis der geaenderten Rust-Verkabelung. Der
+locked Release-Build und Syntaxpruefungen werden auf dem exakten Branch-HEAD
+geprueft; keine formalen oder synthetischen Test-Suiten.
+
+## Naechster lokaler Lauf: nur Direct2
+
+Die vorherigen Provider-/Liquiditaetseinstellungen bleiben fuer den Vergleich
+bestehen. Direct3 und beide Triangle-Formen werden durch die zentrale Liste
+abgeschaltet; Packing-Strategien und V10-Parallelitaet sind davon getrennt.
+
+```powershell
 Set-Location C:\dev_projects\liq_graph
-git fetch origin
-if ($LASTEXITCODE -ne 0) { throw 'Git fetch failed' }
 git switch cp9g-streaming-evidence
-if ($LASTEXITCODE -ne 0) { throw 'Branch switch failed' }
+if ($LASTEXITCODE -ne 0) { throw 'Branchwechsel fehlgeschlagen' }
 git pull --ff-only origin cp9g-streaming-evidence
-if ($LASTEXITCODE -ne 0) { throw 'Git pull failed' }
-cargo test --locked
-if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed' }
-python -m unittest discover -s scripts/tests -p 'test_*.py'
-if ($LASTEXITCODE -ne 0) { throw 'Python tests failed' }
-$previousCommitment=$env:RPC_COMMITMENT
-$previousDexMode=$env:DEXSCREENER_TRANSPORT_MODE
+if ($LASTEXITCODE -ne 0) { throw 'Synchronisierung fehlgeschlagen' }
+$previousCommitment = $env:RPC_COMMITMENT
+$previousDexMode = $env:DEXSCREENER_TRANSPORT_MODE
 try {
-    $env:RPC_COMMITMENT='confirmed'
-    $env:DEXSCREENER_TRANSPORT_MODE='direct'
-    .\scripts\runtime_live.ps1 \`
-        -ExpectedBranch cp9g-streaming-evidence \`
-        -EnabledVenues 'meteora_dlmm,pumpswap' \`
-        -Stage Signals -DurationSeconds 900 -PoolLimit 0 \`
-        -AccountBudget 25000 -MinPoolTvlUsd 500 \`
-        -MinDirectionNotionalUsd 50 -DirectionLiquidityMode Filter \`
-        -Direct2Direct3Only -RouteKind Direct2Direct3 \`
-        -ThresholdBps 0 -V10Parallelism 32 \`
-        -CP9DMaxPairs 3 -CP9CPackingMode AllCoverage \`
-        -ProfileSignals -ExecutionDetailLimit 64 \`
-        -RequireCalibrationEvidence -SimulateV10 -SimulationLimit 0 \`
+    $env:RPC_COMMITMENT = 'confirmed'
+    $env:DEXSCREENER_TRANSPORT_MODE = 'direct'
+    .\scripts\runtime_live.ps1 `
+        -ExpectedBranch cp9g-streaming-evidence `
+        -EnabledVenues 'meteora_dlmm,pumpswap' `
+        -EnabledRoutes 'direct2' `
+        -Stage Signals -DurationSeconds 900 -PoolLimit 0 `
+        -AccountBudget 25000 -MinPoolTvlUsd 500 `
+        -MinDirectionNotionalUsd 50 -DirectionLiquidityMode Filter `
+        -ThresholdBps 0 -V10Parallelism 32 `
+        -CP9DMaxPairs 3 -CP9CPackingMode AllCoverage `
+        -ProfileSignals -ExecutionDetailLimit 64 `
+        -RequireCalibrationEvidence -SimulateV10 -SimulationLimit 0 `
         -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json')
-    if ($LASTEXITCODE -ne 0) { throw 'CP9G live test failed' }
+    if ($LASTEXITCODE -ne 0) { throw 'Direct2-Lauf fehlgeschlagen' }
 } finally {
-    $env:RPC_COMMITMENT=$previousCommitment
-    $env:DEXSCREENER_TRANSPORT_MODE=$previousDexMode
+    $env:RPC_COMMITMENT = $previousCommitment
+    $env:DEXSCREENER_TRANSPORT_MODE = $previousDexMode
 }
-\`\`\`
+```
 
-## Acceptance
-1. Exact \`request_count == report_count == streaming_evidence.matched\`;
-   all Python amount/delivery/calibration invariants pass, no missing pairs.
-2. No dropped writer evidence, bounded max queue/unmatched, no V10 orphan
-   responses, no MarketState or signal event loss.
-3. During the run, JSONL files grow (check midway), not only at shutdown;
-   byte volume and peak process memory are lower at similar request counts.
-4. No impact on signal thresholds and pool coverage; if DLMM TVL remains
-   unavailable, classify latency result as **PumpSwap-only**.
-5. Repeat any economic comparison only with appropriately matched
-   token-pair/revision/market-state samples; no conclusions from raw profit
-   counts between different clock windows.
+Abnahme: exakte Request-/Report-/Writer-Zaehler, keine Markt-/Signalverluste,
+ausschliesslich Direct2-Quellkandidaten, fehlerfreie kompakte Auswertung,
+begrenzte Writer-Queues und nachvollziehbare Bytegroessen. Preisabdeckung und
+Profitabilitaet sind eigene Ergebnisse; gruenes Orchestrierungs-Evidence bedeutet
+weder 100 % Preisabdeckung noch wirtschaftliche Tragfaehigkeit.

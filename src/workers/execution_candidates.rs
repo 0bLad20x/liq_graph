@@ -19,8 +19,7 @@ pub struct Settings {
     pub parameters: ExecutionParameters,
     /// Zero means no lifetime request cap; the output queue remains bounded.
     pub limit: usize,
-    pub kind: Option<SignalRouteKind>,
-    pub direct2_direct3:bool,
+    pub routes:crate::core::EnabledRoutes,
     /// CP9C: independent alternative-packing strategies for the same signal revision.
     strategies:Vec<PackingStrategy>,
     pub cp9d_max_pairs:usize,
@@ -30,14 +29,7 @@ pub struct Settings {
 impl Settings {
     pub fn from_env(wallet: Pubkey, capacity: fn(&ExecutionRequest)->Result<ExecutionMetrics>) -> Result<Self> {
         let limit=env::var("GRAPH_EXECUTION_MAX_REQUESTS").unwrap_or_else(|_|"0".into()).parse()?;
-        let route_mode=env::var("GRAPH_EXECUTION_ROUTE_KIND").unwrap_or_else(|_|"All".into());
-        let direct2_direct3=route_mode.eq_ignore_ascii_case("Direct2Direct3");
-        let kind=match route_mode.to_ascii_lowercase().as_str() {
-            "all"|"direct2direct3"=>None, "direct2"=>Some(SignalRouteKind::Direct2),
-            "direct3"=>Some(SignalRouteKind::Direct3),
-            "triangle3"=>Some(SignalRouteKind::Triangle3), "triangle4"=>Some(SignalRouteKind::Triangle4),
-            _=>bail!("GRAPH_EXECUTION_ROUTE_KIND must be All, Direct2, Direct3, Direct2Direct3, Triangle3 or Triangle4"),
-        };
+        let routes=crate::core::EnabledRoutes::from_env()?;
         let parameters:ExecutionParameters=match env::var("GRAPH_EXECUTION_PARAMETERS_PATH") {
             Ok(path) if !path.is_empty()=>serde_json::from_slice(&std::fs::read(path)
                 .context("read execution parameters")?).context("decode ExecutionParameters")?,
@@ -58,16 +50,12 @@ impl Settings {
             .unwrap_or_else(|_|"1".into()).parse().context("invalid GRAPH_CP9D_MAX_DISTINCT_PAIRS")?;
         ensure!((1..=8).contains(&cp9d_max_pairs),"GRAPH_CP9D_MAX_DISTINCT_PAIRS must be 1..=8");
         ensure!((strategies==[PackingStrategy::Baseline]&&cp9d_max_pairs==1)
-            ||kind==Some(SignalRouteKind::Direct2)||direct2_direct3,
-            "CP9D/CP9E alternative comparisons require Direct2 or Direct2Direct3");
-        Ok(Self {wallet,parameters,limit,kind,direct2_direct3,strategies,cp9d_max_pairs,capacity})
+            ||(!routes.contains(SignalRouteKind::Triangle3)&&!routes.contains(SignalRouteKind::Triangle4)),
+            "alternative packing comparisons require enabled routes direct2 and/or direct3");
+        Ok(Self {wallet,parameters,limit,routes,strategies,cp9d_max_pairs,capacity})
     }
     fn accepts(&self,kind:SignalRouteKind)->bool {
-        if self.direct2_direct3 {
-            matches!(kind,SignalRouteKind::Direct2|SignalRouteKind::Direct3)
-        } else {
-            self.kind.is_none_or(|selected|selected==kind)
-        }
+        self.routes.contains(kind)
     }
 }
 fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
@@ -109,6 +97,8 @@ pub struct Selection {
     cp9d_source:&'static str,
     cp9d_pair_index:u8,
     graph_generation: u64, revision: u64, topology_id: Option<usize>, route_kind: SignalRouteKind,
+    #[serde(with="crate::core::execution::pubkey_json")]
+    target:Pubkey,
     reverse: bool, trigger: Arc<SignalTrigger>, candidate: Option<SignalCandidate>,
     threshold_units: i64, estimated_net_return_bps:Option<f64>,
     pools: Vec<PoolEvidence>, packing: ExecutionMetrics,
@@ -146,6 +136,7 @@ pub struct Report {
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
+    pub fn packing_metrics(&self)->&ExecutionMetrics {&self.packing}
     /// One frozen-model quote at a supplied amount; no search, live state or RPC.
     fn quote_frozen_leg(&self,pool:&str,input_mint:&str,output_mint:&str,amount:u64)->Result<u64,&'static str> {
         let p=self.pools.iter().find(|p|p.pool==pool).ok_or("pool_not_in_frozen_selection")?;
@@ -160,7 +151,7 @@ impl Selection {
         self.quote_frozen_leg(call.pool.as_deref().ok_or("pool_identity_unresolved")?,
             &call.inputs[0].mint,&call.outputs[0].mint,amount)
     }
-    /// Post-run comparison only. Attempted flows on failure are never realized gains.
+    /// Evidence-thread comparison only. Attempted flows on failure are never realized gains.
     pub fn calibration(&self,report:&ExecutionReport)->serde_json::Value {
         use serde_json::json;
         let started=Instant::now();
@@ -288,26 +279,38 @@ impl Selection {
         result["cp9d_pair_index"]=json!(self.cp9d_pair_index);
         result
     }
-    /// Per-request rate/capacity facts; full manifests are stored once per payload.
-    /// Called after the live loop, never during signal evaluation.
+    /// Small result facts; full frozen inputs are retained only in bounded examples.
     pub fn compact_evidence(&self)->Result<serde_json::Value> {
-        let mut value=serde_json::to_value(self)?;
-        value["request"]=serde_json::json!({"id":self.request.id,
-            "wallet":self.request.wallet.to_string(),"settlement":self.request.settlement.to_string(),
-            "parameters":self.request.parameters});
-        let observations=value["pools"].as_array().map(|pools|pools.iter()
-            .map(|pool|pool["observation"].clone()).collect::<Vec<_>>()).unwrap_or_default();
-        if let Some(legs)=value.pointer_mut("/candidate/witness/legs").and_then(serde_json::Value::as_array_mut) {
-            for leg in legs {
-                // Reference only byte-equivalent JSON facts already in this event.
-                // A different witness observation remains complete.
-                if let Some(observation)=observations.iter().find(|o|**o==leg["observation"]) {
-                    leg["observation"]=serde_json::json!({"pool":observation["pool"],"selected_pool_observation":true});
-                }
-            }
-        }
+        let witness=self.candidate.as_ref().and_then(|c|c.witness.as_ref())
+            .context("execution evidence lacks source witness")?;
+        let source=witness.legs.iter().map(|l|l.observation.pool.as_str()).collect::<Vec<_>>();
+        let seed=self.pools.iter().take(source.len()).map(|p|p.pool.as_str()).collect::<Vec<_>>();
+        let mut value=serde_json::json!({
+            "id":self.request.id,"settlement":self.request.settlement.to_string(),
+            "target":self.target.to_string(),"route_kind":self.route_kind,"reverse":self.reverse,
+            "graph_generation":self.graph_generation,"revision":self.revision,
+            "packing_strategy":self.packing_strategy,"packing_revision_variant":self.packing_revision_variant,
+            "cp9d_source":self.cp9d_source,"cp9d_pair_index":self.cp9d_pair_index,
+            "pools":self.pools.iter().map(|p|p.pool.as_str()).collect::<Vec<_>>(),
+            "source_pools":source,"seed_pools":(seed!=source).then_some(seed),
+            "source_log_sum_units":witness.log_sum_units,
+            "packing_seed_log_sum_units":self.packing_seed_log_sum_units,"threshold_units":self.threshold_units,
+            "marginal_signal_bps":witness.estimated_net_return_bps,
+            "estimated_net_return_bps":self.estimated_net_return_bps,
+            "amount_decision":self.amount_assessment.decision,
+            "amount_estimate":self.amount_assessment.estimate.as_ref().map(|e|[e.input_raw,e.output_raw,e.profit_raw]),
+            "liquidity_checked":self.pools.iter().all(|p|p.observation.venue!="meteora_dlmm"
+                ||(p.liquidity_window_checked&&p.observation.liquidity.is_some())),
+            "packing":[self.packing.groups,self.packing.pool_declarations,self.packing.unique_accounts,
+                self.packing.account_references,self.packing.instruction_bytes,self.packing.transaction_bytes],
+            "request_ready_at_us":self.request_ready_at_us
+        });
+        value["selection_ns"]=serde_json::json!(self.selection_ns);
+        value["frame_to_request_us"]=serde_json::json!(self.frame_to_request_us);
+        value["signal_to_request_us"]=serde_json::json!(self.signal_to_request_us);
         Ok(value)
     }
+
 }
 impl Report {
     pub fn take_exclusion_samples(&mut self)->Vec<serde_json::Value> {
@@ -648,7 +651,7 @@ impl State {
         let estimated_net_return_bps=(-(seed_sum as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;
         Ok(Selection{request,packing_strategy:strategy.label(),packing_revision_variant:0,
             cp9d_source:"fresh",cp9d_pair_index:0,graph_generation:self.generation,revision:self.revision,
-            topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
+            topology_id:Some(c.topology_id),route_kind:top.kind,target:top.target,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
             estimated_net_return_bps:estimated_net_return_bps.is_finite().then_some(estimated_net_return_bps),
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
@@ -804,7 +807,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     // Preserve a comparable Direct3 arm when current positive
                     // signals exist, even if many Direct2 entries rank ahead.
                     // Otherwise a 3-source limit could silently starve Direct3.
-                    if cfg.direct2_direct3 && cfg.cp9d_max_pairs>=2
+                    if cfg.routes.contains(SignalRouteKind::Direct3) && cfg.cp9d_max_pairs>=2
                         && !sources.iter().any(|s|s.4.0==SignalRouteKind::Direct3) {
                         let mut reserved=None;
                         for (_,event,index) in &ranked {

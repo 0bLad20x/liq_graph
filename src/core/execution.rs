@@ -133,6 +133,17 @@ pub struct ExecutionReport {
     pub simulation: Option<Value>,
 }
 
+/// Observed wallet changes from a successful simulation, in native raw units.
+/// Missing RPC balance evidence remains unknown; rolled-back transfers are excluded.
+#[derive(Debug,Serialize)]
+pub struct ExecutionBalanceChanges {
+    pub settlement_gain_raw:Option<String>,
+    pub native_wallet_change_lamports:Option<String>,
+    pub new_account_lamports:Option<u64>,
+    /// Only comparable when settlement is WSOL; excludes new-account funding.
+    pub above_network_fee:Option<bool>,
+}
+
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]
 pub struct ExecutionTrace {
     pub status:String,

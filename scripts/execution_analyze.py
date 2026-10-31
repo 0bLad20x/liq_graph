@@ -12,6 +12,93 @@ import zipfile
 WSOL = 'So11111111111111111111111111111111111111112'
 
 
+def decode_compact(header, row):
+    """Decode the self-described result journal; full inputs live only in bounded examples."""
+    def fields(name, values):
+        names = header[name + '_columns']
+        if not isinstance(values, list) or len(values) != len(names) or len(names) != len(set(names)):
+            raise ValueError(f'Invalid compact {name} row')
+        return dict(zip(names, values))
+    if len(row) != 5:
+        raise ValueError('Invalid compact execution row')
+    digest, selected, reported, calibrated, timing = row
+    s, facts, times = fields('selection', selected), fields('report', reported), fields('timing', timing)
+    config = header['configuration']
+    s['request'] = {'id': s['id'], 'settlement': s['settlement'], **config}
+    s.update({k: times[k] for k in ('selection_ns', 'frame_to_request_us', 'signal_to_request_us')})
+    s['pools'] = [{'pool': p} for p in s['pools']]
+    estimate = s.pop('amount_estimate')
+    s['amount_assessment'] = {'decision': s.pop('amount_decision'),
+        'estimate': dict(zip(('input_raw', 'output_raw', 'profit_raw'), estimate)) if estimate else None}
+    r = {'id': s['id'], 'phase': 'complete', 'error': None, 'executor_invoked': True,
+         'metrics': s['packing'], 'context_slot': facts['context_slot'], 'provider': facts['provider'],
+         'simulation': {k: facts[k] for k in ('err', 'error_name', 'fee', 'unitsConsumed')},
+         'balance_changes': facts['balance_changes']}
+    r.update({k: times[k] for k in ('build_us', 'simulation_rpc_ms', 'elapsed_ms', 'trace_us')})
+    c = fields('calibration', calibrated) if calibrated is not None else {
+        'source_path_relation': 'no_observed_dex', 'seed_path_relation': 'no_observed_dex',
+        'model_route_unavailable_reason': 'no_complete_single_cycle'}
+    c.setdefault('legs', [])
+    c['legs'] = [fields('leg', leg) for leg in c['legs']]
+    calls = []
+    for index, leg in enumerate(c['legs']):
+        complete = leg['flow_status'] == 'complete'
+        inputs = [{'mint': leg['input_mint'], 'amount_raw': leg['input_net_raw'],
+                   'gross_amount_raw': leg['input_gross_raw']}] if complete else []
+        outputs = [{'mint': leg['output_mint'], 'amount_raw': leg['observed_output_raw'],
+                    'gross_amount_raw': leg['observed_output_raw']}] if complete else []
+        calls.append({'pool': leg['pool'], 'program': leg['program'], 'status': leg['flow_status'],
+                      'issues': leg['issues'], 'inputs': inputs, 'outputs': outputs})
+        leg['call_index'] = index
+        leg['model_input_raw'] = leg['input_gross_raw'] if complete else None
+        model, actual = leg['model_output_raw'], leg['observed_output_raw']
+        leg['output_error_bps'] = (actual / model - 1) * 10000 if model and actual is not None else None
+        leg['observed_minus_model_raw'] = str(actual - model) if model is not None and actual is not None else None
+        slot = leg['observation_slot']
+        leg['slots_to_simulation'] = facts['context_slot'] - slot if slot is not None and facts['context_slot'] is not None and facts['context_slot'] >= slot else None
+        if leg['snapshot_content_digest'] is not None:
+            leg['snapshot_content_digest'] = list(bytes.fromhex(leg['snapshot_content_digest']))
+    if len(calls) != facts['dex_call_count']:
+        raise ValueError(f"Compact trace count differs: {s['id']}")
+    r['trace'] = {'status': facts['trace_status'], 'calls': calls}
+    r['dex_invocations'] = [call['program'] for call in calls]
+    initial, actual, model = (c.get(k) for k in ('trade_input_raw', 'trade_output_raw', 'model_route_output_raw'))
+    def bps(output):
+        return (output / initial - 1) * 10000 if initial and output is not None else None
+    c.update({'schema_version': 1, 'simulation_committed': facts['err'] is None,
+              'trace_status': facts['trace_status'], 'single_cycle': initial is not None and actual is not None,
+              'model_route_status': 'quoted' if model is not None else 'unavailable',
+              'model_route_return_bps': bps(model), 'attempted_dex_return_bps': bps(actual),
+              'simulated_dex_return_bps': bps(actual) if facts['err'] is None else None,
+              'actual_minus_model_bps': bps(actual) - bps(model) if actual is not None and model is not None and initial else None,
+              'marginal_signal_bps': s['marginal_signal_bps'], 'packing_marginal_bps': s['estimated_net_return_bps'],
+              'source_model_return_bps': bps(c.get('source_model_output_at_trade_input_raw')),
+              'seed_model_return_bps': bps(c.get('seed_model_output_at_trade_input_raw')),
+              'processing_ns': times['calibration_ns']})
+    for key in ('trade_input_raw', 'trade_output_raw', 'model_route_output_raw', 'actual_path_marginal_bps'):
+        c.setdefault(key, None)
+    return {'schema_version': 4, 'compact': True, 'payload_sha256': digest,
+            'selection': s, 'report': r, 'calibration': c}
+
+
+def stream_records(stream):
+    header = None
+    for line in stream:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if isinstance(row, dict) and row.get('schema_version') == 4 and 'selection_columns' in row:
+            if header is not None:
+                raise ValueError('Duplicate compact journal header')
+            header = row
+        elif isinstance(row, list):
+            if header is None:
+                raise ValueError('Compact journal header missing')
+            yield decode_compact(header, row)
+        else:
+            yield row
+
+
 def records(folder=None, archive=None):
     if archive:
         with zipfile.ZipFile(archive) as z:
@@ -20,9 +107,7 @@ def records(folder=None, archive=None):
             events = next((n for n in names if n.endswith('/execution_events.jsonl')), None)
             if events:
                 with z.open(events) as stream:
-                    for line in stream:
-                        if line.strip():
-                            yield json.loads(line)
+                    yield from stream_records(stream)
                 return
             for name in names:
                 if Path(name).name.startswith('selection-') and name.endswith('.json'):
@@ -31,9 +116,7 @@ def records(folder=None, archive=None):
                            'report': json.loads(z.read(report)) if report in members else None}
     else:
         with (Path(folder) / 'execution_events.jsonl').open(encoding='utf-8-sig') as stream:
-            for line in stream:
-                if line.strip():
-                    yield json.loads(line)
+            yield from stream_records(stream)
 
 
 def durations(values):
@@ -68,9 +151,15 @@ def compact_route_identity(selection):
     """Compare physical token pairs *within* route kind: Direct2 != Direct3.
 
     The persisted compact request deliberately excludes full manifest/groups.
-    For Direct3, the third witness leg is settlement conversion (Q -> S).
+    In reverse Direct3 witnesses the conversion is first, so the target is
+    the second leg's output. New journals carry the typed topology target.
     """
     route=selection['route_kind']
+    if selection.get('target') is not None:
+        settlement, target = selection['request']['settlement'], selection['target']
+        if target == settlement:
+            raise ValueError('Route target repeats settlement')
+        return (route, *sorted((settlement, target))) if route == 'direct2' else (route, settlement, target)
     if route=='direct2':
         s,t=compact_direct2_pair(selection)
         return (route,s,t)
@@ -87,7 +176,7 @@ def compact_route_identity(selection):
             legs[1].get('output_mint')==settlement or
             legs[1].get('output_mint')==legs[0].get('output_mint')):
         raise ValueError(f"Invalid compact Direct3 witness: {request['id']}")
-    return (route,settlement,legs[0]['output_mint'])
+    return (route,settlement,legs[1 if selection.get('reverse') else 0]['output_mint'])
 
 
 def analyze(rows):
@@ -160,20 +249,24 @@ def analyze(rows):
         payloads[digest] += 1
         strategy_payloads[strategy].add(digest)
         witness = ((s.get('candidate') or {}).get('witness') or {})
-        if (witness.get('log_sum_units', s['threshold_units']) >= s['threshold_units'] or
+        if (s.get('source_log_sum_units', witness.get('log_sum_units', s['threshold_units'])) >= s['threshold_units'] or
                 s['packing_seed_log_sum_units'] >= s['threshold_units']):
             bad('net', identity)
-        for pool in s['pools']:
-            if pool['observation']['venue'] == 'meteora_dlmm' and (
-                    not pool['observation'].get('liquidity') or not pool.get('liquidity_window_checked')):
+        if row.get('compact'):
+            if not s['liquidity_checked']:
                 bad('liquidity', identity)
-                break
+        else:
+            for pool in s['pools']:
+                if pool['observation']['venue'] == 'meteora_dlmm' and (
+                        not pool['observation'].get('liquidity') or not pool.get('liquidity_window_checked')):
+                    bad('liquidity', identity)
+                    break
         a = s.get('amount_assessment') or {}
         invalid = not a or a.get('decision') == 'excluded' or a.get('reason') == 'not_evaluated'
         if a.get('decision') == 'possible':
             e = a.get('estimate') or {}
             legs = e.get('legs') or []
-            invalid |= (len(legs) < 2 or e.get('input_raw', 0) <= 0 or
+            invalid |= ((not row.get('compact') and len(legs) < 2) or e.get('input_raw', 0) <= 0 or
                         e.get('output_raw', 0) <= e.get('input_raw', 0) or
                         e.get('profit_raw') != e.get('output_raw', 0) - e.get('input_raw', 0))
             if len(legs) >= 2:
@@ -267,6 +360,7 @@ def analyze(rows):
                 bad('calibration', identity)
         if c and c.get('single_cycle') and sim['err'] is None:
             strategy_counts[strategy]['full_cycles'] += 1
+            cp9e_route_counts[route][f"executed_{len(c['legs'])}_leg_cycles"] += 1
             path = tuple((leg.get('pool') or 'unknown') for leg in c.get('legs', ()))
             strategy_full_paths[strategy].add((q['settlement'], path))
         if c:
@@ -289,7 +383,7 @@ def analyze(rows):
                     del quote_outliers[24:]
         if sim['err'] is not None:
             strategy_counts[strategy]['failures'] += 1
-            error = next((re.search(r'Error Code: ([^.]+)', line)[1]
+            error = sim.get('error_name') or next((re.search(r'Error Code: ([^.]+)', line)[1]
                           for line in sim.get('logs', []) if 'Error Code: ' in line),
                          json.dumps(sim['err'], sort_keys=True))
             errors[error] += 1
@@ -302,15 +396,24 @@ def analyze(rows):
         def token_amount(entries):
             return sum(int(b['uiTokenAmount']['amount']) for b in entries
                        if b.get('owner') == q['wallet'] and b['mint'] == q['settlement'])
-        before, after = sim.get('preTokenBalances'), sim.get('postTokenBalances')
-        if before is None or after is None:
-            continue
-        gain = token_amount(after) - token_amount(before)
         asset = q['settlement']
+        if row.get('compact'):
+            changes = r.get('balance_changes') or {}
+            if changes.get('settlement_gain_raw') is None:
+                continue
+            gain = int(changes['settlement_gain_raw'])
+            native_delta = changes.get('native_wallet_change_lamports')
+            native_delta = int(native_delta) if native_delta is not None else None
+            funded = changes.get('new_account_lamports')
+        else:
+            before, after = sim.get('preTokenBalances'), sim.get('postTokenBalances')
+            if before is None or after is None:
+                continue
+            gain = token_amount(after) - token_amount(before)
+            pre_native, post_native = sim.get('preBalances') or [], sim.get('postBalances') or []
+            native_delta = post_native[0] - pre_native[0] if pre_native and post_native else None
+            funded = sum(b - a for a, b in zip(pre_native, post_native) if a == 0 and b > 0)
         gains[asset].append(gain)
-        pre_native, post_native = sim.get('preBalances') or [], sim.get('postBalances') or []
-        native_delta = post_native[0] - pre_native[0] if pre_native and post_native else None
-        funded = sum(b - a for a, b in zip(pre_native, post_native) if a == 0 and b > 0)
         fee = sim.get('fee')
         if asset == WSOL:
             above_fee[asset] += fee is not None and gain > fee
@@ -318,6 +421,7 @@ def analyze(rows):
             if c and c.get('single_cycle') and fee is not None and gain > fee:
                 cp9d_source_counts[source]['above_network_fee']+=1
                 cp9e_route_counts[route]['above_network_fee']+=1
+                cp9e_route_counts[route][f"above_network_fee_{len(c['legs'])}_leg_cycles"]+=1
                 cp9d_positive[source].add((r.get('context_slot'),pair,tuple(
                     leg.get('pool') for leg in c.get('legs',()))))
                 # Distinct simulation slots are not distinct price states.
