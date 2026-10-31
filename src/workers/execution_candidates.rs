@@ -173,6 +173,7 @@ pub struct Report {
     registry_reads:RegistryReads,
     amounts:amounts::Report,
     preparation:Preparation,
+    cp10_capacity_phases:crate::workers::execution_v10::CapacityPhaseProfile,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -1026,6 +1027,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
         Ok(())
     }.await;
     report.error=outcome.err().map(|e|format!("{e:#}"));
+    report.cp10_capacity_phases=crate::workers::execution_v10::capacity_phase_profile();
     crate::log_event!(Info,"execution candidates complete=true requests={} lost={} error={:?}",report.request_count as usize,report.lost_events,report.error);
     Ok(report)
 }
