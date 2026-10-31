@@ -458,11 +458,12 @@ fn minimum_path(domains:&[Vec<Edge>],inputs:&[Input],mut need:u64,allow_unknown_
     Ok((need,chosen))
 }
 fn estimate(path:&[Edge],inputs:&[Input],initial:u64,minimum_profit:u64,
-    scratch:&mut FrozenQuoteScratch)->Option<Estimate> {
+    scratch:&mut Option<FrozenQuoteScratch>)->Option<Estimate> {
     let mut amount=initial;let mut legs=Vec::new();
     for &e in path {
         let input=&inputs[e.pool];let p=profile(input).ok()?;let d=&p.directions[e.direction];
-        let output=scratch.quote(inputs,e,amount).ok()?;
+        let output=scratch.get_or_insert_with(||FrozenQuoteScratch::new(inputs.len()))
+            .quote(inputs,e,amount).ok()?;
         if output==0{return None;}
         legs.push(Leg{pool:input.observation.pool.clone(),input_mint:d.input_mint.clone(),output_mint:d.output_mint.clone(),input_raw:amount,output_raw:output});amount=output;
     }
@@ -487,8 +488,10 @@ pub(super) fn assess(inputs:&[Input],settlement:&str,minimum_profit:u64,single_c
     }
     let mut paths=Vec::new();cycles(settlement,settlement,&domains,&mut vec![settlement.into()],&mut paths);
     if *PROFILE_ON{DOMAINS_NS.fetch_add(ns(domains_started),Ordering::Relaxed);}
-    // Fresh cache per frozen assessment; no MarketState, Graph or worker state.
-    let mut quote_scratch=FrozenQuoteScratch::new(inputs.len());
+    // Lazily allocate per-assessment scratch only if a quote is actually
+    // evaluated. Pure proof/exclusion paths retain CP11's zero-cache cost.
+    // It never survives the frozen assessment.
+    let mut quote_scratch=None;
     let mut any_unknown=false;
     for mints in paths {
         // The typed V10 request supplies only one conversion pool. Two different
