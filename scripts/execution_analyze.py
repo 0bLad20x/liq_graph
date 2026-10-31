@@ -90,6 +90,8 @@ def analyze(rows):
     cp9d_source_counts=collections.defaultdict(collections.Counter)
     cp9d_pairs=collections.defaultdict(set)
     cp9d_positive=collections.defaultdict(set)
+    cp9d_positive_states=collections.defaultdict(set)
+    cp9d_positive_path_states=collections.defaultdict(set)
     cp9d_packages=collections.defaultdict(set)
     cp9d_pair_revisions=collections.defaultdict(set)
     cp9d_thresholds=collections.defaultdict(collections.Counter)
@@ -287,6 +289,14 @@ def analyze(rows):
                 cp9d_source_counts[source]['above_network_fee']+=1
                 cp9d_positive[source].add((r.get('context_slot'),pair,tuple(
                     leg.get('pool') for leg in c.get('legs',()))))
+                # Distinct simulation slots are not distinct price states.
+                # Frozen content digests distinguish changed observed accounts,
+                # but identical digests do not prove identical RPC bank state.
+                executed_path=tuple(leg.get('pool') for leg in c.get('legs',()))
+                frozen_state=tuple(tuple(leg.get('snapshot_content_digest') or ())
+                    for leg in c.get('legs',()))
+                cp9d_positive_states[source].add((pair,executed_path,frozen_state))
+                cp9d_positive_path_states[strategy].add((pair,executed_path,frozen_state))
                 strategy_counts[strategy]['above_network_fee'] += 1
                 strategy_positive_slots[strategy].add(r.get('context_slot'))
                 pool_path=tuple((leg.get('pool') or 'unknown') for leg in c.get('legs', ()))
@@ -333,12 +343,15 @@ def analyze(rows):
         'source_classes':{source:{**dict(counter),
             'different_token_pairs':len(cp9d_pairs[source]),
             'different_pair_revision_combinations':len(cp9d_pair_revisions[source]),
-            'different_positive_path_slots':len(cp9d_positive[source])}
+            'different_positive_path_slots':len(cp9d_positive[source]),
+            'different_positive_frozen_path_states':len(cp9d_positive_states[source])}
             for source,counter in sorted(cp9d_source_counts.items())},
         'offered_oriented_pool_pairs_by_strategy':{k:len(v) for k,v in sorted(cp9d_packages.items())},
+        'different_positive_frozen_path_states_by_strategy':{
+            k:len(v) for k,v in sorted(cp9d_positive_path_states.items())},
         'hypothetical_wsol_settlement_greater_than_lamports':{
             s:dict(v) for s,v in sorted(cp9d_thresholds.items())},
-        'note':'Observed settlement thresholds are post-simulation diagnostics; minimum_profit was not changed. Offered pool pairings are not guaranteed executable.'
+        'note':'Observed settlement thresholds are post-simulation diagnostics; minimum_profit was not changed. Offered pool pairings are not guaranteed executable. Different simulation slots may share exactly the same frozen pool content digest; count them separately from distinct observed market states.'
     }
     return {'schema_version': 2,
             'cp9d_signal_breadth_and_coverage':cp9d,
