@@ -488,6 +488,7 @@ try {
         liquidity_evidence_passed=$liquidityPassed; liquidity=$liquiditySummary
         amount_evidence_passed=$amountPassed; amount_evaluation=$amountSummary
         request_payload_repetition=$requestRepetition
+        streaming_execution_evidence=$execution.streaming_evidence
         signal_score_basis=$production.score_basis; signal_net_threshold_bps=$ThresholdBps
         net_evidence_passed=$netPassed; net_witness_violations=$netViolations
         observations_by_known_net_directions=$production.observations_by_known_net_directions
@@ -533,6 +534,10 @@ try {
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
     Write-Host "Runtime complete=$($summary.runtime_completed); orchestration=$orchestrationPassed; pool TVL evidence=$tvlPassed"
     Write-Host "Pools selected=$($market.selected_pools), priced=$($market.priced_pools); WS gaps=$($market.metrics.gaps)"
+    if ($null -ne $execution.streaming_evidence) {
+        $stream=$execution.streaming_evidence
+        Write-Host "Streaming evidence: matched=$($stream.matched), snapshots_written=$($stream.snapshots_written), unique_payload_writes=$($stream.unique_payloads), max_queue=$($stream.max_backlog), max_unmatched=$($stream.max_unmatched)"
+    }
     if ($RequireCalibrationEvidence) {
         Write-Host "Calibration: requests=$($calibration.counts.records), quoted routes=$($calibration.model_route_statuses.quoted), passed=$calibrationPassed"
     }
