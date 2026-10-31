@@ -47,6 +47,23 @@ def durations(values):
             'p99': values[math.ceil(n * .99) - 1], 'max': values[-1]}
 
 
+def compact_direct2_pair(selection):
+    """Derive the token pair from the frozen witness, not compact request.groups.
+
+    The live recorder intentionally removes groups from selection.request,
+    replacing full execution manifests with compact evidence and payload digests.
+    """
+    request = selection['request']
+    witness = ((selection.get('candidate') or {}).get('witness') or {})
+    legs = witness.get('legs') or []
+    settlement = request['settlement']
+    if (len(legs) != 2 or legs[0].get('input_mint') != settlement or
+            legs[1].get('output_mint') != settlement or
+            legs[0].get('output_mint') != legs[1].get('input_mint') or
+            legs[0].get('output_mint') == settlement):
+        raise ValueError(f"Invalid compact Direct2 witness: {request['id']}")
+    return tuple(sorted((settlement, legs[0]['output_mint'])))
+
 def analyze(rows):
     count = reports = successes = dex_calls = 0
     ids, report_ids = set(), set()
@@ -95,20 +112,8 @@ def analyze(rows):
         routes[route] += 1
         strategy = s.get('packing_strategy', 'baseline')
         strategy_counts[strategy]['requests'] += 1
-        # The live evidence deliberately stores a compact request (no groups).
-        # Recover the Direct2 physical mint pair from the immutable source
-        # witness, which is present for every qualifying selection.
-        witness_legs=((s.get('candidate') or {}).get('witness') or {}).get('legs') or []
-        if route == 'direct2':
-            if (len(witness_legs) != 2 or
-                    witness_legs[0].get('input_mint') != q['settlement'] or
-                    witness_legs[1].get('output_mint') != q['settlement'] or
-                    witness_legs[0].get('output_mint') != witness_legs[1].get('input_mint')):
-                raise ValueError(f'Invalid compact Direct2 witness for request {identity}')
-            pair=tuple(sorted((q['settlement'],witness_legs[0]['output_mint'])))
-        else:
-            # Legacy Direct3/triangles do not have a CP9D Direct2 pair.
-            pair=(q['settlement'],f'non_direct2:{route}')
+        pair=(compact_direct2_pair(s) if route == 'direct2'
+              else (q['settlement'],f'non_direct2:{route}'))
         source=s.get('cp9d_source','fresh')
         generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
