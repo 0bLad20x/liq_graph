@@ -780,76 +780,126 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     let started=Instant::now();
                     let mut reads=RegistryReads::default();
                     ranked.sort_unstable_by_key(|entry|entry.0);
-                    let mut sent_pools=HashSet::<Vec<String>>::new();
-                    let mut invalid_seed=false;
-                    let mut busy_revision=false;
-                    // Rotate strategy order across signal revisions. This prevents
-                    // the reference strategy from always taking a scarce free slot.
-                    let rotation=(state.revision as usize)%cfg.strategies.len();
-                    for step in 0..cfg.strategies.len(){
-                        if cfg.limit>0 && report.requests.len()>=cfg.limit{break;}
-                        let variant=(rotation+step)%cfg.strategies.len();
-                        let strategy=cfg.strategies[variant];
-                        report.cp9c_pack_attempts+=1;
-                        // Never await simulation capacity or backpressure calculation.
-                        let permit=match output.try_reserve() {
-                            Ok(permit)=>permit,
-                            Err(mpsc::error::TrySendError::Full(_))=>{
-                                report.cp9c_queue_full_packs+=1;busy_revision=true;break;
-                            },
-                            Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
-                        };
-                        let mut chosen=None;
-                        for (_,event,index) in &ranked {
-                            let selected=match event.as_ref(){
-                                SignalEvent::Candidates(block)=>state.build_compact(&block.candidates[*index],
-                                    block.threshold_units,block.trigger.clone(),&registry,&cfg,
-                                    report.requests.len()+1,&mut reads,strategy,None),
-                                _=>bail!("ranked event is not a compact candidate"),
-                            };
-                            match selected {
-                                Ok(selection)=>{
-                                    // Same-revision identical pool sets do not test a
-                                    // distinct strategy and waste simulation capacity.
-                                    let mut pool_set=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
-                                    pool_set.sort_unstable();
-                                    if sent_pools.contains(&pool_set){
-                                        report.cp9c_duplicate_packs+=1;
-                                        break;
-                                    }
-                                    if let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,&mut report.amounts)? {
-                                        selection.packing_revision_variant=variant as u8;
-                                        selection.selection_ns=elapsed_ns(started);
-                                        selection.registry_reads=reads.clone();
-                                        selection.request_ready_at_us=now_us();
-                                        selection.frame_to_request_us=selection.price_pipeline.and_then(|t|
-                                            selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
-                                        selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
-                                        // Recompute after amount-seed repair; keep every
-                                        // dispatched request accounted for by the quantity report.
-                                        let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
-                                        actual.sort_unstable();
-                                        sent_pools.insert(actual);
-                                        chosen=Some(selection);break;
-                                    }
-                                },
-                                Err(error)=>{
-                                    invalid_seed=true;report.skipped_invalid_seed+=1;
-                                    report.last_rejection=Some(format!("{error:#}"));
-                                },
+                    // CP9D: one source candidate per distinct physical token pair.
+                    // First give changed, currently priced witnesses priority. Then
+                    // rotate through authoritative active witnesses from this
+                    // generation. Never invent a profitable source witness.
+                    let mut sources=Vec::<(SignalCandidate,Arc<SignalTrigger>,i64,&'static str,(Pubkey,Pubkey))>::new();
+                    let mut pairs=HashSet::new();
+                    for (_,event,index) in &ranked {
+                        let SignalEvent::Candidates(block)=event.as_ref() else {continue};
+                        let candidate=&block.candidates[*index];
+                        let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
+                        let pair=(top.settlement.min(top.target),top.settlement.max(top.target));
+                        if !pairs.insert(pair){continue;}
+                        sources.push((candidate.clone(),block.trigger.clone(),block.threshold_units,"fresh",pair));
+                        if sources.len()>=cfg.cp9d_max_pairs{break;}
+                    }
+                    if sources.len()<cfg.cp9d_max_pairs && cfg.cp9d_max_pairs>1 {
+                        let count=state.active_witnesses.len();
+                        if count>0 {
+                            let offset=(state.revision as usize)%count;
+                            for (_,candidate) in state.active_witnesses.iter().skip(offset)
+                                .chain(state.active_witnesses.iter().take(offset)).take(512) {
+                                report.cp9d_active_candidates_examined+=1;
+                                if candidate.change==SignalRangeChange::Exited {continue;}
+                                let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
+                                if top.kind!=SignalRouteKind::Direct2||cfg.kind.is_some_and(|kind|kind!=top.kind){continue;}
+                                let pair=(top.settlement.min(top.target),top.settlement.max(top.target));
+                                if pairs.contains(&pair){continue;}
+                                let Some(w)=candidate.witness.as_ref() else{continue};
+                                if w.log_sum_units>=state.threshold ||
+                                    state.witness(candidate.topology_id,candidate.reverse,w).is_err(){continue;}
+                                pairs.insert(pair);
+                                sources.push((candidate.clone(),e.trigger.clone(),state.threshold,"active",pair));
+                                if sources.len()>=cfg.cp9d_max_pairs{break;}
                             }
                         }
-                        if let Some(selection)=chosen {
-                            crate::log_event!(Debug,"execution candidates request_id={} strategy={} generation={} revision={} kind={:?} pools={} accounts={} selection_ns={} frame_to_request_us={:?} broadcasts=false",
-                                selection.request.id,selection.packing_strategy,state.generation,state.revision,
-                                selection.route_kind,selection.packing.pool_declarations,
-                                selection.packing.unique_accounts,selection.selection_ns,selection.frame_to_request_us);
+                    }
+                    let mut previous=HashMap::<(Pubkey,Pubkey),Vec<Vec<usize>>>::new();
+                    let mut sent_sets=HashMap::<(Pubkey,Pubkey),HashSet<Vec<String>>>::new();
+                    let mut sent_pair=HashSet::new();
+                    let mut invalid_seed=false;
+                    let mut busy_revision=false;
+                    // The first round tests each token pair before allowing any
+                    // pair to consume more queue slots with its second strategy.
+                    // Coverage always runs after comparison packages.
+                    let base_len=cfg.strategies.iter()
+                        .filter(|&&s|s!=PackingStrategy::Coverage).count();
+                    let rotation=if base_len>0{(state.revision as usize)%base_len}else{0};
+                    let mut ordered=Vec::new();
+                    for step in 0..base_len {
+                        ordered.push(cfg.strategies[(rotation+step)%base_len]);
+                    }
+                    if cfg.strategies.contains(&PackingStrategy::Coverage){
+                        ordered.push(PackingStrategy::Coverage);
+                    }
+                    'packages: for (variant,strategy) in ordered.into_iter().enumerate(){
+                        for (pair_index,(candidate,trigger,threshold,origin,pair)) in sources.iter().enumerate(){
+                            if cfg.limit>0 && report.requests.len()>=cfg.limit{break 'packages;}
+                            report.cp9c_pack_attempts+=1;
+                            // No awaiting capacity: prices and signal decisions must
+                            // never be blocked by slower RPC simulation responses.
+                            let permit=match output.try_reserve() {
+                                Ok(permit)=>permit,
+                                Err(mpsc::error::TrySendError::Full(_))=>{
+                                    report.cp9c_queue_full_packs+=1;
+                                    *report.cp9d_queue_full_by_strategy.entry(strategy.label().into()).or_default()+=1;
+                                    busy_revision=true;break 'packages;
+                                },
+                                Err(mpsc::error::TrySendError::Closed(_))=>bail!("V10 request receiver stopped"),
+                            };
+                            let references=previous.get(pair).map(Vec::as_slice).unwrap_or(&[]);
+                            let selected=state.build_compact(candidate,*threshold,trigger.clone(),
+                                &registry,&cfg,report.requests.len()+1,&mut reads,strategy,references,None);
+                            let selection=match selected{
+                                Ok(selection)=>selection,
+                                Err(error)=>{
+                                    invalid_seed=true;report.skipped_invalid_seed+=1;
+                                    report.last_rejection=Some(format!("{error:#}"));continue;
+                                }
+                            };
+                            let mut pool_set=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
+                            pool_set.sort_unstable();
+                            if sent_sets.get(pair).is_some_and(|sent|sent.contains(&pool_set)){
+                                report.cp9c_duplicate_packs+=1;continue;
+                            }
+                            let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,&mut report.amounts)? else{
+                                continue;
+                            };
+                            let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
+                            actual.sort_unstable();
+                            if !sent_sets.entry(*pair).or_default().insert(actual){
+                                // Defensive: quantity-seed repair can alter the pool set.
+                                // This duplicate already passed the amount proof.
+                                report.cp9c_duplicate_packs+=1;continue;
+                            }
+                            previous.entry(*pair).or_default().push(
+                                selection.pools.iter().map(|p|p.slot/2).collect());
+                            selection.cp9d_source=origin;
+                            selection.cp9d_pair_index=pair_index as u8;
+                            selection.packing_revision_variant=variant as u8;
+                            selection.selection_ns=elapsed_ns(started);
+                            selection.registry_reads=reads.clone();
+                            selection.request_ready_at_us=now_us();
+                            selection.frame_to_request_us=selection.price_pipeline.and_then(|t|
+                                selection.request_ready_at_us.checked_sub(t.frame_received_at_us));
+                            selection.signal_to_request_us=selection.request_ready_at_us.saturating_sub(selection.signal_ready_at_us);
                             *report.cp9c_by_strategy.entry(strategy.label().into()).or_default()+=1;
                             report.cp9c_packs_dispatched+=1;
+                            if sent_pair.insert(*pair) {
+                                report.cp9d_distinct_pairs_dispatched+=1;
+                                if *origin=="fresh"{report.cp9d_fresh_pairs+=1;}
+                                else{report.cp9d_active_pairs+=1;}
+                            }
+                            crate::log_event!(Debug,"execution candidates request_id={} strategy={} source={} pair_rank={} generation={} revision={} pools={} accounts={} selection_ns={} broadcasts=false",
+                                selection.request.id,selection.packing_strategy,selection.cp9d_source,selection.cp9d_pair_index,
+                                state.generation,state.revision,selection.packing.pool_declarations,
+                                selection.packing.unique_accounts,selection.selection_ns);
                             permit.send(selection.request.clone());report.requests.push(selection);
                         }
                     }
-                    if busy_revision {report.skipped_busy_revisions+=1;}
+                    if busy_revision{report.skipped_busy_revisions+=1;}
                     ranked.clear();
                     report.registry_reads.merge(&reads);
                     if invalid_seed {
