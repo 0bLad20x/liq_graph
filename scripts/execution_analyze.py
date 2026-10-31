@@ -62,6 +62,15 @@ def analyze(rows):
     path_relations, model_statuses, leg_reasons = (collections.Counter() for _ in range(3))
     leg_errors = collections.defaultdict(list)
     route_errors, comparison_samples = [], []
+    # CP9C: compare independent packing strategies without treating repeated
+    # simulations of one slot/path as different trading opportunities.
+    strategy_counts = collections.defaultdict(collections.Counter)
+    strategy_payloads = collections.defaultdict(set)
+    strategy_full_paths = collections.defaultdict(set)
+    strategy_positive_slots = collections.defaultdict(set)
+    strategy_positive_path_slots = collections.defaultdict(set)
+    same_revision_pools = collections.defaultdict(dict)
+    quote_outliers = []
 
     def bad(kind, identity):
         violation_counts[kind] += 1
@@ -78,11 +87,16 @@ def analyze(rows):
         ids.add(identity)
         route = s['route_kind']
         routes[route] += 1
+        strategy = s.get('packing_strategy', 'baseline')
+        strategy_counts[strategy]['requests'] += 1
+        generation_revision = (s.get('graph_generation'), s.get('revision'))
+        same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
         digest = row.get('payload_sha256')
         if not digest:
             payload = {k: v for k, v in q.items() if k != 'id'}
             digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         payloads[digest] += 1
+        strategy_payloads[strategy].add(digest)
         witness = ((s.get('candidate') or {}).get('witness') or {})
         if (witness.get('log_sum_units', s['threshold_units']) >= s['threshold_units'] or
                 s['packing_seed_log_sum_units'] >= s['threshold_units']):
@@ -189,7 +203,30 @@ def analyze(rows):
                     del comparison_samples[8:]
             if invalid:
                 bad('calibration', identity)
+        if c and c.get('single_cycle') and sim['err'] is None:
+            strategy_counts[strategy]['full_cycles'] += 1
+            path = tuple((leg.get('pool') or 'unknown') for leg in c.get('legs', ()))
+            strategy_full_paths[strategy].add((q['settlement'], path))
+        if c:
+            for leg in c.get('legs', ()):
+                err = leg.get('output_error_bps')
+                if err is not None and abs(err) > 10:
+                    quote_outliers.append({
+                        'request_id': identity, 'strategy': strategy,
+                        'pool': leg.get('pool'), 'venue': leg.get('venue'),
+                        'model_vs_actual_bps': err,
+                        'observation_slot': leg.get('observation_slot'),
+                        'component_slot_min': leg.get('component_slot_min'),
+                        'component_slot_max': leg.get('component_slot_max'),
+                        'simulation_slot': r.get('context_slot'),
+                        'snapshot_reserve_curve': leg.get('snapshot_reserve_curve'),
+                        'snapshot_content_digest': leg.get('snapshot_content_digest'),
+                        'observation_consistency': leg.get('observation_consistency')
+                    })
+                    quote_outliers.sort(key=lambda x: abs(x['model_vs_actual_bps']), reverse=True)
+                    del quote_outliers[24:]
         if sim['err'] is not None:
+            strategy_counts[strategy]['failures'] += 1
             error = next((re.search(r'Error Code: ([^.]+)', line)[1]
                           for line in sim.get('logs', []) if 'Error Code: ' in line),
                          json.dumps(sim['err'], sort_keys=True))
@@ -197,6 +234,7 @@ def analyze(rows):
             continue
         successes += 1
         successful_routes[route] += 1
+        strategy_counts[strategy]['rpc_successes'] += 1
         def token_amount(entries):
             return sum(int(b['uiTokenAmount']['amount']) for b in entries
                        if b.get('owner') == q['wallet'] and b['mint'] == q['settlement'])
@@ -213,6 +251,13 @@ def analyze(rows):
         if asset == WSOL:
             above_fee[asset] += fee is not None and gain > fee
             positive_cashflow[asset] += native_delta is not None and gain + native_delta > 0
+            if c and c.get('single_cycle') and fee is not None and gain > fee:
+                strategy_counts[strategy]['above_network_fee'] += 1
+                strategy_positive_slots[strategy].add(r.get('context_slot'))
+                pool_path=tuple((leg.get('pool') or 'unknown') for leg in c.get('legs', ()))
+                strategy_positive_path_slots[strategy].add((r.get('context_slot'),q['settlement'],pool_path))
+            if c and c.get('single_cycle') and native_delta is not None and gain + native_delta > 0:
+                strategy_counts[strategy]['positive_native_plus_settlement_cashflow'] += 1
         case = {'id': identity, 'route_kind': route, 'context_slot': r['context_slot'],
                 'settlement': asset, 'settlement_gain_raw': gain, 'network_fee_lamports': fee,
                 'after_network_lamports': gain - fee if asset == WSOL and fee is not None else None,
@@ -223,7 +268,29 @@ def analyze(rows):
         best[asset].sort(key=lambda v: v['settlement_gain_raw'], reverse=True)
         del best[asset][10:]
     repeated = [n for n in payloads.values() if n > 1]
-    return {'schema_version': 2, 'request_count': count, 'report_count': reports,
+    cross_strategy_pools = collections.defaultdict(list)
+    for payload_sets in same_revision_pools.values():
+        names = sorted(payload_sets)
+        for i, a in enumerate(names):
+            for b in names[i+1:]:
+                union = payload_sets[a] | payload_sets[b]
+                if union:
+                    cross_strategy_pools[f'{a}_vs_{b}'].append(
+                        len(payload_sets[a] & payload_sets[b]) / len(union))
+    cp9c = {
+        'strategies': {name: {
+            **dict(counts),
+            'unique_payloads': len(strategy_payloads[name]),
+            'unique_completed_pool_paths': len(strategy_full_paths[name]),
+            'distinct_positive_simulation_slots': len(strategy_positive_slots[name]),
+            'distinct_positive_path_slot_combinations': len(strategy_positive_path_slots[name])
+        } for name, counts in sorted(strategy_counts.items())},
+        'same_revision_pool_jaccard': {
+            name: durations(values) for name, values in sorted(cross_strategy_pools.items())},
+        'largest_quote_discrepancies': quote_outliers
+    }
+    return {'schema_version': 2,
+            'cp9c_strategy_comparison': cp9c, 'request_count': count, 'report_count': reports,
             'simulation_successes': successes, 'simulation_failures': sum(errors.values()),
             'dex_call_reports': dex_calls, 'errors': dict(errors), 'routes': dict(routes),
             'successful_routes': dict(successful_routes), 'violations': violations,
