@@ -3,7 +3,7 @@
 mod amounts;
 mod diversity;
 use diversity::{Strategy as PackingStrategy,Alternative};
-use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{BTreeMap,HashMap,HashSet}, env, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}};
 use anyhow::{Context, Result, bail, ensure};
 use solana_pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc};
@@ -22,6 +22,7 @@ pub struct Settings {
     pub kind: Option<SignalRouteKind>,
     /// CP9C: independent alternative-packing strategies for the same signal revision.
     pub strategies:Vec<PackingStrategy>,
+    pub cp9d_max_pairs:usize,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
     pub capacity: fn(&ExecutionRequest) -> Result<ExecutionMetrics>,
 }
@@ -45,11 +46,17 @@ impl Settings {
             "contrarian"=>vec![PackingStrategy::Contrarian],
             "mixed"=>vec![PackingStrategy::Mixed],
             "all"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed],
-            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed or all"),
+            "all_coverage"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed,PackingStrategy::Coverage],
+            "coverage"=>vec![PackingStrategy::Coverage],
+            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed, all, coverage or all_coverage"),
         };
-        ensure!(strategies==[PackingStrategy::Baseline]||kind==Some(SignalRouteKind::Direct2),
-            "CP9C alternative comparisons require GRAPH_EXECUTION_ROUTE_KIND=Direct2");
-        Ok(Self {wallet,parameters,limit,kind,strategies,capacity})
+        let cp9d_max_pairs:usize=env::var("GRAPH_CP9D_MAX_DISTINCT_PAIRS")
+            .unwrap_or_else(|_|"1".into()).parse().context("invalid GRAPH_CP9D_MAX_DISTINCT_PAIRS")?;
+        ensure!((1..=8).contains(&cp9d_max_pairs),"GRAPH_CP9D_MAX_DISTINCT_PAIRS must be 1..=8");
+        ensure!((strategies==[PackingStrategy::Baseline]&&cp9d_max_pairs==1)
+            ||kind==Some(SignalRouteKind::Direct2),
+            "CP9D breadth/alternative comparison requires GRAPH_EXECUTION_ROUTE_KIND=Direct2");
+        Ok(Self {wallet,parameters,limit,kind,strategies,cp9d_max_pairs,capacity})
     }
 }
 fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
@@ -88,6 +95,8 @@ pub struct Selection {
     pub request: ExecutionRequest,
     packing_strategy:&'static str,
     packing_revision_variant:u8,
+    cp9d_source:&'static str,
+    cp9d_pair_index:u8,
     graph_generation: u64, revision: u64, topology_id: Option<usize>, route_kind: SignalRouteKind,
     reverse: bool, trigger: Arc<SignalTrigger>, candidate: Option<SignalCandidate>,
     threshold_units: i64, estimated_net_return_bps:Option<f64>,
@@ -114,6 +123,9 @@ pub struct Report {
     lost_events: u64, resynchronizations: u64, skipped_busy_revisions: u64,
     pub cp9c_pack_attempts:u64,pub cp9c_packs_dispatched:u64,pub cp9c_duplicate_packs:u64,
     pub cp9c_queue_full_packs:u64,pub cp9c_by_strategy:std::collections::BTreeMap<String,u64>,
+    pub cp9d_fresh_pairs:u64,pub cp9d_active_pairs:u64,pub cp9d_active_candidates_examined:u64,
+    pub cp9d_distinct_pairs_dispatched:u64,
+    pub cp9d_queue_full_by_strategy:BTreeMap<String,u64>,
     skipped_invalid_seed: u64, last_rejection: Option<String>, awaiting_snapshot: bool,
     manifest_refresh_performed: bool,
     catalog_snapshots:u64, catalog_snapshot_candidates:u64, max_active_candidates:usize,
@@ -259,6 +271,8 @@ impl Selection {
         result["simulation_context_slot"]=json!(report.context_slot);
         result["state_comparability"]=json!("slot_is_not_bank_identity");
         result["request_ready_at_us"]=json!(self.request_ready_at_us);
+        result["cp9d_source"]=json!(self.cp9d_source);
+        result["cp9d_pair_index"]=json!(self.cp9d_pair_index);
         result
     }
     /// Per-request rate/capacity facts; full manifests are stored once per payload.
@@ -335,7 +349,9 @@ struct State {
     prices: Vec<Option<Arc<SignalPoolPrice>>>, revision: u64, generation: u64,
     ready_at_us: u64, received_at_us: u64,
     price_pipeline: Option<PricePipelineTiming>,
-    threshold:i64, active:HashSet<(usize,bool)>,prepared_logarithms:u64,
+    threshold:i64, active:HashSet<(usize,bool)>,
+    active_witnesses:BTreeMap<(usize,bool),SignalCandidate>,
+    prepared_logarithms:u64,
 }
 impl State {
     fn amount_input(&self,id:usize,manifest_matches:bool)->Option<amounts::Input> {
@@ -386,7 +402,11 @@ impl State {
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
             if let Some(preferred)=amounts::seed(&universe,&pairs) {
                 if let Ok(mut repaired)=self.build_compact(&candidate,selection.threshold_units,selection.trigger.clone(),
-                    registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,match selection.packing_strategy { "contrarian"=>PackingStrategy::Contrarian,"mixed"=>PackingStrategy::Mixed,_=>PackingStrategy::Baseline },Some(&preferred)) {
+                    registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,
+                    match selection.packing_strategy {
+                        "contrarian"=>PackingStrategy::Contrarian,"mixed"=>PackingStrategy::Mixed,
+                        "coverage"=>PackingStrategy::Coverage,_=>PackingStrategy::Baseline
+                    },&[],Some(&preferred)) {
                     if repaired.amount_seed_changed {
                         let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
                         if next.decision!=amounts::Decision::Excluded {
@@ -423,14 +443,17 @@ impl State {
             self.plan=Some(snapshot.plan.clone()); self.pools=snapshot.pools.clone(); self.prices=snapshot.prices.clone();
             self.generation=s.graph_generation;
             self.threshold=snapshot.threshold_units;
-            self.active.clear();
+            self.active.clear();self.active_witnesses.clear();
             for candidate in &snapshot.candidates {
                 self.witness(candidate.topology_id,candidate.reverse,&candidate.witness)?;
-                ensure!(self.active.insert((candidate.topology_id,candidate.reverse)),
-                    "duplicate execution candidate snapshot key");
+                let key=(candidate.topology_id,candidate.reverse);
+                ensure!(self.active.insert(key),"duplicate execution candidate snapshot key");
+                self.active_witnesses.insert(key,SignalCandidate{
+                    topology_id:candidate.topology_id,reverse:candidate.reverse,
+                    change:SignalRangeChange::Updated,witness:Some(candidate.witness.clone())});
             }
         } else {ensure!(self.plan.is_some() && s.graph_generation==self.generation, "candidate delta without snapshot");}
-        if s.clear {self.prices.fill(None);self.active.clear();}
+        if s.clear {self.prices.fill(None);self.active.clear();self.active_witnesses.clear();}
         for change in &s.changes {
             if change.pool_id==self.pools.len() {self.pools.push(change.identity.clone()); self.prices.push(None);}
             ensure!(self.pools.get(change.pool_id)==Some(&change.identity), "candidate pool identity mismatch");
@@ -474,13 +497,17 @@ impl State {
         ensure!(b.threshold_units==self.threshold,"candidate threshold changed without snapshot");
         let key=(c.topology_id,c.reverse);
         match c.change {
-            SignalRangeChange::Exited=>ensure!(c.witness.is_none()&&self.active.remove(&key),
-                "execution candidate exit missing or carries witness"),
+            SignalRangeChange::Exited=>{
+                ensure!(c.witness.is_none()&&self.active.remove(&key),
+                    "execution candidate exit missing or carries witness");
+                self.active_witnesses.remove(&key);
+            },
             SignalRangeChange::Entered|SignalRangeChange::Updated=>{
                 self.witness(c.topology_id,c.reverse,c.witness.as_ref().context("candidate witness absent")?)?;
                 if c.change==SignalRangeChange::Entered {
                     ensure!(self.active.insert(key),"execution candidate entered twice");
                 } else {ensure!(self.active.contains(&key),"execution candidate updated before entering");}
+                self.active_witnesses.insert(key,c.clone());
             },
         }
         Ok(())
@@ -522,7 +549,8 @@ impl State {
     /// Pack an exact CP6A best-witness without rebuilding any route product.
     /// Alternatives are drawn from currently priced slots with the same mint roles.
     fn build_compact(&self,c:&SignalCandidate,threshold:i64,trigger:Arc<SignalTrigger>,
-        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,strategy:PackingStrategy,preferred:Option<&[usize]>)->Result<Selection>{
+        registry:&PoolRegistry,cfg:&Settings,number:usize,reads:&mut RegistryReads,strategy:PackingStrategy,
+        reference_packs:&[Vec<usize>],preferred:Option<&[usize]>)->Result<Selection>{
         let started=Instant::now();
         let plan=self.plan.as_ref().context("compact candidate plan missing")?;
         let top=plan.compact_topologies.get(c.topology_id)
@@ -608,7 +636,10 @@ impl State {
                 }
             }
         }
-        let ranking=diversity::order(strategy,&alternative_profiles);
+        let ranking=if strategy==PackingStrategy::Coverage {
+            diversity::coverage_order(&alternative_profiles,&slots.iter().map(|(s,_)|s/2).collect::<Vec<_>>(),
+                reference_packs)
+        } else {diversity::order(strategy,&alternative_profiles)};
         let mut considered=0;let mut rejected=0;let mut unavailable=0;
         let mut last_rejection=None;
         for index in ranking{
@@ -632,7 +663,8 @@ impl State {
         let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
         let alternative_pools_added=pools.len()-slots.len();
         let estimated_net_return_bps=(-(seed_sum as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10000.0;
-        Ok(Selection{request,packing_strategy:strategy.label(),packing_revision_variant:0,graph_generation:self.generation,revision:self.revision,
+        Ok(Selection{request,packing_strategy:strategy.label(),packing_revision_variant:0,
+            cp9d_source:"fresh",cp9d_pair_index:0,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
             estimated_net_return_bps:estimated_net_return_bps.is_finite().then_some(estimated_net_return_bps),
