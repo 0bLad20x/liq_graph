@@ -20,6 +20,7 @@ pub struct Settings {
     /// Zero means no lifetime request cap; the output queue remains bounded.
     pub limit: usize,
     pub kind: Option<SignalRouteKind>,
+    pub direct2_direct3:bool,
     /// CP9C: independent alternative-packing strategies for the same signal revision.
     strategies:Vec<PackingStrategy>,
     pub cp9d_max_pairs:usize,
@@ -29,10 +30,13 @@ pub struct Settings {
 impl Settings {
     pub fn from_env(wallet: Pubkey, capacity: fn(&ExecutionRequest)->Result<ExecutionMetrics>) -> Result<Self> {
         let limit=env::var("GRAPH_EXECUTION_MAX_REQUESTS").unwrap_or_else(|_|"0".into()).parse()?;
-        let kind=match env::var("GRAPH_EXECUTION_ROUTE_KIND").unwrap_or_else(|_|"All".into()).to_ascii_lowercase().as_str() {
-            "all"=>None, "direct2"=>Some(SignalRouteKind::Direct2), "direct3"=>Some(SignalRouteKind::Direct3),
+        let route_mode=env::var("GRAPH_EXECUTION_ROUTE_KIND").unwrap_or_else(|_|"All".into());
+        let direct2_direct3=route_mode.eq_ignore_ascii_case("Direct2Direct3");
+        let kind=match route_mode.to_ascii_lowercase().as_str() {
+            "all"|"direct2direct3"=>None, "direct2"=>Some(SignalRouteKind::Direct2),
+            "direct3"=>Some(SignalRouteKind::Direct3),
             "triangle3"=>Some(SignalRouteKind::Triangle3), "triangle4"=>Some(SignalRouteKind::Triangle4),
-            _=>bail!("GRAPH_EXECUTION_ROUTE_KIND must be All, Direct2, Direct3, Triangle3 or Triangle4"),
+            _=>bail!("GRAPH_EXECUTION_ROUTE_KIND must be All, Direct2, Direct3, Direct2Direct3, Triangle3 or Triangle4"),
         };
         let parameters:ExecutionParameters=match env::var("GRAPH_EXECUTION_PARAMETERS_PATH") {
             Ok(path) if !path.is_empty()=>serde_json::from_slice(&std::fs::read(path)
@@ -54,9 +58,16 @@ impl Settings {
             .unwrap_or_else(|_|"1".into()).parse().context("invalid GRAPH_CP9D_MAX_DISTINCT_PAIRS")?;
         ensure!((1..=8).contains(&cp9d_max_pairs),"GRAPH_CP9D_MAX_DISTINCT_PAIRS must be 1..=8");
         ensure!((strategies==[PackingStrategy::Baseline]&&cp9d_max_pairs==1)
-            ||kind==Some(SignalRouteKind::Direct2),
-            "CP9D breadth/alternative comparison requires GRAPH_EXECUTION_ROUTE_KIND=Direct2");
-        Ok(Self {wallet,parameters,limit,kind,strategies,cp9d_max_pairs,capacity})
+            ||kind==Some(SignalRouteKind::Direct2)||direct2_direct3,
+            "CP9D/CP9E alternative comparisons require Direct2 or Direct2Direct3");
+        Ok(Self {wallet,parameters,limit,kind,direct2_direct3,strategies,cp9d_max_pairs,capacity})
+    }
+    fn accepts(&self,kind:SignalRouteKind)->bool {
+        if self.direct2_direct3 {
+            matches!(kind,SignalRouteKind::Direct2|SignalRouteKind::Direct3)
+        } else {
+            self.kind.is_none_or(|selected|selected==kind)
+        }
     }
 }
 fn now_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
@@ -752,7 +763,7 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         let top=state.plan.as_ref()
                             .and_then(|p|p.compact_topologies.get(candidate.topology_id))
                             .context("candidate references unknown topology")?;
-                        if cfg.kind.is_some_and(|kind|kind!=top.kind){continue;}
+                        if !cfg.accepts(top.kind){continue;}
                         if let Some(w)=candidate.witness.as_ref(){
                             ensure!(w.log_sum_units<b.threshold_units,
                                 "best candidate does not satisfy net threshold");
@@ -784,13 +795,14 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     // First give changed, currently priced witnesses priority. Then
                     // rotate through authoritative active witnesses from this
                     // generation. Never invent a profitable source witness.
-                    let mut sources=Vec::<(SignalCandidate,Arc<SignalTrigger>,i64,&'static str,(Pubkey,Pubkey))>::new();
+                    type RoutePair=(SignalRouteKind,Pubkey,Pubkey);
+                    let mut sources=Vec::<(SignalCandidate,Arc<SignalTrigger>,i64,&'static str,RoutePair)>::new();
                     let mut pairs=HashSet::new();
                     for (_,event,index) in &ranked {
                         let SignalEvent::Candidates(block)=event.as_ref() else {continue};
                         let candidate=&block.candidates[*index];
                         let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
-                        let pair=(top.settlement.min(top.target),top.settlement.max(top.target));
+                        let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
                         if !pairs.insert(pair){continue;}
                         sources.push((candidate.clone(),block.trigger.clone(),block.threshold_units,"fresh",pair));
                         if sources.len()>=cfg.cp9d_max_pairs{break;}
@@ -804,8 +816,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 report.cp9d_active_candidates_examined+=1;
                                 if candidate.change==SignalRangeChange::Exited {continue;}
                                 let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
-                                if top.kind!=SignalRouteKind::Direct2||cfg.kind.is_some_and(|kind|kind!=top.kind){continue;}
-                                let pair=(top.settlement.min(top.target),top.settlement.max(top.target));
+                                if !cfg.accepts(top.kind){continue;}
+                                let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
                                 if pairs.contains(&pair){continue;}
                                 let Some(w)=candidate.witness.as_ref() else{continue};
                                 if w.log_sum_units>=state.threshold ||
@@ -816,8 +828,8 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             }
                         }
                     }
-                    let mut previous=HashMap::<(Pubkey,Pubkey),Vec<Vec<usize>>>::new();
-                    let mut sent_sets=HashMap::<(Pubkey,Pubkey),HashSet<Vec<String>>>::new();
+                    let mut previous=HashMap::<RoutePair,Vec<Vec<usize>>>::new();
+                    let mut sent_sets=HashMap::<RoutePair,HashSet<Vec<String>>>::new();
                     let mut sent_pair=HashSet::new();
                     let mut invalid_seed=false;
                     let mut busy_revision=false;
