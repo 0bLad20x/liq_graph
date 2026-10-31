@@ -1,6 +1,6 @@
 //! Complete typed execution job -> signed V10/Solana-v1 simulation -> typed report.
 //! No DB, Registry, graph lookup, pool selection, protocol decoding or broadcasting.
-use std::{cell::RefCell, collections::{HashMap, HashSet}, path::Path, time::Instant, sync::{Arc, LazyLock}};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, path::Path, time::Instant, sync::{Arc, LazyLock, atomic::{AtomicU64, Ordering}}};
 use anyhow::{Context, Result, bail, ensure};
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde_json::Value;
@@ -371,10 +371,51 @@ fn message(ix: &mut Instruction, request: &ExecutionRequest,
     Ok((message,keys))
 }
 
+/// CP10 phases are aggregate, bounded atomic counters; no per-request event buffer.
+#[derive(Default,Debug,serde::Serialize)]
+pub struct CapacityPhaseProfile {
+    pub calls:u64, pub instruction_ns:u64, pub message_ns:u64,
+    pub instruction_failures:u64, pub message_failures:u64,
+}
+static CAP_PROFILE_ENABLED: LazyLock<bool> = LazyLock::new(||
+    matches!(std::env::var("GRAPH_SIGNALS_PROFILE").as_deref(),
+        Ok("true"|"1"|"yes")));
+static CAP_CALLS:AtomicU64=AtomicU64::new(0);
+static CAP_INSTRUCTION_NS:AtomicU64=AtomicU64::new(0);
+static CAP_MESSAGE_NS:AtomicU64=AtomicU64::new(0);
+static CAP_INSTRUCTION_FAILURES:AtomicU64=AtomicU64::new(0);
+static CAP_MESSAGE_FAILURES:AtomicU64=AtomicU64::new(0);
+
+pub fn capacity_phase_profile()->CapacityPhaseProfile {
+    CapacityPhaseProfile {
+        calls:CAP_CALLS.load(Ordering::Relaxed),
+        instruction_ns:CAP_INSTRUCTION_NS.load(Ordering::Relaxed),
+        message_ns:CAP_MESSAGE_NS.load(Ordering::Relaxed),
+        instruction_failures:CAP_INSTRUCTION_FAILURES.load(Ordering::Relaxed),
+        message_failures:CAP_MESSAGE_FAILURES.load(Ordering::Relaxed),
+    }
+}
 /// Exact existing packing/validation boundary. No signing, RPC or pool selection.
+/// The timed phases are recorded only when GRAPH_SIGNALS_PROFILE is enabled.
 pub fn validate(request: &ExecutionRequest) -> Result<ExecutionMetrics> {
-    let mut ix=instruction(request,request.wallet)?;
-    let _=message(&mut ix,request,"11111111111111111111111111111111")?;
+    let measure=*CAP_PROFILE_ENABLED;
+    let started=Instant::now();
+    let constructed=instruction(request,request.wallet);
+    if measure {
+        CAP_CALLS.fetch_add(1,Ordering::Relaxed);
+        CAP_INSTRUCTION_NS.fetch_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed);
+        if constructed.is_err() {CAP_INSTRUCTION_FAILURES.fetch_add(1,Ordering::Relaxed);}
+    }
+    let mut ix=constructed?;
+    let started=Instant::now();
+    let checked=message(&mut ix,request,"11111111111111111111111111111111");
+    if measure {
+        CAP_MESSAGE_NS.fetch_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed);
+        if checked.is_err(){CAP_MESSAGE_FAILURES.fetch_add(1,Ordering::Relaxed);}
+    }
+    let _=checked?;
     Ok(ix.metrics)
 }
 
