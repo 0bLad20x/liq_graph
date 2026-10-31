@@ -259,3 +259,44 @@ fn included_fee(excluded:u64,fee:u64)->Option<u64> {
 fn excluded_fee(included:u64,fee:u64)->u64 {
     (u128::from(included)*u128::from(fee)).div_ceil(PRECISION) as u64
 }
+
+#[cfg(test)]
+mod hotpath_tests {
+    use super::*;
+
+    #[test]
+    fn identical_dlmm_payload_does_not_reparse_or_replace_state() {
+        let pool=Pubkey::new_from_array([23_u8;32]);
+        let program:Pubkey=DLMM_PROGRAM.parse().unwrap();
+        let array_address=Pubkey::find_program_address(
+            &[b"bin_array",pool.as_ref(),&0_i64.to_le_bytes()],&program).0;
+        let mut arrays=[Pubkey::default();6];
+        arrays[0]=array_address;
+        let deps=Dependencies{arrays,count:1,bitmap:None,digest:[0;32]};
+        let mut pair=vec![0_u8;904];
+        pair[..8].copy_from_slice(&DLMM_DISC);
+        let mut book=Book::new(pool,deps,&pair).unwrap();
+        assert!(!book.pair(&pair).unwrap());
+        pair[40]=1;
+        assert!(book.pair(&pair).unwrap());
+        assert!(!book.pair(&pair).unwrap());
+
+        let mut array=vec![0_u8;56+70*144];
+        array[..8].copy_from_slice(&ARRAY_DISC);
+        array[24..56].copy_from_slice(pool.as_ref());
+        assert!(book.array(0,array_address,&array).unwrap());
+        assert!(!book.array(0,array_address,&array).unwrap());
+        array[56+16]=1; // valid nonzero bin price, all reserves zero
+        assert!(book.array(0,array_address,&array).unwrap());
+        assert!(!book.array(0,array_address,&array).unwrap());
+
+        let mut bitmap=vec![0_u8;1576];
+        bitmap[..8].copy_from_slice(&BITMAP_DISC);
+        bitmap[8..40].copy_from_slice(pool.as_ref());
+        assert!(book.bitmap(&bitmap).unwrap());
+        assert!(!book.bitmap(&bitmap).unwrap());
+        bitmap[40]=1;
+        assert!(book.bitmap(&bitmap).unwrap());
+        assert!(!book.bitmap(&bitmap).unwrap());
+    }
+}
