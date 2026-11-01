@@ -919,8 +919,13 @@ impl Engine{
                     let oracle_key=Pubkey::find_program_address(&[b"oracle",address.as_ref()],&program).0.to_string();
                     if watch.orca_adaptive{details.push(oracle_key.clone());}
                     details.push("SysvarC1ock11111111111111111111111111111111".into());
+                    let mut array_keys=watch.orca_arrays.iter().flatten().map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    array_keys.sort();array_keys.dedup();
+                    details.extend(array_keys.iter().cloned());
                     (key(&acc.data,101)?,key(&acc.data,181)?,
-                        State::OrcaWhirlpool{state,oracle:None,oracle_key,oracle_slot:pool_slot,liquidity:None})
+                        State::OrcaWhirlpool{state,oracle:None,oracle_key,oracle_slot:pool_slot,
+                            array_keys,arrays:Vec::new(),liquidity:None})
                 },
                 Venue::RaydiumCpmm=>{
                     ensure!(acc.owner==RAYDIUM_CPMM_PROGRAM && acc.data.starts_with(&RAYDIUM_CPMM_DISC),
@@ -1011,13 +1016,19 @@ impl Engine{
                 *fees=Some(cpmm::config(&cfg.data,&cfg.owner,RAYDIUM_CPMM_PROGRAM)?);
                 *config_slot=cfg.slot;
             }
-            if let State::OrcaWhirlpool{oracle,oracle_key,oracle_slot,..}=&mut state{
+            if let State::OrcaWhirlpool{state:pool_state,oracle,oracle_key,oracle_slot,array_keys,arrays,..}=&mut state{
                 if watch.orca_adaptive{
                     let item=dict.get(oracle_key).context("Prepared Orca adaptive Oracle unavailable")?;
                     ensure!(item.owner==ORCA_WHIRLPOOL_PROGRAM,"Orca Oracle owner mismatch");
                     let pool_id:Pubkey=watch.address.parse()?;
                     *oracle=Some(orca::oracle(&item.data,&pool_id.to_bytes())?);
                     *oracle_slot=item.slot;
+                }
+                let pool_id:Pubkey=watch.address.parse()?;
+                for address in array_keys.iter(){
+                    let account=dict.get(address).context("Prepared Orca TickArray unavailable")?;
+                    ensure!(account.owner==ORCA_WHIRLPOOL_PROGRAM,"Orca TickArray owner mismatch");
+                    arrays.push(orca::tick_array(&account.data,&pool_id.to_bytes(),pool_state.spacing)?);
                 }
             }
             let (canon_base,canon_quote)=canonical(&a,&b);
@@ -1044,6 +1055,11 @@ impl Engine{
             if let State::OrcaWhirlpool{oracle_key,..}=&pool.state{
                 let mut deps=vec![(Field::Clock,"SysvarC1ock11111111111111111111111111111111".to_string())];
                 if watch.orca_adaptive{deps.push((Field::OrcaOracle,oracle_key.clone()));}
+                if let State::OrcaWhirlpool{array_keys,..}=&pool.state{
+                    for (i,address) in array_keys.iter().enumerate(){
+                        deps.push((Field::OrcaArray(i as u8),address.clone()));
+                    }
+                }
                 for (field,address) in deps {
                     let account=dict.get(&address).context("Orca Oracle/Clock baseline missing")?;
                     subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,
@@ -1108,7 +1124,7 @@ impl Engine{
             delta_bps:previous.map(|old|bps(old,pool.price)).filter(|v|v.is_finite()),
             price_kind:pool.price_kind(),
             best_bid_quote_per_base:best_bid,best_ask_quote_per_base:best_ask,
-            consistency:if pool.venue==Venue::Dlmm {
+            consistency:if matches!(pool.venue,Venue::Dlmm|Venue::OrcaWhirlpool) {
                 if component_slot_min==component_slot_max{Consistency::SameSlotNonAtomic}else{Consistency::MixedSlotNonAtomic}
             }else{pool.consistency()},slot:pool.slot,received_at_us:component_received_at_us_max,
             sequence,component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max,trigger_field:field.map(Field::label),
@@ -1298,6 +1314,11 @@ impl Engine{
             (State::OrcaWhirlpool{oracle,oracle_slot,..},Field::OrcaOracle)=>{
                 *oracle=Some(orca::oracle(data,&pool.key.to_bytes())?);
                 *oracle_slot=slot;
+            },
+            (State::OrcaWhirlpool{state,arrays,..},Field::OrcaArray(i))=>{
+                let index=usize::from(i);
+                let current=arrays.get_mut(index).context("Orca TickArray watch index invalid")?;
+                *current=orca::tick_array(data,&pool.key.to_bytes(),state.spacing)?;
             },
             (State::DammV2{sqrt},Field::DammSqrt)|
             (State::RaydiumClmm{sqrt},Field::RaydiumClmmSqrt)|
