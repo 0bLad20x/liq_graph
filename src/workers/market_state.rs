@@ -2,7 +2,7 @@
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
 mod fees;
 mod dlmm;
-mod cpmm;
+pub(crate) mod cpmm;
 use crate::core::rpc::{RpcAnswer,RpcHandle,RpcOperation};
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap, VecDeque}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -10,7 +10,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
 use crate::core::{CompletionState, PoolState, PoolVaults, PoolUpdateBatch, Venue as CoreVenue, MintReader,
-    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
+    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,CpmmQuoteSnapshot,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, 
     graph_watch_catalog::WatchCatalog};
 use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
@@ -287,6 +287,13 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
         for n in curve.fee_bps{digest.update(&n.to_le_bytes());}
         digest.update(&curve.buy_input_padding_raw.to_le_bytes());
     }else{digest.update(&[0]);}
+    if let Some(snapshot)=&profile.cpmm_quote {
+        digest.update(snapshot.mint_0.as_bytes());digest.update(snapshot.mint_1.as_bytes());
+        for raw in [snapshot.reserve_0_raw,snapshot.reserve_1_raw,snapshot.trade_fee_rate,
+            snapshot.creator_fee_rate] { digest.update(&raw.to_le_bytes()); }
+        digest.update(&[u8::from(snapshot.creator_fee_on_input_0_to_1),
+            u8::from(snapshot.creator_fee_on_input_1_to_0)]);
+    }
     if profile.model=="raydium_cpmm_directional_v1" {
         for dir in &profile.directions {
             digest.update(&dir.marginal_net_rate.unwrap_or(0.0).to_bits().to_le_bytes());
@@ -348,12 +355,14 @@ impl Pool{
         });
         for d in &mut directions {if d.status=="empty"{d.reason=Some("trade direction disabled".into());}}
         Some(PoolLiquidity{model:"constant_product_quote_fees_v1",revision:0,content_digest:[0;32],
-            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
+            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),cpmm_quote:None,
             reserve_curve:Some(ReserveCurve{base_mint:self.a.clone(),base_reserve_raw:*base,
                 effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps,buy_input_padding_raw:1}),directions})
     }
     fn cpmm_profile(&self)->Option<PoolLiquidity> {
-        let State::RaydiumCpmm{base,quote,fee0,fee1,..}=&self.state else{return None;};
+        let State::RaydiumCpmm{base,quote,fee0,fee1,fees,creator_mode,creator_enabled,status,..}=&self.state else{return None;};
+        if status&4!=0{return None;}
+        let cfg=(*fees)?;
         let (r0,r1)=(base.checked_sub(*fee0)?,quote.checked_sub(*fee1)?);
         if r0==0||r1==0{return None;}
         let valuation=self.valuation()?;
@@ -376,9 +385,17 @@ impl Pool{
                 output_capacity_raw:output_reserve.to_string(),levels:Vec::new(),
                 reason:rate.is_none().then(||"CPMM directed valuation unavailable".into())}
         });
+        let snapshot=CpmmQuoteSnapshot {
+            mint_0:self.a.clone(),mint_1:self.b.clone(),
+            reserve_0_raw:r0,reserve_1_raw:r1,
+            trade_fee_rate:cfg.trade,
+            creator_fee_rate:if *creator_enabled{cfg.creator}else{0},
+            creator_fee_on_input_0_to_1:*creator_mode==0||*creator_mode==1,
+            creator_fee_on_input_1_to_0:*creator_mode==0||*creator_mode==2,
+        };
         Some(PoolLiquidity{model:"raydium_cpmm_directional_v1",revision:0,content_digest:[0;32],
             account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
-            reserve_curve:None,directions})
+            reserve_curve:None,cpmm_quote:Some(snapshot),directions})
     }
     fn refresh_liquidity(&mut self)->bool {
         if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm) {
