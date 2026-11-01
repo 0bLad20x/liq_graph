@@ -144,7 +144,14 @@ fn profile(input:&Input)->Calc<&PoolLiquidity> {
     if !input.observation.valuation.as_ref().is_some_and(|v|v.token_fee_status.iter().all(|s|*s=="verified_no_standard_transfer_fee")) {
         return Err(Issue::Unknown("token_transfer_cost_unresolved"));
     }
-    input.observation.liquidity.as_deref().ok_or(Issue::Unknown("amount_model_unavailable"))
+    let p=input.observation.liquidity.as_deref().ok_or(Issue::Unknown("amount_model_unavailable"))?;
+    // The signal layer may observe lightweight directional reserve profiles.
+    // Only fully modeled and frozen execution windows may establish a quantity
+    // exclusion proof; unknown leaves sizing and final choice to V10.
+    if p.model!="dlmm_execution_window_v2" && p.model!="constant_product_quote_fees_v1" {
+        return Err(Issue::Unknown("amount_model_not_implemented"));
+    }
+    Ok(p)
 }
 fn ceil_fee(amount:u64,rate:u64,den:u64)->Calc<u64> {
     if den==0||rate>=den{return Err(Issue::Unknown("invalid_fee_fraction"));}
