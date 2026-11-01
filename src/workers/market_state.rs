@@ -1280,7 +1280,7 @@ impl Engine{
             delta_bps:previous.map(|old|bps(old,pool.price)).filter(|v|v.is_finite()),
             price_kind:pool.price_kind(),
             best_bid_quote_per_base:best_bid,best_ask_quote_per_base:best_ask,
-            consistency:if matches!(pool.venue,Venue::Dlmm|Venue::OrcaWhirlpool) {
+            consistency:if matches!(pool.venue,Venue::Dlmm|Venue::OrcaWhirlpool|Venue::RaydiumClmm) {
                 if component_slot_min==component_slot_max{Consistency::SameSlotNonAtomic}else{Consistency::MixedSlotNonAtomic}
             }else{pool.consistency()},slot:pool.slot,received_at_us:component_received_at_us_max,
             sequence,component_slot_min,component_slot_max,component_received_at_us_min,component_received_at_us_max,trigger_field:field.map(Field::label),
