@@ -205,6 +205,43 @@ mod tests{
         assert!((r[1]-0.997).abs()<1e-12);
         let (input,_)=active_capacity(p,f,&[],None).unwrap();assert!(input[1]>0);
     }
+    #[test]fn cp14_fixed_and_dynamic_tick_array_decoding(){
+        let pool=[42_u8;32];
+        let mut fixed=vec![0_u8;8+4+88*113+32];
+        fixed[..8].copy_from_slice(&FIXED_DISC);
+        fixed[12+4*113]=1;
+        let end=12+88*113;fixed[end..end+32].copy_from_slice(&pool);
+        let a=tick_array(&fixed,&pool,64).unwrap();
+        assert_eq!(a.initialized,vec![4*64]);
+        let mut dynamic=vec![0_u8;60+88+112];
+        dynamic[..8].copy_from_slice(&DYNAMIC_DISC);
+        dynamic[12..44].copy_from_slice(&pool);
+        dynamic[60+2]=1;
+        let b=tick_array(&dynamic,&pool,64).unwrap();
+        assert_eq!(b.initialized,vec![2*64]);
+        assert_eq!(nearest_initialized(&[a,b],0,1),Some(128));
+        assert!(tick_array(&dynamic,&[0_u8;32],64).is_err());
+        let mut corrupted=dynamic;corrupted[60]=2;
+        assert!(tick_array(&corrupted,&pool,64).is_err());
+    }
+    #[test]fn cp14_oracle_layout_and_trade_enable(){
+        let pool=[12_u8;32];let mut d=vec![0_u8;254];
+        d[..8].copy_from_slice(&ORACLE_DISC);
+        d[8..40].copy_from_slice(&pool);
+        d[48..50].copy_from_slice(&10_u16.to_le_bytes());
+        d[50..52].copy_from_slice(&30_u16.to_le_bytes());
+        d[52..54].copy_from_slice(&5000_u16.to_le_bytes());
+        d[54..58].copy_from_slice(&1000_u32.to_le_bytes());
+        d[58..62].copy_from_slice(&10000_u32.to_le_bytes());
+        d[62..64].copy_from_slice(&8_u16.to_le_bytes());
+        d[40..48].copy_from_slice(&101_u64.to_le_bytes());
+        let o=oracle(&d,&pool).unwrap();
+        let p=Whirlpool{spacing:64,fee:3000,protocol_share:0,liquidity:1_000_000,
+            sqrt:1_u128<<64,tick:0};
+        assert!(fee(p,Some(o),100).is_err());
+        assert_eq!(fee(p,Some(o),200).unwrap(),3000);
+        assert!(oracle(&d,&[0_u8;32]).is_err());
+    }
     #[test]fn cp14_adaptive_time_and_volatility(){
         let p=Whirlpool{spacing:64,fee:3000,protocol_share:200,liquidity:1_000_000,
             sqrt:1_u128<<64,tick:0};
