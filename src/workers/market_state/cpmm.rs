@@ -122,7 +122,7 @@ mod tests {
             reserve_1_raw:2_000_000,trade_fee_rate:1000,creator_fee_rate:1000,
             creator_fee_on_input_0_to_1:false,creator_fee_on_input_1_to_0:true};
         // Tiny output is rounded away by output-side creator fee.
-        assert_eq!(quote_base_input(&state,"A","B",1).unwrap(),0);
+        assert_eq!(quote_base_input(&state,"A","B",2).unwrap(),0);
         // Nonzero input with fee >= input yields Unknown, never a spurious proof.
         let large_fee=CpmmQuoteSnapshot{trade_fee_rate:999_999,..state};
         assert_eq!(quote_base_input(&large_fee,"B","A",1),Err("cpmm_fee_invalid"));
