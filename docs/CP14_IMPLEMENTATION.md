@@ -40,3 +40,41 @@ The generated `cp14_orca_calibration.json` must show `orca_observed_complete_leg
 Assess additional Orca Prepared/selected/priced pools, new Direct2 pairs/options and actual V10 choice; zero lost WS/signal events; P50/P95/P99 frame→V10; RPC 429/timeout; wallet/settlement cashflow, protocol fee and actual net viability.
 
 Do not merge CP14 until locked CI plus user-provided 600-second live artifacts have been audited. Even after technical closure, floating-point quote calibration is not an exact program clone.
+
+## CP14 closeout: three targeted corrections (November 1, 2026)
+
+### 1. Adaptive Clock/Oracle consistency
+
+Orca PoolState now retains its own update slot alongside its initialized Oracle and chain Clock slots. The net marginal fee and directional profile for adaptive pools are withheld until the chain Clock slot is at least as recent as **both** the pool and Oracle slots, with a positive chain timestamp. No manufactured clock timestamp and no static-fee substitution. Clock WS updates trigger recalculation, and a deterministic test verifies older, equal/newer, missing-clock and static-pool cases. A slot being newer is **not proof of the same Solana bank**; model/trace output still labels this limitation.
+
+### 2. Direction-aware Prepared TickArray admission
+
+`completion/orca_whirlpool.rs` previously required the first TickArray in both A->B and B->A directions. It now requires **at least one valid direction**; the opposite manifest remains a seven-account, **explicitly unusable** block with no invented TickArray. Completion evidence schema version 4 records `direction_a_to_b_ready` and `direction_b_to_a_ready`. Both the full and the light refresh paths share the same consecutive-arrays calculation and verify the direction flags.
+
+`PoolInput` / MarketState carries the manifest readiness in `orca_ready`. An unsupported direction receives no marginal net rate or available directional liquidity and cannot originate an economic signal; the shared Graph and Signal Engine remain unchanged. `execution_v10::block()` additionally **rejects a seven-account Orca block** even if an upstream caller were to bypass the directed-price gate. Regression tests cover A-only, B-only, neither and V10's selected side.
+
+### 3. Independent integer-reference amount differential
+
+`scripts/cp14_orca_reference.py` is a separate pure-Python integer implementation of Orca's *single active interval* base-input fee / Q64.64 sqrt / input-output rounding from `programs/whirlpool/src/math/{swap_math,token_math}.rs`. It reads the bounded detailed live evidence, joins matching compact calibration records by payload hash, and compares the independent output with the existing Rust approximate output and V10's observed output. It reports exact matches, P95 absolute output deviation, per-leg raw output and explicit refusal reasons. CI checks a pinned live fixture (Orca 8EyLm..., 191 raw input => 45104 output).
+
+This is **not** a full `orca_whirlpools_core` multi-tick U256 clone. Crossing the active boundary or adaptive fee-group boundary remains Unknown to this independent reference. The Rust post-selection model still supports bounded multi-tick approximate diagnostics. No economic route exclusion uses either post-selection quote.
+
+### Five-minute acceptance
+
+```powershell
+Set-Location C:\dev_projects\liq_graph
+git fetch origin
+git switch cp14-orca-whirlpool-direct2
+git pull --ff-only origin cp14-orca-whirlpool-direct2
+.\scripts\cp14_orca_live.ps1 -DurationSeconds 300
+```
+
+The wrapper runs the `cp14_` regression tests and the unchanged four-venue 300-second V10 simulation, then writes `cp14_orca_calibration.json` and `cp14_orca_reference.json` to the new runtime directory. It checks for admitted and actually valued Orca pools and Orca complete V10 swap legs.
+
+Compare against CP14 600-second baseline `20261101T070830054Z`:
+- **Adaptive time:** old `Orca Oracle from future slot/time` count=17; new count and `awaits matching Clock slot` occurrences, recovery after clock advance, and no invalid directional fee rates
+- **One-direction pools:** old first TickArray missing cases=86 of 704 completion proofs (both sides combined); new Prepared, A-only/B-only admission and orphan execution errors
+- **Independent quote:** number of calculable single-interval details, model vs integer and observed vs integer errors; unexplained deviations are not proof of profit
+- **Health:** 0 lost market/signal events, ws_gap count and recovery, no unexpected V10 Orca account failure, end-to-end P50/P95/P99 and output trace match
+
+A provider disconnect is not fixed by any of these three protocol-code patches; compare the gap count but do not call a provider gap a regression in Orca arithmetic. Five-minute samples are not time-normalized with the 600-second baseline. Do not merge until the live artifacts have been analyzed and the user approves.
