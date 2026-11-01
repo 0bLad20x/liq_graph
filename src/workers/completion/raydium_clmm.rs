@@ -370,31 +370,31 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let width=l.tick_spacing*60;
     let center=l.tick_current.div_euclid(width)*width;
     let mut present=HashMap::<i32,Pubkey>::new();
+    let mut bad_up=false;let mut bad_down=false;
     for (start,address) in arrays(l,owner) {
         let initialized=match array_initialized(parent,bitmap,start,width){
             Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
                 format!("Raydium CLMM bitmap start={start}: {e:#}")),
         };
-        match get(address) {
-            Some(account)=>{
-                let contains=match validate_array(account,l,start,owner){
-                    Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
-                        format!("Raydium CLMM TickArray start={start}: {e:#}")),
-                };
-                if contains!=initialized {
-                    return incomplete(pool.address,slot,
-                        format!("Raydium CLMM TickArray count/bitmap disagreement at {start}"));
-                }
-                if initialized {present.insert(start,address);}
-            }
-            None if initialized =>return incomplete(pool.address,slot,
-                format!("Raydium CLMM initialized TickArray missing at {start}")).with_reason_code(CompletionReason::MissingExecutionAccounts),
-            None=>{}
+        let valid=match get(address) {
+            Some(account)=>validate_array(account,l,start,owner).ok()
+                .filter(|contains|*contains==initialized).is_some(),
+            None=>!initialized,
+        };
+        if !valid {
+            // An invalid/missing initialized account invalidates only the
+            // direction that needs it. The active-center array is shared.
+            bad_up|=start>=center;
+            bad_down|=start<=center;
+            continue;
         }
+        if initialized{present.insert(start,address);}
     }
-    // Supply first initialized array and further initialized arrays in traversal
-    // order; the Raydium executor skips noninitialized arrays in its bitmap.
-    let (up,down)=ordered_arrays(&present,center,width);
+    // Supply only validated contiguous directional windows. A missing array
+    // cannot be silently skipped to a later tick in the bitmap.
+    let (mut up,mut down)=ordered_arrays(&present,center,width);
+    if bad_up{up.clear();}
+    if bad_down{down.clear();}
     if up.is_empty() && down.is_empty(){
         return incomplete(pool.address,slot,
             "Raydium CLMM has no first initialized TickArray in either direction within validated V10 radius")
