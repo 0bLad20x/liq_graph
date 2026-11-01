@@ -148,7 +148,7 @@ fn profile(input:&Input)->Calc<&PoolLiquidity> {
     // The signal layer may observe lightweight directional reserve profiles.
     // Only fully modeled and frozen execution windows may establish a quantity
     // exclusion proof; unknown leaves sizing and final choice to V10.
-    if p.model!="dlmm_execution_window_v2" && p.model!="constant_product_quote_fees_v1" {
+    if p.model=="raydium_cpmm_directional_v1" {
         return Err(Issue::Unknown("amount_model_not_implemented"));
     }
     Ok(p)
