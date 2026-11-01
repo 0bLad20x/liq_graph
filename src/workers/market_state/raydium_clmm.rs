@@ -158,10 +158,12 @@ pub(super) fn active_window(p:Pool,arrays:&[TickArray],fee_rate:u32,down:bool)
         (l*(1.0/target-1.0/s),l*(s-target))
     }else{(l*(target-s),l*(1.0/s-1.0/target))};
     let factor=1.0-f64::from(fee_rate)/DEN;
-    let gross=inp/factor;
+    let on_input=fee_on_input(p.fee_on,down).ok()?;
+    let gross=if on_input{inp/factor}else{inp};
+    let spendable=if on_input{out}else{out*factor};
     // A strict haircut keeps a float-based capacity estimate away from the
     // actual tick boundary; failure to cover the notional remains Unknown.
-    let (input,output)=(gross*0.98,out*0.98);
+    let (input,output)=(gross*0.98,spendable*0.98);
     if !input.is_finite()||!output.is_finite()||input<=1.0||output<=1.0
         ||input>u64::MAX as f64||output>u64::MAX as f64{return None;}
     Some((input.floor() as u64,output.floor() as u64))
