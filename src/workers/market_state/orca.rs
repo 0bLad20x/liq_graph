@@ -60,6 +60,8 @@ pub(super) fn fee(pool:Whirlpool,oracle:Option<Oracle>,timestamp:i64)->Result<u3
     ensure!(o.trade_enable<=t,"Orca trading time gate closed");
     let most_recent=o.last_reference.max(o.last_major);
     ensure!(t>=most_recent,"Orca Oracle from future slot/time");
+    ensure!(o.tick_group<=pool.spacing && pool.spacing%o.tick_group==0,
+        "Orca Oracle tick group invalid for Whirlpool spacing");
     let group=pool.tick.div_euclid(i32::from(o.tick_group));
     let (reference,ref_group)=if t.saturating_sub(o.last_reference)>3600 {
         (0,group)
