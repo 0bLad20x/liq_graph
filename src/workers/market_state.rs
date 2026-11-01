@@ -918,7 +918,7 @@ impl Engine{
                     let program:Pubkey=ORCA_WHIRLPOOL_PROGRAM.parse()?;
                     let oracle_key=Pubkey::find_program_address(&[b"oracle",address.as_ref()],&program).0.to_string();
                     if watch.orca_adaptive{details.push(oracle_key.clone());}
-                    details.push("SysvarC1ock11111111111111111111111111111111".into());
+                    if watch.orca_adaptive{details.push("SysvarC1ock11111111111111111111111111111111".into());}
                     let mut array_keys=watch.orca_arrays.iter().flatten().map(ToString::to_string)
                         .collect::<Vec<_>>();
                     array_keys.sort();array_keys.dedup();
@@ -1043,7 +1043,7 @@ impl Engine{
             let mint_states=[mints.mint(a.parse()?).and_then(|m|m.onchain),mints.mint(b.parse()?).and_then(|m|m.onchain)];
             let pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
-                clock:if watch.venue==Venue::OrcaWhirlpool {
+                clock:if watch.venue==Venue::OrcaWhirlpool && watch.orca_adaptive {
                     let c=dict.get("SysvarC1ock11111111111111111111111111111111")
                         .context("Orca chain Clock unavailable")?;
                     i64::from_le_bytes(bytes(&c.data,32,8)?.try_into()?)
@@ -1053,8 +1053,11 @@ impl Engine{
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
             subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),key:watch.address.parse()?,owner:pool_records[idx].owner.parse()?,slot:pool_slot,received_us:pool_records[idx].received_us,floor:Some(pool_slot),valid:true});
             if let State::OrcaWhirlpool{oracle_key,..}=&pool.state{
-                let mut deps=vec![(Field::Clock,"SysvarC1ock11111111111111111111111111111111".to_string())];
-                if watch.orca_adaptive{deps.push((Field::OrcaOracle,oracle_key.clone()));}
+                let mut deps=Vec::new();
+                if watch.orca_adaptive{
+                    deps.push((Field::Clock,"SysvarC1ock11111111111111111111111111111111".to_string()));
+                    deps.push((Field::OrcaOracle,oracle_key.clone()));
+                }
                 if let State::OrcaWhirlpool{array_keys,..}=&pool.state{
                     for (i,address) in array_keys.iter().enumerate(){
                         deps.push((Field::OrcaArray(i as u8),address.clone()));
@@ -1462,7 +1465,7 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 }
 fn watch_cost(p:&PoolInput)->usize {
     match p.venue {CoreVenue::MeteoraDlmm=>p.dlmm.map_or(8,|d|d.account_cost()),
-        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::OrcaWhirlpool=>2+usize::from(p.orca_adaptive)+p.orca_arrays.iter().flatten().copied().collect::<HashSet<_>>().len(),CoreVenue::RaydiumAmmV4=>3,_=>1}
+        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::OrcaWhirlpool=>1+2*usize::from(p.orca_adaptive)+p.orca_arrays.iter().flatten().copied().collect::<HashSet<_>>().len(),CoreVenue::RaydiumAmmV4=>3,_=>1}
 }
 fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
     use super::graph_liquidity::RouteTopologyKind as K;
