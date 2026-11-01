@@ -12,7 +12,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
 use crate::core::{CompletionState, PoolState, PoolVaults, PoolUpdateBatch, Venue as CoreVenue, MintReader,
-    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,CpmmQuoteSnapshot,OrcaQuoteSnapshot,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
+    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,CpmmQuoteSnapshot,OrcaQuoteSnapshot,ClmmQuoteSnapshot,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, 
     graph_watch_catalog::WatchCatalog};
 use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
@@ -307,6 +307,14 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
             digest.update(&t.index.to_le_bytes());digest.update(&t.liquidity_net.to_le_bytes());
         }
     }
+    if let Some(q)=&profile.clmm_quote {
+        digest.update(q.mint_0.as_bytes());digest.update(q.mint_1.as_bytes());
+        digest.update(&q.sqrt_price_x64.to_le_bytes());digest.update(&q.active_liquidity.to_le_bytes());
+        digest.update(&q.tick_current.to_le_bytes());digest.update(&q.tick_spacing.to_le_bytes());
+        digest.update(&q.fee_rate.to_le_bytes());digest.update(&[q.fee_on,u8::from(q.dynamic_fee)]);
+        for c in q.active_input_limit_raw{digest.update(&c.to_le_bytes());}
+        for c in [q.pool_slot,q.config_slot,q.clock_slot]{digest.update(&c.to_le_bytes());}
+    }
     if matches!(profile.model,"raydium_cpmm_directional_v1"|"raydium_clmm_active_segment_v1") {
         for dir in &profile.directions {
             digest.update(&dir.marginal_net_rate.unwrap_or(0.0).to_bits().to_le_bytes());
@@ -440,10 +448,21 @@ impl Pool{
                 }else if cap.is_none(){Some("CLMM active interval is not fully observed".into())}
                     else{None}}
         });
+        let snapshot=ClmmQuoteSnapshot{
+            mint_0:self.a.clone(),mint_1:self.b.clone(),
+            sqrt_price_x64:state.sqrt,active_liquidity:state.liquidity,
+            tick_current:state.tick,tick_spacing:state.spacing,
+            fee_rate:fee,fee_on:state.fee_on,
+            active_input_limit_raw:std::array::from_fn(|i|{
+                if ready[i]{raydium_clmm::active_window(*state,arrays,fee,i==0).map_or(0,|v|v.0)}
+                else{0}}),
+            dynamic_fee:state.dynamic.is_some(),pool_slot:*pool_slot,
+            config_slot:*config_slot,clock_slot:*clock_slot,
+        };
         Some(PoolLiquidity{model:"raydium_clmm_active_segment_v1",revision:0,
             content_digest:[0;32],account_set_digest:self.manifest_digest,
             execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,
-            orca_quote:None,clmm_quote:None,directions})
+            orca_quote:None,clmm_quote:Some(snapshot),directions})
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
         let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,pool_slot,..}=&self.state else{return None;};
