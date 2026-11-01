@@ -5,7 +5,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
-$branch='cp13-raydium-cpmm-direct2'
+$branch='cp14-orca-whirlpool-direct2'
 Push-Location -LiteralPath $repo
 $oldCommitment=[Environment]::GetEnvironmentVariable('RPC_COMMITMENT','Process')
 $oldDexMode=[Environment]::GetEnvironmentVariable('DEXSCREENER_TRANSPORT_MODE','Process')
