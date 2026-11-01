@@ -457,7 +457,7 @@ impl Pool{
                 State::RaydiumCpmm{base,quote,fee0,fee1,fees,creator_mode,creator_enabled,status,..}=>{
                     let cfg=fees.context("CPMM config not initialized")?;
                     let p=cpmm_spot(*base,*quote,*fee0,*fee1,self.da,self.db)?;
-                    let rates=cpmm::marginal(p,*cfg,*creator_mode,*creator_enabled,*status)?;
+                    let rates=cpmm::marginal(p,cfg,*creator_mode,*creator_enabled,*status)?;
                     let native_spot=[p,1.0/p];
                     v.dex_fee_rates=std::array::from_fn(|i|Some(1.0-rates[i]/native_spot[i]));
                     v.scope="cpmm_observed_reserve_marginal_dex_net_no_sizing";
