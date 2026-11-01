@@ -44,14 +44,16 @@ jobs:
           cargo test --locked --release cp12_frozen_quote_benchmark -- --ignored --nocapture
           cargo test --locked --release cp12_frozen_amount_benchmark -- --ignored --nocapture
           cargo test --locked --release cp12_repeated_quote_benchmark -- --ignored --nocapture
+      - name: CP13 Raydium CPMM directed fee and layout regression tests
+        run: cargo test --locked --release cp13_
       - name: Live utility Python syntax only
-        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
+        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py','scripts/cp13_calibration_check.py')]"
       - name: Live utility PowerShell syntax only
         shell: pwsh
         run: |
           $tokens = $null
           $errors = $null
-          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1', 'scripts/cp11_quantity_live.ps1', 'scripts/cp12_quote_live.ps1')) {
+          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1', 'scripts/cp11_quantity_live.ps1', 'scripts/cp12_quote_live.ps1', 'scripts/cp13_cpmm_live.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
