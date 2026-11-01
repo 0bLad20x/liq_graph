@@ -2,6 +2,7 @@
 //! Protocol decoding lives here; connections and provider policy live in rpc_transport.
 mod fees;
 mod dlmm;
+mod cpmm;
 use crate::core::rpc::{RpcAnswer,RpcHandle,RpcOperation};
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap, VecDeque}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -35,8 +36,8 @@ const ORCA_WHIRLPOOL_ACCOUNT_LEN:usize=653;
 const ORCA_WHIRLPOOL_SQRT_OFFSET:usize=65;
 const ORCA_WHIRLPOOL_DISC:[u8;8]=[63,149,209,12,225,128,99,9]; // Anchor account:Whirlpool
 const RAYDIUM_CPMM_ACCOUNT_LEN:usize=637;
-const RAYDIUM_CPMM_FEES_OFFSET:usize=341;
-const RAYDIUM_CPMM_FEES_LEN:usize=72;
+const RAYDIUM_CPMM_FEES_OFFSET:usize=329;
+const RAYDIUM_CPMM_FEES_LEN:usize=84;
 const RAYDIUM_AMM_V4_ACCOUNT_LEN:usize=752;
 const TOKEN_PROGRAM:&str="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022:&str="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -286,6 +287,13 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
         for n in curve.fee_bps{digest.update(&n.to_le_bytes());}
         digest.update(&curve.buy_input_padding_raw.to_le_bytes());
     }else{digest.update(&[0]);}
+    if profile.model=="raydium_cpmm_directional_v1" {
+        for dir in &profile.directions {
+            digest.update(&dir.marginal_net_rate.unwrap_or(0.0).to_bits().to_le_bytes());
+            digest.update(dir.input_capacity_raw.as_deref().unwrap_or("").as_bytes());
+            digest.update(dir.output_capacity_raw.as_bytes());
+        }
+    }
     digest.finish().as_ref().try_into().expect("SHA256 length")
 }
 
@@ -305,8 +313,9 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
         base_vault:String,quote_vault:String,
         pool_slot:u64,base_slot:u64,quote_slot:u64},
     RaydiumCpmm{base:u64,quote:u64,fee0:u64,fee1:u64,
-        base_vault:String,quote_vault:String,
-        pool_slot:u64,base_slot:u64,quote_slot:u64},
+        base_vault:String,quote_vault:String,config:String,fees:Option<cpmm::Fees>,
+        creator_mode:u8,creator_enabled:bool,status:u8,liquidity:Option<Arc<PoolLiquidity>>,
+        pool_slot:u64,base_slot:u64,quote_slot:u64,config_slot:u64},
 }
 #[derive(Clone)]struct Pool{
     key:Pubkey,ready:bool,id:String,venue:Venue,a:String,b:String,da:u8,db:u8,
@@ -343,11 +352,42 @@ impl Pool{
             reserve_curve:Some(ReserveCurve{base_mint:self.a.clone(),base_reserve_raw:*base,
                 effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps,buy_input_padding_raw:1}),directions})
     }
+    fn cpmm_profile(&self)->Option<PoolLiquidity> {
+        let State::RaydiumCpmm{base,quote,fee0,fee1,..}=&self.state else{return None;};
+        let (r0,r1)=(base.checked_sub(*fee0)?,quote.checked_sub(*fee1)?);
+        if r0==0||r1==0{return None;}
+        let valuation=self.valuation()?;
+        let directions=std::array::from_fn(|i|{
+            let forward=i==0;
+            let input=if forward{&self.canon_base}else{&self.canon_quote};
+            let output=if forward{&self.canon_quote}else{&self.canon_base};
+            let native_input0=input==&self.a;
+            let input_reserve=if native_input0{r0}else{r1};
+            let output_reserve=if native_input0{r1}else{r0};
+            let rate=valuation.estimated_net_rates[i];
+            DirectedLiquidity{input_mint:input.clone(),output_mint:output.clone(),
+                input_decimals:if native_input0{self.da}else{self.db},
+                output_decimals:if native_input0{self.db}else{self.da},
+                status:if rate.is_some(){"available"}else{"unknown"},
+                coverage:"reserve_curve",next_required_account:None,first_source_position:None,
+                marginal_net_rate:rate,monotone_rate_tail:true,
+                // Approximate reserve availability only; V10 determines the real amount.
+                input_capacity_raw:Some(input_reserve.to_string()),
+                output_capacity_raw:output_reserve.to_string(),levels:Vec::new(),
+                reason:rate.is_none().then(||"CPMM directed valuation unavailable".into())}
+        });
+        Some(PoolLiquidity{model:"raydium_cpmm_directional_v1",revision:0,content_digest:[0;32],
+            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
+            reserve_curve:None,directions})
+    }
     fn refresh_liquidity(&mut self)->bool {
-        if self.venue==Venue::Pump {
-            let mut next=self.reserve_profile();
+        if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm) {
+            let mut next=if self.venue==Venue::Pump{self.reserve_profile()}else{self.cpmm_profile()};
             if let Some(p)=next.as_mut(){p.content_digest=liquidity_digest(p);}
-            let State::Pump{liquidity,..}=&mut self.state else{unreachable!()};
+            let liquidity=match &mut self.state {
+                State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}=>liquidity,
+                _=>unreachable!(),
+            };
             if liquidity.as_ref().map(|p|p.content_digest)==next.as_ref().map(|p|p.content_digest){return false;}
             if let Some(p)=next.as_mut(){p.revision=liquidity.as_ref().map_or(1,|old|old.revision.saturating_add(1));}
             *liquidity=next.map(Arc::new);return true;
@@ -359,10 +399,11 @@ impl Pool{
         }
     }
     fn liquidity(&self)->Option<Arc<crate::core::market_state::PoolLiquidity>> {
-        match &self.state{State::Dlmm{book,..}=>book.profile.clone(),State::Pump{liquidity,..}=>liquidity.clone(),_=>None}
+        match &self.state{State::Dlmm{book,..}=>book.profile.clone(),
+            State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}=>liquidity.clone(),_=>None}
     }
     fn valuation(&self)->Option<FeeValuation> {
-        if !matches!(self.venue,Venue::Dlmm|Venue::Pump) || matches!(&self.state,State::Pending{..}){return None;}
+        if !matches!(self.venue,Venue::Dlmm|Venue::Pump|Venue::RaydiumCpmm) || matches!(&self.state,State::Pending{..}){return None;}
         let mut token_status=std::array::from_fn(|i|match &self.mint_states[i] {
             None=>"unknown",
             Some(m)=>match m.token_extensions.get("classification").and_then(serde_json::Value::as_str) {
@@ -372,13 +413,13 @@ impl Pool{
             }
         });
         if self.a!=self.canon_base{token_status.swap(0,1);}
-        let mut v=FeeValuation{model:if self.venue==Venue::Dlmm{"dlmm"}else{"pumpswap"},
+        let mut v=FeeValuation{model:match self.venue{Venue::Dlmm=>"dlmm",Venue::Pump=>"pumpswap",_=>"raydium_cpmm"},
             estimated_net_rates:[None;2],dex_fee_rates:[None;2],fees_on_input:[true;2],
             base_fee_rate:None,variable_fee_rate:None,lp_fee_bps:None,protocol_fee_bps:None,creator_fee_bps:None,
             fee_schedule:None,market_cap_raw:None,chain_timestamp:self.clock,chain_epoch:self.epoch,
             token_fee_status:token_status,unknown_reason:None,scope:"marginal_dex_fees_only_no_host_rebate_no_depth"};
         let calculated=(||->Result<[f64;2]>{
-            ensure!(self.clock>0,"chain Clock unavailable");
+            if self.venue!=Venue::RaydiumCpmm{ensure!(self.clock>0,"chain Clock unavailable");}
             let raw=match &self.state {
                 State::Dlmm{active,step,fee,book}=>{
                     let (base,total,on_input)=fee.rates(*active,*step,self.clock)?;
@@ -412,6 +453,15 @@ impl Pool{
                     // Pump charges on quote: sell subtracts fees, buy adds fees to quote cost.
                     [if global.disabled&16==0{p*(1.0-f)}else{0.0},
                      if global.disabled&8==0{(1.0/p)/(1.0+f)}else{0.0}]
+                },
+                State::RaydiumCpmm{base,quote,fee0,fee1,fees,creator_mode,creator_enabled,status,..}=>{
+                    let cfg=fees.context("CPMM config not initialized")?;
+                    let p=cpmm_spot(*base,*quote,*fee0,*fee1,self.da,self.db)?;
+                    let rates=cpmm::marginal(p,*cfg,*creator_mode,*creator_enabled,*status)?;
+                    let native_spot=[p,1.0/p];
+                    v.dex_fee_rates=std::array::from_fn(|i|Some(1.0-rates[i]/native_spot[i]));
+                    v.scope="cpmm_observed_reserve_marginal_dex_net_no_sizing";
+                    rates
                 },_=>unreachable!(),
             };
             Ok(if self.a==self.canon_base{raw}else{v.dex_fee_rates.swap(0,1);v.fees_on_input.swap(0,1);[raw[1],raw[0]]})
