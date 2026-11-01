@@ -46,7 +46,7 @@ def analyze(path: Path) -> dict:
                                    "model_output_raw": model, "actual_output_raw": actual,
                                    "snapshot_slot": leg.get("observation_slot"),
                                    "observation_age_at_request_us": leg.get("observation_age_at_request_us")})
-    return {"scope": "cp13_fixed_input_orca_base_input_frozen_vs_v10",
+    return {"scope": "cp14_frozen_orca_amount_model_vs_v10",
             "orca_observed_complete_legs": considered, "orca_quoted_legs": quoted,
             "orca_missing_model": missed, "missing_reasons": reasons,
             "output_error_bps": {"count": len(discrepancies),
