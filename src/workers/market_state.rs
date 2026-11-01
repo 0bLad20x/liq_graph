@@ -3,6 +3,7 @@
 mod fees;
 mod dlmm;
 pub(crate) mod cpmm;
+pub(crate) mod orca;
 use crate::core::rpc::{RpcAnswer,RpcHandle,RpcOperation};
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap, VecDeque}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -10,7 +11,7 @@ use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, watch}, time};
 use futures_util::future::join_all;
 use crate::core::{CompletionState, PoolState, PoolVaults, PoolUpdateBatch, Venue as CoreVenue, MintReader,
-    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,CpmmQuoteSnapshot,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
+    market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,ReserveCurve,CpmmQuoteSnapshot,OrcaQuoteSnapshot,Consistency, MarketStateEvent, PoolRemovalReason, PoolPriceObservation, PriceEventStream, PriceKind, PriceOrigin, PricePipelineTiming}};
 use super::{pool_registry::PoolRegistry, 
     graph_watch_catalog::WatchCatalog};
 use crate::core::account_stream::{AccountView,AccountWatch,AccountEvent as WsEvent,AccountEventStream,AccountStreamControl};
@@ -363,7 +364,7 @@ impl Pool{
         });
         for d in &mut directions {if d.status=="empty"{d.reason=Some("trade direction disabled".into());}}
         Some(PoolLiquidity{model:"constant_product_quote_fees_v1",revision:0,content_digest:[0;32],
-            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),cpmm_quote:None,
+            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),cpmm_quote:None,orca_quote:None,
             reserve_curve:Some(ReserveCurve{base_mint:self.a.clone(),base_reserve_raw:*base,
                 effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps,buy_input_padding_raw:1}),directions})
     }
@@ -403,7 +404,7 @@ impl Pool{
         };
         Some(PoolLiquidity{model:"raydium_cpmm_directional_v1",revision:0,content_digest:[0;32],
             account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
-            reserve_curve:None,cpmm_quote:Some(snapshot),directions})
+            reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,directions})
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
         let State::OrcaWhirlpool{state,oracle,..}=&self.state else{return None;};
