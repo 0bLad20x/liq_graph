@@ -124,6 +124,7 @@ pub struct OrcaQuoteSnapshot {
     pub adaptive_oracle:bool,
     /// Valid observed tick-array window; outside is Unknown, never assumed empty.
     pub coverage_ticks:[i32;2],
+    pub covered_ranges:Vec<[i32;2]>,
     pub initialized_ticks:Vec<OrcaQuoteTick>,
 }
 /// Reserve curve facts, not a protocol decoder or quoting implementation.
