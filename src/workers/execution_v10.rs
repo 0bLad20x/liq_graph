@@ -57,6 +57,7 @@ const ASSOCIATED: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const PUMP: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const ORCA: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const RAYDIUM_CLMM: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const RAYDIUM_MEMO: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const MAINNET: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
 // CP10: decode fixed program addresses exactly once. Do not parse base58 on every
@@ -70,6 +71,7 @@ static ASSOCIATED_KEY: LazyLock<Pubkey> = LazyLock::new(|| ASSOCIATED.parse().ex
 static PUMP_KEY: LazyLock<Pubkey> = LazyLock::new(|| PUMP.parse().expect("PumpSwap program"));
 static ORCA_KEY: LazyLock<Pubkey> = LazyLock::new(|| ORCA.parse().expect("Orca program"));
 static RAYDIUM_CLMM_KEY: LazyLock<Pubkey> = LazyLock::new(|| RAYDIUM_CLMM.parse().expect("Raydium CLMM program"));
+static RAYDIUM_MEMO_KEY: LazyLock<Pubkey> = LazyLock::new(|| RAYDIUM_MEMO.parse().expect("Raydium Memo program"));
 static MAINNET_KEY: LazyLock<Pubkey> = LazyLock::new(|| MAINNET.parse().expect("mainnet genesis"));
 const COLLECTOR_USDC:&str="GzVRuLF349u78FHpr8KbqMhrZ1aDxnhSF59JWiZ6tbgt";
 const COLLECTOR_SOL_FLASH:&str="6AGB9kqgSp2mQXwYpdrV4QVV8urvCaDS35U1wsLssy6H";
@@ -82,7 +84,7 @@ fn key(value: &str) -> Pubkey {
         EXECUTOR => *EXECUTOR_KEY, SOL => *SOL_KEY, USDC => *USDC_KEY,
         TOKEN => *TOKEN_KEY, TOKEN_2022 => *TOKEN_2022_KEY,
         ASSOCIATED => *ASSOCIATED_KEY, PUMP => *PUMP_KEY, ORCA => *ORCA_KEY,
-        RAYDIUM_CLMM => *RAYDIUM_CLMM_KEY,
+        RAYDIUM_CLMM => *RAYDIUM_CLMM_KEY, RAYDIUM_MEMO => *RAYDIUM_MEMO_KEY,
         MAINNET => *MAINNET_KEY,
         COLLECTOR_USDC => *COLLECTOR_USDC_KEY,
         COLLECTOR_SOL_FLASH => *COLLECTOR_SOL_FLASH_KEY,
@@ -179,10 +181,18 @@ fn block<'a>(pool: &'a ExecutionPool, quote: Pubkey, x: Pubkey, wallet: Pubkey)
         ensure!((8..=24).contains(&accounts.len()),"Orca direction has no validated initial TickArray");
     }
     if accounts.first().is_some_and(|m|m.address==*RAYDIUM_CLMM_KEY){
-        // owner, quote, optional Memo, pool, config, observation, bitmap,
-        // two vaults and at least one initialized direction-specific TickArray.
-        ensure!((9..=24).contains(&accounts.len()),
+        let has_memo=accounts.get(2).is_some_and(|m|m.address==*RAYDIUM_MEMO_KEY);
+        let offset=if has_memo{3}else{2};
+        // program, quote, [Memo], pool, config, observation, bitmap,
+        // input vault, output vault, >=1 initialized execution TickArray.
+        ensure!((offset+7..=24).contains(&accounts.len()),
             "Raydium CLMM direction has no validated first initialized TickArray");
+        ensure!(accounts[offset].address==m.pool && accounts[offset].writable
+            && !accounts[offset+1].writable && accounts[offset+2].writable
+            && accounts[offset+3].writable && accounts[offset+4].writable
+            && accounts[offset+5].writable && accounts[offset+6].writable,
+            "Raydium CLMM role/order/writable flags invalid");
+        if has_memo {ensure!(!accounts[2].writable,"Raydium CLMM Memo must be readonly");}
     }
     ensure!(accounts[0].address!=Pubkey::default() && accounts[1].address==quote
         && !accounts[0].writable && !accounts[1].writable
