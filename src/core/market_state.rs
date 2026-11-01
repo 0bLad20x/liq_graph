@@ -110,6 +110,16 @@ pub struct CpmmQuoteSnapshot {
     pub creator_fee_on_input_0_to_1:bool,
     pub creator_fee_on_input_1_to_0:bool,
 }
+/// Frozen active-segment Orca witness. Calibration only, never a pre-V10
+/// economic exclusion proof. Outside active limits requires tick traversal.
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct OrcaQuoteSnapshot {
+    pub mint_a:String,pub mint_b:String,
+    pub sqrt_price_x64:u128,pub active_liquidity:u128,
+    pub tick_current:i32,pub tick_spacing:u16,
+    pub fee_rate:u32,pub active_input_limit_raw:[u64;2],
+    pub adaptive_oracle:bool,
+}
 /// Reserve curve facts, not a protocol decoder or quoting implementation.
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct ReserveCurve {
@@ -130,6 +140,7 @@ pub struct PoolLiquidity {
     /// None uses the exact directed levels; Some describes a reserve curve.
     pub reserve_curve:Option<ReserveCurve>,
     pub cpmm_quote:Option<CpmmQuoteSnapshot>,
+    pub orca_quote:Option<OrcaQuoteSnapshot>,
     /// Canonical base->quote / quote->base, like FeeValuation.
     pub directions:[DirectedLiquidity;2],
 }
