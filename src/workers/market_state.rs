@@ -294,6 +294,14 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
         digest.update(&[u8::from(snapshot.creator_fee_on_input_0_to_1),
             u8::from(snapshot.creator_fee_on_input_1_to_0)]);
     }
+    if let Some(q)=&profile.orca_quote {
+        digest.update(q.mint_a.as_bytes());digest.update(q.mint_b.as_bytes());
+        digest.update(&q.sqrt_price_x64.to_le_bytes());digest.update(&q.active_liquidity.to_le_bytes());
+        digest.update(&q.tick_current.to_le_bytes());digest.update(&q.tick_spacing.to_le_bytes());
+        digest.update(&q.fee_rate.to_le_bytes());
+        for v in q.active_input_limit_raw{digest.update(&v.to_le_bytes());}
+        digest.update(&[u8::from(q.adaptive_oracle)]);
+    }
     if profile.model=="raydium_cpmm_directional_v1" {
         for dir in &profile.directions {
             digest.update(&dir.marginal_net_rate.unwrap_or(0.0).to_bits().to_le_bytes());
@@ -397,12 +405,52 @@ impl Pool{
             account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
             reserve_curve:None,cpmm_quote:Some(snapshot),directions})
     }
+    fn orca_profile(&self)->Option<PoolLiquidity>{
+        let State::OrcaWhirlpool{state,oracle,..}=&self.state else{return None;};
+        let fee=orca::fee(*state,*oracle,self.clock).ok()?;
+        let rates=orca::rates(*state,fee,self.da,self.db).ok()?;
+        let (input_caps,output_caps)=orca::active_capacity(*state,fee).ok()?;
+        let directions=std::array::from_fn(|i|{
+            let input=if i==0{&self.canon_base}else{&self.canon_quote};
+            let output=if i==0{&self.canon_quote}else{&self.canon_base};
+            let native=usize::from(input!=&self.a);
+            DirectedLiquidity {
+                input_mint:input.clone(),output_mint:output.clone(),
+                input_decimals:if native==0{self.da}else{self.db},
+                output_decimals:if native==0{self.db}else{self.da},
+                // An immediate price-limit/tick boundary is not proof of dust:
+                // beyond that boundary liquidity may persist or change.
+                status:if input_caps[native]>0{"available"}else{"unknown"},
+                coverage:"execution_window_end",next_required_account:None,
+                first_source_position:Some(state.tick),marginal_net_rate:Some(rates[native]),
+                monotone_rate_tail:true,
+                input_capacity_raw:Some(input_caps[native].to_string()),
+                output_capacity_raw:output_caps[native].to_string(),
+                levels:Vec::new(),
+                reason:(input_caps[native]==0).then(||"Orca active tick-boundary capacity unavailable".into()),
+            }
+        });
+        let (mut directions,mut caps)=(directions,input_caps);
+        if self.a!=self.canon_base {
+            directions.swap(0,1);caps.swap(0,1);
+        }
+        let snapshot=OrcaQuoteSnapshot {
+            mint_a:self.a.clone(),mint_b:self.b.clone(),
+            sqrt_price_x64:state.sqrt,active_liquidity:state.liquidity,
+            tick_current:state.tick,tick_spacing:state.spacing,
+            fee_rate:fee,active_input_limit_raw:input_caps,adaptive_oracle:oracle.is_some(),
+        };
+        Some(PoolLiquidity{model:"orca_whirlpool_active_segment_v1",revision:0,
+            content_digest:[0;32],account_set_digest:self.manifest_digest,
+            execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,
+            orca_quote:Some(snapshot),directions})
+    }
     fn refresh_liquidity(&mut self)->bool {
-        if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm) {
-            let mut next=if self.venue==Venue::Pump{self.reserve_profile()}else{self.cpmm_profile()};
+        if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool) {
+            let mut next=match self.venue{Venue::Pump=>self.reserve_profile(),Venue::RaydiumCpmm=>self.cpmm_profile(),_=>self.orca_profile()};
             if let Some(p)=next.as_mut(){p.content_digest=liquidity_digest(p);}
             let liquidity=match &mut self.state {
-                State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}=>liquidity,
+                State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}|State::OrcaWhirlpool{liquidity,..}=>liquidity,
                 _=>unreachable!(),
             };
             if liquidity.as_ref().map(|p|p.content_digest)==next.as_ref().map(|p|p.content_digest){return false;}
@@ -417,7 +465,7 @@ impl Pool{
     }
     fn liquidity(&self)->Option<Arc<crate::core::market_state::PoolLiquidity>> {
         match &self.state{State::Dlmm{book,..}=>book.profile.clone(),
-            State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}=>liquidity.clone(),_=>None}
+            State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}|State::OrcaWhirlpool{liquidity,..}=>liquidity.clone(),_=>None}
     }
     fn valuation(&self)->Option<FeeValuation> {
         if !matches!(self.venue,Venue::Dlmm|Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool) || matches!(&self.state,State::Pending{..}){return None;}
@@ -1005,7 +1053,7 @@ impl Engine{
         self.sequence
     }
     fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>,mut pipeline:Option<PricePipelineTiming>) {
-        if matches!(self.pools[pi].venue,Venue::Pump|Venue::RaydiumCpmm) {
+        if matches!(self.pools[pi].venue,Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool) {
             let started=Instant::now();self.pools[pi].refresh_liquidity();
             self.metrics.reserve_curve_build.add(nanos(started));
         }
