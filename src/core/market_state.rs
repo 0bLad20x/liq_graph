@@ -110,6 +110,9 @@ pub struct CpmmQuoteSnapshot {
     pub creator_fee_on_input_0_to_1:bool,
     pub creator_fee_on_input_1_to_0:bool,
 }
+/// Compact initialized Whirlpool tick, frozen from Prepared TickArrays.
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct OrcaQuoteTick { pub index:i32,pub liquidity_net:i128 }
 /// Frozen active-segment Orca witness. Calibration only, never a pre-V10
 /// economic exclusion proof. Outside active limits requires tick traversal.
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
@@ -119,6 +122,9 @@ pub struct OrcaQuoteSnapshot {
     pub tick_current:i32,pub tick_spacing:u16,
     pub fee_rate:u32,pub active_input_limit_raw:[u64;2],
     pub adaptive_oracle:bool,
+    /// Valid observed tick-array window; outside is Unknown, never assumed empty.
+    pub coverage_ticks:[i32;2],
+    pub initialized_ticks:Vec<OrcaQuoteTick>,
 }
 /// Reserve curve facts, not a protocol decoder or quoting implementation.
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
