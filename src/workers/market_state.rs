@@ -46,8 +46,6 @@ const USDC:&str="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const DLMM_DISC:[u8;8]=[33,11,49,98,181,101,177,13];
 const POOL_DISC:[u8;8]=[241,154,109,4,17,177,109,188];
 const DAMM_SQRT_OFFSET:usize=456;
-const RAYDIUM_CLMM_SQRT_OFFSET:usize=253;
-const RAYDIUM_CLMM_DISC:[u8;8]=[247,237,227,245,215,195,222,70]; // Anchor account:PoolState
 const RAYDIUM_CPMM_DISC:[u8;8]=[247,237,227,245,215,195,222,70]; // Anchor account:PoolState
 
 fn bytes(d:&[u8],off:usize,n:usize)->Result<&[u8]> {
