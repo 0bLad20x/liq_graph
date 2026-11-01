@@ -1,4 +1,4 @@
-# CP14 Orca Whirlpool directed valuation + unchanged Direct2/V10 600-second live simulation.
+# CP14 Orca Whirlpool directed valuation + unchanged Direct2/V10 60..600s live simulation.
 param(
     [string]$WalletPath = (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json'),
     [ValidateRange(60,600)][int]$DurationSeconds = 600
@@ -60,6 +60,20 @@ try {
     $market=Get-Content -LiteralPath (Join-Path $folder 'market_state.json') -Raw | ConvertFrom-Json
     $orcaPrepared=[long]$summary.registry_tvl.by_venue.orca_whirlpool.prepared_admitted
     $orcaObserved=[long]$market.metrics.fee_valuation.observations_by_model.orca_whirlpool
+    # Registry-owned, end-of-run snapshot: no additional telemetry queue or
+    # mutable history in MarketState. Counts include only currently admitted pools.
+    $directions=$summary.registry_tvl.orca_direction_admission
+    if ($null -eq $directions) { throw 'CP14 registry direction counters missing from summary.json' }
+    $preparedDirections=[long]$directions.prepared_both +
+        [long]$directions.prepared_a_to_b_only +
+        [long]$directions.prepared_b_to_a_only +
+        [long]$directions.prepared_unclassified
+    if ($preparedDirections -ne $orcaPrepared) {
+        throw "CP14 Orca direction counts inconsistent: $preparedDirections != $orcaPrepared"
+    }
+    $directions | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath (Join-Path $folder 'cp14_orca_directions.json') -Encoding utf8
+    Write-Host "CP14 Orca directions: both=$($directions.prepared_both) AtoB_only=$($directions.prepared_a_to_b_only) BtoA_only=$($directions.prepared_b_to_a_only) unclassified=$($directions.prepared_unclassified) incomplete_neither=$($directions.incomplete_neither)"
     if ($orcaPrepared -le 0 -or $orcaObserved -le 0) {
         throw "CP14 requires observed ORCA valuation: prepared=$orcaPrepared observations=$orcaObserved artifacts=$folder"
     }
