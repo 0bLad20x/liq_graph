@@ -109,7 +109,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String],reads:&mut RpcReads)->Re
     }
     Ok(records)
 }
-#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6]}
+#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6],orca_ready:[bool;2]}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
 impl Venue {
@@ -326,7 +326,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
          global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>,liquidity:Option<Arc<PoolLiquidity>>},
     DammV2{sqrt:u128},
     RaydiumClmm{sqrt:u128},
-    OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,array_keys:Vec<String>,arrays:Vec<orca::TickArray>,liquidity:Option<Arc<PoolLiquidity>>},
+    OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,ready:[bool;2],clock_slot:u64,array_keys:Vec<String>,arrays:Vec<orca::TickArray>,liquidity:Option<Arc<PoolLiquidity>>},
     PancakeSwapClmm{sqrt:u128},
     ByrealClmm{sqrt:u128},
     Manifest{bid:f64,ask:f64,available:bool},
@@ -412,7 +412,8 @@ impl Pool{
             reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,directions})
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
-        let State::OrcaWhirlpool{state,oracle,arrays,..}=&self.state else{return None;};
+        let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,..}=&self.state else{return None;};
+        if oracle.is_some() && (*clock_slot<*oracle_slot || self.clock<=0) {return None;}
         let fee=orca::fee(*state,*oracle,self.clock).ok()?;
         let rates=orca::rates(*state,fee,self.da,self.db).ok()?;
         let (input_caps,output_caps)=orca::active_capacity(*state,fee,arrays,*oracle).ok()?;
@@ -426,14 +427,17 @@ impl Pool{
                 output_decimals:if native==0{self.db}else{self.da},
                 // An immediate price-limit/tick boundary is not proof of dust:
                 // beyond that boundary liquidity may persist or change.
-                status:if input_caps[native]>0{"available"}else{"unknown"},
+                status:if !ready[native]{"unknown"}
+                    else if input_caps[native]>0{"available"}else{"unknown"},
                 coverage:"execution_window_end",next_required_account:None,
-                first_source_position:Some(state.tick),marginal_net_rate:Some(rates[native]),
+                first_source_position:Some(state.tick),
+                marginal_net_rate:ready[native].then_some(rates[native]),
                 monotone_rate_tail:true,
                 input_capacity_raw:Some(input_caps[native].to_string()),
                 output_capacity_raw:output_caps[native].to_string(),
                 levels:Vec::new(),
-                reason:(input_caps[native]==0).then(||"Orca active tick-boundary capacity unavailable".into()),
+                reason:if !ready[native]{Some("Orca Prepared manifest lacks initial tick array in this direction".into())}
+                    else{(input_caps[native]==0).then(||"Orca active tick-boundary capacity unavailable".into())},
             }
         });
         let mut ticks=arrays.iter().flat_map(|a|a.initialized.iter().cloned())
@@ -451,7 +455,10 @@ impl Pool{
             mint_a:self.a.clone(),mint_b:self.b.clone(),
             sqrt_price_x64:state.sqrt,active_liquidity:state.liquidity,
             tick_current:state.tick,tick_spacing:state.spacing,
-            fee_rate:fee,active_input_limit_raw:input_caps,adaptive_oracle:oracle.is_some(),
+            fee_rate:fee,active_input_limit_raw:[
+                if ready[0]{input_caps[0]}else{0},
+                if ready[1]{input_caps[1]}else{0}],
+            adaptive_oracle:oracle.is_some(),
             coverage_ticks,covered_ranges,initialized_ticks:ticks,
         };
         Some(PoolLiquidity{model:"orca_whirlpool_active_segment_v1",revision:0,
@@ -533,13 +540,17 @@ impl Pool{
                     [if global.disabled&16==0{p*(1.0-f)}else{0.0},
                      if global.disabled&8==0{(1.0/p)/(1.0+f)}else{0.0}]
                 },
-                State::OrcaWhirlpool{state,oracle,..}=>{
+                State::OrcaWhirlpool{state,oracle,ready,clock_slot,oracle_slot,..}=>{
+                    ensure!(oracle.is_none() || (*clock_slot>=*oracle_slot && self.clock>0),
+                        "Orca Oracle awaits matching or newer Clock slot");
                     let f=orca::fee(*state,*oracle,self.clock)?;
                     v.base_fee_rate=Some(f64::from(state.fee)/1_000_000.0);
                     v.variable_fee_rate=Some(f64::from(f-u32::from(state.fee))/1_000_000.0);
                     v.dex_fee_rates=[Some(f as f64/1_000_000.0);2];
                     v.scope="orca_active_liquidity_marginal_dex_net_no_sizing";
-                    orca::rates(*state,f,self.da,self.db)?
+                    let mut rates=orca::rates(*state,f,self.da,self.db)?;
+                    for i in 0..2 {if !ready[i]{rates[i]=0.0;v.dex_fee_rates[i]=None;}}
+                    rates
                 },
                 State::RaydiumCpmm{base,quote,fee0,fee1,fees,creator_mode,creator_enabled,status,..}=>{
                     let cfg=fees.context("CPMM config not initialized")?;
@@ -941,7 +952,7 @@ impl Engine{
                     array_keys.sort();array_keys.dedup();
                     details.extend(array_keys.iter().cloned());
                     (key(&acc.data,101)?,key(&acc.data,181)?,
-                        State::OrcaWhirlpool{state,oracle:None,oracle_key,oracle_slot:pool_slot,
+                        State::OrcaWhirlpool{state,oracle:None,oracle_key,oracle_slot:pool_slot,ready:watch.orca_ready,clock_slot:0,
                             array_keys,arrays:Vec::new(),liquidity:None})
                 },
                 Venue::RaydiumCpmm=>{
@@ -1033,13 +1044,15 @@ impl Engine{
                 *fees=Some(cpmm::config(&cfg.data,&cfg.owner,RAYDIUM_CPMM_PROGRAM)?);
                 *config_slot=cfg.slot;
             }
-            if let State::OrcaWhirlpool{state:pool_state,oracle,oracle_key,oracle_slot,array_keys,arrays,..}=&mut state{
+            if let State::OrcaWhirlpool{state:pool_state,oracle,oracle_key,oracle_slot,clock_slot,array_keys,arrays,..}=&mut state{
                 if watch.orca_adaptive{
                     let item=dict.get(oracle_key).context("Prepared Orca adaptive Oracle unavailable")?;
                     ensure!(item.owner==ORCA_WHIRLPOOL_PROGRAM,"Orca Oracle owner mismatch");
                     let pool_id:Pubkey=watch.address.parse()?;
                     *oracle=Some(orca::oracle(&item.data,&pool_id.to_bytes())?);
                     *oracle_slot=item.slot;
+                    *clock_slot=dict.get("SysvarC1ock11111111111111111111111111111111")
+                        .context("Orca Clock baseline unavailable")?.slot;
                 }
                 let pool_id:Pubkey=watch.address.parse()?;
                 for address in array_keys.iter(){
@@ -1317,7 +1330,9 @@ impl Engine{
                 *fee_pool=fees::PumpPool::decode(data)?;
                 *vquote=if data.len()<261{0}else{i128_le(data,245)?};*pool_slot=slot;
             },
-            (_,Field::Clock)=>{ensure!(data.len()==40,"invalid chain Clock length");pool.clock=i64::from_le_bytes(bytes(data,32,8)?.try_into()?);pool.epoch=u64_le(data,16)?;},
+            (_,Field::Clock)=>{ensure!(data.len()==40,"invalid chain Clock length");pool.clock=i64::from_le_bytes(bytes(data,32,8)?.try_into()?);pool.epoch=u64_le(data,16)?;
+                if let State::OrcaWhirlpool{clock_slot,..}=&mut pool.state{*clock_slot=slot;}
+            },
             (State::Pump{global,..},Field::PumpGlobal)=>{if let Some(fees::Shared::Global(value))=shared{*global=Some(value);}},
             (State::Pump{config,..},Field::PumpFees)=>{if let Some(fees::Shared::Config(value))=shared{*config=Some(value);}},
             (State::Pump{supply,..},Field::PumpSupply)=>{ensure!(bytes(data,45,1)?[0]==1,"Pump mint uninitialized");*supply=Some(u64_le(data,36)?);},
@@ -1447,7 +1462,7 @@ impl Settings {
 // Only the price worker's identity index is retained; manifests and canonical pool
 // lifecycle remain in the Registry. Notifications reconcile against the current owner.
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6]}
+struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6],orca_ready:[bool;2]}
 impl PoolInput {
     fn direct(self)->bool {matches!(self.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap)}
     fn structure_available(self)->bool {
@@ -1470,8 +1485,12 @@ impl PoolInput {
             for (i,m) in manifest.base_a.iter().skip(7).take(3).enumerate(){orca_arrays[i]=Some(m.address);}
             for (i,m) in manifest.base_b.iter().skip(7).take(3).enumerate(){orca_arrays[i+3]=Some(m.address);}
         }
+        let orca_ready=if p.venue==CoreVenue::OrcaWhirlpool {
+            let m=p.execution_manifest.as_ref()?;
+            [m.base_b.len()>7,m.base_a.len()>7]
+        }else{[false;2]};
         Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,
-            dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest,orca_adaptive,orca_arrays})
+            dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest,orca_adaptive,orca_arrays,orca_ready})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
@@ -1727,7 +1746,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
-            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest,orca_adaptive:p.orca_adaptive,orca_arrays:p.orca_arrays}))
+            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest,orca_adaptive:p.orca_adaptive,orca_arrays:p.orca_arrays,orca_ready:p.orca_ready}))
             .collect::<Result<Vec<_>>>()?})})();
         let result=match (baseline_source,config) {
             (Some(source),_)=>{
