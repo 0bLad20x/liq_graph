@@ -41,7 +41,7 @@ try {
         CP9DMaxPairs=3
         CP9CPackingMode='AllCoverage'
         ProfileSignals=$true
-        ExecutionDetailLimit=64
+        ExecutionDetailLimit=128
         RequireCalibrationEvidence=$true
         SimulateV10=$true
         SimulationLimit=0
