@@ -413,7 +413,7 @@ impl Pool{
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
         let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,..}=&self.state else{return None;};
-        if oracle.is_some() && (*clock_slot<*oracle_slot || self.clock<=0) {return None;}
+        orca::clock_coherent(oracle.is_some(),*clock_slot,*oracle_slot,self.clock).ok()?;
         let fee=orca::fee(*state,*oracle,self.clock).ok()?;
         let rates=orca::rates(*state,fee,self.da,self.db).ok()?;
         let (input_caps,output_caps)=orca::active_capacity(*state,fee,arrays,*oracle).ok()?;
@@ -541,8 +541,7 @@ impl Pool{
                      if global.disabled&8==0{(1.0/p)/(1.0+f)}else{0.0}]
                 },
                 State::OrcaWhirlpool{state,oracle,ready,clock_slot,oracle_slot,..}=>{
-                    ensure!(oracle.is_none() || (*clock_slot>=*oracle_slot && self.clock>0),
-                        "Orca Oracle awaits matching or newer Clock slot");
+                    orca::clock_coherent(oracle.is_some(),*clock_slot,*oracle_slot,self.clock)?;
                     let f=orca::fee(*state,*oracle,self.clock)?;
                     v.base_fee_rate=Some(f64::from(state.fee)/1_000_000.0);
                     v.variable_fee_rate=Some(f64::from(f-u32::from(state.fee))/1_000_000.0);
