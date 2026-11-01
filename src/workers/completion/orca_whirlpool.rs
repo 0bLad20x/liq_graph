@@ -101,6 +101,16 @@ fn array_addresses(layout: Layout, owner: Pubkey, radius: i32) -> Vec<(i32,Pubke
         Some((start,address))
     }).collect()
 }
+/// Direction-aware Prepared arrays. An empty side is an explicit unsupported
+/// direction; it is not padded with a neighboring or imaginary TickArray.
+fn direction_starts(known:&HashSet<i32>,center:i32,up_center:i32,width:i32,radius:i32)
+    ->(Vec<i32>,Vec<i32>){
+    let down=(0..=radius).map(|distance|center-distance*width)
+        .take_while(|start|known.contains(start)).collect::<Vec<_>>();
+    let up=(0..=radius).map(|distance|up_center+distance*width)
+        .take_while(|start|known.contains(start)).collect::<Vec<_>>();
+    (down,up)
+}
 fn validate_array(account:&AccountData, pool:Pubkey, start:i32, owner:Pubkey) -> Result<&'static str> {
     ensure!(account.owner==owner && account.view==AccountView::Full
         && account.original_len==Some(account.bytes.len()),"Orca TickArray owner/RPC view mismatch");
@@ -273,10 +283,8 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             .with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     // Keep only consecutive initialized arrays starting at each direction's first array.
-    let down=(0..=radius).map(|distance|center-distance*width)
-        .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
-    let up=(0..=radius).map(|distance|up_center+distance*width)
-        .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+    let known=present.keys().copied().collect::<HashSet<_>>();
+    let (down,up)=direction_starts(&known,center,up_center,width,radius);
     let mut selected=down.iter().chain(up.iter()).copied().collect::<Vec<_>>();
     selected.sort_unstable();
     selected.dedup();
@@ -428,10 +436,8 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                             if !present.contains_key(&center)&&!present.contains_key(&up_center){
                                                 return Ok(false);
                                             }
-                                            let down=(0..=settings.radius).map(|i|center-i*width)
-                                                .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
-                                            let up=(0..=settings.radius).map(|i|up_center+i*width)
-                                                .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+                                            let known=present.keys().copied().collect::<HashSet<_>>();
+                                            let (down,up)=direction_starts(&known,center,up_center,width,settings.radius);
                                             let ev=p.completion_evidence.as_ref().context("missing evidence")?;
                                             if ev.payload["base_a_start_ticks"]!=serde_json::json!(up)
                                                 || ev.payload["base_b_start_ticks"]!=serde_json::json!(down)
@@ -531,6 +537,20 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
 #[cfg(test)]
 mod cp14_tests {
     use super::*;
+    #[test]
+    fn cp14_single_direction_only_arrays_are_admitted_without_fake_other_side(){
+        let down_only=HashSet::from([0,-5632]);
+        let (down,up)=direction_starts(&down_only,0,5632,5632,2);
+        assert_eq!(down,vec![0,-5632]);
+        assert!(up.is_empty());
+        let up_only=HashSet::from([5632,11264]);
+        let (down,up)=direction_starts(&up_only,0,5632,5632,2);
+        assert!(down.is_empty());
+        assert_eq!(up,vec![5632,11264]);
+        let neither=HashSet::new();
+        let (down,up)=direction_starts(&neither,0,5632,5632,2);
+        assert!(down.is_empty()&&up.is_empty());
+    }
     #[test]
     fn cp14_v10_oracle_writable_and_directional_tick_array_order(){
         let pk=|n:u8|Pubkey::new_from_array([n;32]);
