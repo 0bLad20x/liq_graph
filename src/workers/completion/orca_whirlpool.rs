@@ -483,6 +483,8 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     let mut tasks=JoinSet::new();
     let mut open=true;
     let mut processed=0_usize;
+    let mut one_way_prepared=0_usize;
+    let mut both_way_prepared=0_usize;
     crate::log_event!(Info,"orca executor started parallel={} pools_per_batch={} radius={} scheduler=completion_lifecycle",
         settings.parallel_batches,settings.pools_per_batch(),settings.radius);
     while open || !tasks.is_empty() {
@@ -517,7 +519,17 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                     let outcome=by_pool.remove(&request.pool.address)
                         .context("Completion request has no matching pool result")?;
                     let kind=match &outcome {
-                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Proof(result)=>{
+                            if result.status==CompletionStatus::Prepared {
+                                if let Some(ev)=result.evidence.as_ref() {
+                                    let ab=ev.payload["direction_a_to_b_ready"].as_bool().unwrap_or(false);
+                                    let ba=ev.payload["direction_b_to_a_ready"].as_bool().unwrap_or(false);
+                                    if ab&&ba{both_way_prepared+=1;}
+                                    else if ab||ba{one_way_prepared+=1;}
+                                }
+                            }
+                            format!("{:?}",result.status)
+                        },
                         CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
                     };
                     crate::log_event!(Debug,"completion_orca_whirlpool completion request_id={} pool={} work={:?} outcome={}",
@@ -530,7 +542,9 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
             },
         }
     }
-    crate::log_event!(Info,"orca executor complete requests={processed}");
+    crate::log_event!(Info,
+        "orca executor complete requests={} prepared_both_directions={} prepared_one_direction={}",
+        processed,both_way_prepared,one_way_prepared);
     Ok(())
 }
 
