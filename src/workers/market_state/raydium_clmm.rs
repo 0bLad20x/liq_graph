@@ -17,7 +17,6 @@ fn u32_at(d:&[u8],n:usize)->Result<u32>{Ok(u32::from_le_bytes(raw(d,n)?))}
 fn u64_at(d:&[u8],n:usize)->Result<u64>{Ok(u64::from_le_bytes(raw(d,n)?))}
 fn u128_at(d:&[u8],n:usize)->Result<u128>{Ok(u128::from_le_bytes(raw(d,n)?))}
 fn i32_at(d:&[u8],n:usize)->Result<i32>{Ok(i32::from_le_bytes(raw(d,n)?))}
-fn i128_at(d:&[u8],n:usize)->Result<i128>{Ok(i128::from_le_bytes(raw(d,n)?))}
 fn key(d:&[u8],n:usize)->Result<Pubkey>{Ok(Pubkey::new_from_array(raw(d,n)?))}
 
 #[derive(Clone,Copy,Debug)]
@@ -98,7 +97,7 @@ pub(super) fn rates(p:Pool,fee:u32,da:u8,db:u8)->Result<[f64;2]>{
     Ok([forward*factor,1.0/forward*factor])
 }
 #[derive(Clone,Debug)]
-pub(super) struct Tick{pub index:i32,pub liquidity_net:i128,pub has_orders:bool}
+pub(super) struct Tick{pub index:i32,pub has_orders:bool}
 #[derive(Clone,Debug)]
 pub(super) struct TickArray{pub start:i32,pub ticks:Vec<Tick>}
 pub(super) fn tick_array(d:&[u8],pool:Pubkey,spacing:u16)->Result<TickArray>{
@@ -116,8 +115,7 @@ pub(super) fn tick_array(d:&[u8],pool:Pubkey,spacing:u16)->Result<TickArray>{
         if gross>0||orders>0||partial>0{
             ensure!(idx==start+i32::try_from(i)?*i32::from(spacing),
                 "invalid CLMM initialized TickState index");
-            ticks.push(Tick{index:idx,liquidity_net:i128_at(d,off+4)?,
-                has_orders:orders>0||partial>0});
+            ticks.push(Tick{index:idx,has_orders:orders>0||partial>0});
         }
     }
     ensure!(d[44+60*168] as usize==ticks.len(),
@@ -230,7 +228,7 @@ mod tests{
     }
     #[test]fn cp15_negative_tick_and_limit_order_boundary_unknown(){
         let mut x=p();x.tick=-5;x.sqrt=(Q64*1.0001_f64.powf(-5.0/2.0)) as u128;
-        let array=TickArray{start:-600,ticks:vec![Tick{index:-10,liquidity_net:100,has_orders:true}]};
+        let array=TickArray{start:-600,ticks:vec![Tick{index:-10,has_orders:true}]};
         assert!(active_window(x,&[array.clone()],3000,true).is_none());
         let mut clean=array;clean.ticks[0].has_orders=false;
         assert!(active_window(x,&[clean],3000,true).is_some());
