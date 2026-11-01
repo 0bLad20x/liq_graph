@@ -74,7 +74,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "CP14 ORCA calibration incomplete or failed (exit=$LASTEXITCODE); see $calibration" }
         Write-Host "CP14 ORCA frozen-vs-V10 calibration: $calibration"
         $reference=Join-Path $folder 'cp14_orca_reference.json'
-        & python (Join-Path $repo 'scripts\cp14_orca_reference.py') --details (Join-Path $folder 'execution_details.jsonl') --out $reference
+        & python (Join-Path $repo 'scripts\cp14_orca_reference.py') --details (Join-Path $folder 'execution_details.jsonl') --events $events --out $reference
         if ($LASTEXITCODE -ne 0) { throw "CP14 Orca independent integer reference check failed; see $reference" }
         Write-Host "CP14 independent integer fee/amount reference: $reference"
     }
