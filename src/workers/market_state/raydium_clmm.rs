@@ -84,6 +84,14 @@ pub(super) fn fee(p:Pool,c:Config,chain_time:i64)->Result<u32>{
     let dynamic=(numerator.div_ceil(100000_u128*10000_u128*10000_u128)).min(100000);
     Ok((u128::from(c.trade)+dynamic).min(100000) as u32)
 }
+pub(super) fn clock_coherent(dynamic:bool,clock_slot:u64,pool_slot:u64,
+    config_slot:u64,chain_time:i64)->Result<()>{
+    if dynamic{
+        ensure!(clock_slot>=pool_slot.max(config_slot)&&chain_time>0,
+            "Raydium CLMM dynamic fee awaits coherent Clock slot");
+    }
+    Ok(())
+}
 pub(super) fn fee_on_input(mode:u8,zero_for_one:bool)->Result<bool>{
     ensure!(mode<=2,"invalid Raydium CLMM fee_on");
     Ok(match mode{0=>true,1=>zero_for_one,2=>!zero_for_one,_=>unreachable!()})
@@ -208,6 +216,12 @@ mod tests{
     use super::*;
     fn p()->Pool{Pool{sqrt:1u128<<64,liquidity:100_000_000,tick:0,spacing:10,
         status:0,fee_on:0,config:Pubkey::default(),dynamic:None}}
+    #[test]fn cp15_clock_slot_coherence_is_required_only_for_dynamic(){
+        assert!(clock_coherent(false,0,100,101,0).is_ok());
+        assert!(clock_coherent(true,99,100,101,1000).is_err());
+        assert!(clock_coherent(true,101,100,101,0).is_err());
+        assert!(clock_coherent(true,101,100,101,1000).is_ok());
+    }
     #[test]fn cp15_static_fee_and_input_output_side(){
         let c=Config{trade:3000,protocol:100000,fund:100000,spacing:10};
         assert_eq!(fee(p(),c,0).unwrap(),3000);
