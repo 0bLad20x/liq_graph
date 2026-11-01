@@ -307,7 +307,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
             digest.update(&t.index.to_le_bytes());digest.update(&t.liquidity_net.to_le_bytes());
         }
     }
-    if profile.model=="raydium_cpmm_directional_v1" {
+    if matches!(profile.model,"raydium_cpmm_directional_v1"|"raydium_clmm_active_segment_v1") {
         for dir in &profile.directions {
             digest.update(&dir.marginal_net_rate.unwrap_or(0.0).to_bits().to_le_bytes());
             digest.update(dir.input_capacity_raw.as_deref().unwrap_or("").as_bytes());
@@ -412,6 +412,39 @@ impl Pool{
             account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
             reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,directions})
     }
+    fn clmm_profile(&self)->Option<PoolLiquidity>{
+        let State::RaydiumClmm{state,config,arrays,ready,pool_slot,config_slot,clock_slot,..}=&self.state else{return None;};
+        let cfg=(*config)?;
+        if state.dynamic.is_some() && (*clock_slot<(*pool_slot).max(*config_slot) || self.clock<=0){
+            return None;
+        }
+        let fee=raydium_clmm::fee(*state,cfg,self.clock).ok()?;
+        let v=self.valuation()?;
+        let directions=std::array::from_fn(|i|{
+            let input=if i==0{&self.canon_base}else{&self.canon_quote};
+            let output=if i==0{&self.canon_quote}else{&self.canon_base};
+            let native=usize::from(input!=&self.a);
+            let cap=if ready[native]{raydium_clmm::active_window(*state,arrays,fee,native==0)}else{None};
+            let rate=v.estimated_net_rates[i];
+            DirectedLiquidity{input_mint:input.clone(),output_mint:output.clone(),
+                input_decimals:if native==0{self.da}else{self.db},
+                output_decimals:if native==0{self.db}else{self.da},
+                status:if cap.is_some()&&rate.is_some(){"available"}else{"unknown"},
+                coverage:"execution_window_end",next_required_account:None,
+                first_source_position:Some(state.tick),marginal_net_rate:rate,
+                monotone_rate_tail:false,
+                input_capacity_raw:cap.map(|x|x.0.to_string()),
+                output_capacity_raw:cap.map_or_else(||"0".into(),|x|x.1.to_string()),
+                levels:Vec::new(),reason:if !ready[native]{
+                    Some("CLMM direction has no initial executable TickArray".into())
+                }else if cap.is_none(){Some("CLMM active interval is not fully observed".into())}
+                    else{None}}
+        });
+        Some(PoolLiquidity{model:"raydium_clmm_active_segment_v1",revision:0,
+            content_digest:[0;32],account_set_digest:self.manifest_digest,
+            execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,
+            orca_quote:None,directions})
+    }
     fn orca_profile(&self)->Option<PoolLiquidity>{
         let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,pool_slot,..}=&self.state else{return None;};
         orca::clock_coherent(oracle.is_some(),*clock_slot,(*oracle_slot).max(*pool_slot),self.clock).ok()?;
@@ -468,11 +501,11 @@ impl Pool{
             orca_quote:Some(snapshot),directions})
     }
     fn refresh_liquidity(&mut self)->bool {
-        if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool) {
-            let mut next=match self.venue{Venue::Pump=>self.reserve_profile(),Venue::RaydiumCpmm=>self.cpmm_profile(),_=>self.orca_profile()};
+        if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool|Venue::RaydiumClmm) {
+            let mut next=match self.venue{Venue::Pump=>self.reserve_profile(),Venue::RaydiumCpmm=>self.cpmm_profile(),Venue::RaydiumClmm=>self.clmm_profile(),_=>self.orca_profile()};
             if let Some(p)=next.as_mut(){p.content_digest=liquidity_digest(p);}
             let liquidity=match &mut self.state {
-                State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}|State::OrcaWhirlpool{liquidity,..}=>liquidity,
+                State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}|State::OrcaWhirlpool{liquidity,..}|State::RaydiumClmm{liquidity,..}=>liquidity,
                 _=>unreachable!(),
             };
             if liquidity.as_ref().map(|p|p.content_digest)==next.as_ref().map(|p|p.content_digest){return false;}
@@ -487,10 +520,10 @@ impl Pool{
     }
     fn liquidity(&self)->Option<Arc<crate::core::market_state::PoolLiquidity>> {
         match &self.state{State::Dlmm{book,..}=>book.profile.clone(),
-            State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}|State::OrcaWhirlpool{liquidity,..}=>liquidity.clone(),_=>None}
+            State::Pump{liquidity,..}|State::RaydiumCpmm{liquidity,..}|State::OrcaWhirlpool{liquidity,..}|State::RaydiumClmm{liquidity,..}=>liquidity.clone(),_=>None}
     }
     fn valuation(&self)->Option<FeeValuation> {
-        if !matches!(self.venue,Venue::Dlmm|Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool) || matches!(&self.state,State::Pending{..}){return None;}
+        if !matches!(self.venue,Venue::Dlmm|Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool|Venue::RaydiumClmm) || matches!(&self.state,State::Pending{..}){return None;}
         let mut token_status=std::array::from_fn(|i|match &self.mint_states[i] {
             None=>"unknown",
             Some(m)=>match m.token_extensions.get("classification").and_then(serde_json::Value::as_str) {
@@ -500,13 +533,13 @@ impl Pool{
             }
         });
         if self.a!=self.canon_base{token_status.swap(0,1);}
-        let mut v=FeeValuation{model:match self.venue{Venue::Dlmm=>"dlmm",Venue::Pump=>"pumpswap",Venue::RaydiumCpmm=>"raydium_cpmm",_=>"orca_whirlpool"},
+        let mut v=FeeValuation{model:match self.venue{Venue::Dlmm=>"dlmm",Venue::Pump=>"pumpswap",Venue::RaydiumCpmm=>"raydium_cpmm",Venue::RaydiumClmm=>"raydium_clmm",_=>"orca_whirlpool"},
             estimated_net_rates:[None;2],dex_fee_rates:[None;2],fees_on_input:[true;2],
             base_fee_rate:None,variable_fee_rate:None,lp_fee_bps:None,protocol_fee_bps:None,creator_fee_bps:None,
             fee_schedule:None,market_cap_raw:None,chain_timestamp:self.clock,chain_epoch:self.epoch,
             token_fee_status:token_status,unknown_reason:None,scope:"marginal_dex_fees_only_no_host_rebate_no_depth"};
         let calculated=(||->Result<[f64;2]>{
-            if !matches!(self.venue,Venue::RaydiumCpmm) && !matches!(&self.state,State::OrcaWhirlpool{oracle:None,..}) {ensure!(self.clock>0,"chain Clock unavailable");}
+            if !matches!(self.venue,Venue::RaydiumCpmm|Venue::RaydiumClmm) && !matches!(&self.state,State::OrcaWhirlpool{oracle:None,..}) {ensure!(self.clock>0,"chain Clock unavailable");}
             let raw=match &self.state {
                 State::Dlmm{active,step,fee,book}=>{
                     let (base,total,on_input)=fee.rates(*active,*step,self.clock)?;
@@ -550,6 +583,28 @@ impl Pool{
                     v.scope="orca_active_liquidity_marginal_dex_net_no_sizing";
                     let mut rates=orca::rates(*state,f,self.da,self.db)?;
                     for i in 0..2 {if !ready[i]{rates[i]=0.0;v.dex_fee_rates[i]=None;}}
+                    rates
+                },
+                State::RaydiumClmm{state,config,ready,pool_slot,config_slot,clock_slot,arrays,..}=>{
+                    let cfg=config.context("Raydium CLMM AmmConfig unavailable")?;
+                    if state.dynamic.is_some(){
+                        ensure!(*clock_slot>=(*pool_slot).max(*config_slot)&&self.clock>0,
+                            "Raydium CLMM dynamic fee awaits coherent Clock slot");
+                    }
+                    let f=raydium_clmm::fee(*state,*cfg,self.clock)?;
+                    v.base_fee_rate=Some(f64::from(cfg.trade)/1_000_000.0);
+                    v.variable_fee_rate=Some(f64::from(f-cfg.trade)/1_000_000.0);
+                    v.dex_fee_rates=[Some(f as f64/1_000_000.0);2];
+                    v.fees_on_input=[
+                        raydium_clmm::fee_on_input(state.fee_on,true)?,
+                        raydium_clmm::fee_on_input(state.fee_on,false)?];
+                    v.scope="raydium_clmm_active_liquidity_marginal_dex_net_no_sizing";
+                    let mut rates=raydium_clmm::rates(*state,f,self.da,self.db)?;
+                    for native in 0..2 {
+                        if !ready[native] || raydium_clmm::active_window(*state,arrays,f,native==0).is_none(){
+                            rates[native]=0.0;v.dex_fee_rates[native]=None;
+                        }
+                    }
                     rates
                 },
                 State::RaydiumCpmm{base,quote,fee0,fee1,fees,creator_mode,creator_enabled,status,..}=>{
@@ -1096,10 +1151,11 @@ impl Engine{
                 _=>pool_slot,
             };
             let mint_states=[mints.mint(a.parse()?).and_then(|m|m.onchain),mints.mint(b.parse()?).and_then(|m|m.onchain)];
+            let needs_clock=(watch.venue==Venue::OrcaWhirlpool && watch.orca_adaptive)
+                || matches!(&state,State::RaydiumClmm{state:raydium_clmm::Pool{dynamic:Some(_),..},..});
             let pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
-                clock:if (watch.venue==Venue::OrcaWhirlpool && watch.orca_adaptive)
-                    || matches!(&state,State::RaydiumClmm{state:raydium_clmm::Pool{dynamic:Some(_),..},..}) {
+                clock:if needs_clock {
                     let c=dict.get("SysvarC1ock11111111111111111111111111111111")
                         .context("Orca chain Clock unavailable")?;
                     i64::from_le_bytes(bytes(&c.data,32,8)?.try_into()?)
@@ -1464,11 +1520,14 @@ impl Engine{
             return Ok(());
         }
         if field==Field::Clock && prior_epoch==pool.epoch && pool.last_valuation.is_some() {
-            let due=match &pool.state{State::Dlmm{fee,..}=>pool.clock>=fee.next_change(prior_clock),_=>false};
+            let due=match &pool.state{
+                State::Dlmm{fee,..}=>pool.clock>=fee.next_change(prior_clock),
+                State::RaydiumClmm{state,..}=>state.dynamic.is_some(),
+                _=>false};
             if !due{return Ok(());}
         }
         let liquidity_started=Instant::now();
-        let liquidity_changed=if pool.venue==Venue::Dlmm {
+        let liquidity_changed=if matches!(pool.venue,Venue::Dlmm|Venue::RaydiumClmm) {
             let changed=pool.refresh_liquidity();
             self.metrics.liquidity.profile_build.add(nanos(liquidity_started));
             self.metrics.liquidity.profile_changes+=u64::from(changed);
