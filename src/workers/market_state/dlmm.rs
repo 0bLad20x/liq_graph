@@ -209,7 +209,7 @@ impl Book {
         if a!=canonical_base {directions.swap(0,1);}
         let mut next=PoolLiquidity{model:"dlmm_execution_window_v2",revision:0,content_digest:[0;32],
             account_set_digest:self.dependencies.digest,
-            execution_accounts:self.dependencies.addresses().iter().map(ToString::to_string).collect(),reserve_curve:None,cpmm_quote:None,orca_quote:None,directions};
+            execution_accounts:self.dependencies.addresses().iter().map(ToString::to_string).collect(),reserve_curve:None,cpmm_quote:None,orca_quote:None,clmm_quote:None,directions};
         next.content_digest=super::liquidity_digest(&next);
         if let Some(previous)=&self.profile {
             next.revision=previous.revision;

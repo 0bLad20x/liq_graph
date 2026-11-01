@@ -163,7 +163,7 @@ mod tests {
             mint_a:input.into(),mint_b:output.into(),base_mint:input.into(),quote_mint:output.into(),
             price_quote_per_base:1.0,valuation:None,liquidity:Some(Arc::new(PoolLiquidity{
                 model:"test",revision:1,content_digest:[0;32],account_set_digest:[0;32],
-                execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,orca_quote:None,
+                execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,orca_quote:None,clmm_quote:None,
                 directions:[direction.clone(),direction]})),previous_price:None,delta_bps:None,
             price_kind:PriceKind::DlmmActiveBin,best_bid_quote_per_base:None,best_ask_quote_per_base:None,
             consistency:Consistency::SingleAccount,slot:1,received_at_us:1,sequence:1,

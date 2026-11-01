@@ -99,6 +99,27 @@ mod cp14_orca_direction_count_tests {
         assert_eq!(orca_direction_class(None),3);
     }
 }
+/// Native Raydium token0/token1 directional readiness from versioned proof.
+fn clmm_direction_class(payload:Option<&Value>)->usize {
+    match payload.map(|v|(v["direction_0_to_1_ready"].as_bool(),
+                           v["direction_1_to_0_ready"].as_bool())) {
+        Some((Some(true),Some(true)))=>0,
+        Some((Some(true),Some(false)))=>1,
+        Some((Some(false),Some(true)))=>2,
+        _=>3,
+    }
+}
+#[cfg(test)]
+mod cp15_clmm_direction_count_tests {
+    use super::clmm_direction_class;
+    use serde_json::json;
+    #[test]fn cp15_registry_native_direction_classes(){
+        assert_eq!(clmm_direction_class(Some(&json!({"direction_0_to_1_ready":true,"direction_1_to_0_ready":false}))),1);
+        assert_eq!(clmm_direction_class(Some(&json!({"direction_0_to_1_ready":false,"direction_1_to_0_ready":true}))),2);
+        assert_eq!(clmm_direction_class(Some(&json!({"direction_0_to_1_ready":true,"direction_1_to_0_ready":true}))),0);
+        assert_eq!(clmm_direction_class(None),3);
+    }
+}
 /// Private Mint admission index and one process-wide pool-TVL policy.
 #[derive(Default)]
 struct AdmissionIndex {
@@ -229,11 +250,29 @@ impl PoolRegistry {
         // [prepared/admitted, selected, priced] for each category.
         let mut orca_directions=[[0_u64;3];4];
         let mut orca_neither=0_u64;
+        let mut clmm_directions=[[0_u64;3];4];
+        let mut clmm_neither=0_u64;
         for p in entries.values() {
             let v=venues.entry(p.venue.name()).or_default();v[0]+=1;
             let prepared=p.completion_state==CompletionState::Prepared;
             v[1]+=u64::from(prepared);v[2]+=u64::from(p.completion_admission.is_admitted());
             v[3]+=u64::from(prepared&&p.completion_admission.is_admitted());
+            if p.venue==Venue::RaydiumClmm && p.completion_admission.is_admitted(){
+                if prepared {
+                    let evidence=p.completion_evidence.as_ref()
+                        .filter(|e|e.kind=="raydium_clmm_tick_arrays"&&e.version==2);
+                    let class=clmm_direction_class(evidence.map(|e|e.payload.as_ref()));
+                    clmm_directions[class][0]+=1;
+                    clmm_directions[class][1]+=u64::from(
+                        coverage.is_some_and(|c|c.selected.contains(&p.address)));
+                    clmm_directions[class][2]+=u64::from(
+                        coverage.is_some_and(|c|c.priced.contains(&p.address)));
+                }else if p.completion_state==CompletionState::Incomplete
+                    && p.completion_reason.as_deref().is_some_and(|v|
+                        v.contains("no first initialized TickArray in either direction")){
+                    clmm_neither+=1;
+                }
+            }
             if p.venue==Venue::OrcaWhirlpool && p.completion_admission.is_admitted() {
                 if prepared {
                     let evidence=p.completion_evidence.as_ref()
@@ -296,6 +335,19 @@ impl PoolRegistry {
                 "pump_pools_selected":coverage.map(|_|pump_pools[3]),"pump_pools_priced":coverage.map(|_|pump_pools[4]),
                 "missing_known_counterpart_samples":missing},
             "source_max_age_seconds":TVL_SOURCE_MAX_AGE_MS/1000,
+            "clmm_direction_admission":{
+                "scope":"current_admitted_registry_snapshot",
+                "prepared_both":clmm_directions[0][0],
+                "prepared_0_to_1_only":clmm_directions[1][0],
+                "prepared_1_to_0_only":clmm_directions[2][0],
+                "prepared_unclassified":clmm_directions[3][0],
+                "selected_both":clmm_directions[0][1],
+                "selected_0_to_1_only":clmm_directions[1][1],
+                "selected_1_to_0_only":clmm_directions[2][1],
+                "priced_both":clmm_directions[0][2],
+                "priced_0_to_1_only":clmm_directions[1][2],
+                "priced_1_to_0_only":clmm_directions[2][2],
+                "incomplete_neither":clmm_neither},
             "orca_direction_admission":{
                 "scope":"current_admitted_registry_snapshot",
                 "prepared_both":orca_directions[0][0],

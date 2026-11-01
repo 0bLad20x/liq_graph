@@ -98,8 +98,9 @@ fn decode_pool(account:&AccountData,expected:&PoolState,program:Pubkey)->Result<
     ensure!((1..=1000).contains(&tick_spacing) && (-443636..=443636).contains(&tick_current),
         "Raydium CLMM tick spacing or tick_current out of bounds");
     ensure!(status&16==0,"Raydium CLMM swaps disabled by pool status bit 4");
-    ensure!(open_time<crate::core::now_unix_ms()?/1000,
-        "Raydium CLMM pool swap open_time not reached");
+    // Upstream Raydium CLMM PoolState explicitly documents open_time as
+    // currently disabled. Never gate on the host wall clock: executable
+    // time/slot policy belongs to the deployed on-chain swap implementation.
     let (Some(a),Some(b))=(expected.mint_a,expected.mint_b) else {
         bail!("Raydium CLMM Registry mint identity absent");
     };
@@ -279,6 +280,32 @@ fn retry(pool:Pubkey,reason:impl Into<String>)->CompletionResult{
 fn incomplete(pool:Pubkey,slot:u64,reason:impl Into<String>)->CompletionResult{
     result(pool,CompletionStatus::Incomplete,Some(slot),Some(reason.into()),None,None,None)
 }
+// Native token 0->1 traverses decreasing ticks (down); 1->0 traverses up.
+// An empty side is never a valid V10 execution block; the other side remains
+// admitted. Every side must begin with the first initialized bitmap array.
+fn ordered_arrays(present:&HashMap<i32,Pubkey>,center:i32,width:i32)->(Vec<Pubkey>,Vec<Pubkey>){
+    let up=(0..=ARRAY_RADIUS).map(|i|center+i*width)
+        .filter_map(|start|present.get(&start).copied()).collect();
+    let down=(0..=ARRAY_RADIUS).map(|i|center-i*width)
+        .filter_map(|start|present.get(&start).copied()).collect();
+    (up,down)
+}
+
+#[cfg(test)]
+mod cp15_direction_tests{
+    use super::*;
+    #[test]fn cp15_one_sided_and_negative_tick_start(){
+        let pool=Pubkey::new_unique();let mut present=HashMap::new();
+        present.insert(-600,pool);
+        let (up,down)=ordered_arrays(&present,-600,600);
+        assert_eq!(up,vec![pool]);assert_eq!(down,vec![pool]);
+        present.remove(&-600);
+        let next=Pubkey::new_unique();present.insert(-1200,next);
+        let (up,down)=ordered_arrays(&present,-600,600);
+        assert!(up.is_empty());assert_eq!(down,vec![next]);
+        present.clear();assert_eq!(ordered_arrays(&present,-600,600),(vec![],vec![]));
+    }
+}
 fn make_manifest(l:Layout,slot:u64,up:&[Pubkey],down:&[Pubkey],
     token_2022:bool,owner:Pubkey)->ExecutionManifest{
     let ro=|address|AccountMeta{address,writable:false};
@@ -343,41 +370,39 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let width=l.tick_spacing*60;
     let center=l.tick_current.div_euclid(width)*width;
     let mut present=HashMap::<i32,Pubkey>::new();
+    let mut bad_up=false;let mut bad_down=false;
     for (start,address) in arrays(l,owner) {
         let initialized=match array_initialized(parent,bitmap,start,width){
             Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
                 format!("Raydium CLMM bitmap start={start}: {e:#}")),
         };
-        match get(address) {
-            Some(account)=>{
-                let contains=match validate_array(account,l,start,owner){
-                    Ok(v)=>v,Err(e)=>return incomplete(pool.address,slot,
-                        format!("Raydium CLMM TickArray start={start}: {e:#}")),
-                };
-                if contains!=initialized {
-                    return incomplete(pool.address,slot,
-                        format!("Raydium CLMM TickArray count/bitmap disagreement at {start}"));
-                }
-                if initialized {present.insert(start,address);}
-            }
-            None if initialized =>return incomplete(pool.address,slot,
-                format!("Raydium CLMM initialized TickArray missing at {start}")).with_reason_code(CompletionReason::MissingExecutionAccounts),
-            None=>{}
+        let valid=match get(address) {
+            Some(account)=>validate_array(account,l,start,owner).ok()
+                .filter(|contains|*contains==initialized).is_some(),
+            None=>!initialized,
+        };
+        if !valid {
+            // An invalid/missing initialized account invalidates only the
+            // direction that needs it. The active-center array is shared.
+            bad_up|=start>=center;
+            bad_down|=start<=center;
+            continue;
         }
+        if initialized{present.insert(start,address);}
     }
-    // Supply first initialized array and further initialized arrays in traversal
-    // order; the Raydium executor skips noninitialized arrays in its bitmap.
-    let up=(0..=ARRAY_RADIUS).map(|i|center+i*width)
-        .filter_map(|index|present.get(&index).copied()).collect::<Vec<_>>();
-    let down=(0..=ARRAY_RADIUS).map(|i|center-i*width)
-        .filter_map(|index|present.get(&index).copied()).collect::<Vec<_>>();
-    if up.is_empty()||down.is_empty(){
+    // Supply only validated contiguous directional windows. A missing array
+    // cannot be silently skipped to a later tick in the bitmap.
+    let (mut up,mut down)=ordered_arrays(&present,center,width);
+    if bad_up{up.clear();}
+    if bad_down{down.clear();}
+    if up.is_empty() && down.is_empty(){
         return incomplete(pool.address,slot,
-            "Raydium CLMM requires initialized TickArrays in both V10 directions within radius 2").with_reason_code(CompletionReason::MissingExecutionAccounts);
+            "Raydium CLMM has no first initialized TickArray in either direction within validated V10 radius")
+            .with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     let proofs=if pool.mint_a==Some(l.mints[0]){[mint0,mint1]}else{[mint1,mint0]};
     let ev=Arc::new(CompletionEvidence{
-        kind:"raydium_clmm_tick_arrays".into(),version:1,
+        kind:"raydium_clmm_tick_arrays".into(),version:2,
         payload:Arc::new(json!({
             "program":owner.to_string(),"config":l.config.to_string(),
             "observation":l.observation.to_string(),"bitmap":l.bitmap.to_string(),
@@ -386,6 +411,8 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             "tick_spacing":l.tick_spacing,"tick_current":l.tick_current,
             "status":l.status,"open_time":l.open_time,
             "radius":ARRAY_RADIUS,
+            "direction_0_to_1_ready":!down.is_empty(),
+            "direction_1_to_0_ready":!up.is_empty(),
             "base_a_array_addresses":up.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "base_b_array_addresses":down.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "token_program_0":ma.owner.to_string(),"token_program_1":mb.owner.to_string()
@@ -473,7 +500,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
         && r.pool.completion_state==crate::core::CompletionState::Prepared
         && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
         && r.pool.completion_evidence.as_ref().is_some_and(|e|
-            e.kind=="raydium_clmm_tick_arrays" && e.version==1)
+            e.kind=="raydium_clmm_tick_arrays" && e.version==2)
         && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
     let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
     if !eligible.is_empty(){
@@ -524,13 +551,12 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                             None=>{},
                                         }
                                     }
-                                    let up=(0..=ARRAY_RADIUS).map(|i|center+i*width)
-                                        .filter_map(|start|present.get(&start).copied()).collect::<Vec<_>>();
-                                    let down=(0..=ARRAY_RADIUS).map(|i|center-i*width)
-                                        .filter_map(|start|present.get(&start).copied()).collect::<Vec<_>>();
-                                    if up.is_empty()||down.is_empty(){return Ok(false);}
+                                    let (up,down)=ordered_arrays(&present,center,width);
+                                    if up.is_empty()&&down.is_empty(){return Ok(false);}
                                     let ev=p.completion_evidence.as_ref().context("no evidence")?;
-                                    if ev.payload["base_a_array_addresses"]!=serde_json::json!(
+                                    if ev.payload["direction_0_to_1_ready"].as_bool()!=Some(!down.is_empty())
+                                        || ev.payload["direction_1_to_0_ready"].as_bool()!=Some(!up.is_empty())
+                                        || ev.payload["base_a_array_addresses"]!=serde_json::json!(
                                             up.iter().map(ToString::to_string).collect::<Vec<_>>())
                                         || ev.payload["base_b_array_addresses"]!=serde_json::json!(
                                             down.iter().map(ToString::to_string).collect::<Vec<_>>())
