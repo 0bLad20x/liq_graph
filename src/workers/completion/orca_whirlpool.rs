@@ -268,11 +268,9 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     // A->B starts at center; B->A starts one array higher at the upper boundary.
     let shifted = layout.tick_current + layout.tick_spacing >= center + width;
     let up_center = if shifted { center + width } else { center };
-    if !present.contains_key(&center) {
-        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
-    }
-    if !present.contains_key(&up_center) {
-        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
+    if !present.contains_key(&center) && !present.contains_key(&up_center) {
+        return incomplete(pool.address,slot,"Orca no executable first TickArray in either direction")
+            .with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     // Keep only consecutive initialized arrays starting at each direction's first array.
     let down=(0..=radius).map(|distance|center-distance*width)
@@ -288,7 +286,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let arrays_b=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let mints=[mint_a,mint_b];
     let ev=Arc::new(CompletionEvidence{
-        kind:"orca_whirlpool_tick_arrays".into(),version:3,
+        kind:"orca_whirlpool_tick_arrays".into(),version:4,
         payload:Arc::new(json!({
             "program":owner.to_string(),"oracle":oracle.to_string(),
             "oracle_initialized":oracle_present,"tick_spacing":layout.tick_spacing,
@@ -299,6 +297,8 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             })).collect::<Vec<_>>(),
             "base_a_start_ticks":up,
             "base_b_start_ticks":down,
+            "direction_b_to_a_ready":!arrays_a.is_empty(),
+            "direction_a_to_b_ready":!arrays_b.is_empty(),
             "token_program_a":a.owner.to_string(),"token_program_b":b.owner.to_string()
         }))
     });
@@ -370,7 +370,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
         && r.work!=crate::core::CompletionWork::Initial
         && r.pool.completion_state==crate::core::CompletionState::Prepared
         && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
-        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="orca_whirlpool_tick_arrays"&&e.version==3)
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="orca_whirlpool_tick_arrays"&&e.version==4)
         && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
     let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
     if !eligible.is_empty(){
@@ -425,7 +425,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                                 }
                                                 present.insert(start,addr);
                                             }
-                                            if !present.contains_key(&center)||!present.contains_key(&up_center){
+                                            if !present.contains_key(&center)&&!present.contains_key(&up_center){
                                                 return Ok(false);
                                             }
                                             let down=(0..=settings.radius).map(|i|center-i*width)
@@ -435,6 +435,8 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                             let ev=p.completion_evidence.as_ref().context("missing evidence")?;
                                             if ev.payload["base_a_start_ticks"]!=serde_json::json!(up)
                                                 || ev.payload["base_b_start_ticks"]!=serde_json::json!(down)
+                                                || ev.payload["direction_b_to_a_ready"]!=serde_json::json!(!up.is_empty())
+                                                || ev.payload["direction_a_to_b_ready"]!=serde_json::json!(!down.is_empty())
                                                 || ev.payload["vault_a"].as_str()!=Some(l.vault_a.to_string().as_str())
                                                 || ev.payload["vault_b"].as_str()!=Some(l.vault_b.to_string().as_str())
                                                 || ev.payload["radius"].as_i64()!=Some(i64::from(settings.radius)){
