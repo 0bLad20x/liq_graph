@@ -302,6 +302,10 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
         digest.update(&q.fee_rate.to_le_bytes());
         for v in q.active_input_limit_raw{digest.update(&v.to_le_bytes());}
         digest.update(&[u8::from(q.adaptive_oracle)]);
+        for n in q.coverage_ticks{digest.update(&n.to_le_bytes());}
+        for t in &q.initialized_ticks{
+            digest.update(&t.index.to_le_bytes());digest.update(&t.liquidity_net.to_le_bytes());
+        }
     }
     if profile.model=="raydium_cpmm_directional_v1" {
         for dir in &profile.directions {
@@ -431,11 +435,23 @@ impl Pool{
                 reason:(input_caps[native]==0).then(||"Orca active tick-boundary capacity unavailable".into()),
             }
         });
+        let mut ticks=arrays.iter().flat_map(|a|a.initialized.iter().cloned())
+            .collect::<Vec<_>>();
+        ticks.sort_by_key(|t|t.index);
+        ticks.dedup_by_key(|t|t.index);
+        let covered_ranges=arrays.iter().map(|a|{
+            [a.start,a.start.saturating_add(88*i32::from(state.spacing))]
+        }).collect::<Vec<_>>();
+        let coverage_ticks=[
+            covered_ranges.iter().map(|v|v[0]).min().unwrap_or(state.tick),
+            covered_ranges.iter().map(|v|v[1]).max().unwrap_or(state.tick),
+        ];
         let snapshot=OrcaQuoteSnapshot {
             mint_a:self.a.clone(),mint_b:self.b.clone(),
             sqrt_price_x64:state.sqrt,active_liquidity:state.liquidity,
             tick_current:state.tick,tick_spacing:state.spacing,
             fee_rate:fee,active_input_limit_raw:input_caps,adaptive_oracle:oracle.is_some(),
+            coverage_ticks,initialized_ticks:ticks,
         };
         Some(PoolLiquidity{model:"orca_whirlpool_active_segment_v1",revision:0,
             content_digest:[0;32],account_set_digest:self.manifest_digest,
