@@ -91,7 +91,7 @@ pub(super) fn rates(p:Whirlpool,applied_fee:u32,da:u8,db:u8)->Result<[f64;2]> {
 #[derive(Clone,Debug)]
 pub(super) struct TickArray {
     pub start:i32,
-    pub initialized:Vec<i32>,
+    pub initialized:Vec<crate::core::market_state::OrcaQuoteTick>,
 }
 const FIXED_DISC:[u8;8]=[69,97,189,190,110,7,66,187];
 const DYNAMIC_DISC:[u8;8]=[17,216,246,142,225,199,218,56];
@@ -107,7 +107,10 @@ pub(super) fn tick_array(d:&[u8],pool:&[u8;32],spacing:u16)->Result<TickArray>{
             let off=12+i*113;
             let tag=d[off];
             ensure!(tag<=1,"invalid Orca fixed TickArray flag");
-            if tag==1 {ticks.push(start+i as i32*i32::from(spacing));}
+            if tag==1 {ticks.push(crate::core::market_state::OrcaQuoteTick{
+                index:start+i as i32*i32::from(spacing),
+                liquidity_net:i128::from_le_bytes(chunk(d,off+1)?)
+            });}
         }
     }else if d.starts_with(&DYNAMIC_DISC){
         ensure!(d.len()>=8+4+32+16+88 &&
@@ -119,7 +122,10 @@ pub(super) fn tick_array(d:&[u8],pool:&[u8;32],spacing:u16)->Result<TickArray>{
             off+=1;
             if tag==1{
                 ensure!(d.get(off..off+112).is_some(),"Orca dynamic tick payload truncated");
-                ticks.push(start+i as i32*i32::from(spacing));
+                ticks.push(crate::core::market_state::OrcaQuoteTick{
+                    index:start+i as i32*i32::from(spacing),
+                    liquidity_net:i128::from_le_bytes(chunk(d,off)?)
+                });
                 off+=112;
             }
         }
@@ -129,7 +135,7 @@ pub(super) fn tick_array(d:&[u8],pool:&[u8;32],spacing:u16)->Result<TickArray>{
     Ok(TickArray{start,initialized:ticks})
 }
 pub(super) fn nearest_initialized(arrays:&[TickArray],tick:i32,direction:usize)->Option<i32>{
-    arrays.iter().flat_map(|a|a.initialized.iter().copied())
+    arrays.iter().flat_map(|a|a.initialized.iter().map(|v|v.index))
         .filter(|&i|if direction==0{i<tick}else{i>tick})
         .min_by_key(|&i|i.abs_diff(tick))
 }
@@ -214,13 +220,13 @@ mod tests{
         fixed[12+4*113]=1;
         let end=12+88*113;fixed[end..end+32].copy_from_slice(&pool);
         let a=tick_array(&fixed,&pool,64).unwrap();
-        assert_eq!(a.initialized,vec![4*64]);
+        assert_eq!(a.initialized[0].index,4*64);
         let mut dynamic=vec![0_u8;60+88+112];
         dynamic[..8].copy_from_slice(&DYNAMIC_DISC);
         dynamic[12..44].copy_from_slice(&pool);
         dynamic[60+2]=1;
         let b=tick_array(&dynamic,&pool,64).unwrap();
-        assert_eq!(b.initialized,vec![2*64]);
+        assert_eq!(b.initialized[0].index,2*64);
         assert_eq!(nearest_initialized(&[a,b],0,1),Some(128));
         assert!(tick_array(&dynamic,&[0_u8;32],64).is_err());
         let mut corrupted=dynamic;corrupted[60]=2;
