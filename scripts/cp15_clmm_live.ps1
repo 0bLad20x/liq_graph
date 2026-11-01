@@ -73,6 +73,13 @@ try {
     if ($preparedDirections -ne $clmmPrepared) {
         throw "CP15 Raydium CLMM direction counts inconsistent: $preparedDirections != $clmmPrepared"
     }
+    $selectedDirections=[long]$directions.selected_both +
+        [long]$directions.selected_0_to_1_only + [long]$directions.selected_1_to_0_only
+    $pricedDirections=[long]$directions.priced_both +
+        [long]$directions.priced_0_to_1_only + [long]$directions.priced_1_to_0_only
+    if ($selectedDirections -le 0 -or $pricedDirections -le 0) {
+        throw "CP15 requires CLMM selected and priced: selected=$selectedDirections priced=$pricedDirections"
+    }
     $directions | ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $folder 'cp15_clmm_directions.json') -Encoding utf8
     Write-Host "CP15 Raydium CLMM directions: both=$($directions.prepared_both) 0to1_only=$($directions.prepared_0_to_1_only) 1to0_only=$($directions.prepared_1_to_0_only) unclassified=$($directions.prepared_unclassified) incomplete_neither=$($directions.incomplete_neither)"
