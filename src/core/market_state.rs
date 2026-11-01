@@ -104,7 +104,7 @@ fn decimal_u128<S:serde::Serializer>(value:&u128,serializer:S)->Result<S::Ok,S::
 /// input size; never consulted by Direct2 signals or candidate exclusion.
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct CpmmQuoteSnapshot {
-    pub mint_0:String,
+    pub mint_0:String,pub mint_1:String,
     pub reserve_0_raw:u64,pub reserve_1_raw:u64,
     pub trade_fee_rate:u64,pub creator_fee_rate:u64,
     pub creator_fee_on_input_0_to_1:bool,
