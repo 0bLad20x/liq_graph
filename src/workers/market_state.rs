@@ -326,7 +326,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
          global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>,liquidity:Option<Arc<PoolLiquidity>>},
     DammV2{sqrt:u128},
     RaydiumClmm{sqrt:u128},
-    OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,ready:[bool;2],clock_slot:u64,array_keys:Vec<String>,arrays:Vec<orca::TickArray>,liquidity:Option<Arc<PoolLiquidity>>},
+    OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,pool_slot:u64,ready:[bool;2],clock_slot:u64,array_keys:Vec<String>,arrays:Vec<orca::TickArray>,liquidity:Option<Arc<PoolLiquidity>>},
     PancakeSwapClmm{sqrt:u128},
     ByrealClmm{sqrt:u128},
     Manifest{bid:f64,ask:f64,available:bool},
@@ -412,8 +412,8 @@ impl Pool{
             reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,directions})
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
-        let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,..}=&self.state else{return None;};
-        orca::clock_coherent(oracle.is_some(),*clock_slot,*oracle_slot,self.clock).ok()?;
+        let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,pool_slot,..}=&self.state else{return None;};
+        orca::clock_coherent(oracle.is_some(),*clock_slot,(*oracle_slot).max(*pool_slot),self.clock).ok()?;
         let fee=orca::fee(*state,*oracle,self.clock).ok()?;
         let rates=orca::rates(*state,fee,self.da,self.db).ok()?;
         let (input_caps,output_caps)=orca::active_capacity(*state,fee,arrays,*oracle).ok()?;
@@ -540,8 +540,8 @@ impl Pool{
                     [if global.disabled&16==0{p*(1.0-f)}else{0.0},
                      if global.disabled&8==0{(1.0/p)/(1.0+f)}else{0.0}]
                 },
-                State::OrcaWhirlpool{state,oracle,ready,clock_slot,oracle_slot,..}=>{
-                    orca::clock_coherent(oracle.is_some(),*clock_slot,*oracle_slot,self.clock)?;
+                State::OrcaWhirlpool{state,oracle,ready,clock_slot,oracle_slot,pool_slot,..}=>{
+                    orca::clock_coherent(oracle.is_some(),*clock_slot,(*oracle_slot).max(*pool_slot),self.clock)?;
                     let f=orca::fee(*state,*oracle,self.clock)?;
                     v.base_fee_rate=Some(f64::from(state.fee)/1_000_000.0);
                     v.variable_fee_rate=Some(f64::from(f-u32::from(state.fee))/1_000_000.0);
@@ -951,7 +951,7 @@ impl Engine{
                     array_keys.sort();array_keys.dedup();
                     details.extend(array_keys.iter().cloned());
                     (key(&acc.data,101)?,key(&acc.data,181)?,
-                        State::OrcaWhirlpool{state,oracle:None,oracle_key,oracle_slot:pool_slot,ready:watch.orca_ready,clock_slot:0,
+                        State::OrcaWhirlpool{state,oracle:None,oracle_key,oracle_slot:pool_slot,pool_slot,ready:watch.orca_ready,clock_slot:0,
                             array_keys,arrays:Vec::new(),liquidity:None})
                 },
                 Venue::RaydiumCpmm=>{
@@ -1341,8 +1341,8 @@ impl Engine{
             (State::Pump{quote,quote_slot,..},Field::QuoteVault)=>{
                 *quote=u64_le(data,0)?;*quote_slot=slot;
             },
-            (State::OrcaWhirlpool{state,..},Field::OrcaWhirlpoolSqrt)=>{
-                *state=orca::pool(data)?;
+            (State::OrcaWhirlpool{state,pool_slot,..},Field::OrcaWhirlpoolSqrt)=>{
+                *state=orca::pool(data)?;*pool_slot=slot;
                 ensure!(key(data,101)?==pool.a&&key(data,181)?==pool.b,"Orca pool mint identity changed");
             },
             (State::OrcaWhirlpool{oracle,oracle_slot,..},Field::OrcaOracle)=>{
