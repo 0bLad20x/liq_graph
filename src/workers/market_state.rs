@@ -1468,7 +1468,7 @@ impl Settings {
 // Only the price worker's identity index is retained; manifests and canonical pool
 // lifecycle remain in the Registry. Notifications reconcile against the current owner.
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6],orca_ready:[bool;2]}
+struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6],orca_ready:[bool;2],clmm_config:Option<Pubkey>,clmm_arrays:[Option<Pubkey>;6],clmm_ready:[bool;2]}
 impl PoolInput {
     fn direct(self)->bool {matches!(self.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap)}
     fn structure_available(self)->bool {
@@ -1495,8 +1495,28 @@ impl PoolInput {
             let m=p.execution_manifest.as_ref()?;
             [m.base_b.len()>7,m.base_a.len()>7]
         }else{[false;2]};
+        let mut clmm_arrays=[None;6];
+        let mut clmm_config=None;
+        let mut clmm_ready=[false;2];
+        if p.venue==CoreVenue::RaydiumClmm {
+            let ev=p.completion_evidence.as_ref()?;
+            if ev.kind!="raydium_clmm_tick_arrays"||ev.version!=2{return None;}
+            clmm_config=Some(ev.payload["config"].as_str()?.parse().ok()?);
+            clmm_ready=[ev.payload["direction_0_to_1_ready"].as_bool()?,
+                        ev.payload["direction_1_to_0_ready"].as_bool()?];
+            let mut keys=Vec::<Pubkey>::new();
+            for name in ["base_a_array_addresses","base_b_array_addresses"] {
+                for item in ev.payload[name].as_array()? {
+                    let key:Pubkey=item.as_str()?.parse().ok()?;
+                    if !keys.contains(&key){keys.push(key);}
+                }
+            }
+            if keys.is_empty()||keys.len()>6{return None;}
+            for (i,key) in keys.into_iter().enumerate(){clmm_arrays[i]=Some(key);}
+        }
         Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,
-            dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest,orca_adaptive,orca_arrays,orca_ready})
+            dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest,orca_adaptive,orca_arrays,orca_ready,
+            clmm_config,clmm_arrays,clmm_ready})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
@@ -1507,7 +1527,8 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 }
 fn watch_cost(p:&PoolInput)->usize {
     match p.venue {CoreVenue::MeteoraDlmm=>p.dlmm.map_or(8,|d|d.account_cost()),
-        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::OrcaWhirlpool=>1+2*usize::from(p.orca_adaptive)+p.orca_arrays.iter().flatten().copied().collect::<HashSet<_>>().len(),CoreVenue::RaydiumAmmV4=>3,_=>1}
+        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::OrcaWhirlpool=>1+2*usize::from(p.orca_adaptive)+p.orca_arrays.iter().flatten().copied().collect::<HashSet<_>>().len(),CoreVenue::RaydiumAmmV4=>3,
+        CoreVenue::RaydiumClmm=>3+p.clmm_arrays.iter().flatten().count(),_=>1}
 }
 fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
     use super::graph_liquidity::RouteTopologyKind as K;
@@ -1752,7 +1773,8 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
-            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest,orca_adaptive:p.orca_adaptive,orca_arrays:p.orca_arrays,orca_ready:p.orca_ready}))
+            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest,orca_adaptive:p.orca_adaptive,orca_arrays:p.orca_arrays,orca_ready:p.orca_ready,
+                clmm_config:p.clmm_config,clmm_arrays:p.clmm_arrays,clmm_ready:p.clmm_ready}))
             .collect::<Result<Vec<_>>>()?})})();
         let result=match (baseline_source,config) {
             (Some(source),_)=>{
