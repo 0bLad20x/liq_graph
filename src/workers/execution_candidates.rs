@@ -195,6 +195,14 @@ impl Selection {
         let profile=p.observation.liquidity.as_ref().ok_or("amount_model_unavailable")?;
         let direction=profile.directions.iter().position(|d|d.input_mint==input_mint
             &&d.output_mint==output_mint).ok_or("direction_not_in_model")?;
+        if let Some(state)=profile.clmm_quote.as_ref(){
+            if !p.liquidity_window_checked{return Err("manifest_window_changed");}
+            if !p.observation.valuation.as_ref().is_some_and(|v|
+                v.token_fee_status.iter().all(|s|*s=="verified_no_standard_transfer_fee")){
+                return Err("token_transfer_cost_unresolved");
+            }
+            return super::market_state::raydium_clmm::quote(state,input_mint,output_mint,amount);
+        }
         if let Some(state)=profile.orca_quote.as_ref(){
             // Diagnostic active-segment estimate at V10's actual input quantity.
             // Unknown if the swap crosses a tick, uses unsupported token fees,
@@ -280,8 +288,10 @@ impl Selection {
                 "snapshot_reserve_curve":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|l.reserve_curve.as_ref())),
                 "snapshot_cpmm_quote":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|l.cpmm_quote.as_ref())),
                 "snapshot_orca_quote":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|l.orca_quote.as_ref())),
+                "snapshot_clmm_quote":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|l.clmm_quote.as_ref())),
                 "model_quote_basis":p.and_then(|p|p.observation.liquidity.as_ref()).map(|l|
-                    if l.cpmm_quote.is_some(){"frozen_cpmm_base_input"}
+                    if l.clmm_quote.is_some(){"raydium_clmm_active_segment_approximation_only"}
+                        else if l.cpmm_quote.is_some(){"frozen_cpmm_base_input"}
                     else if l.orca_quote.is_some(){"orca_active_segment_approximation_only"}
                     else{"existing_exact_amount_model"}),
                 "snapshot_direction":p.and_then(|p|p.observation.liquidity.as_ref().and_then(|l|
