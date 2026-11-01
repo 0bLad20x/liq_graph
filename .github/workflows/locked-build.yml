@@ -48,8 +48,10 @@ jobs:
         run: cargo test --locked --release cp13_
       - name: CP14 Orca Whirlpool adaptive fee and tick-array regression tests
         run: cargo test --locked --release cp14_
+      - name: CP14 closeout directional, adaptive Clock, and single-sided manifest tests
+        run: cargo test --locked --release cp14_
       - name: Live utility Python syntax only
-        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py','scripts/cp13_calibration_check.py','scripts/cp14_calibration_check.py')]"
+        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py','scripts/cp13_calibration_check.py','scripts/cp14_calibration_check.py','scripts/cp14_orca_reference.py')]"
       - name: Live utility PowerShell syntax only
         shell: pwsh
         run: |
