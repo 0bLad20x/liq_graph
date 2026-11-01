@@ -72,11 +72,14 @@ def compact_calibration(events, samples):
                 continue
             if key in found:
                 raise ValueError(f"duplicate compact Orca report key: {key}")
-            if not row[3]:
-                continue
-            calibration = dict(zip(cols, row[3]))
-            found[key] = [dict(zip(leg_cols, leg)) if leg else None
-                          for leg in calibration.get("legs") or []]
+            # Failed/non-calibrated simulations still have an exact compact
+            # counterpart; an absent calibration must not be a false join miss.
+            if row[3]:
+                calibration = dict(zip(cols, row[3]))
+                found[key] = [dict(zip(leg_cols, leg)) if leg else None
+                              for leg in calibration.get("legs") or []]
+            else:
+                found[key] = []
             if len(found) == len(samples):
                 break
     return found
