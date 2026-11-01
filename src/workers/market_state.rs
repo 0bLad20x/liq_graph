@@ -109,7 +109,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String],reads:&mut RpcReads)->Re
     }
     Ok(records)
 }
-#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32],orca_adaptive:bool}
+#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6]}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
 impl Venue {
@@ -321,7 +321,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
          global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>,liquidity:Option<Arc<PoolLiquidity>>},
     DammV2{sqrt:u128},
     RaydiumClmm{sqrt:u128},
-    OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,liquidity:Option<Arc<PoolLiquidity>>},
+    OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,array_keys:Vec<String>,arrays:Vec<orca::TickArray>,liquidity:Option<Arc<PoolLiquidity>>},
     PancakeSwapClmm{sqrt:u128},
     ByrealClmm{sqrt:u128},
     Manifest{bid:f64,ask:f64,available:bool},
@@ -407,10 +407,10 @@ impl Pool{
             reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,directions})
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
-        let State::OrcaWhirlpool{state,oracle,..}=&self.state else{return None;};
+        let State::OrcaWhirlpool{state,oracle,arrays,..}=&self.state else{return None;};
         let fee=orca::fee(*state,*oracle,self.clock).ok()?;
         let rates=orca::rates(*state,fee,self.da,self.db).ok()?;
-        let (input_caps,output_caps)=orca::active_capacity(*state,fee).ok()?;
+        let (input_caps,output_caps)=orca::active_capacity(*state,fee,arrays,*oracle).ok()?;
         let directions=std::array::from_fn(|i|{
             let input=if i==0{&self.canon_base}else{&self.canon_quote};
             let output=if i==0{&self.canon_quote}else{&self.canon_base};
@@ -600,16 +600,16 @@ impl Pool{
         }
     }
 }
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmConfig,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,OrcaOracle,PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmConfig,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,OrcaOracle,OrcaArray(u8),PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
 impl Field{
-    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook|Self::RaydiumCpmmConfig|Self::OrcaWhirlpoolSqrt|Self::OrcaOracle)}
+    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook|Self::RaydiumCpmmConfig|Self::OrcaWhirlpoolSqrt|Self::OrcaOracle|Self::OrcaArray(_))}
 
     fn label(self)->&'static str{match self{Self::Clock=>"chain_clock",Self::PumpGlobal=>"pump_global_fees",Self::PumpFees=>"pump_fee_config",Self::PumpSupply=>"pump_base_supply",Self::Dlmm=>"dlmm_lbpair",Self::DlmmArray(_)=>"dlmm_bin_array",Self::DlmmBitmap=>"dlmm_bitmap",Self::VirtualQuote=>"pump_pool",Self::BaseVault=>"pump_base_vault",Self::QuoteVault=>"pump_quote_vault",Self::DammSqrt=>"damm_v2_pool",Self::RaydiumV4Pnl=>"raydium_v4_pool_pnl",
         Self::RaydiumV4BaseVault=>"raydium_v4_base_vault",Self::RaydiumV4QuoteVault=>"raydium_v4_quote_vault",
         Self::RaydiumClmmSqrt=>"raydium_clmm_pool",
         Self::RaydiumCpmmConfig=>"raydium_cpmm_amm_config",Self::RaydiumCpmmFees=>"raydium_cpmm_pool_fees",Self::RaydiumCpmmBaseVault=>"raydium_cpmm_base_vault",
         Self::RaydiumCpmmQuoteVault=>"raydium_cpmm_quote_vault",
-        Self::OrcaWhirlpoolSqrt=>"orca_whirlpool_pool",Self::OrcaOracle=>"orca_adaptive_oracle",
+        Self::OrcaWhirlpoolSqrt=>"orca_whirlpool_pool",Self::OrcaOracle=>"orca_adaptive_oracle",Self::OrcaArray(_)=>"orca_tick_array",
         Self::PancakeSwapClmmSqrt=>"pancakeswap_clmm_pool",Self::ManifestBook=>"manifest_market_book",
         Self::ByrealClmmSqrt=>"byreal_clmm_pool"}}
     fn slice(self)->(usize,usize){match self{Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::RaydiumCpmmConfig=>(0,0),Self::BaseVault|Self::QuoteVault=>(64,8),Self::DammSqrt=>(DAMM_SQRT_OFFSET,16),Self::RaydiumV4Pnl=>(192,16),
@@ -617,7 +617,7 @@ impl Field{
         Self::RaydiumClmmSqrt=>(RAYDIUM_CLMM_SQRT_OFFSET,16),
         Self::RaydiumCpmmFees=>(RAYDIUM_CPMM_FEES_OFFSET,RAYDIUM_CPMM_FEES_LEN),
         Self::RaydiumCpmmBaseVault|Self::RaydiumCpmmQuoteVault=>(64,8),
-        Self::OrcaWhirlpoolSqrt|Self::OrcaOracle=>(0,0),
+        Self::OrcaWhirlpoolSqrt|Self::OrcaOracle|Self::OrcaArray(_)=>(0,0),
         Self::PancakeSwapClmmSqrt=>(PANCAKESWAP_CLMM_SQRT_OFFSET,16),
         Self::ByrealClmmSqrt=>(BYREAL_CLMM_SQRT_OFFSET,16),
         Self::ManifestBook=>(0,0) // full variable-length market account; no dataSlice
@@ -1406,7 +1406,7 @@ impl Settings {
 // Only the price worker's identity index is retained; manifests and canonical pool
 // lifecycle remain in the Registry. Notifications reconcile against the current owner.
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32],orca_adaptive:bool}
+struct PoolInput {address:Pubkey,venue:CoreVenue,mint_a:Pubkey,mint_b:Pubkey,dlmm:Option<dlmm::Dependencies>,vaults:Option<PoolVaults>,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6]}
 impl PoolInput {
     fn direct(self)->bool {matches!(self.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap)}
     fn structure_available(self)->bool {
@@ -1423,8 +1423,14 @@ impl PoolInput {
         let orca_adaptive=p.venue==CoreVenue::OrcaWhirlpool &&
             p.completion_evidence.as_ref().and_then(|e|
                 e.payload.get("oracle_initialized").and_then(serde_json::Value::as_bool)).unwrap_or(false);
+        let mut orca_arrays=[None;6];
+        if p.venue==CoreVenue::OrcaWhirlpool {
+            let manifest=p.execution_manifest.as_ref()?;
+            for (i,m) in manifest.base_a.iter().skip(7).take(3).enumerate(){orca_arrays[i]=Some(m.address);}
+            for (i,m) in manifest.base_b.iter().skip(7).take(3).enumerate(){orca_arrays[i+3]=Some(m.address);}
+        }
         Some(Self{address:p.address,venue:p.venue,mint_a:p.mint_a?,mint_b:p.mint_b?,
-            dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest,orca_adaptive})
+            dlmm,vaults:p.vaults.as_deref().copied(),manifest_digest,orca_adaptive,orca_arrays})
     }
 }
 fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,address:Pubkey)->bool {
@@ -1435,7 +1441,7 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 }
 fn watch_cost(p:&PoolInput)->usize {
     match p.venue {CoreVenue::MeteoraDlmm=>p.dlmm.map_or(8,|d|d.account_cost()),
-        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::OrcaWhirlpool=>3,CoreVenue::RaydiumAmmV4=>3,_=>1}
+        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::OrcaWhirlpool=>2+usize::from(p.orca_adaptive)+p.orca_arrays.iter().flatten().copied().collect::<HashSet<_>>().len(),CoreVenue::RaydiumAmmV4=>3,_=>1}
 }
 fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
     use super::graph_liquidity::RouteTopologyKind as K;
@@ -1680,7 +1686,7 @@ async fn hydrate(pools:&[PoolInput],rpc:&RpcHandle,out:&broadcast::Sender<Arc<Ma
     while let Some(batch)=pending.pop() {
         if batch.is_empty(){continue;}
         let config=(||->Result<Config>{Ok(Config{watches:batch.iter().map(|p|
-            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest,orca_adaptive:p.orca_adaptive}))
+            Ok(Watch{address:p.address.to_string(),venue:Venue::from_core(p.venue)?,manifest_digest:p.manifest_digest,orca_adaptive:p.orca_adaptive,orca_arrays:p.orca_arrays}))
             .collect::<Result<Vec<_>>>()?})})();
         let result=match (baseline_source,config) {
             (Some(source),_)=>{
