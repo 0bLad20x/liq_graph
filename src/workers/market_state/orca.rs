@@ -314,6 +314,27 @@ mod tests{
         assert_eq!(fee(p,Some(o),200).unwrap(),3000);
         assert!(oracle(&d,&[0_u8;32]).is_err());
     }
+    #[test]fn cp14_frozen_orca_quote_inside_segment_and_tick_crossing(){
+        use crate::core::market_state::{OrcaQuoteSnapshot,OrcaQuoteTick};
+        let mut q=OrcaQuoteSnapshot{
+            mint_a:"A".into(),mint_b:"B".into(),sqrt_price_x64:1_u128<<64,
+            active_liquidity:1_000_000,tick_current:0,tick_spacing:64,
+            fee_rate:3000,active_input_limit_raw:[0,3200],adaptive_oracle:false,
+            coverage_ticks:[-5632,5632],covered_ranges:vec![[-5632,0],[0,5632]],
+            initialized_ticks:vec![OrcaQuoteTick{index:64,liquidity_net:50000}],
+        };
+        let one=quote(&q,"B","A",200).unwrap();
+        assert!(one>190&&one<=200);
+        let two=quote(&q,"B","A",5000).unwrap();
+        assert!(two>one);
+        assert_eq!(quote(&q,"B","unknown",200),Err("orca_direction_mismatch"));
+        q.adaptive_oracle=true;
+        assert_eq!(quote(&q,"B","A",5000),
+            Err("orca_adaptive_fee_group_crossing_unmodeled"));
+        q.adaptive_oracle=false;q.covered_ranges.clear();
+        assert_eq!(quote(&q,"B","A",5000),
+            Err("orca_frozen_tick_window_uncovered"));
+    }
     #[test]fn cp14_adaptive_time_and_volatility(){
         let p=Whirlpool{spacing:64,fee:3000,protocol_share:200,liquidity:1_000_000,
             sqrt:1_u128<<64,tick:0};
