@@ -98,8 +98,9 @@ fn decode_pool(account:&AccountData,expected:&PoolState,program:Pubkey)->Result<
     ensure!((1..=1000).contains(&tick_spacing) && (-443636..=443636).contains(&tick_current),
         "Raydium CLMM tick spacing or tick_current out of bounds");
     ensure!(status&16==0,"Raydium CLMM swaps disabled by pool status bit 4");
-    ensure!(open_time<crate::core::now_unix_ms()?/1000,
-        "Raydium CLMM pool swap open_time not reached");
+    // Upstream Raydium CLMM PoolState explicitly documents open_time as
+    // currently disabled. Never gate on the host wall clock: executable
+    // time/slot policy belongs to the deployed on-chain swap implementation.
     let (Some(a),Some(b))=(expected.mint_a,expected.mint_b) else {
         bail!("Raydium CLMM Registry mint identity absent");
     };
