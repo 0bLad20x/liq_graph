@@ -81,6 +81,15 @@ pub(super) fn fee(pool:Whirlpool,oracle:Option<Oracle>,timestamp:i64)->Result<u3
         .context("Orca adaptive fee overflow")?.div_ceil(100_000_u128*100_000_000);
     Ok((u128::from(pool.fee)+charge).min(100000) as u32)
 }
+/// A more recent Orca Oracle cannot be priced using an older Clock
+/// observation. Wait for the Clock stream to advance; never fabricate time.
+pub(super) fn clock_coherent(adaptive:bool,clock_slot:u64,oracle_slot:u64,chain_time:i64)->Result<()>{
+    if adaptive {
+        ensure!(chain_time>0,"Orca adaptive fee awaits chain Clock timestamp");
+        ensure!(clock_slot>=oracle_slot,"Orca adaptive fee awaits matching Clock slot");
+    }
+    Ok(())
+}
 pub(super) fn rates(p:Whirlpool,applied_fee:u32,da:u8,db:u8)->Result<[f64;2]> {
     let sqrt=p.sqrt as f64/Q64;
     let price=sqrt*sqrt*10_f64.powi(i32::from(da)-i32::from(db));
@@ -183,6 +192,9 @@ pub(crate) fn quote(snapshot:&OrcaQuoteSnapshot,input:&str,output:&str,amount:u6
         else{return Err("orca_direction_mismatch")};
     let direction=usize::from(!down);
     if amount==0{return Err("orca_zero_amount");}
+    if snapshot.active_input_limit_raw[direction]==0{
+        return Err("orca_direction_not_prepared_or_active_witness_unavailable");
+    }
     if snapshot.adaptive_oracle&&amount>snapshot.active_input_limit_raw[direction]{
         return Err("orca_adaptive_fee_group_crossing_unmodeled");
     }
@@ -295,6 +307,12 @@ mod tests{
         assert!(tick_array(&dynamic,&[0_u8;32],64).is_err());
         let mut corrupted=dynamic;corrupted[60]=2;
         assert!(tick_array(&corrupted,&pool,64).is_err());
+    }
+    #[test]fn cp14_clock_observation_must_not_precede_adaptive_oracle(){
+        assert!(clock_coherent(true,800,801,1000).is_err());
+        assert!(clock_coherent(true,802,801,1000).is_ok());
+        assert!(clock_coherent(true,802,801,0).is_err());
+        assert!(clock_coherent(false,0,801,0).is_ok());
     }
     #[test]fn cp14_oracle_layout_and_trade_enable(){
         let pool=[12_u8;32];let mut d=vec![0_u8;254];
