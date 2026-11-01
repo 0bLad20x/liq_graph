@@ -59,6 +59,12 @@ class Cp14OrcaIntegerReferenceTests(unittest.TestCase):
                             "inputs":[{"mint":"B","gross_amount_raw":191}],
                             "outputs":[{"mint":"A","amount_raw":45104}]
                         }]}}})
+            # A report without calibration must still count as joined.
+            rows.append([payload_hash,["report-c"],[102],None])
+            records.append({"payload_sha256":payload_hash,
+                            "selection":{"pools":[]},
+                            "report":{"id":"report-c","context_slot":102,
+                                      "trace":{"calls":[]}}})
             events.write_text("\n".join(json.dumps(x) for x in [header,*rows])+"\n",
                               encoding="utf8")
             details.write_text("\n".join(json.dumps(x) for x in records)+"\n",
