@@ -55,6 +55,7 @@ const TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const PUMP: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const ORCA: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const MAINNET: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
 // CP10: decode fixed program addresses exactly once. Do not parse base58 on every
@@ -66,6 +67,7 @@ static TOKEN_KEY: LazyLock<Pubkey> = LazyLock::new(|| TOKEN.parse().expect("toke
 static TOKEN_2022_KEY: LazyLock<Pubkey> = LazyLock::new(|| TOKEN_2022.parse().expect("token-2022 program"));
 static ASSOCIATED_KEY: LazyLock<Pubkey> = LazyLock::new(|| ASSOCIATED.parse().expect("ATA program"));
 static PUMP_KEY: LazyLock<Pubkey> = LazyLock::new(|| PUMP.parse().expect("PumpSwap program"));
+static ORCA_KEY: LazyLock<Pubkey> = LazyLock::new(|| ORCA.parse().expect("Orca program"));
 static MAINNET_KEY: LazyLock<Pubkey> = LazyLock::new(|| MAINNET.parse().expect("mainnet genesis"));
 const COLLECTOR_USDC:&str="GzVRuLF349u78FHpr8KbqMhrZ1aDxnhSF59JWiZ6tbgt";
 const COLLECTOR_SOL_FLASH:&str="6AGB9kqgSp2mQXwYpdrV4QVV8urvCaDS35U1wsLssy6H";
@@ -77,7 +79,7 @@ fn key(value: &str) -> Pubkey {
     match value {
         EXECUTOR => *EXECUTOR_KEY, SOL => *SOL_KEY, USDC => *USDC_KEY,
         TOKEN => *TOKEN_KEY, TOKEN_2022 => *TOKEN_2022_KEY,
-        ASSOCIATED => *ASSOCIATED_KEY, PUMP => *PUMP_KEY,
+        ASSOCIATED => *ASSOCIATED_KEY, PUMP => *PUMP_KEY, ORCA => *ORCA_KEY,
         MAINNET => *MAINNET_KEY,
         COLLECTOR_USDC => *COLLECTOR_USDC_KEY,
         COLLECTOR_SOL_FLASH => *COLLECTOR_SOL_FLASH_KEY,
@@ -168,6 +170,11 @@ fn block<'a>(pool: &'a ExecutionPool, quote: Pubkey, x: Pubkey, wallet: Pubkey)
         else if m.mint_b==quote && m.mint_a==x { &m.base_b }
         else { bail!("pool {} does not match its declared V10 role",m.pool) };
     ensure!((3..=24).contains(&accounts.len()), "pool account block must contain 3..=24 entries");
+    // A one-sided Prepared Orca pool deliberately carries no arrays on its
+    // unsupported side. Never let a malformed seven-account V10 leg through.
+    if accounts.first().is_some_and(|m|m.address==*ORCA_KEY){
+        ensure!((8..=24).contains(&accounts.len()),"Orca direction has no validated initial TickArray");
+    }
     ensure!(accounts[0].address!=Pubkey::default() && accounts[1].address==quote
         && !accounts[0].writable && !accounts[1].writable
         && accounts.iter().any(|a|a.address==m.pool), "invalid pool program/quote/account block");
@@ -832,5 +839,43 @@ mod cp10_tests {
         }
         let optimized=started.elapsed();
         println!("CP10 legacy={legacy:?} optimized={optimized:?} repetitions={repetitions}");
+    }
+}
+
+#[cfg(test)]
+mod cp14_one_sided_tests {
+    use super::*;
+    use crate::core::{ExecutionManifest,MintProof};
+    #[test]
+    fn cp14_v10_only_selects_validated_orca_direction() {
+        let wallet=Pubkey::new_from_array([98;32]);
+        let a=Pubkey::new_from_array([12;32]);
+        let b=Pubkey::new_from_array([13;32]);
+        let pool=Pubkey::new_from_array([14;32]);
+        let program=key("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+        let mut base_a=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:a,writable:false},
+            AccountMeta{address:Pubkey::new_from_array([20;32]),writable:false},
+            AccountMeta{address:pool,writable:true},
+            AccountMeta{address:Pubkey::new_from_array([21;32]),writable:true},
+            AccountMeta{address:Pubkey::new_from_array([22;32]),writable:true},
+            AccountMeta{address:Pubkey::new_from_array([23;32]),writable:true},
+        ];
+        let mut base_b=base_a.clone();
+        base_b[1].address=b;
+        base_b.push(AccountMeta{address:Pubkey::new_from_array([24;32]),writable:true});
+        let execution=ExecutionPool {
+            manifest:Arc::new(ExecutionManifest{
+                pool,mint_a:a,mint_b:b,validated_slot:42,bound_signer:None,
+                base_a:Arc::from(base_a.clone()),base_b:Arc::from(base_b)}),
+            mints:[
+                MintProof{address:a,token_2022:false,extensions:vec![],unsupported:vec![]},
+                MintProof{address:b,token_2022:false,extensions:vec![],unsupported:vec![]},
+            ],
+        };
+        assert!(block(&execution,a,b,wallet).is_err());
+        assert_eq!(block(&execution,b,a,wallet).unwrap().len(),8);
+        base_a.push(AccountMeta{address:Pubkey::new_from_array([25;32]),writable:true});
     }
 }

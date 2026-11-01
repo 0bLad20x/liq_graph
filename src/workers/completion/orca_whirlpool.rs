@@ -101,6 +101,16 @@ fn array_addresses(layout: Layout, owner: Pubkey, radius: i32) -> Vec<(i32,Pubke
         Some((start,address))
     }).collect()
 }
+/// Direction-aware Prepared arrays. An empty side is an explicit unsupported
+/// direction; it is not padded with a neighboring or imaginary TickArray.
+fn direction_starts(known:&HashSet<i32>,center:i32,up_center:i32,width:i32,radius:i32)
+    ->(Vec<i32>,Vec<i32>){
+    let down=(0..=radius).map(|distance|center-distance*width)
+        .take_while(|start|known.contains(start)).collect::<Vec<_>>();
+    let up=(0..=radius).map(|distance|up_center+distance*width)
+        .take_while(|start|known.contains(start)).collect::<Vec<_>>();
+    (down,up)
+}
 fn validate_array(account:&AccountData, pool:Pubkey, start:i32, owner:Pubkey) -> Result<&'static str> {
     ensure!(account.owner==owner && account.view==AccountView::Full
         && account.original_len==Some(account.bytes.len()),"Orca TickArray owner/RPC view mismatch");
@@ -268,17 +278,13 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     // A->B starts at center; B->A starts one array higher at the upper boundary.
     let shifted = layout.tick_current + layout.tick_spacing >= center + width;
     let up_center = if shifted { center + width } else { center };
-    if !present.contains_key(&center) {
-        return incomplete(pool.address,slot,"Orca A->B first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
-    }
-    if !present.contains_key(&up_center) {
-        return incomplete(pool.address,slot,"Orca B->A first TickArray not initialized").with_reason_code(CompletionReason::MissingExecutionAccounts);
+    if !present.contains_key(&center) && !present.contains_key(&up_center) {
+        return incomplete(pool.address,slot,"Orca no executable first TickArray in either direction")
+            .with_reason_code(CompletionReason::MissingExecutionAccounts);
     }
     // Keep only consecutive initialized arrays starting at each direction's first array.
-    let down=(0..=radius).map(|distance|center-distance*width)
-        .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
-    let up=(0..=radius).map(|distance|up_center+distance*width)
-        .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+    let known=present.keys().copied().collect::<HashSet<_>>();
+    let (down,up)=direction_starts(&known,center,up_center,width,radius);
     let mut selected=down.iter().chain(up.iter()).copied().collect::<Vec<_>>();
     selected.sort_unstable();
     selected.dedup();
@@ -288,7 +294,7 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
     let arrays_b=down.iter().map(|start|present[start].0).collect::<Vec<_>>();
     let mints=[mint_a,mint_b];
     let ev=Arc::new(CompletionEvidence{
-        kind:"orca_whirlpool_tick_arrays".into(),version:3,
+        kind:"orca_whirlpool_tick_arrays".into(),version:4,
         payload:Arc::new(json!({
             "program":owner.to_string(),"oracle":oracle.to_string(),
             "oracle_initialized":oracle_present,"tick_spacing":layout.tick_spacing,
@@ -299,6 +305,8 @@ fn finish(pool:&PoolState,initial:Layout,slot:u64,
             })).collect::<Vec<_>>(),
             "base_a_start_ticks":up,
             "base_b_start_ticks":down,
+            "direction_b_to_a_ready":!arrays_a.is_empty(),
+            "direction_a_to_b_ready":!arrays_b.is_empty(),
             "token_program_a":a.owner.to_string(),"token_program_b":b.owner.to_string()
         }))
     });
@@ -370,7 +378,7 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
         && r.work!=crate::core::CompletionWork::Initial
         && r.pool.completion_state==crate::core::CompletionState::Prepared
         && r.pool.execution_manifest.is_some() && r.pool.mint_proofs.is_some()
-        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="orca_whirlpool_tick_arrays"&&e.version==3)
+        && r.pool.completion_evidence.as_ref().is_some_and(|e|e.kind=="orca_whirlpool_tick_arrays"&&e.version==4)
         && r.pool.completion_validated_slot.is_some()).collect::<Vec<_>>();
     let mut outcomes=HashMap::<Pubkey,CompletionOutcome>::new();
     if !eligible.is_empty(){
@@ -425,16 +433,16 @@ async fn process_optimized(rpc:&RpcHandle,requests:&[CompletionRequest],settings
                                                 }
                                                 present.insert(start,addr);
                                             }
-                                            if !present.contains_key(&center)||!present.contains_key(&up_center){
+                                            if !present.contains_key(&center)&&!present.contains_key(&up_center){
                                                 return Ok(false);
                                             }
-                                            let down=(0..=settings.radius).map(|i|center-i*width)
-                                                .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
-                                            let up=(0..=settings.radius).map(|i|up_center+i*width)
-                                                .take_while(|start|present.contains_key(start)).collect::<Vec<_>>();
+                                            let known=present.keys().copied().collect::<HashSet<_>>();
+                                            let (down,up)=direction_starts(&known,center,up_center,width,settings.radius);
                                             let ev=p.completion_evidence.as_ref().context("missing evidence")?;
                                             if ev.payload["base_a_start_ticks"]!=serde_json::json!(up)
                                                 || ev.payload["base_b_start_ticks"]!=serde_json::json!(down)
+                                                || ev.payload["direction_b_to_a_ready"]!=serde_json::json!(!up.is_empty())
+                                                || ev.payload["direction_a_to_b_ready"]!=serde_json::json!(!down.is_empty())
                                                 || ev.payload["vault_a"].as_str()!=Some(l.vault_a.to_string().as_str())
                                                 || ev.payload["vault_b"].as_str()!=Some(l.vault_b.to_string().as_str())
                                                 || ev.payload["radius"].as_i64()!=Some(i64::from(settings.radius)){
@@ -475,6 +483,8 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     let mut tasks=JoinSet::new();
     let mut open=true;
     let mut processed=0_usize;
+    let mut one_way_prepared=0_usize;
+    let mut both_way_prepared=0_usize;
     crate::log_event!(Info,"orca executor started parallel={} pools_per_batch={} radius={} scheduler=completion_lifecycle",
         settings.parallel_batches,settings.pools_per_batch(),settings.radius);
     while open || !tasks.is_empty() {
@@ -509,7 +519,17 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
                     let outcome=by_pool.remove(&request.pool.address)
                         .context("Completion request has no matching pool result")?;
                     let kind=match &outcome {
-                        CompletionOutcome::Proof(result)=>format!("{:?}",result.status),
+                        CompletionOutcome::Proof(result)=>{
+                            if result.status==CompletionStatus::Prepared {
+                                if let Some(ev)=result.evidence.as_ref() {
+                                    let ab=ev.payload["direction_a_to_b_ready"].as_bool().unwrap_or(false);
+                                    let ba=ev.payload["direction_b_to_a_ready"].as_bool().unwrap_or(false);
+                                    if ab&&ba{both_way_prepared+=1;}
+                                    else if ab||ba{one_way_prepared+=1;}
+                                }
+                            }
+                            format!("{:?}",result.status)
+                        },
                         CompletionOutcome::Unchanged(_)=>"Unchanged".to_owned(),
                     };
                     crate::log_event!(Debug,"completion_orca_whirlpool completion request_id={} pool={} work={:?} outcome={}",
@@ -522,6 +542,43 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
             },
         }
     }
-    crate::log_event!(Info,"orca executor complete requests={processed}");
+    crate::log_event!(Info,
+        "orca executor complete requests={} prepared_both_directions={} prepared_one_direction={}",
+        processed,both_way_prepared,one_way_prepared);
     Ok(())
+}
+
+#[cfg(test)]
+mod cp14_tests {
+    use super::*;
+    #[test]
+    fn cp14_single_direction_only_arrays_are_admitted_without_fake_other_side(){
+        let down_only=HashSet::from([0,-5632]);
+        let (down,up)=direction_starts(&down_only,0,5632,5632,2);
+        assert_eq!(down,vec![0,-5632]);
+        assert!(up.is_empty());
+        let up_only=HashSet::from([5632,11264]);
+        let (down,up)=direction_starts(&up_only,0,5632,5632,2);
+        assert!(down.is_empty());
+        assert_eq!(up,vec![5632,11264]);
+        let neither=HashSet::new();
+        let (down,up)=direction_starts(&neither,0,5632,5632,2);
+        assert!(down.is_empty()&&up.is_empty());
+    }
+    #[test]
+    fn cp14_v10_oracle_writable_and_directional_tick_array_order(){
+        let pk=|n:u8|Pubkey::new_from_array([n;32]);
+        let l=Layout{pool:pk(1),mint_a:pk(2),mint_b:pk(3),
+            vault_a:pk(4),vault_b:pk(5),tick_spacing:64,tick_current:0};
+        let m=make_manifest(l,100,&[pk(6),pk(7)],&[pk(8)],pk(9));
+        for leg in [&m.base_a,&m.base_b]{
+            assert!(leg[4].writable,"Adaptive Orca requires writable Oracle account");
+            assert_eq!(leg[3].address,l.pool);
+            assert!(leg.iter().skip(7).all(|a|a.writable));
+        }
+        assert_eq!(m.base_a[7].address,pk(6));
+        assert_eq!(m.base_b[7].address,pk(8));
+        assert_eq!(m.base_a[5].address,pk(5));
+        assert_eq!(m.base_b[5].address,pk(4));
+    }
 }
