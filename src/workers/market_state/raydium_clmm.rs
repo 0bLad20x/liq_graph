@@ -58,7 +58,7 @@ pub(super) fn config(d:&[u8])->Result<Config>{
     ensure!(d.len()==117&&d.starts_with(&CONFIG_DISC),"invalid Raydium CLMM AmmConfig");
     let c=Config{trade:u32_at(d,47)?,protocol:u32_at(d,43)?,
         fund:u32_at(d,53)?,spacing:u16_at(d,51)?};
-    ensure!(c.trade<100000&&c.protocol<=1000000&&c.fund<=1000000
+    ensure!(c.trade<=100000&&c.protocol<=1000000&&c.fund<=1000000
         &&u64::from(c.protocol)+u64::from(c.fund)<=1000000&&c.spacing>0,
         "invalid CLMM AmmConfig fee rates or tick spacing");
     Ok(c)
@@ -138,7 +138,8 @@ pub(super) fn active_window(p:Pool,arrays:&[TickArray],fee_rate:u32,down:bool)
     // depth to the *observed array's* last accessible tick, never beyond it.
     let covered=arrays.iter().filter_map(|a|{
         let end=a.start+59*i32::from(p.spacing);
-        if a.start<=p.tick && p.tick<=end {
+        let exclusive_end=a.start+60*i32::from(p.spacing);
+        if a.start<=p.tick && p.tick<exclusive_end {
             Some(if down{a.start}else{end})
         }else{None}
     }).next()?;
