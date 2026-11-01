@@ -169,7 +169,7 @@ pub(super) fn active_window(p:Pool,arrays:&[TickArray],fee_rate:u32,down:bool)
 /// Bounded diagnostic prediction at the amount chosen by V10.
 /// The canonical reference script uses exact integers. This fast model is
 /// deliberately advisory; tick/fee-group/limit-order crossings return Unknown.
-pub(super) fn quote(s:&crate::core::market_state::ClmmQuoteSnapshot,
+pub(crate) fn quote(s:&crate::core::market_state::ClmmQuoteSnapshot,
     input:&str,output:&str,amount:u64)->std::result::Result<u64,&'static str>{
     let native=if input==s.mint_0&&output==s.mint_1{0}
         else if input==s.mint_1&&output==s.mint_0{1}
