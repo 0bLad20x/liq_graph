@@ -67,12 +67,16 @@ try {
         $summary.market_delivery_passed -and $summary.signal_delivery_passed)) {
         throw "CP14 runtime/delivery acceptance failed: $folder"
     }
-    if ($DurationSeconds -eq 60 -or $DurationSeconds -eq 600) {
+    if ($DurationSeconds -ge 60) {
         $events=Join-Path $folder 'execution_events.jsonl'
         $calibration=Join-Path $folder 'cp14_orca_calibration.json'
         & python (Join-Path $repo 'scripts\cp14_calibration_check.py') --events $events --out $calibration
-        if ($LASTEXITCODE -ne 0) { throw "CP14 60-second ORCA calibration incomplete or failed (exit=$LASTEXITCODE); see $calibration" }
+        if ($LASTEXITCODE -ne 0) { throw "CP14 ORCA calibration incomplete or failed (exit=$LASTEXITCODE); see $calibration" }
         Write-Host "CP14 ORCA frozen-vs-V10 calibration: $calibration"
+        $reference=Join-Path $folder 'cp14_orca_reference.json'
+        & python (Join-Path $repo 'scripts\cp14_orca_reference.py') --details (Join-Path $folder 'execution_details.jsonl') --out $reference
+        if ($LASTEXITCODE -ne 0) { throw "CP14 Orca independent integer reference check failed; see $reference" }
+        Write-Host "CP14 independent integer fee/amount reference: $reference"
     }
     Write-Host "CP14 verified: ORCA prepared=$orcaPrepared valuations=$orcaObserved artifacts=$folder"
 
