@@ -370,7 +370,7 @@ impl Pool{
         });
         for d in &mut directions {if d.status=="empty"{d.reason=Some("trade direction disabled".into());}}
         Some(PoolLiquidity{model:"constant_product_quote_fees_v1",revision:0,content_digest:[0;32],
-            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),cpmm_quote:None,orca_quote:None,
+            account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),cpmm_quote:None,orca_quote:None,clmm_quote:None,
             reserve_curve:Some(ReserveCurve{base_mint:self.a.clone(),base_reserve_raw:*base,
                 effective_quote_reserve_raw:effective,spendable_quote_reserve_raw:spendable,fee_bps,buy_input_padding_raw:1}),directions})
     }
@@ -410,7 +410,7 @@ impl Pool{
         };
         Some(PoolLiquidity{model:"raydium_cpmm_directional_v1",revision:0,content_digest:[0;32],
             account_set_digest:self.manifest_digest,execution_accounts:Vec::new(),
-            reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,directions})
+            reserve_curve:None,cpmm_quote:Some(snapshot),orca_quote:None,clmm_quote:None,directions})
     }
     fn clmm_profile(&self)->Option<PoolLiquidity>{
         let State::RaydiumClmm{state,config,arrays,ready,pool_slot,config_slot,clock_slot,..}=&self.state else{return None;};
@@ -443,7 +443,7 @@ impl Pool{
         Some(PoolLiquidity{model:"raydium_clmm_active_segment_v1",revision:0,
             content_digest:[0;32],account_set_digest:self.manifest_digest,
             execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,
-            orca_quote:None,directions})
+            orca_quote:None,clmm_quote:None,directions})
     }
     fn orca_profile(&self)->Option<PoolLiquidity>{
         let State::OrcaWhirlpool{state,oracle,arrays,ready,oracle_slot,clock_slot,pool_slot,..}=&self.state else{return None;};
@@ -498,7 +498,7 @@ impl Pool{
         Some(PoolLiquidity{model:"orca_whirlpool_active_segment_v1",revision:0,
             content_digest:[0;32],account_set_digest:self.manifest_digest,
             execution_accounts:Vec::new(),reserve_curve:None,cpmm_quote:None,
-            orca_quote:Some(snapshot),directions})
+            orca_quote:Some(snapshot),clmm_quote:None,directions})
     }
     fn refresh_liquidity(&mut self)->bool {
         if matches!(self.venue,Venue::Pump|Venue::RaydiumCpmm|Venue::OrcaWhirlpool|Venue::RaydiumClmm) {
