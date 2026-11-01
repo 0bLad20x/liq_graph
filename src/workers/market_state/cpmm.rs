@@ -46,6 +46,41 @@ pub(super) fn marginal(native_price:f64,fees:Fees,mode:u8,creator_enabled:bool,s
     ensure!(first>0.0 && second>0.0,"Raydium CPMM nonpositive fee-adjusted rate");
     Ok([native_price*first,second/native_price])
 }
+/// Frozen, base-input Raydium cp-swap quote for comparison against V10's
+/// actual chosen amount. Based on CurveCalculator::swap_base_input and
+/// ConstantProductCurve::swap_base_input_without_fees. No amount search or veto.
+pub(crate) fn quote_base_input(
+    state:&crate::core::market_state::CpmmQuoteSnapshot,
+    input_mint:&str,output_mint:&str,amount:u64,
+)->std::result::Result<u64,&'static str>{
+    if amount==0{return Err("cpmm_zero_input");}
+    let (rin,rout,fee_on_input)=if input_mint==state.mint_0&&output_mint==state.mint_1 {
+        (state.reserve_0_raw,state.reserve_1_raw,state.creator_fee_on_input_0_to_1)
+    }else if input_mint==state.mint_1&&output_mint==state.mint_0 {
+        (state.reserve_1_raw,state.reserve_0_raw,state.creator_fee_on_input_1_to_0)
+    }else{return Err("cpmm_direction_mismatch")};
+    if rin==0||rout==0{return Err("cpmm_empty_reserves");}
+    let creator=state.creator_fee_rate;
+    let rate=state.trade_fee_rate.checked_add(if fee_on_input{creator}else{0})
+        .ok_or("cpmm_fee_overflow")?;
+    const DEN:u128=1_000_000;
+    if rate as u128>=DEN||creator as u128>=DEN{return Err("cpmm_fee_invalid");}
+    // Raydium takes a single ceil-rounded fee on the combined input rate.
+    let fee=u128::from(amount).checked_mul(u128::from(rate))
+        .ok_or("cpmm_fee_overflow")?.div_ceil(DEN);
+    let net=u128::from(amount).checked_sub(fee).ok_or("cpmm_input_exhausted")?;
+    if net==0{return Err("cpmm_input_exhausted");}
+    let numerator=net.checked_mul(u128::from(rout)).ok_or("cpmm_amount_overflow")?;
+    let denominator=u128::from(rin).checked_add(net).ok_or("cpmm_amount_overflow")?;
+    let gross=numerator/denominator;
+    if gross==0{return Err("cpmm_zero_output");}
+    let creator_output_fee=if fee_on_input{0}else{
+        gross.checked_mul(u128::from(creator)).ok_or("cpmm_fee_overflow")?.div_ceil(DEN)
+    };
+    u64::try_from(gross.checked_sub(creator_output_fee)
+        .ok_or("cpmm_creator_fee_exceeds_output")?).map_err(|_|"cpmm_amount_overflow")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +94,38 @@ mod tests {
         assert!((disabled[0]-2.0*0.9975).abs()<1e-12);
         assert!((disabled[1]-0.5*0.9975).abs()<1e-12);
         assert!(marginal(2.0,fees,1,true,4).is_err());
+    }
+    #[test]
+    fn cp13_fixed_amount_cpmm_calibration_exact_base_input_rounding(){
+        use crate::core::market_state::CpmmQuoteSnapshot;
+        let mut state=CpmmQuoteSnapshot{
+            mint_0:"A".into(),mint_1:"B".into(),reserve_0_raw:1_000_000,
+            reserve_1_raw:2_000_000,trade_fee_rate:2500,creator_fee_rate:1000,
+            creator_fee_on_input_0_to_1:true,creator_fee_on_input_1_to_0:false,
+        };
+        // Input A -> B: ceil(10_000 * 3500 / 1e6)=35, then CPMM floor.
+        let expected=(9965_u128*2_000_000/(1_000_000+9965)) as u64;
+        assert_eq!(quote_base_input(&state,"A","B",10_000).unwrap(),expected);
+        // B -> A: trade fee on input, creator ceil fee on gross output.
+        let gross=(9975_u128*1_000_000/(2_000_000+9975)) as u64;
+        let creator=(u128::from(gross)*1000).div_ceil(1_000_000) as u64;
+        assert_eq!(quote_base_input(&state,"B","A",10_000).unwrap(),gross-creator);
+        state.creator_fee_rate=0;
+        assert_eq!(quote_base_input(&state,"B","A",10_000).unwrap(),gross);
+        assert_eq!(quote_base_input(&state,"A","X",10_000),Err("cpmm_direction_mismatch"));
+        assert_eq!(quote_base_input(&state,"A","B",0),Err("cpmm_zero_input"));
+    }
+    #[test]
+    fn cp13_frozen_cpmm_quote_rounding_boundary(){
+        use crate::core::market_state::CpmmQuoteSnapshot;
+        let state=CpmmQuoteSnapshot{mint_0:"A".into(),mint_1:"B".into(),reserve_0_raw:1_000_000,
+            reserve_1_raw:2_000_000,trade_fee_rate:1000,creator_fee_rate:1000,
+            creator_fee_on_input_0_to_1:false,creator_fee_on_input_1_to_0:true};
+        // Tiny output is rounded away by output-side creator fee.
+        assert_eq!(quote_base_input(&state,"A","B",1).unwrap(),0);
+        // Nonzero input with fee >= input yields Unknown, never a spurious proof.
+        let large_fee=CpmmQuoteSnapshot{trade_fee_rate:999_999,..state};
+        assert_eq!(quote_base_input(&large_fee,"B","A",1),Err("cpmm_fee_invalid"));
     }
     #[test]
     fn cp13_pool_mode_layout_and_config(){
