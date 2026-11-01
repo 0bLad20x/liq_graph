@@ -303,6 +303,7 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
         for v in q.active_input_limit_raw{digest.update(&v.to_le_bytes());}
         digest.update(&[u8::from(q.adaptive_oracle)]);
         for n in q.coverage_ticks{digest.update(&n.to_le_bytes());}
+        for r in &q.covered_ranges{for n in r{digest.update(&n.to_le_bytes());}}
         for t in &q.initialized_ticks{
             digest.update(&t.index.to_le_bytes());digest.update(&t.liquidity_net.to_le_bytes());
         }
@@ -451,7 +452,7 @@ impl Pool{
             sqrt_price_x64:state.sqrt,active_liquidity:state.liquidity,
             tick_current:state.tick,tick_spacing:state.spacing,
             fee_rate:fee,active_input_limit_raw:input_caps,adaptive_oracle:oracle.is_some(),
-            coverage_ticks,initialized_ticks:ticks,
+            coverage_ticks,covered_ranges,initialized_ticks:ticks,
         };
         Some(PoolLiquidity{model:"orca_whirlpool_active_segment_v1",revision:0,
             content_digest:[0;32],account_set_digest:self.manifest_digest,
