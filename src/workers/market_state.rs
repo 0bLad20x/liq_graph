@@ -642,8 +642,17 @@ impl Pool{
         }
         // Token transfer fees have caps/rounding and require an amount. Do not claim
         // these DEX-only estimates represent the final wallet net rate.
-        if token_status.iter().any(|s|*s!="verified_no_standard_transfer_fee") && v.unknown_reason.is_none(){
-            v.unknown_reason=Some("token transfer cost requires amount-specific evaluation".into());
+        if token_status.iter().any(|s|*s!="verified_no_standard_transfer_fee") {
+            if v.unknown_reason.is_none(){
+                v.unknown_reason=Some("token transfer cost requires amount-specific evaluation".into());
+            }
+            // CP15 requires fail-closed: GraphSignals currently treats Unknown
+            // notional as advisory, so a positive CLMM rate MUST NOT survive
+            // an unresolved Token-2022 transfer charge.
+            if self.venue==Venue::RaydiumClmm {
+                v.estimated_net_rates=[None;2];
+                v.dex_fee_rates=[None;2];
+            }
         }
         Some(v)
     }
