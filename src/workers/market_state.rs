@@ -1143,7 +1143,14 @@ impl Engine{
                 for address in array_keys.iter(){
                     let account=dict.get(address).context("Prepared Raydium CLMM TickArray missing")?;
                     ensure!(account.owner==RAYDIUM_CLMM_PROGRAM,"Raydium CLMM TickArray owner mismatch");
-                    arrays.push(raydium_clmm::tick_array(&account.data,watch.address.parse()?,clmm_state.spacing)?);
+                    let parsed=raydium_clmm::tick_array(&account.data,watch.address.parse()?,clmm_state.spacing)?;
+                    let pool_id:Pubkey=watch.address.parse()?;
+                    let program:Pubkey=RAYDIUM_CLMM_PROGRAM.parse()?;
+                    let expected=Pubkey::find_program_address(
+                        &[b"tick_array",pool_id.as_ref(),&parsed.start.to_be_bytes()],&program).0;
+                    ensure!(expected==address.parse::<Pubkey>()?,
+                        "Prepared CLMM TickArray PDA/start mismatch");
+                    arrays.push(parsed);
                 }
                 if clmm_state.dynamic.is_some(){
                     *clock_slot=dict.get("SysvarC1ock11111111111111111111111111111111")
@@ -1493,7 +1500,9 @@ impl Engine{
             (State::RaydiumClmm{state,arrays,..},Field::RaydiumClmmArray(i))=>{
                 let index=usize::from(i);
                 let target=arrays.get_mut(index).context("CLMM TickArray watch index invalid")?;
-                *target=raydium_clmm::tick_array(data,pool.key,state.spacing)?;
+                let next=raydium_clmm::tick_array(data,pool.key,state.spacing)?;
+                ensure!(next.start==target.start,"CLMM watched TickArray changed its start");
+                *target=next;
             },
             (State::DammV2{sqrt},Field::DammSqrt)|
             (State::PancakeSwapClmm{sqrt},Field::PancakeSwapClmmSqrt)|
