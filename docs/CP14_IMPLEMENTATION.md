@@ -78,3 +78,40 @@ Compare against CP14 600-second baseline `20261101T070830054Z`:
 - **Health:** 0 lost market/signal events, ws_gap count and recovery, no unexpected V10 Orca account failure, end-to-end P50/P95/P99 and output trace match
 
 A provider disconnect is not fixed by any of these three protocol-code patches; compare the gap count but do not call a provider gap a regression in Orca arithmetic. Five-minute samples are not time-normalized with the 600-second baseline. Do not merge until the live artifacts have been analyzed and the user approves.
+
+## CP14 post-review observability and reference correction
+
+- The independent reference joins detailed simulations to compact calibration records
+  using **request ID + payload SHA-256 + simulation context slot**. A single
+  payload may be simulated several times with differing bank/observation state;
+  hash-only joins were incorrect. Repeated-payload regression coverage is in
+  `scripts/test_cp14_orca_reference.py`. The verifier fails the run if any
+  detailed report has no unique compact counterpart.
+- At runtime closeout the authoritative PoolRegistry emits
+  `registry_tvl.orca_direction_admission` into `summary.json`, covering
+  `prepared_both`, `prepared_a_to_b_only`, `prepared_b_to_a_only`,
+  `prepared_unclassified`, `incomplete_neither` and selected/priced
+  per-direction cohorts. These represent **currently admitted unique pools in
+  the final registry snapshot**, not total historical Completion attempts.
+  The CP14 wrapper checks the category sum against `prepared_admitted` and
+  also writes `cp14_orca_directions.json` for convenient inspection.
+- Redundant CP14 CI invocation and unused Orca constants were removed.
+  The narrow integer reference remains single-interval only; none of these
+  diagnostic tools changes V10 sizing or Graph/Signal logic.
+
+### Required final operator acceptance: 600 seconds
+
+```powershell
+Set-Location C:\dev_projects\liq_graph
+git fetch origin
+git switch cp14-orca-whirlpool-direct2
+git pull --ff-only origin cp14-orca-whirlpool-direct2
+.\scripts\cp14_orca_live.ps1 -DurationSeconds 600
+```
+
+Compare the full artifact ZIP with the earlier CP14 300-second and 600-second
+samples. Check the direction cohorts, unclassified count, reference unique
+join count (must be zero), complete Orca legs, unknown quote reasons, Clock
+deferrals, WS/signal losses and Orca-specific V10 errors. Do not conflate
+different durations or assume a non-atomic snapshot matches the execution
+bank. **Do not merge before the 600-second operator ZIP has been reviewed.**
