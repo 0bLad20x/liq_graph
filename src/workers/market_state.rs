@@ -628,13 +628,13 @@ impl Pool{
         }
     }
 }
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmConfig,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,OrcaOracle,OrcaArray(u8),PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumClmmConfig,RaydiumClmmArray(u8),RaydiumCpmmConfig,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,OrcaOracle,OrcaArray(u8),PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
 impl Field{
-    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook|Self::RaydiumCpmmConfig|Self::OrcaWhirlpoolSqrt|Self::OrcaOracle|Self::OrcaArray(_))}
+    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook|Self::RaydiumCpmmConfig|Self::RaydiumClmmSqrt|Self::RaydiumClmmConfig|Self::RaydiumClmmArray(_)|Self::OrcaWhirlpoolSqrt|Self::OrcaOracle|Self::OrcaArray(_))}
 
     fn label(self)->&'static str{match self{Self::Clock=>"chain_clock",Self::PumpGlobal=>"pump_global_fees",Self::PumpFees=>"pump_fee_config",Self::PumpSupply=>"pump_base_supply",Self::Dlmm=>"dlmm_lbpair",Self::DlmmArray(_)=>"dlmm_bin_array",Self::DlmmBitmap=>"dlmm_bitmap",Self::VirtualQuote=>"pump_pool",Self::BaseVault=>"pump_base_vault",Self::QuoteVault=>"pump_quote_vault",Self::DammSqrt=>"damm_v2_pool",Self::RaydiumV4Pnl=>"raydium_v4_pool_pnl",
         Self::RaydiumV4BaseVault=>"raydium_v4_base_vault",Self::RaydiumV4QuoteVault=>"raydium_v4_quote_vault",
-        Self::RaydiumClmmSqrt=>"raydium_clmm_pool",
+        Self::RaydiumClmmSqrt=>"raydium_clmm_pool",Self::RaydiumClmmConfig=>"raydium_clmm_amm_config",Self::RaydiumClmmArray(_)=>"raydium_clmm_tick_array",
         Self::RaydiumCpmmConfig=>"raydium_cpmm_amm_config",Self::RaydiumCpmmFees=>"raydium_cpmm_pool_fees",Self::RaydiumCpmmBaseVault=>"raydium_cpmm_base_vault",
         Self::RaydiumCpmmQuoteVault=>"raydium_cpmm_quote_vault",
         Self::OrcaWhirlpoolSqrt=>"orca_whirlpool_pool",Self::OrcaOracle=>"orca_adaptive_oracle",Self::OrcaArray(_)=>"orca_tick_array",
@@ -642,7 +642,7 @@ impl Field{
         Self::ByrealClmmSqrt=>"byreal_clmm_pool"}}
     fn slice(self)->(usize,usize){match self{Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::RaydiumCpmmConfig=>(0,0),Self::BaseVault|Self::QuoteVault=>(64,8),Self::DammSqrt=>(DAMM_SQRT_OFFSET,16),Self::RaydiumV4Pnl=>(192,16),
         Self::RaydiumV4BaseVault|Self::RaydiumV4QuoteVault=>(64,8),
-        Self::RaydiumClmmSqrt=>(RAYDIUM_CLMM_SQRT_OFFSET,16),
+        Self::RaydiumClmmSqrt|Self::RaydiumClmmConfig|Self::RaydiumClmmArray(_)=>(0,0),
         Self::RaydiumCpmmFees=>(RAYDIUM_CPMM_FEES_OFFSET,RAYDIUM_CPMM_FEES_LEN),
         Self::RaydiumCpmmBaseVault|Self::RaydiumCpmmQuoteVault=>(64,8),
         Self::OrcaWhirlpoolSqrt|Self::OrcaOracle|Self::OrcaArray(_)=>(0,0),
@@ -915,12 +915,21 @@ impl Engine{
                     (key(&acc.data,168)?,key(&acc.data,200)?,State::DammV2{sqrt:u128_le(&acc.data,DAMM_SQRT_OFFSET)?})
                 },
                 Venue::RaydiumClmm=>{
-                    ensure!(acc.owner==RAYDIUM_CLMM_PROGRAM && acc.data.starts_with(&RAYDIUM_CLMM_DISC),
-                        "{} not a Raydium CLMM PoolState",watch.address);
-                    ensure!(acc.data.len()>=RAYDIUM_CLMM_SQRT_OFFSET+16,
-                        "Raydium CLMM account too short {}: {} bytes",watch.address,acc.data.len());
+                    ensure!(acc.owner==RAYDIUM_CLMM_PROGRAM,"Raydium CLMM program owner mismatch");
+                    let state=raydium_clmm::pool(&acc.data)?;
+                    let config=watch.clmm_config.context("Prepared Raydium CLMM config missing")?;
+                    ensure!(state.config==config,"Raydium CLMM config changed since Completion");
+                    let config_key=config.to_string();
+                    details.push(config_key.clone());
+                    let mut array_keys=watch.clmm_arrays.iter().flatten().map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    array_keys.sort();array_keys.dedup();
+                    details.extend(array_keys.iter().cloned());
+                    if state.dynamic.is_some(){details.push("SysvarC1ock11111111111111111111111111111111".into());}
                     (key(&acc.data,73)?,key(&acc.data,105)?,
-                        State::RaydiumClmm{sqrt:u128_le(&acc.data,RAYDIUM_CLMM_SQRT_OFFSET)?})
+                        State::RaydiumClmm{state,config_key,config:None,
+                            ready:watch.clmm_ready,pool_slot,config_slot:0,clock_slot:0,
+                            array_keys,arrays:Vec::new(),liquidity:None})
                 },
                 Venue::PancakeSwapClmm=>{
                     ensure!(acc.owner==PANCAKESWAP_CLMM_PROGRAM && acc.data.starts_with(&PANCAKESWAP_CLMM_DISC),
@@ -1044,6 +1053,22 @@ impl Engine{
                 *fees=Some(cpmm::config(&cfg.data,&cfg.owner,RAYDIUM_CPMM_PROGRAM)?);
                 *config_slot=cfg.slot;
             }
+            if let State::RaydiumClmm{state:clmm_state,config,config_key,config_slot,clock_slot,
+                array_keys,arrays,..}=&mut state {
+                let account=dict.get(config_key).context("CLMM AmmConfig baseline missing")?;
+                ensure!(account.owner==RAYDIUM_CLMM_PROGRAM,"Raydium CLMM AmmConfig owner mismatch");
+                *config=Some(raydium_clmm::config(&account.data)?);
+                *config_slot=account.slot;
+                for address in array_keys.iter(){
+                    let account=dict.get(address).context("Prepared Raydium CLMM TickArray missing")?;
+                    ensure!(account.owner==RAYDIUM_CLMM_PROGRAM,"Raydium CLMM TickArray owner mismatch");
+                    arrays.push(raydium_clmm::tick_array(&account.data,watch.address.parse()?,clmm_state.spacing)?);
+                }
+                if clmm_state.dynamic.is_some(){
+                    *clock_slot=dict.get("SysvarC1ock11111111111111111111111111111111")
+                        .context("CLMM dynamic Clock missing")?.slot;
+                }
+            }
             if let State::OrcaWhirlpool{state:pool_state,oracle,oracle_key,oracle_slot,clock_slot,array_keys,arrays,..}=&mut state{
                 if watch.orca_adaptive{
                     let item=dict.get(oracle_key).context("Prepared Orca adaptive Oracle unavailable")?;
@@ -1073,7 +1098,8 @@ impl Engine{
             let mint_states=[mints.mint(a.parse()?).and_then(|m|m.onchain),mints.mint(b.parse()?).and_then(|m|m.onchain)];
             let pool=Pool{key:watch.address.parse()?,ready:false,id:watch.address.clone(),venue:watch.venue,a,b,da,db,
                 canon_base:canon_base.clone(),canon_quote:canon_quote.clone(),state,
-                clock:if watch.venue==Venue::OrcaWhirlpool && watch.orca_adaptive {
+                clock:if (watch.venue==Venue::OrcaWhirlpool && watch.orca_adaptive)
+                    || matches!(&state,State::RaydiumClmm{state:raydium_clmm::Pool{dynamic:Some(_),..},..}) {
                     let c=dict.get("SysvarC1ock11111111111111111111111111111111")
                         .context("Orca chain Clock unavailable")?;
                     i64::from_le_bytes(bytes(&c.data,32,8)?.try_into()?)
@@ -1082,6 +1108,21 @@ impl Engine{
             };
             let pool_field=match watch.venue{Venue::Dlmm=>Field::Dlmm,Venue::Pump=>Field::VirtualQuote,Venue::DammV2=>Field::DammSqrt,Venue::RaydiumAmmV4=>Field::RaydiumV4Pnl,Venue::RaydiumClmm=>Field::RaydiumClmmSqrt,Venue::RaydiumCpmm=>Field::RaydiumCpmmFees,Venue::OrcaWhirlpool=>Field::OrcaWhirlpoolSqrt,Venue::PancakeSwapClmm=>Field::PancakeSwapClmmSqrt,Venue::Manifest=>Field::ManifestBook,Venue::ByrealClmm=>Field::ByrealClmmSqrt};
             subs.push(Subscription{pool:idx,field:pool_field,address:watch.address.clone(),key:watch.address.parse()?,owner:pool_records[idx].owner.parse()?,slot:pool_slot,received_us:pool_records[idx].received_us,floor:Some(pool_slot),valid:true});
+            if let State::RaydiumClmm{state,config_key,array_keys,..}=&pool.state{
+                let mut deps=vec![(Field::RaydiumClmmConfig,config_key.clone())];
+                for (i,address) in array_keys.iter().enumerate(){
+                    deps.push((Field::RaydiumClmmArray(i as u8),address.clone()));
+                }
+                if state.dynamic.is_some(){
+                    deps.push((Field::Clock,"SysvarC1ock11111111111111111111111111111111".into()));
+                }
+                for (field,address) in deps {
+                    let account=dict.get(&address).context("CLMM dependency baseline unavailable")?;
+                    subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,
+                        owner:account.owner.parse()?,slot:account.slot,received_us:account.received_us,
+                        floor:Some(account.slot),valid:true});
+                }
+            }
             if let State::OrcaWhirlpool{oracle_key,..}=&pool.state{
                 let mut deps=Vec::new();
                 if watch.orca_adaptive{
@@ -1332,6 +1373,7 @@ impl Engine{
             },
             (_,Field::Clock)=>{ensure!(data.len()==40,"invalid chain Clock length");pool.clock=i64::from_le_bytes(bytes(data,32,8)?.try_into()?);pool.epoch=u64_le(data,16)?;
                 if let State::OrcaWhirlpool{clock_slot,..}=&mut pool.state{*clock_slot=slot;}
+                if let State::RaydiumClmm{clock_slot,..}=&mut pool.state{*clock_slot=slot;}
             },
             (State::Pump{global,..},Field::PumpGlobal)=>{if let Some(fees::Shared::Global(value))=shared{*global=Some(value);}},
             (State::Pump{config,..},Field::PumpFees)=>{if let Some(fees::Shared::Config(value))=shared{*config=Some(value);}},
@@ -1358,9 +1400,18 @@ impl Engine{
             (State::RaydiumClmm{state,pool_slot,..},Field::RaydiumClmmSqrt)=>{
                 let next=raydium_clmm::pool(data)?;
                 ensure!(key(data,73)?==pool.a&&key(data,105)?==pool.b,"Raydium CLMM mint identity changed");
-                // Structure changes invalidate old manifest/watch set and must reprepare.
-                ensure!(next.config==state.config,"CLMM config changed; completion refresh required");
+                ensure!(next.config==state.config && next.spacing==state.spacing
+                    && next.dynamic.is_some()==state.dynamic.is_some(),
+                    "CLMM structure or fee regime changed; Completion refresh required");
                 *state=next;*pool_slot=slot;
+            },
+            (State::RaydiumClmm{config,config_slot,..},Field::RaydiumClmmConfig)=>{
+                *config=Some(raydium_clmm::config(data)?);*config_slot=slot;
+            },
+            (State::RaydiumClmm{state,arrays,..},Field::RaydiumClmmArray(i))=>{
+                let index=usize::from(i);
+                let target=arrays.get_mut(index).context("CLMM TickArray watch index invalid")?;
+                *target=raydium_clmm::tick_array(data,pool.key,state.spacing)?;
             },
             (State::DammV2{sqrt},Field::DammSqrt)|
             (State::PancakeSwapClmm{sqrt},Field::PancakeSwapClmmSqrt)|
