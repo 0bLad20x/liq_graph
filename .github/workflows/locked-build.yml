@@ -47,7 +47,7 @@ jobs:
       - name: CP13 Raydium CPMM directed fee and layout regression tests
         run: cargo test --locked --release cp13_
       - name: Live utility Python syntax only
-        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py')]"
+        run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py','scripts/cp13_calibration_check.py')]"
       - name: Live utility PowerShell syntax only
         shell: pwsh
         run: |
