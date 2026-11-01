@@ -100,6 +100,16 @@ fn level_summary<S:serde::Serializer>(levels:&[LiquidityLevel],serializer:S)->Re
 fn decimal_u128<S:serde::Serializer>(value:&u128,serializer:S)->Result<S::Ok,S::Error> {
     serializer.serialize_str(&value.to_string())
 }
+/// Frozen CPMM diagnostic state. Used only to predict output at V10's chosen
+/// input size; never consulted by Direct2 signals or candidate exclusion.
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct CpmmQuoteSnapshot {
+    pub mint_0:String,
+    pub reserve_0_raw:u64,pub reserve_1_raw:u64,
+    pub trade_fee_rate:u64,pub creator_fee_rate:u64,
+    pub creator_fee_on_input_0_to_1:bool,
+    pub creator_fee_on_input_1_to_0:bool,
+}
 /// Reserve curve facts, not a protocol decoder or quoting implementation.
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct ReserveCurve {
@@ -119,6 +129,7 @@ pub struct PoolLiquidity {
     pub execution_accounts:Vec<String>,
     /// None uses the exact directed levels; Some describes a reserve curve.
     pub reserve_curve:Option<ReserveCurve>,
+    pub cpmm_quote:Option<CpmmQuoteSnapshot>,
     /// Canonical base->quote / quote->base, like FeeValuation.
     pub directions:[DirectedLiquidity;2],
 }
