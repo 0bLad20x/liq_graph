@@ -166,6 +166,42 @@ pub(super) fn active_window(p:Pool,arrays:&[TickArray],fee_rate:u32,down:bool)
         ||input>u64::MAX as f64||output>u64::MAX as f64{return None;}
     Some((input.floor() as u64,output.floor() as u64))
 }
+/// Bounded diagnostic prediction at the amount chosen by V10.
+/// The canonical reference script uses exact integers. This fast model is
+/// deliberately advisory; tick/fee-group/limit-order crossings return Unknown.
+pub(super) fn quote(s:&crate::core::market_state::ClmmQuoteSnapshot,
+    input:&str,output:&str,amount:u64)->std::result::Result<u64,&'static str>{
+    let native=if input==s.mint_0&&output==s.mint_1{0}
+        else if input==s.mint_1&&output==s.mint_0{1}
+        else{return Err("clmm_direction_mismatch")};
+    if amount==0{return Err("clmm_empty_or_dust");}
+    if s.active_input_limit_raw[native]==0||amount>s.active_input_limit_raw[native]{
+        return Err("clmm_outside_observed_active_interval");
+    }
+    if s.fee_rate>=1_000_000||s.active_liquidity==0||s.sqrt_price_x64==0{
+        return Err("clmm_invalid_frozen_state");
+    }
+    let fee_on_input=fee_on_input(s.fee_on,native==0).map_err(|_|"clmm_invalid_fee_on")?;
+    let gross=amount as f64;
+    let fee=s.fee_rate as f64/DEN;
+    let net_input=if fee_on_input{(gross*(1.0-fee)).floor()}else{gross};
+    let (liquidity,sqrt)=(s.active_liquidity as f64,s.sqrt_price_x64 as f64/Q64);
+    if net_input<=0.0||sqrt<=0.0||liquidity<=0.0{return Err("clmm_empty_or_dust");}
+    let next=if native==0{liquidity*sqrt/(liquidity+net_input*sqrt)}
+        else{sqrt+net_input/liquidity};
+    let gross_out=if native==0{liquidity*(sqrt-next)}
+        else{liquidity*(1.0/sqrt-1.0/next)};
+    if !gross_out.is_finite()||gross_out<1.0||gross_out>u64::MAX as f64{
+        return Err("clmm_amount_unrepresentable");
+    }
+    let raw=gross_out.floor() as u64;
+    let net=if fee_on_input{raw}else{
+        let fee_raw=(u128::from(raw)*u128::from(s.fee_rate)).div_ceil(1_000_000);
+        raw.checked_sub(u64::try_from(fee_raw).map_err(|_|"clmm_fee_overflow")?)
+            .ok_or("clmm_output_fee_exceeds_output")?
+    };
+    if net==0{Err("clmm_empty_or_dust")}else{Ok(net)}
+}
 #[cfg(test)]
 mod tests{
     use super::*;
