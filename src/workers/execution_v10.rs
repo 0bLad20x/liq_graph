@@ -183,6 +183,8 @@ fn block<'a>(pool: &'a ExecutionPool, quote: Pubkey, x: Pubkey, wallet: Pubkey)
     if accounts.first().is_some_and(|m|m.address==*RAYDIUM_CLMM_KEY){
         let has_memo=accounts.get(2).is_some_and(|m|m.address==*RAYDIUM_MEMO_KEY);
         let offset=if has_memo{3}else{2};
+        ensure!(has_memo==pool.mints.iter().any(|p|p.token_2022),
+            "Raydium CLMM Token-2022 Memo presence disagrees with mint proof");
         // program, quote, [Memo], pool, config, observation, bitmap,
         // input vault, output vault, >=1 initialized execution TickArray.
         ensure!((offset+7..=24).contains(&accounts.len()),
@@ -896,5 +898,64 @@ mod cp14_one_sided_tests {
         assert!(block(&execution,a,b,wallet).is_err());
         assert_eq!(block(&execution,b,a,wallet).unwrap().len(),8);
         base_a.push(AccountMeta{address:Pubkey::new_from_array([25;32]),writable:true});
+    }
+}
+
+#[cfg(test)]
+mod cp15_clmm_v10_tests {
+    use super::*;
+    use crate::core::{ExecutionManifest,MintProof};
+    fn sample(token_2022:bool,with_tick:bool)->ExecutionPool{
+        let a=Pubkey::new_from_array([61;32]);
+        let b=Pubkey::new_from_array([62;32]);
+        let pool=Pubkey::new_from_array([63;32]);
+        let ro=|address|AccountMeta{address,writable:false};
+        let rw=|address|AccountMeta{address,writable:true};
+        let mut base=vec![ro(*RAYDIUM_CLMM_KEY),ro(a)];
+        if token_2022{base.push(ro(*RAYDIUM_MEMO_KEY));}
+        base.extend([
+            rw(pool),ro(Pubkey::new_from_array([64;32])),
+            rw(Pubkey::new_from_array([65;32])),rw(Pubkey::new_from_array([66;32])),
+            rw(Pubkey::new_from_array([67;32])),rw(Pubkey::new_from_array([68;32])),
+        ]);
+        if with_tick{base.push(rw(Pubkey::new_from_array([69;32])));}
+        let mut other=base.clone();other[1].address=b;
+        ExecutionPool{
+            manifest:Arc::new(ExecutionManifest{pool,mint_a:a,mint_b:b,
+                validated_slot:42,bound_signer:None,
+                base_a:Arc::from(base),base_b:Arc::from(other)}),
+            mints:[
+                MintProof{address:a,token_2022,extensions:vec![],unsupported:vec![]},
+                MintProof{address:b,token_2022:false,extensions:vec![],unsupported:vec![]}
+            ]
+        }
+    }
+    #[test]
+    fn cp15_clmm_rejects_missing_initial_array_for_legacy_and_token2022(){
+        let a=Pubkey::new_from_array([61;32]);
+        let b=Pubkey::new_from_array([62;32]);
+        let wallet=Pubkey::new_from_array([99;32]);
+        for token_2022 in [false,true]{
+            assert!(block(&sample(token_2022,false),a,b,wallet).is_err());
+            assert!(block(&sample(token_2022,true),a,b,wallet).is_ok());
+        }
+    }
+    #[test]
+    fn cp15_clmm_rejects_invalid_writable_tick_and_missing_memo(){
+        let a=Pubkey::new_from_array([61;32]);
+        let b=Pubkey::new_from_array([62;32]);
+        let wallet=Pubkey::new_from_array([99;32]);
+        let mut p=sample(false,true);
+        let manifest=Arc::make_mut(&mut p.manifest);
+        let mut base=manifest.base_a.to_vec();
+        base.last_mut().unwrap().writable=false;
+        manifest.base_a=Arc::from(base);
+        assert!(block(&p,a,b,wallet).is_err());
+        let mut p=sample(true,true);
+        let manifest=Arc::make_mut(&mut p.manifest);
+        let mut base=manifest.base_a.to_vec();
+        base.remove(2);
+        manifest.base_a=Arc::from(base);
+        assert!(block(&p,a,b,wallet).is_err());
     }
 }
