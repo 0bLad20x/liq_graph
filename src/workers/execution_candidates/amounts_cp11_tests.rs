@@ -43,7 +43,7 @@ fn pool(id:u8,kind:u8,levels:usize,coverage:&'static str,fee_verified:bool)->Arc
     })}else{None};
     let liquidity=Arc::new(PoolLiquidity{
         model:"test",revision:1,content_digest:[id;32],account_set_digest:[id;32],
-        execution_accounts:Vec::new(),reserve_curve,cpmm_quote:None,orca_quote:None,
+        execution_accounts:Vec::new(),reserve_curve,cpmm_quote:None,orca_quote:None,clmm_quote:None,
         directions:[directed(0),directed(1)],
     });
     Arc::new(PoolPriceObservation{
