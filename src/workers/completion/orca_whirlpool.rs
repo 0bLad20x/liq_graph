@@ -525,3 +525,24 @@ pub async fn run(mut input:mpsc::Receiver<CompletionRequestBatch>,
     crate::log_event!(Info,"orca executor complete requests={processed}");
     Ok(())
 }
+
+#[cfg(test)]
+mod cp14_tests {
+    use super::*;
+    #[test]
+    fn cp14_v10_oracle_writable_and_directional_tick_array_order(){
+        let pk=|n:u8|Pubkey::new_from_array([n;32]);
+        let l=Layout{pool:pk(1),mint_a:pk(2),mint_b:pk(3),
+            vault_a:pk(4),vault_b:pk(5),tick_spacing:64,tick_current:0};
+        let m=make_manifest(l,100,&[pk(6),pk(7)],&[pk(8)],pk(9));
+        for leg in [&m.base_a,&m.base_b]{
+            assert!(leg[4].writable,"Adaptive Orca requires writable Oracle account");
+            assert_eq!(leg[3].address,l.pool);
+            assert!(leg.iter().skip(7).all(|a|a.writable));
+        }
+        assert_eq!(m.base_a[7].address,pk(6));
+        assert_eq!(m.base_b[7].address,pk(8));
+        assert_eq!(m.base_a[5].address,pk(5));
+        assert_eq!(m.base_b[5].address,pk(4));
+    }
+}
