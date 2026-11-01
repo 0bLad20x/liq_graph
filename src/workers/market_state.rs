@@ -530,19 +530,19 @@ impl Pool{
         }
     }
 }
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum Field{Clock,PumpGlobal,PumpFees,PumpSupply,Dlmm,DlmmArray(u8),DlmmBitmap,VirtualQuote,BaseVault,QuoteVault,DammSqrt,RaydiumV4Pnl,RaydiumV4BaseVault,RaydiumV4QuoteVault,RaydiumClmmSqrt,RaydiumCpmmConfig,RaydiumCpmmFees,RaydiumCpmmBaseVault,RaydiumCpmmQuoteVault,OrcaWhirlpoolSqrt,PancakeSwapClmmSqrt,ManifestBook,ByrealClmmSqrt}
 impl Field{
-    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook)}
+    fn full(self)->bool{matches!(self,Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::ManifestBook|Self::RaydiumCpmmConfig)}
 
     fn label(self)->&'static str{match self{Self::Clock=>"chain_clock",Self::PumpGlobal=>"pump_global_fees",Self::PumpFees=>"pump_fee_config",Self::PumpSupply=>"pump_base_supply",Self::Dlmm=>"dlmm_lbpair",Self::DlmmArray(_)=>"dlmm_bin_array",Self::DlmmBitmap=>"dlmm_bitmap",Self::VirtualQuote=>"pump_pool",Self::BaseVault=>"pump_base_vault",Self::QuoteVault=>"pump_quote_vault",Self::DammSqrt=>"damm_v2_pool",Self::RaydiumV4Pnl=>"raydium_v4_pool_pnl",
         Self::RaydiumV4BaseVault=>"raydium_v4_base_vault",Self::RaydiumV4QuoteVault=>"raydium_v4_quote_vault",
         Self::RaydiumClmmSqrt=>"raydium_clmm_pool",
-        Self::RaydiumCpmmFees=>"raydium_cpmm_pool_fees",Self::RaydiumCpmmBaseVault=>"raydium_cpmm_base_vault",
+        Self::RaydiumCpmmConfig=>"raydium_cpmm_amm_config",Self::RaydiumCpmmFees=>"raydium_cpmm_pool_fees",Self::RaydiumCpmmBaseVault=>"raydium_cpmm_base_vault",
         Self::RaydiumCpmmQuoteVault=>"raydium_cpmm_quote_vault",
         Self::OrcaWhirlpoolSqrt=>"orca_whirlpool_pool",
         Self::PancakeSwapClmmSqrt=>"pancakeswap_clmm_pool",Self::ManifestBook=>"manifest_market_book",
         Self::ByrealClmmSqrt=>"byreal_clmm_pool"}}
-    fn slice(self)->(usize,usize){match self{Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply=>(0,0),Self::BaseVault|Self::QuoteVault=>(64,8),Self::DammSqrt=>(DAMM_SQRT_OFFSET,16),Self::RaydiumV4Pnl=>(192,16),
+    fn slice(self)->(usize,usize){match self{Self::Dlmm|Self::DlmmArray(_)|Self::DlmmBitmap|Self::VirtualQuote|Self::Clock|Self::PumpGlobal|Self::PumpFees|Self::PumpSupply|Self::RaydiumCpmmConfig=>(0,0),Self::BaseVault|Self::QuoteVault=>(64,8),Self::DammSqrt=>(DAMM_SQRT_OFFSET,16),Self::RaydiumV4Pnl=>(192,16),
         Self::RaydiumV4BaseVault|Self::RaydiumV4QuoteVault=>(64,8),
         Self::RaydiumClmmSqrt=>(RAYDIUM_CLMM_SQRT_OFFSET,16),
         Self::RaydiumCpmmFees=>(RAYDIUM_CPMM_FEES_OFFSET,RAYDIUM_CPMM_FEES_LEN),
@@ -855,10 +855,13 @@ impl Engine{
                         "{} Raydium CPMM account length {} != {}",watch.address,acc.data.len(),RAYDIUM_CPMM_ACCOUNT_LEN);
                     let a=key(&acc.data,168)?;let b=key(&acc.data,200)?;
                     let base_vault=key(&acc.data,72)?;let quote_vault=key(&acc.data,104)?;
-                    details.push(base_vault.clone());details.push(quote_vault.clone());
-                    let (fee0,fee1)=cpmm_fee_balances(&acc.data,RAYDIUM_CPMM_FEES_OFFSET)?;
-                    (a,b,State::RaydiumCpmm{base:0,quote:0,fee0,fee1,base_vault,quote_vault,
-                        pool_slot,base_slot:pool_slot,quote_slot:pool_slot})
+                    let config=key(&acc.data,8)?;
+                    details.push(base_vault.clone());details.push(quote_vault.clone());details.push(config.clone());
+                    let (fee0,fee1)=cpmm_fee_balances(&acc.data,RAYDIUM_CPMM_FEES_OFFSET+12)?;
+                    let (status,creator_mode,creator_enabled)=cpmm::pool_flags(&acc.data,RAYDIUM_CPMM_FEES_OFFSET)?;
+                    (a,b,State::RaydiumCpmm{base:0,quote:0,fee0,fee1,base_vault,quote_vault,config,
+                        fees:None,creator_mode,creator_enabled,status,liquidity:None,
+                        pool_slot,base_slot:pool_slot,quote_slot:pool_slot,config_slot:pool_slot})
                 },
                 Venue::Manifest=>{
                     ensure!(acc.owner==MANIFEST_PROGRAM,"{} owner is not Manifest",watch.address);
@@ -925,11 +928,14 @@ impl Engine{
                 *base_slot=dict.get(base_vault).context("base vault slot missing")?.slot;
                 *quote_slot=dict.get(quote_vault).context("quote vault slot missing")?.slot;
             }
-            if let State::RaydiumCpmm{base,quote,base_vault,quote_vault,base_slot,quote_slot,..}=&mut state {
+            if let State::RaydiumCpmm{base,quote,base_vault,quote_vault,config,fees,base_slot,quote_slot,config_slot,..}=&mut state {
                 *base=vault_amount(dict.get(base_vault).context("CPMM base vault missing")?,&a)?;
                 *quote=vault_amount(dict.get(quote_vault).context("CPMM quote vault missing")?,&b)?;
                 *base_slot=dict.get(base_vault).context("base vault slot missing")?.slot;
                 *quote_slot=dict.get(quote_vault).context("quote vault slot missing")?.slot;
+                let cfg=dict.get(config).context("CPMM config missing")?;
+                *fees=Some(cpmm::config(&cfg.data,&cfg.owner,RAYDIUM_CPMM_PROGRAM)?);
+                *config_slot=cfg.slot;
             }
             let (canon_base,canon_quote)=canonical(&a,&b);
             // Single-account prices belong to the pool account slot, not to the
@@ -955,9 +961,9 @@ impl Engine{
                     subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
                 }
             }
-            if let State::RaydiumCpmm{base_vault,quote_vault,..}=&pool.state {
+            if let State::RaydiumCpmm{base_vault,quote_vault,config,..}=&pool.state {
                 for (field,address) in [(Field::RaydiumCpmmBaseVault,base_vault),
-                    (Field::RaydiumCpmmQuoteVault,quote_vault)] {
+                    (Field::RaydiumCpmmQuoteVault,quote_vault),(Field::RaydiumCpmmConfig,config)] {
                     let acc=dict.get(address).context("Raydium CPMM vault missing")?;
                     subs.push(Subscription{pool:idx,field,address:address.clone(),key:address.parse()?,owner:acc.owner.parse()?,slot:acc.slot,received_us:acc.received_us,floor:Some(acc.slot),valid:true});
                 }
@@ -974,7 +980,7 @@ impl Engine{
         self.sequence
     }
     fn publish_price(&mut self,pi:usize,origin:PriceOrigin,previous:Option<f64>,field:Option<Field>,mut pipeline:Option<PricePipelineTiming>) {
-        if self.pools[pi].venue==Venue::Pump {
+        if matches!(self.pools[pi].venue,Venue::Pump|Venue::RaydiumCpmm) {
             let started=Instant::now();self.pools[pi].refresh_liquidity();
             self.metrics.reserve_curve_build.add(nanos(started));
         }
@@ -1204,9 +1210,14 @@ impl Engine{
             (State::RaydiumAmmV4{quote,quote_slot,..},Field::RaydiumV4QuoteVault)=>{
                 *quote=u64_le(data,0)?;*quote_slot=slot;
             },
-            (State::RaydiumCpmm{fee0,fee1,pool_slot,..},Field::RaydiumCpmmFees)=>{
-                let (next0,next1)=cpmm_fee_balances(data,0)?;
-                *fee0=next0;*fee1=next1;*pool_slot=slot;
+            (State::RaydiumCpmm{fee0,fee1,pool_slot,status,creator_mode,creator_enabled,..},Field::RaydiumCpmmFees)=>{
+                let (next0,next1)=cpmm_fee_balances(data,12)?;
+                let (s,m,e)=cpmm::pool_flags(data,0)?;
+                *fee0=next0;*fee1=next1;*status=s;*creator_mode=m;*creator_enabled=e;*pool_slot=slot;
+            },
+            (State::RaydiumCpmm{fees,config_slot,..},Field::RaydiumCpmmConfig)=>{
+                *fees=Some(cpmm::config(data,&owner.to_string(),RAYDIUM_CPMM_PROGRAM)?);
+                *config_slot=slot;
             },
             (State::RaydiumCpmm{base,base_slot,..},Field::RaydiumCpmmBaseVault)=>{
                 *base=u64_le(data,0)?;*base_slot=slot;
@@ -1316,7 +1327,7 @@ fn reconcile(registry:&PoolRegistry,candidates:&mut HashMap<Pubkey,PoolInput>,ad
 }
 fn watch_cost(p:&PoolInput)->usize {
     match p.venue {CoreVenue::MeteoraDlmm=>p.dlmm.map_or(8,|d|d.account_cost()),
-        CoreVenue::PumpSwap=>4,CoreVenue::RaydiumAmmV4|CoreVenue::RaydiumCpmm=>3,_=>1}
+        CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm=>4,CoreVenue::RaydiumAmmV4=>3,_=>1}
 }
 fn route_kind(t:&super::graph_liquidity::RouteTopology)->usize{
     use super::graph_liquidity::RouteTopologyKind as K;
