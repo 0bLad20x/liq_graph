@@ -173,30 +173,94 @@ pub(super) fn active_capacity(p:Whirlpool,applied_fee:u32,arrays:&[TickArray],or
         floored(l*up/(now*high)*0.999)];
     Ok((input,output))
 }
-/// Calibration-only **approximate** active-segment quote. No tick crossing, no
-/// exact integer-swap promise. Unknown when V10's input crosses the witness.
+/// Frozen-amount **approximate** quote. Exact venue integer rounding (Q64 fixed
+/// point and U256) belongs to official Orca core; this diagnostic estimate
+/// explicitly refuses uncovered ticks or adaptive fee-group crossings.
 pub(crate) fn quote(snapshot:&OrcaQuoteSnapshot,input:&str,output:&str,amount:u64)
     ->std::result::Result<u64,&'static str>{
-    let direction=if input==snapshot.mint_a&&output==snapshot.mint_b{0}
-        else if input==snapshot.mint_b&&output==snapshot.mint_a{1}
+    let down=if input==snapshot.mint_a&&output==snapshot.mint_b{true}
+        else if input==snapshot.mint_b&&output==snapshot.mint_a{false}
         else{return Err("orca_direction_mismatch")};
-    if amount==0||amount>snapshot.active_input_limit_raw[direction]{
-        return Err("orca_amount_outside_frozen_active_segment");
+    let direction=usize::from(!down);
+    if amount==0{return Err("orca_zero_amount");}
+    if snapshot.adaptive_oracle&&amount>snapshot.active_input_limit_raw[direction]{
+        return Err("orca_adaptive_fee_group_crossing_unmodeled");
     }
     let p=snapshot.sqrt_price_x64 as f64/Q64;
-    let l=snapshot.active_liquidity as f64;
-    let effective=1.0-snapshot.fee_rate as f64/DEN;
-    if p<=0.0||l<=0.0||effective<=0.0{return Err("orca_invalid_snapshot");}
-    let after=amount as f64*effective;
-    let out=if direction==0 {
-        let next=l*p/(l+after*p);
-        l*(p-next)
-    }else{
-        let next=p+after/l;
-        l*(next-p)/(p*next)
+    let mut price=p;
+    let mut liquidity=snapshot.active_liquidity as f64;
+    let efficiency=1.0-snapshot.fee_rate as f64/DEN;
+    if price<=0.0||liquidity<=0.0||efficiency<=0.0{
+        return Err("orca_invalid_frozen_state");
+    }
+    let mut intervals=snapshot.covered_ranges.clone();
+    intervals.sort_by_key(|v|v[0]);
+    let covered=|a:i32,b:i32|->bool{
+        let mut next=a.min(b);
+        let end=a.max(b);
+        for span in &intervals {
+            if span[0]>next{break;}
+            if span[1]>next{next=span[1];}
+            if next>=end{return true;}
+        }
+        end==a.min(b)
     };
-    if !out.is_finite()||out<0.0||out>u64::MAX as f64{return Err("orca_quote_range");}
-    Ok(out.floor() as u64)
+    let mut remaining=amount as f64;
+    let mut output_total=0.0_f64;
+    let mut current_tick=snapshot.tick_current;
+    for _ in 0..128 {
+        if remaining<1.0 {break;}
+        let next=snapshot.initialized_ticks.iter().filter(|t|
+            if down {t.index<current_tick}else{t.index>current_tick})
+            .min_by_key(|t|t.index.abs_diff(current_tick));
+        let limit=next.map(|t|t.index).unwrap_or(if down{
+            snapshot.coverage_ticks[0]
+        }else{snapshot.coverage_ticks[1]});
+        if limit==current_tick||!covered(current_tick,limit) {
+            return Err("orca_frozen_tick_window_uncovered");
+        }
+        let target=1.0001_f64.powf(limit as f64/2.0);
+        if !target.is_finite()||target<=0.0 ||
+            (down && target>=price)||( !down && target<=price) {
+            return Err("orca_invalid_tick_target");
+        }
+        let required_net=if down{
+            liquidity*(price-target)/(price*target)
+        }else{
+            liquidity*(target-price)
+        };
+        if !required_net.is_finite()||required_net<0.0{return Err("orca_amount_range");}
+        let full_gross=(required_net/efficiency).ceil();
+        let partial=remaining<=full_gross;
+        let spent=if partial{remaining}else{full_gross};
+        let fee=(spent*snapshot.fee_rate as f64/DEN).ceil();
+        let net=(spent-fee).max(0.0);
+        let next_price=if partial{
+            if down{liquidity*price/(liquidity+net*price)}
+            else{price+net/liquidity}
+        }else{target};
+        let output=if down{
+            liquidity*(price-next_price)
+        }else{
+            liquidity*(next_price-price)/(next_price*price)
+        };
+        if !output.is_finite()||output<0.0{return Err("orca_amount_range");}
+        output_total+=output;
+        remaining-=spent;
+        if partial {break;}
+        price=target;
+        current_tick=limit;
+        if let Some(tick)=next {
+            liquidity+=if down{-(tick.liquidity_net as f64)}
+                else{tick.liquidity_net as f64};
+            if liquidity<=0.0{return Err("orca_no_liquidity_after_tick_crossing");}
+        }else{
+            return Err("orca_frozen_tick_window_uncovered");
+        }
+    }
+    if remaining>=1.0{return Err("orca_quote_step_limit_or_uncovered");}
+    if output_total<0.0||output_total>=u64::MAX as f64{return Err("orca_output_range");}
+    Ok(output_total.floor() as u64)
 }
 #[cfg(test)]
 mod tests{
