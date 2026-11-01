@@ -130,13 +130,29 @@ pub(super) fn tick_array(d:&[u8],pool:Pubkey,spacing:u16)->Result<TickArray>{
 pub(super) fn active_window(p:Pool,arrays:&[TickArray],fee_rate:u32,down:bool)
     ->Option<(u64,u64)>{
     if p.liquidity==0||arrays.is_empty(){return None;}
-    let boundary=arrays.iter().flat_map(|a|a.ticks.iter())
+    let nearest=arrays.iter().flat_map(|a|a.ticks.iter())
         .filter(|t|if down{t.index<=p.tick}else{t.index>p.tick})
         .min_by_key(|t|if down{i64::from(p.tick)-i64::from(t.index)}
-            else{i64::from(t.index)-i64::from(p.tick)})?;
-    if boundary.has_orders{return None;}
+            else{i64::from(t.index)-i64::from(p.tick)});
+    // When there is no initialized tick ahead in the prepared arrays, bound
+    // depth to the *observed array's* last accessible tick, never beyond it.
+    let covered=arrays.iter().filter_map(|a|{
+        let end=a.start+59*i32::from(p.spacing);
+        if a.start<=p.tick && p.tick<=end {
+            Some(if down{a.start}else{end})
+        }else{None}
+    }).next()?;
+    let mut target_tick=nearest.map_or(covered,|t|if down{t.index.max(covered)}else{t.index.min(covered)});
+    if nearest.is_some_and(|t|t.index==target_tick && t.has_orders){return None;}
+    if p.dynamic.is_some(){
+        let spacing=i32::from(p.spacing);
+        let fee_boundary=if down{p.tick.div_euclid(spacing)*spacing}
+            else{(p.tick.div_euclid(spacing)+1)*spacing};
+        target_tick=if down{target_tick.max(fee_boundary)}
+            else{target_tick.min(fee_boundary)};
+    }
     let s=p.sqrt as f64/Q64;
-    let target=1.0001_f64.powf(f64::from(boundary.index)/2.0);
+    let target=1.0001_f64.powf(f64::from(target_tick)/2.0);
     let l=p.liquidity as f64;
     let (inp,out)=if down{
         (l*(1.0/target-1.0/s),l*(s-target))
