@@ -591,7 +591,7 @@ impl Pool{
                         ensure!(*clock_slot>=(*pool_slot).max(*config_slot)&&self.clock>0,
                             "Raydium CLMM dynamic fee awaits coherent Clock slot");
                     }
-                    let f=raydium_clmm::fee(*state,*cfg,self.clock)?;
+                    let f=raydium_clmm::fee(*state,cfg,self.clock)?;
                     v.base_fee_rate=Some(f64::from(cfg.trade)/1_000_000.0);
                     v.variable_fee_rate=Some(f64::from(f-cfg.trade)/1_000_000.0);
                     v.dex_fee_rates=[Some(f as f64/1_000_000.0);2];
