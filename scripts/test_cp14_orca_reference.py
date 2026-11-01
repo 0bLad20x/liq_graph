@@ -59,9 +59,9 @@ class Cp14OrcaIntegerReferenceTests(unittest.TestCase):
                             "inputs":[{"mint":"B","gross_amount_raw":191}],
                             "outputs":[{"mint":"A","amount_raw":45104}]
                         }]}}})
-            events.write_text("\\n".join(json.dumps(x) for x in [header,*rows])+"\\n",
+            events.write_text("\n".join(json.dumps(x) for x in [header,*rows])+"\n",
                               encoding="utf8")
-            details.write_text("\\n".join(json.dumps(x) for x in records)+"\\n",
+            details.write_text("\n".join(json.dumps(x) for x in records)+"\n",
                                encoding="utf8")
             result=assess(details,events)
             self.assertEqual(result["exact_matches_with_v10"],2)
