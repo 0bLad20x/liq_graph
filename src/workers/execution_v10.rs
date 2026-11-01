@@ -839,3 +839,41 @@ mod cp10_tests {
         println!("CP10 legacy={legacy:?} optimized={optimized:?} repetitions={repetitions}");
     }
 }
+
+#[cfg(test)]
+mod cp14_one_sided_tests {
+    use super::*;
+    use crate::core::{ExecutionManifest,MintProof};
+    #[test]
+    fn cp14_v10_only_selects_validated_orca_direction() {
+        let wallet=Pubkey::new_from_array([98;32]);
+        let a=Pubkey::new_from_array([12;32]);
+        let b=Pubkey::new_from_array([13;32]);
+        let pool=Pubkey::new_from_array([14;32]);
+        let program=key("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+        let mut base_a=vec![
+            AccountMeta{address:program,writable:false},
+            AccountMeta{address:a,writable:false},
+            AccountMeta{address:Pubkey::new_from_array([20;32]),writable:false},
+            AccountMeta{address:pool,writable:true},
+            AccountMeta{address:Pubkey::new_from_array([21;32]),writable:true},
+            AccountMeta{address:Pubkey::new_from_array([22;32]),writable:true},
+            AccountMeta{address:Pubkey::new_from_array([23;32]),writable:true},
+        ];
+        let mut base_b=base_a.clone();
+        base_b[1].address=b;
+        base_b.push(AccountMeta{address:Pubkey::new_from_array([24;32]),writable:true});
+        let execution=ExecutionPool {
+            manifest:Arc::new(ExecutionManifest{
+                pool,mint_a:a,mint_b:b,validated_slot:42,bound_signer:None,
+                base_a:Arc::from(base_a.clone()),base_b:Arc::from(base_b)}),
+            mints:[
+                MintProof{address:a,token_2022:false,extensions:vec![],unsupported:vec![]},
+                MintProof{address:b,token_2022:false,extensions:vec![],unsupported:vec![]},
+            ],
+        };
+        assert!(block(&execution,a,b,wallet).is_err());
+        assert_eq!(block(&execution,b,a,wallet).unwrap().len(),8);
+        base_a.push(AccountMeta{address:Pubkey::new_from_array([25;32]),writable:true});
+    }
+}
