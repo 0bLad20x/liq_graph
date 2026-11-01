@@ -28,7 +28,7 @@ pub(super) fn pool(d:&[u8])->Result<Whirlpool>{
     let p=Whirlpool{spacing:u16_at(d,41)?,fee:u16_at(d,45)?,
         protocol_share:u16_at(d,47)?,liquidity:u128_at(d,49)?,
         sqrt:u128_at(d,65)?,tick:i32_at(d,81)?};
-    ensure!(p.spacing>0&&p.spacing<=32768&&p.fee<=65535&&p.protocol_share<=10000
+    ensure!(p.spacing>0&&p.spacing<=32768&&p.protocol_share<=10000
         &&(-443636..=443636).contains(&p.tick)&&p.sqrt>0,"invalid Whirlpool state");
     Ok(p)
 }
