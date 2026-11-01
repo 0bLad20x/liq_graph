@@ -145,7 +145,7 @@ pub(super) fn tick_array(d:&[u8],pool:&[u8;32],spacing:u16)->Result<TickArray>{
 }
 pub(super) fn nearest_initialized(arrays:&[TickArray],tick:i32,direction:usize)->Option<i32>{
     arrays.iter().flat_map(|a|a.initialized.iter().map(|v|v.index))
-        .filter(|&i|if direction==0{i<tick}else{i>tick})
+        .filter(|&i|if direction==0{i<=tick}else{i>tick})
         .min_by_key(|&i|i.abs_diff(tick))
 }
 /// Conservative active-position witness to the next initializable tick.
@@ -313,6 +313,14 @@ mod tests{
         assert!(clock_coherent(true,802,801,1000).is_ok());
         assert!(clock_coherent(true,802,801,0).is_err());
         assert!(clock_coherent(false,0,801,0).is_ok());
+    }
+    #[test]fn cp14_downward_initial_tick_boundary_must_not_be_skipped(){
+        use crate::core::market_state::OrcaQuoteTick;
+        let arrays=[TickArray{start:0,initialized:vec![
+            OrcaQuoteTick{index:0,liquidity_net:10},
+            OrcaQuoteTick{index:64,liquidity_net:-10}]}];
+        assert_eq!(nearest_initialized(&arrays,0,0),Some(0));
+        assert_eq!(nearest_initialized(&arrays,0,1),Some(64));
     }
     #[test]fn cp14_oracle_layout_and_trade_enable(){
         let pool=[12_u8;32];let mut d=vec![0_u8;254];
