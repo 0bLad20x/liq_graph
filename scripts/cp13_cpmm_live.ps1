@@ -42,8 +42,30 @@ try {
         SimulationLimit=0
         WalletPath=$WalletPath
     }
+    $artifactRoot=Join-Path $repo 'runtime_live'
+    $existing=@{}
+    if (Test-Path -LiteralPath $artifactRoot) {
+        Get-ChildItem -LiteralPath $artifactRoot -Directory | ForEach-Object { $existing[$_.FullName]=$true }
+    }
     & (Join-Path $repo 'scripts\runtime_live.ps1') @opts
     if ($LASTEXITCODE -ne 0) { throw 'CP13 600-second mainnet simulation did not pass' }
+    $runs=@(Get-ChildItem -LiteralPath $artifactRoot -Directory |
+        Where-Object { -not $existing.ContainsKey($_.FullName) })
+    if ($runs.Count -ne 1) { throw "Expected one new CP13 artifact directory; found $($runs.Count)." }
+    $folder=$runs[0].FullName
+    $summary=Get-Content -LiteralPath (Join-Path $folder 'summary.json') -Raw | ConvertFrom-Json
+    $market=Get-Content -LiteralPath (Join-Path $folder 'market_state.json') -Raw | ConvertFrom-Json
+    $cpmmPrepared=[long]$summary.registry_tvl.by_venue.raydium_cpmm.prepared_admitted
+    $cpmmObserved=[long]$market.metrics.fee_valuation.observations_by_model.raydium_cpmm
+    if ($cpmmPrepared -le 0 -or $cpmmObserved -le 0) {
+        throw "CP13 requires observed CPMM valuation: prepared=$cpmmPrepared observations=$cpmmObserved artifacts=$folder"
+    }
+    if (-not ($summary.runtime_completed -and $summary.execution_integration_passed -and
+        $summary.market_delivery_passed -and $summary.signal_delivery_passed)) {
+        throw "CP13 runtime/delivery acceptance failed: $folder"
+    }
+    Write-Host "CP13 verified: CPMM prepared=$cpmmPrepared valuations=$cpmmObserved artifacts=$folder"
+
 } finally {
     [Environment]::SetEnvironmentVariable('RPC_COMMITMENT',$oldCommitment,'Process')
     [Environment]::SetEnvironmentVariable('DEXSCREENER_TRANSPORT_MODE',$oldDexMode,'Process')
