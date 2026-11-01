@@ -86,15 +86,69 @@ pub(super) fn rates(p:Whirlpool,applied_fee:u32,da:u8,db:u8)->Result<[f64;2]> {
     ensure!(price.is_finite()&&price>0.0&&effective>0.0,"Orca invalid net price");
     Ok([price*effective,effective/price])
 }
+#[derive(Clone,Debug)]
+pub(super) struct TickArray {
+    pub start:i32,
+    pub initialized:Vec<i32>,
+}
+const FIXED_DISC:[u8;8]=[69,97,189,190,110,7,66,187];
+const DYNAMIC_DISC:[u8;8]=[17,216,246,142,225,199,218,56];
+pub(super) fn tick_array(d:&[u8],pool:&[u8;32],spacing:u16)->Result<TickArray>{
+    ensure!(spacing>0&&d.len()>=60,"Orca TickArray short/spacing zero");
+    let start=i32_at(d,8)?;
+    ensure!(start%(i32::from(spacing)*88)==0,"Orca tick array start is not initializable");
+    let mut ticks=Vec::new();
+    if d.starts_with(&FIXED_DISC){
+        ensure!(d.len()==8+4+88*113+32 &&
+            d.get(8+4+88*113..)==Some(pool.as_slice()),"invalid Orca fixed TickArray");
+        for i in 0..88{
+            let off=12+i*113;
+            let tag=d[off];
+            ensure!(tag<=1,"invalid Orca fixed TickArray flag");
+            if tag==1 {ticks.push(start+i as i32*i32::from(spacing));}
+        }
+    }else if d.starts_with(&DYNAMIC_DISC){
+        ensure!(d.len()>=8+4+32+16+88 &&
+            d.get(12..44)==Some(pool.as_slice()),"invalid Orca dynamic TickArray");
+        let mut off=60;
+        for i in 0..88{
+            let tag=*d.get(off).context("Orca dynamic TickArray truncated tag")?;
+            ensure!(tag<=1,"invalid Orca dynamic tick flag");
+            off+=1;
+            if tag==1{
+                ensure!(d.get(off..off+112).is_some(),"Orca dynamic tick payload truncated");
+                ticks.push(start+i as i32*i32::from(spacing));
+                off+=112;
+            }
+        }
+        ensure!(off==d.len() || d[off..].iter().all(|&v|v==0),
+            "Orca dynamic TickArray trailing data invalid");
+    }else{anyhow::bail!("Orca TickArray discriminator invalid")};
+    Ok(TickArray{start,initialized:ticks})
+}
+pub(super) fn nearest_initialized(arrays:&[TickArray],tick:i32,direction:usize)->Option<i32>{
+    arrays.iter().flat_map(|a|a.initialized.iter().copied())
+        .filter(|&i|if direction==0{i<tick}else{i>tick})
+        .min_by_key(|&i|i.abs_diff(tick))
+}
 /// Conservative active-position witness to the next initializable tick.
 /// It never assumes liquidity beyond that boundary, where `liquidity_net` may
 /// alter available capacity. A small witness is Unknown, not evidence of Dust.
-pub(super) fn active_capacity(p:Whirlpool,applied_fee:u32)->Result<([u64;2],[u64;2])>{
+pub(super) fn active_capacity(p:Whirlpool,applied_fee:u32,arrays:&[TickArray],oracle:Option<Oracle>)->Result<([u64;2],[u64;2])>{
     let now=p.sqrt as f64/Q64;
     ensure!(now>0.0&&now.is_finite()&&p.liquidity>0,"Orca no active liquidity");
     let width=i32::from(p.spacing);
-    let lower=p.tick.div_euclid(width)*width;
-    let upper=lower+width;
+    let mut lower=p.tick.div_euclid(width)*width;
+    let mut upper=lower+width;
+    if let Some(t)=nearest_initialized(arrays,p.tick,0){lower=lower.min(t);}
+    if let Some(t)=nearest_initialized(arrays,p.tick,1){upper=upper.max(t);}
+    // Adaptive fee may change on a tick-group boundary even without an
+    // initialized liquidity tick. Keep the marginal fee witness inside that group.
+    if let Some(o)=oracle{
+        let g=i32::from(o.tick_group);
+        lower=lower.max(p.tick.div_euclid(g)*g);
+        upper=upper.min(p.tick.div_euclid(g)*g+g);
+    }
     let low=1.0001_f64.powf(lower as f64/2.0);
     let high=1.0001_f64.powf(upper as f64/2.0);
     let l=p.liquidity as f64;
@@ -149,7 +203,7 @@ mod tests{
         let f=fee(p,None,0).unwrap();assert_eq!(f,3000);
         let r=rates(p,f,6,6).unwrap();assert!((r[0]-0.997).abs()<1e-12);
         assert!((r[1]-0.997).abs()<1e-12);
-        let (input,_)=active_capacity(p,f).unwrap();assert!(input[1]>0);
+        let (input,_)=active_capacity(p,f,&[],None).unwrap();assert!(input[1]>0);
     }
     #[test]fn cp14_adaptive_time_and_volatility(){
         let p=Whirlpool{spacing:64,fee:3000,protocol_share:200,liquidity:1_000_000,
