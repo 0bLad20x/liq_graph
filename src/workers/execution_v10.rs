@@ -168,6 +168,11 @@ fn block<'a>(pool: &'a ExecutionPool, quote: Pubkey, x: Pubkey, wallet: Pubkey)
         else if m.mint_b==quote && m.mint_a==x { &m.base_b }
         else { bail!("pool {} does not match its declared V10 role",m.pool) };
     ensure!((3..=24).contains(&accounts.len()), "pool account block must contain 3..=24 entries");
+    // A one-sided Prepared Orca pool deliberately carries no arrays on its
+    // unsupported side. Never let a malformed seven-account V10 leg through.
+    if accounts.first().is_some_and(|m|m.address==key("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")){
+        ensure!((8..=24).contains(&accounts.len()),"Orca direction has no validated initial TickArray");
+    }
     ensure!(accounts[0].address!=Pubkey::default() && accounts[1].address==quote
         && !accounts[0].writable && !accounts[1].writable
         && accounts.iter().any(|a|a.address==m.pool), "invalid pool program/quote/account block");
