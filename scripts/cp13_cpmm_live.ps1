@@ -1,5 +1,8 @@
 # CP13 Raydium CPMM directional valuation + unchanged Direct2/V10 600-second live simulation.
-param([string]$WalletPath = (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json'))
+param(
+    [string]$WalletPath = (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json'),
+    [ValidateRange(60,600)][int]$DurationSeconds = 600
+)
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
 $branch='cp13-raydium-cpmm-direct2'
@@ -25,7 +28,7 @@ try {
         EnabledVenues='meteora_dlmm,pumpswap,raydium_cpmm'
         EnabledRoutes='direct2'
         Stage='Signals'
-        DurationSeconds=600
+        DurationSeconds=$DurationSeconds
         PoolLimit=0
         AccountBudget=25000
         MinPoolTvlUsd=500
@@ -63,6 +66,13 @@ try {
     if (-not ($summary.runtime_completed -and $summary.execution_integration_passed -and
         $summary.market_delivery_passed -and $summary.signal_delivery_passed)) {
         throw "CP13 runtime/delivery acceptance failed: $folder"
+    }
+    if ($DurationSeconds -eq 60) {
+        $events=Join-Path $folder 'execution_events.jsonl'
+        $calibration=Join-Path $folder 'cp13_cpmm_calibration.json'
+        & python (Join-Path $repo 'scripts\cp13_calibration_check.py') --events $events --out $calibration
+        if ($LASTEXITCODE -ne 0) { throw "CP13 60-second CPMM calibration incomplete or failed (exit=$LASTEXITCODE); see $calibration" }
+        Write-Host "CP13 CPMM frozen-vs-V10 calibration: $calibration"
     }
     Write-Host "CP13 verified: CPMM prepared=$cpmmPrepared valuations=$cpmmObserved artifacts=$folder"
 
