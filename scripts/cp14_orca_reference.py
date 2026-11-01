@@ -61,13 +61,22 @@ def compact_calibration(events, samples):
         header = json.loads(next(stream))
         cols = header["calibration_columns"]
         leg_cols = header["leg_columns"]
+        id_col = header["selection_columns"].index("id")
+        slot_col = header["report_columns"].index("context_slot")
         for line in stream:
             row = json.loads(line)
-            if row[0] not in samples or not row[3]:
+            # The same payload can be simulated in several banks, with different
+            # frozen observations/outputs. Never join solely on payload_sha256.
+            key = (row[1][id_col], row[0], row[2][slot_col])
+            if key not in samples:
+                continue
+            if key in found:
+                raise ValueError(f"duplicate compact Orca report key: {key}")
+            if not row[3]:
                 continue
             calibration = dict(zip(cols, row[3]))
-            found[row[0]] = [dict(zip(leg_cols, leg)) if leg else None
-                             for leg in calibration.get("legs") or []]
+            found[key] = [dict(zip(leg_cols, leg)) if leg else None
+                          for leg in calibration.get("legs") or []]
             if len(found) == len(samples):
                 break
     return found
@@ -78,8 +87,11 @@ def assess(path, events=None):
     observed = 0
     details = 0
     compact = compact_calibration(events, {
-        json.loads(line)["payload_sha256"] for line in path.open(encoding="utf8") if line.strip()
+        (obj["report"]["id"], obj["payload_sha256"], obj["report"]["context_slot"])
+        for line in path.open(encoding="utf8") if line.strip()
+        for obj in (json.loads(line),)
     })
+    compact_join_missing = 0
     for line in path.open(encoding="utf8"):
         if not line.strip():
             continue
@@ -89,7 +101,11 @@ def assess(path, events=None):
                  for p in obj.get("selection", {}).get("pools", [])
                  if p["observation"].get("liquidity")
                  and p["observation"]["liquidity"].get("orca_quote")}
-        legs = compact.get(obj["payload_sha256"], [])
+        report_key = (obj["report"]["id"], obj["payload_sha256"],
+                      obj["report"]["context_slot"])
+        legs = compact.get(report_key, [])
+        if events is not None and report_key not in compact:
+            compact_join_missing += 1
         for call_index, call in enumerate(obj.get("report", {}).get("trace", {}).get("calls", [])):
             snap = pools.get(call.get("pool"))
             if snap is None or call.get("status") != "complete":
@@ -118,6 +134,7 @@ def assess(path, events=None):
         "complete_orca_legs_in_details": observed,
         "reference_calculable_legs": len(items),
         "reference_unknown_reasons": dict(reasons),
+        "compact_report_join_missing": compact_join_missing,
         "exact_matches_with_v10": sum(x["observed_minus_reference_raw"] == 0 for x in items),
         "rust_vs_reference_compared": sum(x["rust_approx_minus_reference_raw"] is not None for x in items),
         "rust_vs_reference_exact_matches": sum(x["rust_approx_minus_reference_raw"] == 0 for x in items),
@@ -138,7 +155,7 @@ def main():
     report = assess(a.details, a.events)
     a.out.write_text(json.dumps(report, indent=2), encoding="utf8")
     print(json.dumps({k: v for k, v in report.items() if k != "reference_samples"}))
-    return 0 if report["reference_calculable_legs"] else 2
+    return 0 if report["reference_calculable_legs"] and not report["compact_report_join_missing"] else 2
 
 if __name__ == "__main__":
     raise SystemExit(main())
