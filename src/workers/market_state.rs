@@ -4,6 +4,7 @@ mod fees;
 mod dlmm;
 pub(crate) mod cpmm;
 pub(crate) mod orca;
+pub(crate) mod raydium_clmm;
 use crate::core::rpc::{RpcAnswer,RpcHandle,RpcOperation};
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{HashMap, HashSet, BTreeMap, VecDeque}, env, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -107,7 +108,7 @@ async fn fetch_batch(rpc:&RpcHandle,addresses:&[String],reads:&mut RpcReads)->Re
     }
     Ok(records)
 }
-#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6],orca_ready:[bool;2]}
+#[derive(Clone)]struct Watch {address:String,venue:Venue,manifest_digest:[u8;32],orca_adaptive:bool,orca_arrays:[Option<Pubkey>;6],orca_ready:[bool;2],clmm_config:Option<Pubkey>,clmm_arrays:[Option<Pubkey>;6],clmm_ready:[bool;2]}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Venue {Dlmm,Pump,DammV2,RaydiumAmmV4,RaydiumClmm,RaydiumCpmm,OrcaWhirlpool,PancakeSwapClmm,Manifest,ByrealClmm}
 impl Venue {
@@ -323,7 +324,9 @@ fn liquidity_digest(profile:&PoolLiquidity)->[u8;32] {
          pool_slot:u64,base_slot:u64,quote_slot:u64,fee_pool:fees::PumpPool,
          global:Option<Arc<fees::Global>>,config:Option<Arc<fees::Config>>,supply:Option<u64>,liquidity:Option<Arc<PoolLiquidity>>},
     DammV2{sqrt:u128},
-    RaydiumClmm{sqrt:u128},
+    RaydiumClmm{state:raydium_clmm::Pool,config_key:String,config:Option<raydium_clmm::Config>,
+        arrays:Vec<raydium_clmm::TickArray>,array_keys:Vec<String>,ready:[bool;2],
+        pool_slot:u64,config_slot:u64,clock_slot:u64,liquidity:Option<Arc<PoolLiquidity>>},
     OrcaWhirlpool{state:orca::Whirlpool,oracle:Option<orca::Oracle>,oracle_key:String,oracle_slot:u64,pool_slot:u64,ready:[bool;2],clock_slot:u64,array_keys:Vec<String>,arrays:Vec<orca::TickArray>,liquidity:Option<Arc<PoolLiquidity>>},
     PancakeSwapClmm{sqrt:u128},
     ByrealClmm{sqrt:u128},
@@ -578,7 +581,7 @@ impl Pool{
             State::Dlmm{active,step,..}=>dlmm_spot(*active,*step,self.da,self.db)?,
             State::Pump{vquote,base,quote,..}=>pump_spot(*base,*quote,*vquote,self.da,self.db)?,
             State::DammV2{sqrt}=>damm_spot(*sqrt,self.da,self.db)?,
-            State::RaydiumClmm{sqrt}=>damm_spot(*sqrt,self.da,self.db)?,
+            State::RaydiumClmm{state,..}=>damm_spot(state.sqrt,self.da,self.db)?,
             State::OrcaWhirlpool{state:orca::Whirlpool{sqrt,..},..}=>damm_spot(*sqrt,self.da,self.db)?,
             State::PancakeSwapClmm{sqrt}=>damm_spot(*sqrt,self.da,self.db)?,
             State::ByrealClmm{sqrt}=>damm_spot(*sqrt,self.da,self.db)?,
@@ -1352,8 +1355,14 @@ impl Engine{
                 let current=arrays.get_mut(index).context("Orca TickArray watch index invalid")?;
                 *current=orca::tick_array(data,&pool.key.to_bytes(),state.spacing)?;
             },
+            (State::RaydiumClmm{state,pool_slot,..},Field::RaydiumClmmSqrt)=>{
+                let next=raydium_clmm::pool(data)?;
+                ensure!(key(data,73)?==pool.a&&key(data,105)?==pool.b,"Raydium CLMM mint identity changed");
+                // Structure changes invalidate old manifest/watch set and must reprepare.
+                ensure!(next.config==state.config,"CLMM config changed; completion refresh required");
+                *state=next;*pool_slot=slot;
+            },
             (State::DammV2{sqrt},Field::DammSqrt)|
-            (State::RaydiumClmm{sqrt},Field::RaydiumClmmSqrt)|
             (State::PancakeSwapClmm{sqrt},Field::PancakeSwapClmmSqrt)|
             (State::ByrealClmm{sqrt},Field::ByrealClmmSqrt)=>{
                 *sqrt=u128_le(data,0)?;
@@ -1470,7 +1479,7 @@ impl PoolInput {
         let dlmm=if p.venue==CoreVenue::MeteoraDlmm {
             p.execution_manifest.as_ref().and_then(|m|dlmm::Dependencies::from_manifest(m).ok())
         }else{None};
-        let manifest_digest=if matches!(p.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm|CoreVenue::OrcaWhirlpool) {
+        let manifest_digest=if matches!(p.venue,CoreVenue::MeteoraDlmm|CoreVenue::PumpSwap|CoreVenue::RaydiumCpmm|CoreVenue::OrcaWhirlpool|CoreVenue::RaydiumClmm) {
             p.execution_manifest.as_ref()?.account_set_digest()
         }else{[0;32]};
         let orca_adaptive=p.venue==CoreVenue::OrcaWhirlpool &&
