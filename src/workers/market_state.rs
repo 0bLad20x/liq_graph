@@ -421,9 +421,8 @@ impl Pool{
     fn clmm_profile(&self)->Option<PoolLiquidity>{
         let State::RaydiumClmm{state,config,arrays,ready,pool_slot,config_slot,clock_slot,..}=&self.state else{return None;};
         let cfg=(*config)?;
-        if state.dynamic.is_some() && (*clock_slot<(*pool_slot).max(*config_slot) || self.clock<=0){
-            return None;
-        }
+        raydium_clmm::clock_coherent(state.dynamic.is_some(),*clock_slot,
+            *pool_slot,*config_slot,self.clock).ok()?;
         let fee=raydium_clmm::fee(*state,cfg,self.clock).ok()?;
         let v=self.valuation()?;
         let directions=std::array::from_fn(|i|{
@@ -604,10 +603,8 @@ impl Pool{
                 },
                 State::RaydiumClmm{state,config,ready,pool_slot,config_slot,clock_slot,arrays,..}=>{
                     let cfg=config.context("Raydium CLMM AmmConfig unavailable")?;
-                    if state.dynamic.is_some(){
-                        ensure!(*clock_slot>=(*pool_slot).max(*config_slot)&&self.clock>0,
-                            "Raydium CLMM dynamic fee awaits coherent Clock slot");
-                    }
+                    raydium_clmm::clock_coherent(state.dynamic.is_some(),
+                        *clock_slot,*pool_slot,*config_slot,self.clock)?;
                     let f=raydium_clmm::fee(*state,cfg,self.clock)?;
                     v.base_fee_rate=Some(f64::from(cfg.trade)/1_000_000.0);
                     v.variable_fee_rate=Some(f64::from(f-cfg.trade)/1_000_000.0);
