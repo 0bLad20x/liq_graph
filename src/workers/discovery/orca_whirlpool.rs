@@ -275,10 +275,6 @@ async fn lane(client:reqwest::Client,gate:Arc<Mutex<Instant>>,
         if settings.once{return Ok(());}
     }
 }
-errors={errors} elapsed_ms={}",started.elapsed().as_millis());
-        if settings.once{return Ok(());}
-    }
-}
 pub async fn run(client:reqwest::Client,output:broadcast::Sender<Arc<DataBatch>>,
     settings:Settings)->Result<()>{
     ensure!(settings.rps>0&&settings.rps<=100,"Orca RPS must be 1..=100");
