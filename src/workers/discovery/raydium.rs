@@ -59,7 +59,7 @@ pub struct Settings { pub once: bool, pub max_pages: Option<u32>, pub rps: u32,
 
 #[derive(Deserialize)]
 struct Response { success: bool, data: Option<Page> }
-#[derive(Deserialize)]
+#[derive(Debug,Deserialize)]
 struct Page {
     data: Vec<Value>,
     #[serde(rename="nextPageId")]
