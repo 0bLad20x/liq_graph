@@ -271,7 +271,7 @@ impl PoolRegistry {
             if p.tvl_usd.is_some() {
                 let source=p.last_observation.as_ref()
                     .and_then(|o|o.get("source")).and_then(Value::as_str);
-                let class=if source==native_source(p.venue){0}
+                let class=if native_source(p.venue).is_some_and(|native|source==Some(native)){0}
                     else if source==Some(DEX_SOURCE){1}else{2};
                 tvl_by_source.entry(p.venue.name()).or_default()[class]+=1;
             }
