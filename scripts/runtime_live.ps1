@@ -556,6 +556,27 @@ try {
         if ($restarts -gt 0) {
             throw "CP15R rejected: Raydium whole-worker restarted $restarts times; inspect cp15r_transport_report.json"
         }
+        # CP15O: Orca fault-isolation proof from the same finite live run.
+        $orcaRestarts = @(Select-String -LiteralPath $log -Pattern 'runtime worker=discovery\.orca_whirlpool restart_in_s=').Count
+        $orcaMetrics = [ordered]@{
+            global_worker_restarts = $orcaRestarts
+            page_retries = @(Select-String -LiteralPath $log -Pattern 'orca page_retry ').Count
+            exhausted_pages = @(Select-String -LiteralPath $log -Pattern 'orca page_exhausted ').Count
+            cursor_preserved_pauses = @(Select-String -LiteralPath $log -Pattern 'orca route_paused ').Count
+            local_lane_restarts = @(Select-String -LiteralPath $log -Pattern 'orca route_local_restart ').Count
+            http_429_events = @(Select-String -LiteralPath $log -Pattern 'orca http_429 ').Count
+            discovery_records = [long]$discovery['orca_whirlpool_api']
+            prepared_admitted = [long]$tvl.by_venue.orca_whirlpool.prepared_admitted
+            missing_tvl_after_qualification = [long]$tvl.by_venue.orca_whirlpool.missing_tvl
+            tvl_protocol_api = [long]$tvl.by_venue.orca_whirlpool.tvl_by_source.protocol_api
+            tvl_dexscreener = [long]$tvl.by_venue.orca_whirlpool.tvl_by_source.dexscreener
+        }
+        $orcaMetrics | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath (Join-Path $folder 'cp15o_orca_transport_report.json') -Encoding UTF8
+        Write-Host "CP15O Orca worker restarts=$($orcaMetrics.global_worker_restarts) retries=$($orcaMetrics.page_retries) exhausted=$($orcaMetrics.exhausted_pages) preserved_cursor_pauses=$($orcaMetrics.cursor_preserved_pauses) local_restarts=$($orcaMetrics.local_lane_restarts) prepared_admitted=$($orcaMetrics.prepared_admitted)"
+        if ($orcaRestarts -gt 0 -and $plan.enabled_venues -contains 'orca_whirlpool') {
+            throw "CP15O rejected: Orca whole-worker restarted $orcaRestarts times; inspect cp15o_orca_transport_report.json"
+        }
     }
     Write-Host "Runtime complete=$($summary.runtime_completed); orchestration=$orchestrationPassed; pool TVL evidence=$tvlPassed"
     Write-Host "Pools selected=$($market.selected_pools), priced=$($market.priced_pools); WS gaps=$($market.metrics.gaps)"
