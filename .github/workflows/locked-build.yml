@@ -61,7 +61,7 @@ jobs:
         run: |
           $tokens = $null
           $errors = $null
-          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1', 'scripts/cp11_quantity_live.ps1', 'scripts/cp12_quote_live.ps1', 'scripts/cp13_cpmm_live.ps1','scripts/cp14_orca_live.ps1','scripts/cp15_clmm_live.ps1')) {
+          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1', 'scripts/cp11_quantity_live.ps1', 'scripts/cp12_quote_live.ps1', 'scripts/cp13_cpmm_live.ps1','scripts/cp14_orca_live.ps1','scripts/cp15_clmm_live.ps1','scripts/cp15_tvl_coverage_1h.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
