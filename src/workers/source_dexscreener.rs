@@ -576,12 +576,19 @@ pub async fn run_live(
     let mut source_open=true;
     // Initial snapshot also covers updates published before proxy discovery finished.
     let initial=qualified.borrow_and_update().clone();
+    let initial_set=initial.iter().copied().collect::<HashSet<_>>();
+    let urgent=registry.missing_tvl_qualified_mints(&initial_set);
+    let initial_at=tokio::time::Instant::now();
     for &mint in initial.iter() {
-        if active.insert(mint) {due.insert((tokio::time::Instant::now(),mint));}
+        if active.insert(mint) {
+            let at=if urgent.contains(&mint) {initial_at}
+                else {initial_at+Duration::from_secs(5)};
+            due.insert((at,mint));
+        }
     }
     crate::log_event!(Info,
-        "dexscreener cp1 continuous started=true active_mints={} parallel={} refresh_s={} failure_retry_s={}",
-        active.len(),settings.parallel,refresh_secs,failure_retry_secs);
+        "dexscreener cp1 continuous started=true active_mints={} urgent_missing_tvl_mints={} parallel={} refresh_s={} failure_retry_s={}",
+        active.len(),urgent.len(),settings.parallel,refresh_secs,failure_retry_secs);
     loop {
         // Dispatch every due mint until the concurrency limit is reached.
         // The shared HTTP transport owns proxy/rate limiting and backpressure.
@@ -607,9 +614,12 @@ pub async fn run_live(
                     let now=tokio::time::Instant::now();
                     due.retain(|(_,mint)|new_active.contains(mint));
                     let mut added=0_usize;
+                    let urgent=registry.missing_tvl_qualified_mints(&new_active);
                     for &mint in &new_active {
                         if !active.contains(&mint) && !inflight.contains(&mint) {
-                            due.insert((now,mint));
+                            let at=if urgent.contains(&mint){now}
+                                else{now+Duration::from_secs(5)};
+                            due.insert((at,mint));
                             added+=1;
                         }
                     }
@@ -617,8 +627,8 @@ pub async fn run_live(
                     active=new_active;
                     changes+=1;
                     crate::log_event!(Info,
-                        "dexscreener cp1 selection_changed active_mints={} added={} removed={} queued={} in_flight={} change={changes}",
-                        active.len(),added,removed,due.len(),tasks.len());
+                        "dexscreener cp1 selection_changed active_mints={} urgent_missing_tvl_mints={} added={} removed={} queued={} in_flight={} change={changes}",
+                        active.len(),urgent.len(),added,removed,due.len(),tasks.len());
                 }
             },
             finished=tasks.join_next(), if !tasks.is_empty()=>{
