@@ -2,10 +2,10 @@
 # Requires local .env, PostgreSQL and configured REST/RPC providers.
 param(
     [string]$EnabledVenues = 'raydium_cpmm,raydium_clmm,orca_whirlpool',
-    [int]$DurationSeconds = 3600
+    [ValidateSet(300,3600)][int]$DurationSeconds = 3600
 )
 $ErrorActionPreference='Stop'
-if ($DurationSeconds -ne 3600) {throw 'CP15 one-hour audit requires DurationSeconds=3600'}
+if ($DurationSeconds -eq 300) {Write-Host 'CP15 TVL coverage: 300-second transport smoke test, not one-hour acceptance'}
 $repo=Split-Path -Parent $PSScriptRoot
 $oldDexMode=[Environment]::GetEnvironmentVariable('DEXSCREENER_TRANSPORT_MODE','Process')
 Push-Location -LiteralPath $repo
@@ -19,6 +19,7 @@ try {
         -EnabledRoutes direct2 `
         -Stage Graph `
         -GraphAudit `
+        -TvlSourceInfo `
         -DurationSeconds $DurationSeconds `
         -PoolLimit 0 `
         -AccountBudget 25000 `
