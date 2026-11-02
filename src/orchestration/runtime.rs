@@ -557,7 +557,7 @@ async fn run_pipeline(settings:RunSettings,evidence:Arc<Mutex<RunEvidence>>)->Re
         (stop_tx.clone(),stop_rx.clone()),rpc.clone(),completion_workers,completion_settings,None)?;
     drop(completions);
     let discovery_resources=discovery::Resources {
-        http,rpc:Some(rpc.clone()),output:source.clone(),stop:stop_rx.clone(),
+        http,registry:Some(registry.clone()),rpc:Some(rpc.clone()),output:source.clone(),stop:stop_rx.clone(),
     };
     discovery::spawn_hydration(&mut tasks,registry.clone(),updates.clone(),
         discovery_resources.clone(),venue_hydration_settings,venue_hydration_seed)?;
