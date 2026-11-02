@@ -334,8 +334,8 @@ impl PoolRegistry {
             "missing_tvl":v[4],"below_minimum":v[5],
             "observed_tvl_missing":v[9],"admitted_without_tvl":v[10],"admitted_below_tvl_floor":v[11],
             "prepared_qualified_known_below_100":v[6],"prepared_qualified_100_to_500":v[7],
-            "prepared_qualified_at_least_500":v[8]})}
-        ).collect::<std::collections::BTreeMap<_,_>>();
+            "prepared_qualified_at_least_500":v[8]}))
+        }).collect::<std::collections::BTreeMap<_,_>>();
         let targets=entries.values().filter(|p|p.venue==Venue::MeteoraDlmm && p.completion_admission.is_admitted())
             .flat_map(|p|[p.mint_a,p.mint_b]).flatten().filter(|m|!reference_mints().contains(m)).collect::<HashSet<_>>();
         let mut stages=[HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new()];
