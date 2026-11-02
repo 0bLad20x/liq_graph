@@ -136,7 +136,7 @@ fn spawn_sources(
     tasks.spawn(pool_registry::run(registry_input, None, registry,
         registry_output, source_done_tx, strict_lag, None));
     let (_stop,stop_rx)=watch::channel(false);
-    discovery::spawn_finite(tasks,workers,discovery::Resources {
+    discovery::spawn_finite(tasks,workers,discovery::Resources {registry:None,
         http:core::http_client()?,rpc:None,output,stop:stop_rx,
     });
     Ok(())
