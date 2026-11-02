@@ -54,6 +54,8 @@ jobs:
         run: cargo test --locked --release cp15_
       - name: CP15R Raydium HTTP fault isolation and cursor-preserving retry regression
         run: cargo test --locked --release cp15r_rest_fault_tests
+      - name: CP15O Orca HTTP failure-isolation regression
+        run: cargo test --locked --release cp15o_rest_fault_tests
       - name: CP15 independent Raydium CLMM integer reference regression
         run: python scripts/test_cp15_clmm_reference.py
       - name: Live utility Python syntax only
