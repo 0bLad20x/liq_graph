@@ -36,6 +36,19 @@ pub fn minimum_tvl_from_env()->Result<f64> {
 // Installation granularity, not a limit on pools, refreshes or route coverage.
 const TVL_WRITE_BATCH: usize = 64;
 
+/// Recovered TVL is live only with the same recent source, value and timestamp.
+fn restored_tvl_quote(venue:Venue,tvl:Option<f64>,observation:Option<&Value>,now:u64)->Option<Quote>{
+    let o=observation?;
+    let source=o.get("source")?.as_str()?;
+    if source!=DEX_SOURCE && Some(source)!=native_source(venue){return None;}
+    let at=o.get("observed_at_ms")?.as_u64()?;
+    if at>now || now-at>TVL_SOURCE_MAX_AGE_MS {return None;}
+    let value=o.get("tvl_usd")?.as_f64()?;
+    if !value.is_finite() || value<0.0 || tvl!=Some(value){return None;}
+    Some(Quote{value,at,source:if source==DEX_SOURCE{DEX_SOURCE}else{native_source(venue)?}})
+}
+
+
 fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 
 #[derive(Default,serde::Serialize)]
@@ -385,6 +398,28 @@ impl PoolRegistry {
         (state,wait_ns,elapsed_ns(holding))
     }
 
+    /// Select only qualified Raydium identities missing current TVL, prioritizing
+    /// pools already holding valid execution manifests.
+    pub fn raydium_missing_tvl_targets(&self,limit:usize)->Vec<Pubkey>{
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let mut selected=entries.values().filter(|p|
+            matches!(p.venue,Venue::RaydiumClmm|Venue::RaydiumCpmm|Venue::RaydiumAmmV4)
+            && p.completion_admission==CompletionAdmission::TvlUnavailable
+        ).map(|p|(p.completion_state!=CompletionState::Prepared,p.address))
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.into_iter().take(limit).map(|(_,address)|address).collect()
+    }
+
+    /// DexScreener is mint-oriented; missing-pool TVL must take priority.
+    pub fn missing_tvl_qualified_mints(&self,qualified:&HashSet<Pubkey>)->HashSet<Pubkey>{
+        self.entries.read().expect("pool registry lock poisoned").values()
+            .filter(|p|p.completion_admission==CompletionAdmission::TvlUnavailable)
+            .flat_map(|p|[p.mint_a,p.mint_b].into_iter().flatten())
+            .filter(|mint|qualified.contains(mint))
+            .collect()
+    }
+
     pub fn live_tvl_count(&self) -> usize {
         self.entries.read().expect("pool registry lock poisoned")
             .values().filter(|p|p.tvl_usd.is_some()).count()
@@ -428,8 +463,19 @@ impl PoolRegistry {
         let mut admission = self.admission.write().expect("admission index lock poisoned");
         ensure!(entries.is_empty(), "Registry restore requires an empty RAM state");
         let mut restored = HashMap::with_capacity(pools.len());
+        let mut quotes = HashMap::new();
+        let now=now_unix_ms()?;
         for mut pool in pools {
             if !self.enabled_venues.contains(pool.venue){continue;}
+            if let Some(q)=restored_tvl_quote(pool.venue,pool.tvl_usd,pool.last_observation.as_deref(),now){
+                let mut state=PoolQuotes::default();
+                if q.source==DEX_SOURCE{state.dex=Some(q);}else{state.protocol=Some(q);}
+                state.last_persisted=q.at;
+                quotes.insert(pool.address,state);
+            }else{
+                // Missing, unverifiable or expired historical TVL is not current.
+                pool.tvl_usd=None;
+            }
             admission.index(pool.address,pool.mint_a,pool.mint_b);
             pool.completion_admission=admission.admission(&pool);
             ensure!(pool.address != Pubkey::default(), "invalid restored pool address");
@@ -480,6 +526,7 @@ impl PoolRegistry {
                 "duplicate persisted pool address");
         }
         *entries = restored;
+        *self.quotes.write().expect("pool market state lock poisoned")=quotes;
         Ok(entries.len())
     }
 
@@ -1247,6 +1294,31 @@ pub async fn run(
     venue_counts.sort_by(|a,b|a.0.cmp(&b.0));
     crate::log_event!(Info,"pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
     Ok(())
+}
+
+#[cfg(test)]
+mod cp15_tvl_restore_tests {
+    use super::*;
+    #[test]
+    fn restored_quotes_require_matching_fresh_provenance(){
+        let now=10_000_000_u64;
+        let mk=|source:&str,at:u64,value:f64|json!({
+            "source":source,"observed_at_ms":at,"tvl_usd":value
+        });
+        let ray=mk("raydium_api",now-1000,950.0);
+        assert_eq!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),Some(&ray),now)
+            .map(|q|q.value),Some(950.0));
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(951.0),Some(&ray),now).is_none());
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),
+            Some(&mk("raydium_api",now-TVL_SOURCE_MAX_AGE_MS-1,950.0)),now).is_none());
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),
+            Some(&mk("unknown",now,950.0)),now).is_none());
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),
+            Some(&mk("raydium_api",now+1,950.0)),now).is_none());
+        assert_eq!(restored_tvl_quote(Venue::RaydiumCpmm,Some(500.0),
+            Some(&mk(DEX_SOURCE,now-10,500.0)),now).map(|q|q.source),Some(DEX_SOURCE));
+        assert!(restored_tvl_quote(Venue::OrcaWhirlpool,Some(950.0),Some(&ray),now).is_none());
+    }
 }
 
 #[cfg(test)]
