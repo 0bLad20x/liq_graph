@@ -257,6 +257,7 @@ impl PoolRegistry {
         let entries=self.entries.read().expect("pool registry lock poisoned");
         let admission=self.admission.read().expect("admission index lock poisoned");
         let mut venues=std::collections::BTreeMap::<&str,[u64;12]>::new();
+        let mut tvl_by_source=std::collections::BTreeMap::<&str,[u64;3]>::new();
         let mut violations=0_u64;
         // Final snapshot counters: no per-event buffering, no extra registry copy.
         // Indexed as [both, A->B only, B->A only, unknown evidence] and
@@ -267,6 +268,13 @@ impl PoolRegistry {
         let mut clmm_neither=0_u64;
         for p in entries.values() {
             let v=venues.entry(p.venue.name()).or_default();v[0]+=1;
+            if p.tvl_usd.is_some() {
+                let source=p.last_observation.as_ref()
+                    .and_then(|o|o.get("source")).and_then(Value::as_str);
+                let class=if source==native_source(p.venue){0}
+                    else if source==Some(DEX_SOURCE){1}else{2};
+                tvl_by_source.entry(p.venue.name()).or_default()[class]+=1;
+            }
             let prepared=p.completion_state==CompletionState::Prepared;
             v[1]+=u64::from(prepared);v[2]+=u64::from(p.completion_admission.is_admitted());
             v[3]+=u64::from(prepared&&p.completion_admission.is_admitted());
@@ -318,12 +326,16 @@ impl PoolRegistry {
             if p.venue!=Venue::PumpSwap && p.completion_admission.is_admitted() && admission.minimum_tvl_usd>0.0
                 && p.tvl_usd.is_none_or(|v|!v.is_finite()||v<admission.minimum_tvl_usd) {violations+=1;}
         }
-        let by_venue=venues.into_iter().map(|(venue,v)|(venue,json!({
+        let by_venue=venues.into_iter().map(|(venue,v)|{
+            let sources=tvl_by_source.get(venue).copied().unwrap_or_default();
+            (venue,json!({
             "total":v[0],"prepared":v[1],"admitted":v[2],"prepared_admitted":v[3],
+            "tvl_by_source":{"protocol_api":sources[0],"dexscreener":sources[1],"unattributed":sources[2]},
             "missing_tvl":v[4],"below_minimum":v[5],
             "observed_tvl_missing":v[9],"admitted_without_tvl":v[10],"admitted_below_tvl_floor":v[11],
             "prepared_qualified_known_below_100":v[6],"prepared_qualified_100_to_500":v[7],
-            "prepared_qualified_at_least_500":v[8]}))).collect::<std::collections::BTreeMap<_,_>>();
+            "prepared_qualified_at_least_500":v[8]})}
+        ).collect::<std::collections::BTreeMap<_,_>>();
         let targets=entries.values().filter(|p|p.venue==Venue::MeteoraDlmm && p.completion_admission.is_admitted())
             .flat_map(|p|[p.mint_a,p.mint_b]).flatten().filter(|m|!reference_mints().contains(m)).collect::<HashSet<_>>();
         let mut stages=[HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new()];
