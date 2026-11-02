@@ -41,7 +41,7 @@ A one-hour live Mainnet run requires user-controlled provider credentials and th
 
 ## CP15R — Raydium REST fault isolation
 
-The May/November 2026 five-minute audit showed six restart events in the
+The November 2, 2026 five-minute audit showed six restart events in the
 Raydium discovery supervisor caused by a page response-body timeout. These
 previously terminated all ten cursor lanes and the targeted-ID job together.
 
