@@ -182,9 +182,15 @@ async fn fetch_page(
     client: &reqwest::Client, gate: &Mutex<Instant>, spacing: Duration,
     sort: &str, direction: &str, cursor: Option<&str>,
 ) -> Result<Page> {
+    fetch_page_at(URL,client,gate,spacing,sort,direction,cursor).await
+}
+async fn fetch_page_at(
+    url:&str,client: &reqwest::Client, gate: &Mutex<Instant>, spacing: Duration,
+    sort: &str, direction: &str, cursor: Option<&str>,
+) -> Result<Page> {
     for attempt in 1..=REQUEST_ATTEMPTS {
         wait_slot(gate, spacing).await;
-        let mut request = client.get(URL).query(&[
+        let mut request = client.get(url).query(&[
             ("sortField",sort), ("sortType",direction), ("size","1000"),
         ]);
         if let Some(next) = cursor { request = request.query(&[("nextPageId",next)]); }
@@ -612,4 +618,74 @@ pub async fn run(
     refresh_tasks.shutdown().await;
     if !settings.once { bail!("all Raydium API routes stopped"); }
     Ok(())
+}
+
+#[cfg(test)]
+mod cp15r_rest_fault_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn transient_status_classification_and_bounded_retries(){
+        for status in [408,429,500,502,503,504] {
+            assert!(retryable_status(reqwest::StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [400,401,403,404,422] {
+            assert!(!retryable_status(reqwest::StatusCode::from_u16(status).unwrap()));
+        }
+        assert_eq!(retry_delay(1),Duration::from_secs(2));
+        assert_eq!(retry_delay(4),Duration::from_secs(16));
+        assert_eq!(retry_delay(12),Duration::from_secs(16));
+    }
+
+    /// The first response deliberately advertises more body bytes than supplied.
+    /// The second response succeeds. Both requests must carry the original cursor.
+    #[tokio::test]
+    async fn truncated_body_retried_without_losing_cursor(){
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream,_) = listener.accept().await.unwrap();
+                let mut request=vec![0_u8;8192];
+                let n=stream.read(&mut request).await.unwrap();
+                let raw=String::from_utf8_lossy(&request[..n]);
+                assert!(raw.contains("nextPageId=keep_cursor"),
+                    "lost page cursor on attempt {attempt}: {raw}");
+                let body=r#"{"success":true,"data":{"data":[],"nextPageId":null}}"#;
+                let length=if attempt==0 {body.len()+100} else {body.len()};
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}");
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let client=reqwest::Client::builder().timeout(Duration::from_secs(4)).build().unwrap();
+        let gate=Mutex::new(Instant::now());
+        let page=fetch_page_at(&format!("http://{address}/pools/info/list-v2"),
+            &client,&gate,Duration::from_millis(1),"liquidity","asc",Some("keep_cursor"))
+            .await.unwrap();
+        assert!(page.data.is_empty());
+        assert!(page.next.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_http_error_identified_without_retry_loop(){
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move{
+            let (mut stream,_) = listener.accept().await.unwrap();
+            let mut request=[0_u8;2048];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let client=reqwest::Client::new();
+        let gate=Mutex::new(Instant::now());
+        let err=fetch_page_at(&format!("http://{address}/pools/info/list-v2"),
+            &client,&gate,Duration::from_millis(1),"volume24h","desc",Some("bad_cursor"))
+            .await.unwrap_err();
+        assert!(err.downcast_ref::<PermanentPageError>().is_some());
+        server.await.unwrap();
+    }
 }
