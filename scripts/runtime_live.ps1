@@ -13,6 +13,7 @@ param(
     [ValidateRange(0,86400)][int]$CompletionRecheckSeconds = 0,
     [switch]$Rewatch,
     [switch]$GraphAudit,
+    [switch]$TvlSourceInfo,
     [switch]$RequireCatalogReconciliation,
     [switch]$TracePrices,
     [switch]$TraceSignals,
@@ -179,6 +180,9 @@ try {
             'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info',
             'liq_graph::workers::rpc_transport::ws=info'
         ) -join ',')
+    }
+    if ($TvlSourceInfo) {
+        $values.LIQ_GRAPH_LOG += ',liq_graph::workers::discovery::raydium=info,liq_graph::workers::discovery::orca_whirlpool=info,liq_graph::workers::source_dexscreener=info'
     }
     if ($EnabledVenues) { $values.GRAPH_ENABLED_VENUES = $EnabledVenues }
     if ($EnabledRoutes) { $values.GRAPH_ENABLED_ROUTES = $EnabledRoutes }
