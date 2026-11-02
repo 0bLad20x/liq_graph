@@ -78,3 +78,51 @@ preservation pauses, local restarts, head-refresh errors, targeted-ID success/
 failure, and DexScreener progress. A whole-worker Raydium restart invalidates
 the CP15R smoke acceptance; Graph membership and TVL admission evidence must
 also pass. Other sources (e.g., Orca) remain out of scope.
+
+## CP15O — Orca REST fault isolation
+
+Raydium CP15R is accepted from the previous five-minute real-provider run:
+zero Raydium full-worker restarts despite 107 page retries and nine exhausted
+requests. Keep the same source and graph semantics while fixing the equivalent
+fault in Orca's five REST cursor lanes.
+
+The previous Orca worker propagated response-body and JSON errors from each
+lane to the complete source; the orchestrator repeatedly restarted all lanes.
+CP15O applies the established fault boundary:
+
+- Orca API `/v2/solana/pools` retains its five sort/filter routes and shared
+  `ORCA_API_RPS` gate. No new API client or Registry is introduced.
+- HTTP send, body-read, JSON decode, 408/429 and 5xx are retried up to three
+  times with a bounded delay. HTTP 429 also respects a clamped Retry-After.
+- After all attempts fail, **only that lane** pauses and retries the same
+  `next` cursor. Successfully processed earlier pages are not discarded.
+- Permanent 4xx or invalid cursor anomalies can restart the relevant lane
+  after a local cooldown; they do not stop other Orca lanes or Raydium.
+- Publishing to the existing `DataBatch` channel and TVL admission criteria
+  are unchanged. Loss of the Registry receiver remains fatal.
+- `cp15o_rest_fault_tests` injects a broken response body and tests that the
+  next successful attempt retains the original `next` cursor; 400 responses
+  are independently classified as permanent.
+
+### Five-minute smoke test (before a longer run)
+
+```powershell
+Set-Location C:\dev_projects\liq_graph
+git fetch origin
+git switch cp15-raydium-clmm-direct2
+git pull --ff-only origin cp15-raydium-clmm-direct2
+.\scripts\cp15_tvl_coverage_1h.ps1 -DurationSeconds 300
+```
+
+The existing source-detail runner writes `cp15r_transport_report.json` and
+`cp15o_orca_transport_report.json`. Acceptance requires:
+
+- Zero whole-worker restarts for **both** Raydium and Orca.
+- Any transport retries or cursor pauses occur locally with no dropped Registry
+  batches and a passed Graph audit.
+- Source coverage (`orca_whirlpool_api` records, native TVL,
+  missing qualified TVL and prepared+admitted) is recorded, not assumed to
+  increase monotonically between independent samples.
+
+If successful, repeat with `-DurationSeconds 3600` and compare the end-of-run
+source coverage and Direct2 routes, including which pool pairs actually match.
