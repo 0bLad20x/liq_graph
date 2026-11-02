@@ -298,3 +298,71 @@ pub async fn run(client:reqwest::Client,output:broadcast::Sender<Arc<DataBatch>>
     if !settings.once{bail!("all Orca API routes stopped");}
     Ok(())
 }
+
+#[cfg(test)]
+mod cp15o_rest_fault_tests{
+    use super::*;
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn classify_temporary_and_permanent_statuses(){
+        for status in [408,429,500,502,503,504]{
+            assert!(retryable_status(reqwest::StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [400,401,403,404,422]{
+            assert!(!retryable_status(reqwest::StatusCode::from_u16(status).unwrap()));
+        }
+        assert_eq!(retry_delay(1),Duration::from_secs(2));
+        assert_eq!(retry_delay(4),Duration::from_secs(16));
+        assert_eq!(retry_delay(10),Duration::from_secs(16));
+    }
+
+    #[tokio::test]
+    async fn truncated_body_retries_identical_next_cursor(){
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream,_)=listener.accept().await.unwrap();
+                let mut buffer=[0_u8;4096];
+                let n=stream.read(&mut buffer).await.unwrap();
+                let request=String::from_utf8_lossy(&buffer[..n]);
+                assert!(request.contains("next=keep_cursor"),
+                    "cursor missing on attempt {attempt}: {request}");
+                let body=r#"{"data":[],"meta":{"cursor":{"next":null}}}"#;
+                let announced=if attempt==0{body.len()+100}else{body.len()};
+                let header=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {announced}\r\nConnection: close\r\n\r\n{body}");
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let client=reqwest::Client::builder().timeout(Duration::from_secs(4)).build().unwrap();
+        let gate=Mutex::new(Instant::now());
+        let page=fetch_page_at(&format!("http://{address}/v2/solana/pools"),
+            &client,&gate,Duration::from_millis(1),
+            "tvl_asc","tvl","asc","minTvl",Some("keep_cursor")).await.unwrap();
+        assert!(page.data.is_empty());
+        assert!(page.meta.cursor.next.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bad_request_is_lane_local_permanent_error(){
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move{
+            let (mut stream,_)=listener.accept().await.unwrap();
+            let mut buffer=[0_u8;2048];
+            stream.read(&mut buffer).await.unwrap();
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let client=reqwest::Client::new();
+        let gate=Mutex::new(Instant::now());
+        let err=fetch_page_at(&format!("http://{address}/v2/solana/pools"),
+            &client,&gate,Duration::from_millis(1),
+            "tvl_desc","tvl","desc","minTvl",Some("invalid")).await.unwrap_err();
+        assert!(err.downcast_ref::<PermanentPageError>().is_some());
+        server.await.unwrap();
+    }
+}
