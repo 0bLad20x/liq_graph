@@ -32,6 +32,13 @@ fn retryable_status(status:reqwest::StatusCode)->bool {
 fn retry_delay(attempt:u32)->Duration {
     Duration::from_secs(2_u64.saturating_pow(attempt.min(4)))
 }
+#[derive(Debug)]
+struct PermanentPageError(String);
+impl std::fmt::Display for PermanentPageError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(&self.0)}
+}
+impl std::error::Error for PermanentPageError {}
+
 
 const ROUTES: [(&str, &str); 10] = [
     ("liquidity","asc"), ("liquidity","desc"),
@@ -198,7 +205,9 @@ async fn fetch_page(
                 }else if !status.is_success() {
                     // Invalid credentials, invalid queries and other permanent 4xx:
                     // restart only this route rather than burning through retries.
-                    bail!("Raydium {sort}/{direction} nonretryable HTTP {status}");
+                    return Err(PermanentPageError(format!(
+                        "Raydium {sort}/{direction} nonretryable HTTP {status}"
+                    )).into());
                 }else{
                     async {
                         let bytes=response.bytes().await.context("read Raydium page bytes")?;
@@ -350,7 +359,10 @@ async fn route_pass(
         let page = match fetch_page(client, gate, spacing, sort, direction, cursor.as_deref()).await {
             Ok(page)=>{consecutive_failures=0;page},
             Err(error)=>{
-                if settings.once {return Err(error);}
+                // Permanent HTTP errors restart this lane, never the whole worker.
+                if settings.once || error.downcast_ref::<PermanentPageError>().is_some() {
+                    return Err(error);
+                }
                 consecutive_failures=consecutive_failures.saturating_add(1);
                 let backoff=retry_delay(consecutive_failures.min(4));
                 crate::log_event!(Warn,
@@ -482,7 +494,7 @@ async fn target_missing_tvl(
         cycle+=1;
         let now=Instant::now();
         let mut selected=registry.raydium_missing_tvl_targets(usize::MAX).into_iter()
-            .filter(|id|attempted.get(id).is_none_or(|at|now.duration_since(*at)>=TARGET_RETRY_DELAY))
+            .filter(|id|attempted.get(id).is_none_or(|due|now>=*due))
             .take(TARGET_POOLS_PER_CYCLE).collect::<Vec<_>>();
         let candidates=selected.len();
         let mut accepted=0_usize;
@@ -492,8 +504,6 @@ async fn target_missing_tvl(
         for chunk in selected.chunks(TARGET_POOL_BATCH) {
             let ids=chunk.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
             let requested=chunk.iter().copied().collect::<HashSet<_>>();
-            let now=Instant::now();
-            for id in chunk {attempted.insert(*id,now);}
             wait_slot(&gate,spacing).await;
             let response=client.get("https://api-v3.raydium.io/pools/info/ids")
                 .query(&[("ids",ids)]).send().await;
@@ -523,8 +533,15 @@ async fn target_missing_tvl(
                 Ok::<(usize,usize),anyhow::Error>((count,published.accepted))
             }.await;
             match result {
-                Ok((found,pub_count))=>{resolved+=found;accepted+=pub_count;},
+                Ok((found,pub_count))=>{
+                    resolved+=found;accepted+=pub_count;
+                    let due=Instant::now()+TARGET_RETRY_DELAY;
+                    for id in chunk{attempted.insert(*id,due);}
+                },
                 Err(error)=>{
+                    // Short retry for failed batches: do not suppress up to 30 minutes.
+                    let due=Instant::now()+TARGET_FAILURE_RETRY_DELAY;
+                    for id in chunk{attempted.insert(*id,due);}
                     failures+=1;
                     if failures<=3 {
                         crate::log_event!(Warn,"raydium targeted_tvl cycle={cycle} error={error:#}");
@@ -535,7 +552,7 @@ async fn target_missing_tvl(
         crate::log_event!(Info,
             "raydium targeted_tvl cycle={cycle} attempted={candidates} found={resolved} published={accepted} failed_batches={failures} tracked_cooldowns={} retry_s={}",
             attempted.len(),TARGET_RETRY_DELAY.as_secs());
-        attempted.retain(|_,at|now.duration_since(*at)<TARGET_RETRY_DELAY);
+        attempted.retain(|_,due|*due>Instant::now());
         selected.clear();
         sleep(TARGET_SCAN_INTERVAL).await;
     }
