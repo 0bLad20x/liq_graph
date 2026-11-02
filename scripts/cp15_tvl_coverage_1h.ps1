@@ -7,8 +7,12 @@ param(
 $ErrorActionPreference='Stop'
 if ($DurationSeconds -ne 3600) {throw 'CP15 one-hour audit requires DurationSeconds=3600'}
 $repo=Split-Path -Parent $PSScriptRoot
+$oldDexMode=[Environment]::GetEnvironmentVariable('DEXSCREENER_TRANSPORT_MODE','Process')
 Push-Location -LiteralPath $repo
 try {
+    # Keep the same working direct API transport as the CP15 simulation runner.
+    # Proxy-only mode without verified routes rejects every enrichment request.
+    $env:DEXSCREENER_TRANSPORT_MODE='direct'
     & (Join-Path $repo 'scripts\runtime_live.ps1') `
         -ExpectedBranch cp15-raydium-clmm-direct2 `
         -EnabledVenues $EnabledVenues `
@@ -21,5 +25,6 @@ try {
         -MinPoolTvlUsd 500
     if ($LASTEXITCODE -ne 0) {throw 'CP15 Raydium TVL one-hour audit failed'}
 } finally {
+    [Environment]::SetEnvironmentVariable('DEXSCREENER_TRANSPORT_MODE',$oldDexMode,'Process')
     Pop-Location
 }
