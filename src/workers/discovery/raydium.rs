@@ -1,18 +1,23 @@
 //! Raydium REST discovery: ten cursor routes, shared rate limit and early head refresh.
 //! ASC/DESC liquidity passes may end early only after strictly crossed TVL frontiers
 //! with observed address overlap. Ties or non-monotonic responses disable early exit.
-use std::{collections::HashSet, env, sync::Arc, time::Duration};
+use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, Mutex}, task::JoinSet, time::{Instant, sleep, sleep_until}};
 use crate::core::{DataBatch, DataRecord, RecordIdentity, Venue, now_unix_ms};
+use crate::workers::pool_registry::PoolRegistry;
 
 const URL: &str = "https://api-v3.raydium.io/pools/info/list-v2";
 const SOURCE: &str = "raydium_api";
 const PAGE_SIZE: usize = 1000;
 const OVERLAP_CONFIRM_ADDRESSES: usize = 32;
+const TARGET_POOL_BATCH: usize = 10;
+const TARGET_POOLS_PER_CYCLE: usize = 512;
+const TARGET_RETRY_DELAY: Duration = Duration::from_secs(1800);
+const TARGET_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const ROUTES: [(&str, &str); 10] = [
     ("liquidity","asc"), ("liquidity","desc"),
     ("volume24h","asc"), ("volume24h","desc"),
@@ -38,6 +43,8 @@ struct Page {
     #[serde(rename="nextPageId")]
     next: Option<String>,
 }
+#[derive(Deserialize)]
+struct IdsResponse { success:bool, data:Option<Vec<Value>> }
 
 struct Published {
     batch: Option<Arc<DataBatch>>,
@@ -393,9 +400,82 @@ async fn refresh_head(
     }
 }
 
+/// Enrich existing mint-qualified Raydium pools directly by known pool IDs.
+/// The same request gate is shared with the global discovery and head refresh.
+/// Missing/partial API results are retried later, never synthesized as zero TVL.
+async fn target_missing_tvl(
+    client:reqwest::Client,gate:Arc<Mutex<Instant>>,spacing:Duration,
+    output:broadcast::Sender<Arc<DataBatch>>,registry:PoolRegistry,
+    enabled:crate::core::EnabledVenues,
+)->Result<()> {
+    let mut attempted=HashMap::<Pubkey,Instant>::new();
+    let mut cycle=0_u64;
+    loop {
+        cycle+=1;
+        let now=Instant::now();
+        let mut selected=registry.raydium_missing_tvl_targets(usize::MAX).into_iter()
+            .filter(|id|attempted.get(id).is_none_or(|at|now.duration_since(*at)>=TARGET_RETRY_DELAY))
+            .take(TARGET_POOLS_PER_CYCLE).collect::<Vec<_>>();
+        let candidates=selected.len();
+        let mut accepted=0_usize;
+        let mut resolved=0_usize;
+        let mut failures=0_usize;
+        // Small batches avoid request-URL size and Raydium endpoint limits.
+        for chunk in selected.chunks(TARGET_POOL_BATCH) {
+            let ids=chunk.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+            let requested=chunk.iter().copied().collect::<HashSet<_>>();
+            let now=Instant::now();
+            for id in chunk {attempted.insert(*id,now);}
+            wait_slot(&gate,spacing).await;
+            let response=client.get("https://api-v3.raydium.io/pools/info/ids")
+                .query(&[("ids",ids)]).send().await;
+            let result=async {
+                let response=response.context("Raydium targeted ID request transport")?;
+                if response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    cool_down(&gate,Duration::from_secs(5)).await;
+                    bail!("Raydium targeted ID HTTP 429");
+                }
+                ensure!(response.status().is_success(),
+                    "Raydium targeted ID HTTP {}",response.status());
+                let bytes=response.bytes().await.context("Raydium targeted ID response body")?;
+                let body:IdsResponse=serde_json::from_slice(&bytes)
+                    .context("Raydium targeted ID JSON envelope")?;
+                ensure!(body.success,"Raydium targeted ID returned success=false");
+                let payloads=body.data.context("Raydium targeted ID response missing data")?;
+                let mut verified=Vec::new();
+                for item in payloads {
+                    // A provider response cannot create unrelated discovery identities.
+                    if let Some(id)=item.get("id").and_then(Value::as_str)
+                        .and_then(|v|v.parse::<Pubkey>().ok()) {
+                        if requested.contains(&id) {verified.push(item);}
+                    }
+                }
+                let count=verified.len();
+                let published=publish(&output,verified,"targeted","ids",enabled)?;
+                Ok::<(usize,usize),anyhow::Error>((count,published.accepted))
+            }.await;
+            match result {
+                Ok((found,pub_count))=>{resolved+=found;accepted+=pub_count;},
+                Err(error)=>{
+                    failures+=1;
+                    if failures<=3 {
+                        crate::log_event!(Warn,"raydium targeted_tvl cycle={cycle} error={error:#}");
+                    }
+                }
+            }
+        }
+        crate::log_event!(Info,
+            "raydium targeted_tvl cycle={cycle} attempted={candidates} found={resolved} published={accepted} failed_batches={failures} tracked_cooldowns={} retry_s={}",
+            attempted.len(),TARGET_RETRY_DELAY.as_secs());
+        attempted.retain(|_,at|now.duration_since(*at)<TARGET_RETRY_DELAY);
+        selected.clear();
+        sleep(TARGET_SCAN_INTERVAL).await;
+    }
+}
+
 pub async fn run(
     client: reqwest::Client, output: broadcast::Sender<Arc<DataBatch>>,
-    settings: Settings,
+    settings: Settings, registry:Option<PoolRegistry>,
 ) -> Result<()> {
     ensure!(settings.rps > 0 && settings.rps <= 100, "Raydium RPS must be 1..=100");
     let refresh_seconds: u64 = env::var("RAYDIUM_HEAD_REFRESH_SECONDS")
@@ -417,6 +497,12 @@ pub async fn run(
         ));
     }
     let mut tasks = JoinSet::new();
+    if !settings.once {
+        if let Some(registry)=registry {
+            tasks.spawn(target_missing_tvl(client.clone(),gate.clone(),spacing,
+                output.clone(),registry,settings.enabled_venues));
+        }
+    }
     for (sort, direction) in ROUTES {
         if sort == "liquidity" { continue; }
         let client = client.clone();
