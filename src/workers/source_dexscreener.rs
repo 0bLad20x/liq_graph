@@ -513,7 +513,9 @@ pub async fn run_live(
     crate::log_event!(Info,"dexscreener transport_mode={} direct_host_cap_rps={}",mode,
         if mode=="direct"{4}else{0});
     let (tx,mut rx)=broadcast::channel::<Arc<DexPairBatch>>(256);
+    let publish_registry=registry.clone();
     let publish=tokio::spawn(async move {
+        let registry=publish_registry;
         let mut recent=HashMap::<Pubkey,u64>::new();
         loop {
             let batch=match rx.recv().await {
