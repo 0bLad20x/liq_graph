@@ -38,3 +38,43 @@ Compare `summary.json` (`registry_tvl.by_venue`) and `runtime.log` counters `ray
 Success requires no execution of broadcasts, no lost source batches, preserved identity/graph membership and valid TVL provenance; a particular number of newly admitted pools is **not** hard-coded as a requirement.
 
 A one-hour live Mainnet run requires user-controlled provider credentials and the local database and is not available in GitHub CI. Rust tests and PowerShell syntax checks are performed by `.github/workflows/locked-build.yml`.
+
+## CP15R — Raydium REST fault isolation
+
+The May/November 2026 five-minute audit showed six restart events in the
+Raydium discovery supervisor caused by a page response-body timeout. These
+previously terminated all ten cursor lanes and the targeted-ID job together.
+
+The CP15R change keeps all requests on the existing Raydium HTTP client and
+shared RPS gate:
+
+- Each page request has three attempts, including transport errors, interrupted
+  response bodies, malformed JSON, HTTP 408/429 and 5xx; 429 respects bounded
+  Retry-After with the existing shared cooldown.
+- On exhausted transient retries, the owning route pauses and retries the **same
+  cursor**, with bounded backoff. It does not restart other routes.
+- Nonretryable 4xx restart only the offending route; the two liquidity
+  directions may restart as a pair because they share overlap evidence.
+- Head refresh failures are isolated per route; targeted-ID fetches continue.
+- Failed targeted-ID batches are eligible again after 45 seconds instead of
+  the 30-minute successful-refresh interval.
+- Test `cp15r_rest_fault_tests` injects a truncated HTTP body then verifies that
+  the retry carries the identical `nextPageId`; permanent 400 is identified
+  separately without a retry storm.
+
+Before another hour-long acceptance, use the 300-second smoke test:
+
+```powershell
+Set-Location C:\dev_projects\liq_graph
+git fetch origin
+git switch cp15-raydium-clmm-direct2
+git pull --ff-only origin cp15-raydium-clmm-direct2
+.\scripts\cp15_tvl_coverage_1h.ps1 -DurationSeconds 300
+```
+
+`cp15r_transport_report.json` is produced alongside `summary.json` and
+`runtime.log`, with counts of whole-worker restarts, page retries, cursor
+preservation pauses, local restarts, head-refresh errors, targeted-ID success/
+failure, and DexScreener progress. A whole-worker Raydium restart invalidates
+the CP15R smoke acceptance; Graph membership and TVL admission evidence must
+also pass. Other sources (e.g., Orca) remain out of scope.
