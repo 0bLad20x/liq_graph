@@ -127,6 +127,18 @@ pub struct OrcaQuoteSnapshot {
     pub covered_ranges:Vec<[i32;2]>,
     pub initialized_ticks:Vec<OrcaQuoteTick>,
 }
+/// Frozen, bounded Raydium CLMM active-interval input quote for post-V10
+/// calibration. Fee-group or initialized-tick crossing is outside this witness.
+#[derive(Clone,Debug,PartialEq,serde::Serialize)]
+pub struct ClmmQuoteSnapshot {
+    pub mint_0:String,pub mint_1:String,
+    pub sqrt_price_x64:u128,pub active_liquidity:u128,
+    pub tick_current:i32,pub tick_spacing:u16,
+    pub fee_rate:u32,pub fee_on:u8,
+    pub active_input_limit_raw:[u64;2],
+    pub dynamic_fee:bool,
+    pub pool_slot:u64,pub config_slot:u64,pub clock_slot:u64,
+}
 /// Reserve curve facts, not a protocol decoder or quoting implementation.
 #[derive(Clone,Debug,PartialEq,serde::Serialize)]
 pub struct ReserveCurve {
@@ -148,6 +160,7 @@ pub struct PoolLiquidity {
     pub reserve_curve:Option<ReserveCurve>,
     pub cpmm_quote:Option<CpmmQuoteSnapshot>,
     pub orca_quote:Option<OrcaQuoteSnapshot>,
+    pub clmm_quote:Option<ClmmQuoteSnapshot>,
     /// Canonical base->quote / quote->base, like FeeValuation.
     pub directions:[DirectedLiquidity;2],
 }

@@ -1,18 +1,45 @@
 //! Raydium REST discovery: ten cursor routes, shared rate limit and early head refresh.
 //! ASC/DESC liquidity passes may end early only after strictly crossed TVL frontiers
 //! with observed address overlap. Ties or non-monotonic responses disable early exit.
-use std::{collections::HashSet, env, sync::Arc, time::Duration};
+use std::{collections::{HashMap,HashSet}, env, sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 use tokio::{sync::{broadcast, Mutex}, task::JoinSet, time::{Instant, sleep, sleep_until}};
 use crate::core::{DataBatch, DataRecord, RecordIdentity, Venue, now_unix_ms};
+use crate::workers::pool_registry::PoolRegistry;
 
 const URL: &str = "https://api-v3.raydium.io/pools/info/list-v2";
 const SOURCE: &str = "raydium_api";
 const PAGE_SIZE: usize = 1000;
 const OVERLAP_CONFIRM_ADDRESSES: usize = 32;
+const TARGET_POOL_BATCH: usize = 10;
+const TARGET_POOLS_PER_CYCLE: usize = 512;
+const TARGET_RETRY_DELAY: Duration = Duration::from_secs(1800);
+const TARGET_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+const REQUEST_ATTEMPTS: u32 = 3;
+const ROUTE_FAILURE_BACKOFF: Duration = Duration::from_secs(15);
+const TARGET_FAILURE_RETRY_DELAY: Duration = Duration::from_secs(45);
+
+/// A failed HTTP request must never discard a route's cursor or restart
+/// unrelated Raydium lanes. Permanent malformed cursors restart only that lane.
+fn retryable_status(status:reqwest::StatusCode)->bool {
+    status==reqwest::StatusCode::TOO_MANY_REQUESTS ||
+    status==reqwest::StatusCode::REQUEST_TIMEOUT ||
+    status.is_server_error()
+}
+fn retry_delay(attempt:u32)->Duration {
+    Duration::from_secs(2_u64.saturating_pow(attempt.min(4)))
+}
+#[derive(Debug)]
+struct PermanentPageError(String);
+impl std::fmt::Display for PermanentPageError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(&self.0)}
+}
+impl std::error::Error for PermanentPageError {}
+
+
 const ROUTES: [(&str, &str); 10] = [
     ("liquidity","asc"), ("liquidity","desc"),
     ("volume24h","asc"), ("volume24h","desc"),
@@ -32,12 +59,14 @@ pub struct Settings { pub once: bool, pub max_pages: Option<u32>, pub rps: u32,
 
 #[derive(Deserialize)]
 struct Response { success: bool, data: Option<Page> }
-#[derive(Deserialize)]
+#[derive(Debug,Deserialize)]
 struct Page {
     data: Vec<Value>,
     #[serde(rename="nextPageId")]
     next: Option<String>,
 }
+#[derive(Deserialize)]
+struct IdsResponse { success:bool, data:Option<Vec<Value>> }
 
 struct Published {
     batch: Option<Arc<DataBatch>>,
@@ -147,52 +176,76 @@ async fn cool_down(gate: &Mutex<Instant>, duration: Duration) {
 }
 
 /// All full-scan and head-refresh requests share this transport and rate limit.
+/// A bounded request retry covers send, body-read, JSON and provider 5xx failures.
+/// The route owner keeps its cursor when these attempts are exhausted.
 async fn fetch_page(
     client: &reqwest::Client, gate: &Mutex<Instant>, spacing: Duration,
     sort: &str, direction: &str, cursor: Option<&str>,
 ) -> Result<Page> {
-    loop {
+    fetch_page_at(URL,client,gate,spacing,sort,direction,cursor).await
+}
+async fn fetch_page_at(
+    url:&str,client: &reqwest::Client, gate: &Mutex<Instant>, spacing: Duration,
+    sort: &str, direction: &str, cursor: Option<&str>,
+) -> Result<Page> {
+    for attempt in 1..=REQUEST_ATTEMPTS {
         wait_slot(gate, spacing).await;
-        let mut request = client.get(URL).query(&[
+        let mut request = client.get(url).query(&[
             ("sortField",sort), ("sortType",direction), ("size","1000"),
         ]);
         if let Some(next) = cursor { request = request.query(&[("nextPageId",next)]); }
-        let response = match request.send().await {
-            Ok(value) => value,
-            Err(error) => {
-                crate::log_event!(Warn,"raydium sort={sort} direction={direction} request_error={error:#}");
-                sleep(Duration::from_secs(2)).await;
-                continue;
+        let response = request.send().await;
+        let outcome:Result<Page> = match response {
+            Err(error) => Err(error).context("Raydium page request transport"),
+            Ok(response) => {
+                let status=response.status();
+                if retryable_status(status) {
+                    if status==reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let seconds=response.headers().get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok())
+                            .unwrap_or(5).clamp(1,60);
+                        cool_down(gate,Duration::from_secs(seconds)).await;
+                        crate::log_event!(Warn,"raydium page http_429 sort={sort} direction={direction} cooldown_s={seconds}");
+                    }
+                    Err(anyhow!("Raydium {sort}/{direction} retryable HTTP {status}"))
+                }else if !status.is_success() {
+                    // Invalid credentials, invalid queries and other permanent 4xx:
+                    // restart only this route rather than burning through retries.
+                    return Err(PermanentPageError(format!(
+                        "Raydium {sort}/{direction} nonretryable HTTP {status}"
+                    )).into());
+                }else{
+                    async {
+                        let bytes=response.bytes().await.context("read Raydium page bytes")?;
+                        let envelope:Response=serde_json::from_slice(&bytes)
+                            .context("decode Raydium envelope")?;
+                        ensure!(envelope.success,"Raydium success=false");
+                        let page=envelope.data.context("Raydium response missing data")?;
+                        ensure!(page.data.len()<=PAGE_SIZE,"Raydium returned oversized page");
+                        ensure!(!page.data.is_empty() ||
+                            page.next.as_deref().is_none_or(str::is_empty),
+                            "Raydium empty page with cursor");
+                        Ok(page)
+                    }.await
+                }
             }
         };
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let seconds = response.headers().get(reqwest::header::RETRY_AFTER)
-                .and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).unwrap_or(5);
-            cool_down(gate, Duration::from_secs(seconds)).await;
-            crate::log_event!(Info,"raydium sort={sort} direction={direction} http_429 cooldown_s={seconds}");
-            continue;
+        match outcome {
+            Ok(page)=>return Ok(page),
+            Err(error)=>{
+                if attempt==REQUEST_ATTEMPTS {
+                    crate::log_event!(Warn,"raydium page_exhausted sort={sort} direction={direction} cursor_present={} attempts={attempt} error={error:#}",
+                        cursor.is_some());
+                    return Err(error);
+                }
+                let backoff=retry_delay(attempt);
+                crate::log_event!(Warn,"raydium page_retry sort={sort} direction={direction} cursor_present={} attempt={attempt}/{REQUEST_ATTEMPTS} retry_s={} error={error:#}",
+                    cursor.is_some(),backoff.as_secs());
+                sleep(backoff).await;
+            }
         }
-        if response.status().is_client_error() {
-            bail!("Raydium {sort}/{direction} HTTP {}", response.status());
-        }
-        if !response.status().is_success() {
-            crate::log_event!(Warn,"raydium sort={sort} direction={direction} http_error={}",response.status());
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        let bytes = response.bytes().await.context("read Raydium page bytes")?;
-        let envelope: Response = serde_json::from_slice(&bytes).context("decode Raydium envelope")?;
-        if !envelope.success {
-            crate::log_event!(Info,"raydium sort={sort} direction={direction} success=false retrying_cursor");
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        let page = envelope.data.context("Raydium response missing data")?;
-        ensure!(page.data.len() <= PAGE_SIZE, "Raydium returned oversized page");
-        ensure!(!page.data.is_empty() || page.next.as_deref().is_none_or(str::is_empty),
-            "Raydium empty page with cursor");
-        return Ok(page);
     }
+    unreachable!("bounded retry loop")
 }
 
 /// Decode the full provider objects once and publish the existing DataBatch contract.
@@ -301,6 +354,7 @@ async fn route_pass(
     let mut rejected = 0_usize;
     let mut rejected_unknown = 0_usize;
     let mut stopped_on_overlap = false;
+    let mut consecutive_failures=0_u32;
     loop {
         if let Some(overlap) = overlap {
             if overlap.lock().await.crossed {
@@ -308,7 +362,23 @@ async fn route_pass(
                 break;
             }
         }
-        let page = fetch_page(client, gate, spacing, sort, direction, cursor.as_deref()).await?;
+        let page = match fetch_page(client, gate, spacing, sort, direction, cursor.as_deref()).await {
+            Ok(page)=>{consecutive_failures=0;page},
+            Err(error)=>{
+                // Permanent HTTP errors restart this lane, never the whole worker.
+                if settings.once || error.downcast_ref::<PermanentPageError>().is_some() {
+                    return Err(error);
+                }
+                consecutive_failures=consecutive_failures.saturating_add(1);
+                let backoff=retry_delay(consecutive_failures.min(4));
+                crate::log_event!(Warn,
+                    "raydium route_paused sort={sort} direction={direction} cursor_present={} pages={page_no} consecutive_failures={consecutive_failures} retry_s={} error={error:#}",
+                    cursor.is_some(),backoff.as_secs());
+                sleep(backoff).await;
+                // Crucially, do not overwrite cursor or partial coverage on timeout.
+                continue;
+            }
+        };
         let next = page.next.filter(|v| !v.is_empty());
         ensure!(!page.data.is_empty() || next.is_none(),
             "Raydium {sort}/{direction} empty page with cursor");
@@ -340,8 +410,8 @@ async fn route_pass(
     Ok(())
 }
 
-/// Only the two liquidity directions share overlap state; the other eight keep
-/// their independent cursors and restart policies.
+/// The two liquidity directions may restart together if their shared overlap
+/// state is corrupted; all other lanes (including targeted IDs) stay alive.
 async fn liquidity_pair(
     client: reqwest::Client, gate: Arc<Mutex<Instant>>, spacing: Duration,
     output: broadcast::Sender<Arc<DataBatch>>, settings: Settings,
@@ -350,12 +420,20 @@ async fn liquidity_pair(
     loop {
         pass += 1;
         let overlap = Arc::new(Mutex::new(LiquidityOverlap::new()));
-        tokio::try_join!(
+        let result=tokio::try_join!(
             route_pass(&client, &gate, spacing, &output, settings,
                 "liquidity", "asc", Some(&overlap)),
             route_pass(&client, &gate, spacing, &output, settings,
                 "liquidity", "desc", Some(&overlap)),
-        )?;
+        );
+        if let Err(error)=result {
+            if settings.once{return Err(error);}
+            crate::log_event!(Warn,
+                "raydium liquidity_pair local_restart pass={pass} backoff_s={} error={error:#}",
+                ROUTE_FAILURE_BACKOFF.as_secs());
+            sleep(ROUTE_FAILURE_BACKOFF).await;
+            continue;
+        }
         let state = overlap.lock().await;
         crate::log_event!(Info,"raydium liquidity_pair pass={pass} overlapped={} common_addresses={} asc_last_tvl={:?} desc_last_tvl={:?} asc_sorted={} desc_sorted={}",
             state.crossed, state.common_addresses, state.asc_last, state.desc_last,
@@ -370,13 +448,22 @@ async fn ordinary_lane(
     sort: &'static str, direction: &'static str,
 ) -> Result<()> {
     loop {
-        route_pass(&client, &gate, spacing, &output, settings, sort, direction, None).await?;
+        match route_pass(&client, &gate, spacing, &output, settings, sort, direction, None).await {
+            Ok(())=>{},
+            Err(error)=>{
+                if settings.once{return Err(error);}
+                crate::log_event!(Warn,
+                    "raydium route local_restart sort={sort} direction={direction} backoff_s={} error={error:#}",
+                    ROUTE_FAILURE_BACKOFF.as_secs());
+                sleep(ROUTE_FAILURE_BACKOFF).await;
+            }
+        }
         if settings.once { return Ok(()); }
     }
 }
 
-/// Every route refreshes its own first page independently. A slow route cannot
-/// delay refresh cycles on other routes. All requests use the shared RPS gate.
+/// Every route refreshes its own first page independently. One failure never
+/// tears down any other route or the targeted missing-TVL loop.
 async fn refresh_head(
     client: reqwest::Client, gate: Arc<Mutex<Instant>>, spacing: Duration,
     output: broadcast::Sender<Arc<DataBatch>>, interval: Duration,
@@ -385,17 +472,101 @@ async fn refresh_head(
     loop {
         sleep(interval).await;
         let started = Instant::now();
-        let page=fetch_page(&client,&gate,spacing,sort,direction,None).await?;
-        let decoded=publish(&output,page.data,sort,direction,enabled)?;
-        crate::log_event!(Debug,
-            "raydium head_refresh sort={sort} direction={direction} received={} accepted={} rejected={} elapsed_ms={}",
-            decoded.received,decoded.accepted,decoded.rejected,started.elapsed().as_millis());
+        match fetch_page(&client,&gate,spacing,sort,direction,None).await {
+            Ok(page)=>{
+                let decoded=publish(&output,page.data,sort,direction,enabled)?;
+                crate::log_event!(Debug,
+                    "raydium head_refresh sort={sort} direction={direction} received={} accepted={} rejected={} elapsed_ms={}",
+                    decoded.received,decoded.accepted,decoded.rejected,started.elapsed().as_millis());
+            },
+            Err(error)=>crate::log_event!(Warn,
+                "raydium head_refresh_error sort={sort} direction={direction} elapsed_ms={} error={error:#}",
+                started.elapsed().as_millis()),
+        }
+    }
+}
+
+/// Enrich existing mint-qualified Raydium pools directly by known pool IDs.
+/// The same request gate is shared with the global discovery and head refresh.
+/// Missing/partial API results are retried later, never synthesized as zero TVL.
+async fn target_missing_tvl(
+    client:reqwest::Client,gate:Arc<Mutex<Instant>>,spacing:Duration,
+    output:broadcast::Sender<Arc<DataBatch>>,registry:PoolRegistry,
+    enabled:crate::core::EnabledVenues,
+)->Result<()> {
+    let mut attempted=HashMap::<Pubkey,Instant>::new();
+    let mut cycle=0_u64;
+    loop {
+        cycle+=1;
+        let now=Instant::now();
+        let mut selected=registry.raydium_missing_tvl_targets(usize::MAX).into_iter()
+            .filter(|id|attempted.get(id).is_none_or(|due|now>=*due))
+            .take(TARGET_POOLS_PER_CYCLE).collect::<Vec<_>>();
+        let candidates=selected.len();
+        let mut accepted=0_usize;
+        let mut resolved=0_usize;
+        let mut failures=0_usize;
+        // Small batches avoid request-URL size and Raydium endpoint limits.
+        for chunk in selected.chunks(TARGET_POOL_BATCH) {
+            let ids=chunk.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+            let requested=chunk.iter().copied().collect::<HashSet<_>>();
+            wait_slot(&gate,spacing).await;
+            let response=client.get("https://api-v3.raydium.io/pools/info/ids")
+                .query(&[("ids",ids)]).send().await;
+            let result=async {
+                let response=response.context("Raydium targeted ID request transport")?;
+                if response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    cool_down(&gate,Duration::from_secs(5)).await;
+                    bail!("Raydium targeted ID HTTP 429");
+                }
+                ensure!(response.status().is_success(),
+                    "Raydium targeted ID HTTP {}",response.status());
+                let bytes=response.bytes().await.context("Raydium targeted ID response body")?;
+                let body:IdsResponse=serde_json::from_slice(&bytes)
+                    .context("Raydium targeted ID JSON envelope")?;
+                ensure!(body.success,"Raydium targeted ID returned success=false");
+                let payloads=body.data.context("Raydium targeted ID response missing data")?;
+                let mut verified=Vec::new();
+                for item in payloads {
+                    // A provider response cannot create unrelated discovery identities.
+                    if let Some(id)=item.get("id").and_then(Value::as_str)
+                        .and_then(|v|v.parse::<Pubkey>().ok()) {
+                        if requested.contains(&id) {verified.push(item);}
+                    }
+                }
+                let count=verified.len();
+                let published=publish(&output,verified,"targeted","ids",enabled)?;
+                Ok::<(usize,usize),anyhow::Error>((count,published.accepted))
+            }.await;
+            match result {
+                Ok((found,pub_count))=>{
+                    resolved+=found;accepted+=pub_count;
+                    let due=Instant::now()+TARGET_RETRY_DELAY;
+                    for id in chunk{attempted.insert(*id,due);}
+                },
+                Err(error)=>{
+                    // Short retry for failed batches: do not suppress up to 30 minutes.
+                    let due=Instant::now()+TARGET_FAILURE_RETRY_DELAY;
+                    for id in chunk{attempted.insert(*id,due);}
+                    failures+=1;
+                    if failures<=3 {
+                        crate::log_event!(Warn,"raydium targeted_tvl cycle={cycle} error={error:#}");
+                    }
+                }
+            }
+        }
+        crate::log_event!(Info,
+            "raydium targeted_tvl cycle={cycle} attempted={candidates} found={resolved} published={accepted} failed_batches={failures} tracked_cooldowns={} retry_s={}",
+            attempted.len(),TARGET_RETRY_DELAY.as_secs());
+        attempted.retain(|_,due|*due>Instant::now());
+        selected.clear();
+        sleep(TARGET_SCAN_INTERVAL).await;
     }
 }
 
 pub async fn run(
     client: reqwest::Client, output: broadcast::Sender<Arc<DataBatch>>,
-    settings: Settings,
+    settings: Settings, registry:Option<PoolRegistry>,
 ) -> Result<()> {
     ensure!(settings.rps > 0 && settings.rps <= 100, "Raydium RPS must be 1..=100");
     let refresh_seconds: u64 = env::var("RAYDIUM_HEAD_REFRESH_SECONDS")
@@ -417,6 +588,12 @@ pub async fn run(
         ));
     }
     let mut tasks = JoinSet::new();
+    if !settings.once {
+        if let Some(registry)=registry {
+            tasks.spawn(target_missing_tvl(client.clone(),gate.clone(),spacing,
+                output.clone(),registry,settings.enabled_venues));
+        }
+    }
     for (sort, direction) in ROUTES {
         if sort == "liquidity" { continue; }
         let client = client.clone();
@@ -441,4 +618,74 @@ pub async fn run(
     refresh_tasks.shutdown().await;
     if !settings.once { bail!("all Raydium API routes stopped"); }
     Ok(())
+}
+
+#[cfg(test)]
+mod cp15r_rest_fault_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn transient_status_classification_and_bounded_retries(){
+        for status in [408,429,500,502,503,504] {
+            assert!(retryable_status(reqwest::StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [400,401,403,404,422] {
+            assert!(!retryable_status(reqwest::StatusCode::from_u16(status).unwrap()));
+        }
+        assert_eq!(retry_delay(1),Duration::from_secs(2));
+        assert_eq!(retry_delay(4),Duration::from_secs(16));
+        assert_eq!(retry_delay(12),Duration::from_secs(16));
+    }
+
+    /// The first response deliberately advertises more body bytes than supplied.
+    /// The second response succeeds. Both requests must carry the original cursor.
+    #[tokio::test]
+    async fn truncated_body_retried_without_losing_cursor(){
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream,_) = listener.accept().await.unwrap();
+                let mut request=vec![0_u8;8192];
+                let n=stream.read(&mut request).await.unwrap();
+                let raw=String::from_utf8_lossy(&request[..n]);
+                assert!(raw.contains("nextPageId=keep_cursor"),
+                    "lost page cursor on attempt {attempt}: {raw}");
+                let body=r#"{"success":true,"data":{"data":[],"nextPageId":null}}"#;
+                let length=if attempt==0 {body.len()+100} else {body.len()};
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}");
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let client=reqwest::Client::builder().timeout(Duration::from_secs(4)).build().unwrap();
+        let gate=Mutex::new(Instant::now());
+        let page=fetch_page_at(&format!("http://{address}/pools/info/list-v2"),
+            &client,&gate,Duration::from_millis(1),"liquidity","asc",Some("keep_cursor"))
+            .await.unwrap();
+        assert!(page.data.is_empty());
+        assert!(page.next.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_http_error_identified_without_retry_loop(){
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move{
+            let (mut stream,_) = listener.accept().await.unwrap();
+            let mut request=[0_u8;2048];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let client=reqwest::Client::new();
+        let gate=Mutex::new(Instant::now());
+        let err=fetch_page_at(&format!("http://{address}/pools/info/list-v2"),
+            &client,&gate,Duration::from_millis(1),"volume24h","desc",Some("bad_cursor"))
+            .await.unwrap_err();
+        assert!(err.downcast_ref::<PermanentPageError>().is_some());
+        server.await.unwrap();
+    }
 }

@@ -36,6 +36,19 @@ pub fn minimum_tvl_from_env()->Result<f64> {
 // Installation granularity, not a limit on pools, refreshes or route coverage.
 const TVL_WRITE_BATCH: usize = 64;
 
+/// Recovered TVL is live only with the same recent source, value and timestamp.
+fn restored_tvl_quote(venue:Venue,tvl:Option<f64>,observation:Option<&Value>,now:u64)->Option<Quote>{
+    let o=observation?;
+    let source=o.get("source")?.as_str()?;
+    if source!=DEX_SOURCE && Some(source)!=native_source(venue){return None;}
+    let at=o.get("observed_at_ms")?.as_u64()?;
+    if at>now || now-at>TVL_SOURCE_MAX_AGE_MS {return None;}
+    let value=o.get("tvl_usd")?.as_f64()?;
+    if !value.is_finite() || value<0.0 || tvl!=Some(value){return None;}
+    Some(Quote{value,at,source:if source==DEX_SOURCE{DEX_SOURCE}else{native_source(venue)?}})
+}
+
+
 fn elapsed_ns(start:Instant)->u64 {start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64}
 
 #[derive(Default,serde::Serialize)]
@@ -97,6 +110,27 @@ mod cp14_orca_direction_count_tests {
         assert_eq!(orca_direction_class(Some(&json!({
             "direction_a_to_b_ready":false,"direction_b_to_a_ready":false}))),3);
         assert_eq!(orca_direction_class(None),3);
+    }
+}
+/// Native Raydium token0/token1 directional readiness from versioned proof.
+fn clmm_direction_class(payload:Option<&Value>)->usize {
+    match payload.map(|v|(v["direction_0_to_1_ready"].as_bool(),
+                           v["direction_1_to_0_ready"].as_bool())) {
+        Some((Some(true),Some(true)))=>0,
+        Some((Some(true),Some(false)))=>1,
+        Some((Some(false),Some(true)))=>2,
+        _=>3,
+    }
+}
+#[cfg(test)]
+mod cp15_clmm_direction_count_tests {
+    use super::clmm_direction_class;
+    use serde_json::json;
+    #[test]fn cp15_registry_native_direction_classes(){
+        assert_eq!(clmm_direction_class(Some(&json!({"direction_0_to_1_ready":true,"direction_1_to_0_ready":false}))),1);
+        assert_eq!(clmm_direction_class(Some(&json!({"direction_0_to_1_ready":false,"direction_1_to_0_ready":true}))),2);
+        assert_eq!(clmm_direction_class(Some(&json!({"direction_0_to_1_ready":true,"direction_1_to_0_ready":true}))),0);
+        assert_eq!(clmm_direction_class(None),3);
     }
 }
 /// Private Mint admission index and one process-wide pool-TVL policy.
@@ -223,17 +257,43 @@ impl PoolRegistry {
         let entries=self.entries.read().expect("pool registry lock poisoned");
         let admission=self.admission.read().expect("admission index lock poisoned");
         let mut venues=std::collections::BTreeMap::<&str,[u64;12]>::new();
+        let mut tvl_by_source=std::collections::BTreeMap::<&str,[u64;3]>::new();
         let mut violations=0_u64;
         // Final snapshot counters: no per-event buffering, no extra registry copy.
         // Indexed as [both, A->B only, B->A only, unknown evidence] and
         // [prepared/admitted, selected, priced] for each category.
         let mut orca_directions=[[0_u64;3];4];
         let mut orca_neither=0_u64;
+        let mut clmm_directions=[[0_u64;3];4];
+        let mut clmm_neither=0_u64;
         for p in entries.values() {
             let v=venues.entry(p.venue.name()).or_default();v[0]+=1;
+            if p.tvl_usd.is_some() {
+                let source=p.last_observation.as_ref()
+                    .and_then(|o|o.get("source")).and_then(Value::as_str);
+                let class=if native_source(p.venue).is_some_and(|native|source==Some(native)){0}
+                    else if source==Some(DEX_SOURCE){1}else{2};
+                tvl_by_source.entry(p.venue.name()).or_default()[class]+=1;
+            }
             let prepared=p.completion_state==CompletionState::Prepared;
             v[1]+=u64::from(prepared);v[2]+=u64::from(p.completion_admission.is_admitted());
             v[3]+=u64::from(prepared&&p.completion_admission.is_admitted());
+            if p.venue==Venue::RaydiumClmm && p.completion_admission.is_admitted(){
+                if prepared {
+                    let evidence=p.completion_evidence.as_ref()
+                        .filter(|e|e.kind=="raydium_clmm_tick_arrays"&&e.version==2);
+                    let class=clmm_direction_class(evidence.map(|e|e.payload.as_ref()));
+                    clmm_directions[class][0]+=1;
+                    clmm_directions[class][1]+=u64::from(
+                        coverage.is_some_and(|c|c.selected.contains(&p.address)));
+                    clmm_directions[class][2]+=u64::from(
+                        coverage.is_some_and(|c|c.priced.contains(&p.address)));
+                }else if p.completion_state==CompletionState::Incomplete
+                    && p.completion_reason.as_deref().is_some_and(|v|
+                        v.contains("no first initialized TickArray in either direction")){
+                    clmm_neither+=1;
+                }
+            }
             if p.venue==Venue::OrcaWhirlpool && p.completion_admission.is_admitted() {
                 if prepared {
                     let evidence=p.completion_evidence.as_ref()
@@ -266,12 +326,16 @@ impl PoolRegistry {
             if p.venue!=Venue::PumpSwap && p.completion_admission.is_admitted() && admission.minimum_tvl_usd>0.0
                 && p.tvl_usd.is_none_or(|v|!v.is_finite()||v<admission.minimum_tvl_usd) {violations+=1;}
         }
-        let by_venue=venues.into_iter().map(|(venue,v)|(venue,json!({
+        let by_venue=venues.into_iter().map(|(venue,v)|{
+            let sources=tvl_by_source.get(venue).copied().unwrap_or_default();
+            (venue,json!({
             "total":v[0],"prepared":v[1],"admitted":v[2],"prepared_admitted":v[3],
+            "tvl_by_source":{"protocol_api":sources[0],"dexscreener":sources[1],"unattributed":sources[2]},
             "missing_tvl":v[4],"below_minimum":v[5],
             "observed_tvl_missing":v[9],"admitted_without_tvl":v[10],"admitted_below_tvl_floor":v[11],
             "prepared_qualified_known_below_100":v[6],"prepared_qualified_100_to_500":v[7],
-            "prepared_qualified_at_least_500":v[8]}))).collect::<std::collections::BTreeMap<_,_>>();
+            "prepared_qualified_at_least_500":v[8]}))
+        }).collect::<std::collections::BTreeMap<_,_>>();
         let targets=entries.values().filter(|p|p.venue==Venue::MeteoraDlmm && p.completion_admission.is_admitted())
             .flat_map(|p|[p.mint_a,p.mint_b]).flatten().filter(|m|!reference_mints().contains(m)).collect::<HashSet<_>>();
         let mut stages=[HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new()];
@@ -296,6 +360,19 @@ impl PoolRegistry {
                 "pump_pools_selected":coverage.map(|_|pump_pools[3]),"pump_pools_priced":coverage.map(|_|pump_pools[4]),
                 "missing_known_counterpart_samples":missing},
             "source_max_age_seconds":TVL_SOURCE_MAX_AGE_MS/1000,
+            "clmm_direction_admission":{
+                "scope":"current_admitted_registry_snapshot",
+                "prepared_both":clmm_directions[0][0],
+                "prepared_0_to_1_only":clmm_directions[1][0],
+                "prepared_1_to_0_only":clmm_directions[2][0],
+                "prepared_unclassified":clmm_directions[3][0],
+                "selected_both":clmm_directions[0][1],
+                "selected_0_to_1_only":clmm_directions[1][1],
+                "selected_1_to_0_only":clmm_directions[2][1],
+                "priced_both":clmm_directions[0][2],
+                "priced_0_to_1_only":clmm_directions[1][2],
+                "priced_1_to_0_only":clmm_directions[2][2],
+                "incomplete_neither":clmm_neither},
             "orca_direction_admission":{
                 "scope":"current_admitted_registry_snapshot",
                 "prepared_both":orca_directions[0][0],
@@ -331,6 +408,28 @@ impl PoolRegistry {
         let state=entries.get(&address).cloned();
         drop(entries);
         (state,wait_ns,elapsed_ns(holding))
+    }
+
+    /// Select only qualified Raydium identities missing current TVL, prioritizing
+    /// pools already holding valid execution manifests.
+    pub fn raydium_missing_tvl_targets(&self,limit:usize)->Vec<Pubkey>{
+        let entries=self.entries.read().expect("pool registry lock poisoned");
+        let mut selected=entries.values().filter(|p|
+            matches!(p.venue,Venue::RaydiumClmm|Venue::RaydiumCpmm|Venue::RaydiumAmmV4)
+            && p.completion_admission==CompletionAdmission::TvlUnavailable
+        ).map(|p|(p.completion_state!=CompletionState::Prepared,p.address))
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.into_iter().take(limit).map(|(_,address)|address).collect()
+    }
+
+    /// DexScreener is mint-oriented; missing-pool TVL must take priority.
+    pub fn missing_tvl_qualified_mints(&self,qualified:&HashSet<Pubkey>)->HashSet<Pubkey>{
+        self.entries.read().expect("pool registry lock poisoned").values()
+            .filter(|p|p.completion_admission==CompletionAdmission::TvlUnavailable)
+            .flat_map(|p|[p.mint_a,p.mint_b].into_iter().flatten())
+            .filter(|mint|qualified.contains(mint))
+            .collect()
     }
 
     pub fn live_tvl_count(&self) -> usize {
@@ -376,8 +475,19 @@ impl PoolRegistry {
         let mut admission = self.admission.write().expect("admission index lock poisoned");
         ensure!(entries.is_empty(), "Registry restore requires an empty RAM state");
         let mut restored = HashMap::with_capacity(pools.len());
+        let mut quotes = HashMap::new();
+        let now=now_unix_ms()?;
         for mut pool in pools {
             if !self.enabled_venues.contains(pool.venue){continue;}
+            if let Some(q)=restored_tvl_quote(pool.venue,pool.tvl_usd,pool.last_observation.as_deref(),now){
+                let mut state=PoolQuotes::default();
+                if q.source==DEX_SOURCE{state.dex=Some(q);}else{state.protocol=Some(q);}
+                state.last_persisted=q.at;
+                quotes.insert(pool.address,state);
+            }else{
+                // Missing, unverifiable or expired historical TVL is not current.
+                pool.tvl_usd=None;
+            }
             admission.index(pool.address,pool.mint_a,pool.mint_b);
             pool.completion_admission=admission.admission(&pool);
             ensure!(pool.address != Pubkey::default(), "invalid restored pool address");
@@ -428,6 +538,7 @@ impl PoolRegistry {
                 "duplicate persisted pool address");
         }
         *entries = restored;
+        *self.quotes.write().expect("pool market state lock poisoned")=quotes;
         Ok(entries.len())
     }
 
@@ -1195,6 +1306,31 @@ pub async fn run(
     venue_counts.sort_by(|a,b|a.0.cmp(&b.0));
     crate::log_event!(Info,"pool registry discovery_sources={source_counts:?} unique_by_venue={venue_counts:?} strict_lag={fail_on_lag}");
     Ok(())
+}
+
+#[cfg(test)]
+mod cp15_tvl_restore_tests {
+    use super::*;
+    #[test]
+    fn restored_quotes_require_matching_fresh_provenance(){
+        let now=10_000_000_u64;
+        let mk=|source:&str,at:u64,value:f64|json!({
+            "source":source,"observed_at_ms":at,"tvl_usd":value
+        });
+        let ray=mk("raydium_api",now-1000,950.0);
+        assert_eq!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),Some(&ray),now)
+            .map(|q|q.value),Some(950.0));
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(951.0),Some(&ray),now).is_none());
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),
+            Some(&mk("raydium_api",now-TVL_SOURCE_MAX_AGE_MS-1,950.0)),now).is_none());
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),
+            Some(&mk("unknown",now,950.0)),now).is_none());
+        assert!(restored_tvl_quote(Venue::RaydiumClmm,Some(950.0),
+            Some(&mk("raydium_api",now+1,950.0)),now).is_none());
+        assert_eq!(restored_tvl_quote(Venue::RaydiumCpmm,Some(500.0),
+            Some(&mk(DEX_SOURCE,now-10,500.0)),now).map(|q|q.source),Some(DEX_SOURCE));
+        assert!(restored_tvl_quote(Venue::OrcaWhirlpool,Some(950.0),Some(&ray),now).is_none());
+    }
 }
 
 #[cfg(test)]

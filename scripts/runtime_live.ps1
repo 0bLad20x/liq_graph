@@ -13,6 +13,7 @@ param(
     [ValidateRange(0,86400)][int]$CompletionRecheckSeconds = 0,
     [switch]$Rewatch,
     [switch]$GraphAudit,
+    [switch]$TvlSourceInfo,
     [switch]$RequireCatalogReconciliation,
     [switch]$TracePrices,
     [switch]$TraceSignals,
@@ -179,6 +180,9 @@ try {
             'liq_graph::workers::execution_v10=info','liq_graph::workers::rpc_transport=info',
             'liq_graph::workers::rpc_transport::ws=info'
         ) -join ',')
+    }
+    if ($TvlSourceInfo) {
+        $values.LIQ_GRAPH_LOG += ',liq_graph::workers::discovery::raydium=info,liq_graph::workers::discovery::orca_whirlpool=info,liq_graph::workers::source_dexscreener=info'
     }
     if ($EnabledVenues) { $values.GRAPH_ENABLED_VENUES = $EnabledVenues }
     if ($EnabledRoutes) { $values.GRAPH_ENABLED_ROUTES = $EnabledRoutes }
@@ -522,6 +526,58 @@ try {
         transactions_sent=0; artifacts=$folder
     }
     $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'summary.json') -Encoding UTF8
+    if ($TvlSourceInfo) {
+        # CP15R: finite, end-of-run evidence; no new in-RAM counters or telemetry worker.
+        $restarts = @(Select-String -LiteralPath $log -Pattern 'runtime worker=discovery\.raydium restart_in_s=').Count
+        $targeted = @(Select-String -LiteralPath $log -Pattern 'raydium targeted_tvl cycle=\d+ attempted=(\d+) found=(\d+) published=(\d+) failed_batches=(\d+)')
+        $tvlMetrics = [ordered]@{
+            global_worker_restarts = $restarts
+            page_retries = @(Select-String -LiteralPath $log -Pattern 'raydium page_retry ').Count
+            exhausted_pages = @(Select-String -LiteralPath $log -Pattern 'raydium page_exhausted ').Count
+            cursor_preserved_pauses = @(Select-String -LiteralPath $log -Pattern 'raydium route_paused ').Count
+            local_lane_restarts = @(Select-String -LiteralPath $log -Pattern 'raydium route local_restart |raydium liquidity_pair local_restart ').Count
+            head_refresh_errors = @(Select-String -LiteralPath $log -Pattern 'raydium head_refresh_error ').Count
+            targeted_cycles = $targeted.Count
+            targeted_attempted = [long](($targeted | ForEach-Object { [long]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)
+            targeted_found = [long](($targeted | ForEach-Object { [long]$_.Matches[0].Groups[2].Value } | Measure-Object -Sum).Sum)
+            targeted_published = [long](($targeted | ForEach-Object { [long]$_.Matches[0].Groups[3].Value } | Measure-Object -Sum).Sum)
+            targeted_failed_batches = [long](($targeted | ForEach-Object { [long]$_.Matches[0].Groups[4].Value } | Measure-Object -Sum).Sum)
+            dexscreener_mint_requests_completed = 0
+        }
+        # Last continuous snapshot is cumulative; don't sum successive snapshots.
+        $dexPulse=Select-String -LiteralPath $log -Pattern 'dexscreener cp1 continuous active_mints=(\d+) queued=(\d+) in_flight=(\d+) completed=(\d+) failed=(\d+) pairs=(\d+)' | Select-Object -Last 1
+        if ($null -ne $dexPulse) {
+            $tvlMetrics.dexscreener_mint_requests_completed=[long]$dexPulse.Matches[0].Groups[4].Value
+            $tvlMetrics.dexscreener_mint_requests_failed=[long]$dexPulse.Matches[0].Groups[5].Value
+        }
+        $tvlMetrics | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath (Join-Path $folder 'cp15r_transport_report.json') -Encoding UTF8
+        Write-Host "CP15R Raydium worker restarts=$($tvlMetrics.global_worker_restarts) page_retries=$($tvlMetrics.page_retries) preserved_cursor_pauses=$($tvlMetrics.cursor_preserved_pauses) targeted_found=$($tvlMetrics.targeted_found) targeted_batches_failed=$($tvlMetrics.targeted_failed_batches)"
+        if ($restarts -gt 0) {
+            throw "CP15R rejected: Raydium whole-worker restarted $restarts times; inspect cp15r_transport_report.json"
+        }
+        # CP15O: Orca fault-isolation proof from the same finite live run.
+        $orcaRestarts = @(Select-String -LiteralPath $log -Pattern 'runtime worker=discovery\.orca_whirlpool restart_in_s=').Count
+        $orcaMetrics = [ordered]@{
+            global_worker_restarts = $orcaRestarts
+            page_retries = @(Select-String -LiteralPath $log -Pattern 'orca page_retry ').Count
+            exhausted_pages = @(Select-String -LiteralPath $log -Pattern 'orca page_exhausted ').Count
+            cursor_preserved_pauses = @(Select-String -LiteralPath $log -Pattern 'orca route_paused ').Count
+            local_lane_restarts = @(Select-String -LiteralPath $log -Pattern 'orca route_local_restart ').Count
+            http_429_events = @(Select-String -LiteralPath $log -Pattern 'orca http_429 ').Count
+            discovery_records = [long]$discovery['orca_whirlpool_api']
+            prepared_admitted = [long]$tvl.by_venue.orca_whirlpool.prepared_admitted
+            missing_tvl_after_qualification = [long]$tvl.by_venue.orca_whirlpool.missing_tvl
+            tvl_protocol_api = [long]$tvl.by_venue.orca_whirlpool.tvl_by_source.protocol_api
+            tvl_dexscreener = [long]$tvl.by_venue.orca_whirlpool.tvl_by_source.dexscreener
+        }
+        $orcaMetrics | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath (Join-Path $folder 'cp15o_orca_transport_report.json') -Encoding UTF8
+        Write-Host "CP15O Orca worker restarts=$($orcaMetrics.global_worker_restarts) retries=$($orcaMetrics.page_retries) exhausted=$($orcaMetrics.exhausted_pages) preserved_cursor_pauses=$($orcaMetrics.cursor_preserved_pauses) local_restarts=$($orcaMetrics.local_lane_restarts) prepared_admitted=$($orcaMetrics.prepared_admitted)"
+        if ($orcaRestarts -gt 0 -and $plan.enabled_venues -contains 'orca_whirlpool') {
+            throw "CP15O rejected: Orca whole-worker restarted $orcaRestarts times; inspect cp15o_orca_transport_report.json"
+        }
+    }
     Write-Host "Runtime complete=$($summary.runtime_completed); orchestration=$orchestrationPassed; pool TVL evidence=$tvlPassed"
     Write-Host "Pools selected=$($market.selected_pools), priced=$($market.priced_pools); WS gaps=$($market.metrics.gaps)"
     if ($null -ne $execution.streaming_evidence) {

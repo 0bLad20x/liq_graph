@@ -21,6 +21,7 @@ pub(super) enum Worker {
 #[derive(Clone)]
 pub(super) struct Resources {
     pub http:reqwest::Client,
+    pub registry:Option<pool_registry::PoolRegistry>,
     pub rpc:Option<crate::core::rpc::RpcHandle>,
     pub output:broadcast::Sender<Arc<DataBatch>>,
     pub stop:watch::Receiver<bool>,
@@ -36,7 +37,7 @@ impl Worker {
     pub(super) async fn run(self,r:Resources)->Result<()> { match self {
         Self::Dlmm(s)=>meteora_dlmm::run(r.http,r.output,s).await,
         Self::Damm(s)=>meteora_damm_v2::run(r.http,r.output,s).await,
-        Self::Raydium(s)=>raydium::run(r.http,r.output,s).await,
+        Self::Raydium(s)=>raydium::run(r.http,r.output,s,r.registry).await,
         Self::Orca(s)=>orca_whirlpool::run(r.http,r.output,s).await,
         Self::Pancake(s)=>pancakeswap_clmm::run(r.http,r.output,s).await,
         Self::Byreal(s)=>byreal_clmm::run(r.http,r.output,s).await,
@@ -197,7 +198,7 @@ pub(super) async fn live(args:&[String])->Result<()> {
     consumers.spawn(pool_registry::observe_updates(output,false,true));
     consumers.spawn(pool_registry::run(registry_input,None,registry.clone(),updates.clone(),done,true,None));
     if persist {consumers.spawn(database.context("missing persistence")?.run(writer_input.context("missing writer input")?));}
-    let resources=Resources{http:core::http_client()?,rpc,output:source.clone(),stop:stop_rx};
+    let resources=Resources{http:core::http_client()?,rpc,registry:None,output:source.clone(),stop:stop_rx};
     let mut producers=JoinSet::new();
     if name=="identity_hydration" {
         let initial=registry.snapshot().into_iter().filter(|p|p.mint_a.is_none()||p.mint_b.is_none())

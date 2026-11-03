@@ -236,7 +236,7 @@ pub(super) async fn live(args:&[String])->Result<()> {
     }
     let mut discovery_workers=Vec::new();
     for set in sources {discovery_workers.extend(discovery::configured(set,false,None)?);}
-    discovery::spawn_continuous(&mut tasks,discovery_workers,discovery::Resources{
+    discovery::spawn_continuous(&mut tasks,discovery_workers,discovery::Resources{registry:None,
         http:core::http_client()?,rpc:Some(rpc.clone()),output:source.clone(),stop:stop_rx});
     }
     critical(&mut tasks,"rpc_transport",async move{(&mut rpc_task.0).await?});
