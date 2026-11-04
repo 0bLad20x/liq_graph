@@ -131,6 +131,22 @@ fn eligible(v:&MintState,allow_missing:bool)->bool {
         && v.market_cap_usd.map_or(missing_ok,|n|n.is_finite()&&n>=MIN_MARKET_CAP_USD)
 }
 
+/// Single-missing-metric experiment: both missing fields remain excluded.
+fn only_one_missing()->Result<bool> {
+    match std::env::var("MINT_QUALIFICATION_ONE_MISSING_ONLY") {
+        Ok(v)=>match v.as_str(){
+            "true"|"1"=>Ok(true), "false"|"0"=>Ok(false),
+            _=>anyhow::bail!("MINT_QUALIFICATION_ONE_MISSING_ONLY must be true/false or 1/0"),
+        },
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Err(e)=>Err(e.into()),
+    }
+}
+fn eligible_for_run(v:&MintState,allow_missing:bool,only_one:bool)->bool {
+    eligible(v,allow_missing)
+        && !(only_one && v.liquidity_usd.is_none() && v.market_cap_usd.is_none())
+}
+
 /// One authoritative continuously updated economic set. Registry signals only
 /// add mint identities; their economic state is owned by the RAM Mint Registry.
 /// Jupiter is given new/missing and qualified mints; no database scan is needed.
@@ -147,8 +163,9 @@ pub async fn run(
     mut stop:Option<watch::Receiver<bool>>,
 )->Result<()> {
     let allow_missing=missing_values_allowed()?;
-    crate::log_event!(Info,"mint qualification policy allow_missing_metrics={} min_liquidity_usd={} min_market_cap_usd={}",
-        allow_missing,MIN_LIQUIDITY_USD,MIN_MARKET_CAP_USD);
+    let only_one=only_one_missing()?;
+    crate::log_event!(Info,"mint qualification policy allow_missing_metrics={} only_one_missing={} min_liquidity_usd={} min_market_cap_usd={}",
+        allow_missing,only_one,MIN_LIQUIDITY_USD,MIN_MARKET_CAP_USD);
     let mut known=HashSet::<Pubkey>::new();
     for pool in restored_pools {
         for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){known.insert(mint);}
@@ -158,7 +175,7 @@ pub async fn run(
     let mut admitted_missing_liquidity=0_usize;
     let mut admitted_both_missing=0_usize;
     for state in mints.snapshot(){
-        if !known.contains(&state.address)||!eligible(&state,allow_missing){continue;}
+        if !known.contains(&state.address)||!eligible_for_run(&state,allow_missing,only_one){continue;}
         qualified.insert(state.address);
         match (state.liquidity_usd.is_none(),state.market_cap_usd.is_none()) {
             (false,true)=>admitted_missing_mcap+=1,
@@ -205,7 +222,7 @@ pub async fn run(
                     for pool in &batch.pools {
                         for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){
                             if known.insert(mint) {
-                                if mints.get(mint).as_ref().is_some_and(|v|eligible(v,allow_missing)) {
+                                if mints.get(mint).as_ref().is_some_and(|v|eligible_for_run(v,allow_missing,only_one)) {
                                     qualified.insert(mint);
                                 }
                                 dirty=true;
@@ -223,7 +240,7 @@ pub async fn run(
                         if !known.contains(&mint){continue;}
                         let was_qualified=qualified.contains(&mint);
                         let current=mints.get(mint);
-                        let is_qualified=current.as_ref().is_some_and(|v|eligible(v,allow_missing));
+                        let is_qualified=current.as_ref().is_some_and(|v|eligible_for_run(v,allow_missing,only_one));
                         if is_qualified {qualified.insert(mint);}
                         else {qualified.remove(&mint);}
                         if was_qualified!=is_qualified {
@@ -326,6 +343,17 @@ mod tests {
         }
         assert!(!eligible(&mint(None,None,0),true),"on-chain-only mint is not Jupiter-observed");
         assert!(!eligible(&mint(Some(f64::NAN),None,1),true));
+    }
+
+    #[test]
+    fn only_one_missing_mode_keeps_both_unknown_excluded() {
+        assert!(eligible_for_run(&mint(Some(2_000.0),None,1),true,true));
+        assert!(eligible_for_run(&mint(None,Some(10_000.0),1),true,true));
+        assert!(!eligible_for_run(&mint(None,None,1),true,true));
+        assert!(!eligible_for_run(&mint(None,Some(9_999.0),1),true,true));
+        assert!(!eligible_for_run(&mint(Some(1_999.0),None,1),true,true));
+        assert!(!eligible_for_run(&mint(Some(2_000.0),None,0),true,true));
+        assert!(!eligible_for_run(&mint(Some(2_000.0),None,1),false,true));
     }
 
     #[test]
