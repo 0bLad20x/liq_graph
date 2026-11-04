@@ -58,6 +58,14 @@ impl MintRegistry {
             let n=v.as_f64().or_else(||v.as_str()?.parse::<f64>().ok())?;
             (n.is_finite()&&n>=0.0).then_some(n)
         }
+        // A missing field/null is unknown. A present but malformed or negative
+        // economic value must not be reclassified as "missing" by the experiment.
+        fn economic_amount(v:Option<&Value>)->Option<f64> {
+            match v {
+                None|Some(Value::Null)=>None,
+                Some(raw)=>Some(amount(Some(raw)).unwrap_or(0.0)),
+            }
+        }
         fn date(v:Option<&Value>)->Option<String> {
             match v? {
                 Value::Number(n)=>Some(n.to_string()),
@@ -86,8 +94,8 @@ impl MintRegistry {
                     .or_else(||previous.and_then(|v|v.created_at.clone())),
                 updated_at:date(v.get("updatedAt"))
                     .or_else(||previous.and_then(|v|v.updated_at.clone())),
-                liquidity_usd:amount(v.get("liquidity")),
-                market_cap_usd:amount(v.get("mcap")),
+                liquidity_usd:economic_amount(v.get("liquidity")),
+                market_cap_usd:economic_amount(v.get("mcap")),
                 holder_count:v.get("holderCount").and_then(|v|
                     v.as_u64().or_else(||v.as_str().and_then(|s|s.parse::<u64>().ok()))),
                 usd_price:amount(v.get("usdPrice")),
@@ -103,9 +111,24 @@ impl MintRegistry {
 impl MintReader for MintRegistry {
     fn mint(&self,address:Pubkey)->Option<MintState>{self.get(address)}
 }
-fn eligible(v:&MintState)->bool {
-    v.liquidity_usd.is_some_and(|n|n>=MIN_LIQUIDITY_USD)
-        && v.market_cap_usd.is_some_and(|n|n>=MIN_MARKET_CAP_USD)
+/// Explicitly opt in for one comparative live run; unchanged production default.
+fn missing_values_allowed()->Result<bool> {
+    match std::env::var("MINT_QUALIFICATION_ALLOW_MISSING_METRICS") {
+        Ok(v)=>match v.as_str() {
+            "true"|"1"=>Ok(true),
+            "false"|"0"=>Ok(false),
+            _=>anyhow::bail!("MINT_QUALIFICATION_ALLOW_MISSING_METRICS must be true/false or 1/0"),
+        },
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Err(e)=>Err(e.into()),
+    }
+}
+fn eligible(v:&MintState,allow_missing:bool)->bool {
+    // An on-chain-only placeholder is not a Jupiter observation. Do not
+    // admit it merely because both economic fields are still unset.
+    let missing_ok=allow_missing && v.fetched_at_ms>0;
+    v.liquidity_usd.map_or(missing_ok,|n|n.is_finite()&&n>=MIN_LIQUIDITY_USD)
+        && v.market_cap_usd.map_or(missing_ok,|n|n.is_finite()&&n>=MIN_MARKET_CAP_USD)
 }
 
 /// One authoritative continuously updated economic set. Registry signals only
@@ -123,14 +146,30 @@ pub async fn run(
     onchain_revision:Option<watch::Sender<u64>>,
     mut stop:Option<watch::Receiver<bool>>,
 )->Result<()> {
+    let allow_missing=missing_values_allowed()?;
+    crate::log_event!(Info,"mint qualification policy allow_missing_metrics={} min_liquidity_usd={} min_market_cap_usd={}",
+        allow_missing,MIN_LIQUIDITY_USD,MIN_MARKET_CAP_USD);
     let mut known=HashSet::<Pubkey>::new();
     for pool in restored_pools {
         for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){known.insert(mint);}
     }
     let mut qualified=HashSet::<Pubkey>::new();
-    for state in mints.snapshot(){if known.contains(&state.address)&&eligible(&state){
+    let mut admitted_missing_mcap=0_usize;
+    let mut admitted_missing_liquidity=0_usize;
+    let mut admitted_both_missing=0_usize;
+    for state in mints.snapshot(){
+        if !known.contains(&state.address)||!eligible(&state,allow_missing){continue;}
         qualified.insert(state.address);
-    }}
+        match (state.liquidity_usd.is_none(),state.market_cap_usd.is_none()) {
+            (false,true)=>admitted_missing_mcap+=1,
+            (true,false)=>admitted_missing_liquidity+=1,
+            (true,true)=>admitted_both_missing+=1,
+            _=>{},
+        }
+    }
+    crate::log_event!(Info,
+        "mint qualification bootstrap qualified={} pass_through_missing_market_cap={} pass_through_missing_liquidity={} pass_through_both_missing={}",
+        qualified.len(),admitted_missing_mcap,admitted_missing_liquidity,admitted_both_missing);
     let mut ticker=tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut missing_cursor=0_usize;
@@ -166,7 +205,7 @@ pub async fn run(
                     for pool in &batch.pools {
                         for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){
                             if known.insert(mint) {
-                                if mints.get(mint).as_ref().is_some_and(eligible) {
+                                if mints.get(mint).as_ref().is_some_and(|v|eligible(v,allow_missing)) {
                                     qualified.insert(mint);
                                 }
                                 dirty=true;
@@ -184,7 +223,7 @@ pub async fn run(
                         if !known.contains(&mint){continue;}
                         let was_qualified=qualified.contains(&mint);
                         let current=mints.get(mint);
-                        let is_qualified=current.as_ref().is_some_and(eligible);
+                        let is_qualified=current.as_ref().is_some_and(|v|eligible(v,allow_missing));
                         if is_qualified {qualified.insert(mint);}
                         else {qualified.remove(&mint);}
                         if was_qualified!=is_qualified {
@@ -251,4 +290,64 @@ pub async fn run(
         if !pool_open&&!jupiter_open{break;}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::DataRecord;
+    use serde_json::json;
+
+    fn mint(liquidity:Option<f64>,mcap:Option<f64>,fetched_at_ms:u64)->MintState {
+        MintState {address:Pubkey::default(),token_program:None,decimals:None,
+            created_at:None,updated_at:None,liquidity_usd:liquidity,
+            market_cap_usd:mcap,holder_count:None,usd_price:None,
+            fetched_at_ms,onchain:None}
+    }
+
+    #[test]
+    fn missing_economic_fields_are_accepted_only_when_enabled_and_observed() {
+        let cases=[
+            (Some(2_000.0),Some(10_000.0),true,true),
+            (Some(2_000.0),None,false,true),
+            (None,Some(10_000.0),false,true),
+            (None,None,false,true),
+            (Some(1_999.0),None,false,false),
+            (None,Some(9_999.0),false,false),
+            (Some(1_999.0),Some(10_000.0),false,false),
+            (Some(2_000.0),Some(9_999.0),false,false),
+            (Some(0.0),None,false,false),
+            (None,Some(0.0),false,false),
+        ];
+        for (liquidity,mcap,strict,permissive) in cases {
+            let state=mint(liquidity,mcap,1);
+            assert_eq!(eligible(&state,false),strict,"strict: {liquidity:?}/{mcap:?}");
+            assert_eq!(eligible(&state,true),permissive,"permissive: {liquidity:?}/{mcap:?}");
+        }
+        assert!(!eligible(&mint(None,None,0),true),"on-chain-only mint is not Jupiter-observed");
+        assert!(!eligible(&mint(Some(f64::NAN),None,1),true));
+    }
+
+    #[test]
+    fn malformed_or_negative_jupiter_metrics_fail_closed() {
+        let address:Pubkey="So11111111111111111111111111111111111111112".parse().unwrap();
+        let registry=MintRegistry::default();
+        let batch=DataBatch {source:"jupiter_search",received_at_ms:12,
+            records:vec![DataRecord {identity:RecordIdentity::Mint{address},
+                tvl_usd:None,config:None,payload:json!({
+                    "liquidity":"invalid", "mcap":null
+                })}]};
+        registry.apply(&batch);
+        let actual=registry.get(address).unwrap();
+        assert_eq!(actual.liquidity_usd,Some(0.0));
+        assert_eq!(actual.market_cap_usd,None);
+        assert!(!eligible(&actual,true));
+        let batch=DataBatch {source:"jupiter_search",received_at_ms:13,
+            records:vec![DataRecord {identity:RecordIdentity::Mint{address},
+                tvl_usd:None,config:None,payload:json!({
+                    "liquidity":-1.0,"mcap":100_000.0
+                })}]};
+        registry.apply(&batch);
+        assert!(!eligible(&registry.get(address).unwrap(),true));
+    }
 }
