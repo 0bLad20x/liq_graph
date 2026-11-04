@@ -154,9 +154,22 @@ pub async fn run(
         for mint in [pool.mint_a,pool.mint_b].into_iter().flatten(){known.insert(mint);}
     }
     let mut qualified=HashSet::<Pubkey>::new();
-    for state in mints.snapshot(){if known.contains(&state.address)&&eligible(&state,allow_missing){
+    let mut admitted_missing_mcap=0_usize;
+    let mut admitted_missing_liquidity=0_usize;
+    let mut admitted_both_missing=0_usize;
+    for state in mints.snapshot(){
+        if !known.contains(&state.address)||!eligible(&state,allow_missing){continue;}
         qualified.insert(state.address);
-    }}
+        match (state.liquidity_usd.is_none(),state.market_cap_usd.is_none()) {
+            (false,true)=>admitted_missing_mcap+=1,
+            (true,false)=>admitted_missing_liquidity+=1,
+            (true,true)=>admitted_both_missing+=1,
+            _=>{},
+        }
+    }
+    crate::log_event!(Info,
+        "mint qualification bootstrap qualified={} pass_through_missing_market_cap={} pass_through_missing_liquidity={} pass_through_both_missing={}",
+        qualified.len(),admitted_missing_mcap,admitted_missing_liquidity,admitted_both_missing);
     let mut ticker=tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut missing_cursor=0_usize;
