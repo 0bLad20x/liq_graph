@@ -173,18 +173,19 @@ def post(events_path):
             used=list(selection[sci["pools"]] or [])
             targets.add(target);pools.update(used)
             error=report[ri["err"]]
-            category="success" if error is None else str(error)[:100]
+            category="simulation_no_error" if error is None else str(error)[:100]
             bps=selection[sci["marginal_signal_bps"]]
-            entries.append((target,used,category,bps))
+            dex_calls=report[ri["dex_call_count"]]
+            entries.append((target,used,category,bps,dex_calls))
     mint_rows=batched(targets,"mints","mint_address,liquidity_usd::double precision AS liquidity_usd,market_cap_usd::double precision AS market_cap_usd,fetched_at IS NOT NULL AS observed","mint_address")
     pool_rows=batched(pools,"pools","pool_address,venue,tvl_usd::double precision AS tvl_usd,(tvl_observed_at BETWEEN now()-interval '1 hour' AND now()) AS fresh_tvl,tvl_source","pool_address")
     groups={}
-    for target,used,outcome,bps in entries:
+    for target,used,outcome,bps,dex_calls in entries:
         m=mint_rows.get(target)
         cls=classify(m.get("liquidity_usd") if m else None,
                      m.get("market_cap_usd") if m else None,
                      bool(m and m.get("observed")))
-        item=groups.setdefault(cls,{"simulations":0,"successes":0,"unique_targets":set(),
+        item=groups.setdefault(cls,{"simulations":0,"successes":0,"dex_calls_observed":0,"unique_targets":set(),
                                     "unique_pools":set(),"error_names":collections.Counter(),
                                     "all_pools_have_fresh_tvl":0,
                                     "at_least_one_fresh_tvl_500":0,
@@ -194,8 +195,9 @@ def post(events_path):
         item["simulations"]+=1
         item["unique_targets"].add(target)
         item["unique_pools"].update(used)
-        item["successes"]+=int(outcome=="success")
-        if outcome!="success":item["error_names"][outcome]+=1
+        item["successes"]+=int(outcome=="simulation_no_error")
+        item["dex_calls_observed"]+=int(isinstance(dex_calls,int) and dex_calls>0)
+        if outcome!="simulation_no_error":item["error_names"][outcome]+=1
         rp=[pool_rows.get(p) for p in used]
         all_fresh=bool(rp) and all(p and p.get("fresh_tvl") and p.get("tvl_usd") is not None for p in rp)
         some_500=any(p and p.get("fresh_tvl") and p.get("tvl_usd") is not None and p["tvl_usd"]>=500 for p in rp)
@@ -208,7 +210,7 @@ def post(events_path):
     compact={}
     for cls,g in groups.items():
         compact[cls]={
-            "simulations":g["simulations"],"successes":g["successes"],
+            "simulations":g["simulations"],"successes":g["successes"],"dex_calls_observed":g["dex_calls_observed"],
             "unique_targets":len(g["unique_targets"]),"unique_pools":len(g["unique_pools"]),
             "all_pools_have_fresh_tvl":g["all_pools_have_fresh_tvl"],
             "at_least_one_fresh_tvl_500":g["at_least_one_fresh_tvl_500"],
