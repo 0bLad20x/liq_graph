@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from urllib.parse import parse_qs, unquote, urlparse
 
 WSOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -34,9 +35,22 @@ def db_uri():
     raise RuntimeError("LIQ_GRAPH_DATABASE_URL / DATABASE_URL missing from environment or .env")
 
 def sql(query):
-    # Never include the URI in output/error messages (could contain password).
+    # Set libpq connection fields through the local process environment, not
+    # command-line arguments or persisted audit reports.
     env=os.environ.copy()
-    env["PGDATABASE"]=db_uri()
+    uri=db_uri()
+    parsed=urlparse(uri)
+    if parsed.scheme not in ("postgres", "postgresql"):
+        raise RuntimeError("Expected a postgresql:// connection URL in local .env")
+    for key,value in (("PGHOST",parsed.hostname),("PGPORT",parsed.port),
+                      ("PGUSER",parsed.username),("PGPASSWORD",parsed.password),
+                      ("PGDATABASE",parsed.path.lstrip("/"))):
+        if value is not None and value != "":
+            env[key]=unquote(str(value))
+    for key,pg in (("sslmode","PGSSLMODE"),("connect_timeout","PGCONNECT_TIMEOUT"),
+                   ("application_name","PGAPPNAME"),("target_session_attrs","PGTARGETSESSIONATTRS")):
+        value=parse_qs(parsed.query).get(key)
+        if value: env[pg]=value[-1]
     result=subprocess.run(["psql","-X","-A","-t","-v","ON_ERROR_STOP=1","-c",query],
                           text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
     if result.returncode:
