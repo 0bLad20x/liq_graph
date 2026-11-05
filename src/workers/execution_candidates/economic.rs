@@ -262,20 +262,47 @@ pub(super) fn comparison(selection:&Selection,
     };
     let settlement=selection.request.settlement.to_string();
     let target=selection.target.to_string();
-    let input=calls[0].inputs.first().map(|x|x.gross_amount_raw);
-    let Some(input)=input else{return json!({"status":"unavailable","reason":"actual_input_missing"});};
+    let Some(first_input)=calls[0].inputs.first()else{
+        return json!({"status":"unavailable","reason":"actual_input_missing"});
+    };
+    let Some(first_output)=calls[0].outputs.first()else{
+        return json!({"status":"unavailable","reason":"first_output_missing"});
+    };
+    let Some(second_input)=calls[1].inputs.first()else{
+        return json!({"status":"unavailable","reason":"second_input_missing"});
+    };
+    let Some(second_output)=calls[1].outputs.first()else{
+        return json!({"status":"unavailable","reason":"second_output_missing"});
+    };
+    // Compare only continuous, fully closed flows. Unused settlement input is
+    // returned to the wallet and must not be mistaken for a quote discrepancy.
+    if first_input.mint!=settlement || first_output.mint!=target
+        || second_input.mint!=target || second_output.mint!=settlement
+        || first_output.amount_raw!=second_input.gross_amount_raw
+        || second_input.amount_raw!=second_input.gross_amount_raw
+        || first_input.gross_amount_raw<first_input.amount_raw {
+        return json!({"status":"unavailable","reason":"not_complete_continuous_cycle"});
+    }
+    let input=first_input.gross_amount_raw;
+    let refund=first_input.gross_amount_raw-first_input.amount_raw;
+    let actual=second_output.amount_raw.checked_add(refund);
+    let actual_gain=actual.map(|o|i128::from(o)-i128::from(input));
     let model=if first.liquidity_window_checked&&second.liquidity_window_checked {
         route(&first.observation,&second.observation,&settlement,&target,input as f64)
     }else{None};
-    let actual=calls[1].outputs.first().map(|o|o.amount_raw);
-    let actual_gain=actual.map(|o|i128::from(o)-i128::from(input));
     let output=model.map(|n|n.floor() as u64);
+    let network=network_cost(&settlement,&selection.request.parameters);
     json!({"status":if output.is_some(){"estimated"}else{"unknown"},
         "scope":"frozen_snapshot_same_executed_pair_at_v10_chosen_amount",
         "actual_input_raw":input,"actual_output_raw":actual,
         "predicted_output_at_v10_input_raw":output,
         "predicted_dex_gain_at_v10_input_raw":output.map(|o|i128::from(o)-i128::from(input)).map(|x|x.to_string()),
         "actual_dex_gain_raw":actual_gain.map(|x|x.to_string()),
+        "settlement_input_refund_raw":refund,
+        "prediction_input_delta_actual_minus_optimum_raw":selection.economic.input_raw
+            .map(|q|(i128::from(input)-i128::from(q)).to_string()),
+        "predicted_net_gain_at_v10_input_raw":output.zip(network)
+            .map(|(o,c)|(i128::from(o)-i128::from(input)-i128::from(c)).to_string()),
         "output_delta_actual_minus_predicted_raw":actual.zip(output)
             .map(|(a,p)|(i128::from(a)-i128::from(p)).to_string()),
         "prediction_optimal_input_raw":selection.economic.input_raw,
