@@ -1,6 +1,7 @@
 //! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
+mod economic;
 #[cfg(test)]
 mod amounts_reference;
 #[cfg(test)]
@@ -161,6 +162,7 @@ pub struct Selection {
     /// May differ from the source SignalCandidate after quantity seed repair.
     packing_seed_log_sum_units:i64,
     amount_assessment:amounts::Assessment,amount_seed_changed:bool,
+    economic:economic::Prediction,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
@@ -185,6 +187,8 @@ pub struct Report {
     preparation:Preparation,
     cp10_capacity_phases:crate::workers::execution_v10::CapacityPhaseProfile,
     cp11_quantity_phases:amounts::PhaseProfile,
+    pub cp20_economic_forecasts:u64,pub cp20_economic_modeled:u64,
+    pub cp20_economic_positive:u64,pub cp20_economic_unknown:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -357,6 +361,8 @@ impl Selection {
                 .all(|(l,c)|Some(l.pool.as_str())==c.pool.as_deref()&&l.input_mint==c.inputs[0].mint&&l.output_mint==c.outputs[0].mint)),
             "probe_same_amount":probe.zip(initial).map(|(p,i)|p.input_raw==i),"processing_ns":elapsed_ns(started)});
         // Keep the legacy calibration macro small to avoid json! recursion depth.
+        result["economic_prediction"]=json!(&self.economic);
+        result["economic_at_v10_input"]=economic::comparison(self,report);
         result["cp9c_audit_schema"]=json!(1);
         result["packing_strategy"]=json!(self.packing_strategy);
         result["packing_revision_variant"]=json!(self.packing_revision_variant);
@@ -515,7 +521,9 @@ impl State {
             }
         }
         assessment.elapsed_ns=elapsed_ns(started);report.record(&assessment);
-        selection.amount_assessment=assessment;Ok(Some(selection))
+        selection.amount_assessment=assessment;
+        selection.economic=economic::predict(&selection);
+        Ok(Some(selection))
     }
     fn apply(&mut self, s:&SignalStateUpdate, recovering:bool,preparation:&mut Preparation)->Result<()> {
         self.received_at_us=now_us();
@@ -824,7 +832,8 @@ impl State {
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added,packing_seed_log_sum_units:seed_sum,
-            amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed})
+            amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed,
+            economic:economic::Prediction::unknown("not_evaluated")})
         })();
         preparation.pack_build_ns.record(elapsed_ns(started));
         result
@@ -952,7 +961,17 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     report.preparation.signal_to_round_start_ns.record(
                         now_us().saturating_sub(state.ready_at_us).saturating_mul(1000));
                     let mut reads=RegistryReads::default();
-                    ranked.sort_unstable_by_key(|entry|entry.0);
+                    // CP20: compute economic priority once; unknown remains eligible.
+                    ranked.sort_by_cached_key(|(marginal,event,index)|{
+                        let gain=match event.as_ref(){
+                            SignalEvent::Candidates(batch)=>batch.candidates.get(*index)
+                                .and_then(|c|c.witness.as_ref())
+                                .and_then(|w|economic::witness_gain(w,&cfg.parameters)),
+                            _=>None,
+                        };
+                        let category=match gain{Some(n) if n>0=>0,None=>1,Some(_)=>2};
+                        (category,std::cmp::Reverse(gain.unwrap_or(0)),*marginal)
+                    });
                     // CP9D: one source candidate per distinct physical token pair.
                     // First give changed, currently priced witnesses priority. Then
                     // rotate through authoritative active witnesses from this
@@ -1078,6 +1097,13 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 &mut report.amounts,&mut report.preparation)? else{
                                 continue;
                             };
+                            report.cp20_economic_forecasts+=1;
+                            if selection.economic.status=="estimated" {
+                                report.cp20_economic_modeled+=1;
+                                if selection.economic.predicted_net_gain_raw.is_some_and(|n|n>0) {
+                                    report.cp20_economic_positive+=1;
+                                }
+                            }else{report.cp20_economic_unknown+=1;}
                             let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
                             actual.sort_unstable();
                             // Once the amount assessment has been accounted for,
