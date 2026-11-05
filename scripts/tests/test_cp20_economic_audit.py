@@ -31,7 +31,8 @@ def compact_record(request_id, slot=123, economic=True, with_cycle=True):
         "marginal_signal_bps":0.01,"estimated_net_return_bps":0.01,
         "amount_decision":"unknown","amount_estimate":None,
         "liquidity_checked":True,"packing":[1,2,10,10,100,1000],
-        "request_ready_at_us":500,"economic":prediction
+        "request_ready_at_us":500,"economic":prediction,
+        "packed_state_digest":"f"*64
     }
     facts={
         "context_slot":slot,"provider":"rpc","err":None,"error_name":None,
@@ -156,6 +157,9 @@ class CP20EconomicAuditTests(unittest.TestCase):
         self.assertEqual(cp["v10_comparison"]["same_path_quantity_compared"],2)
         repeat=cp["frozen_state_repetition"]
         self.assertEqual(repeat["different_frozen_path_states"],1)
+        packed=cp["packed_snapshot_repetition"]
+        self.assertEqual(packed["different_packed_frozen_states"],1)
+        self.assertEqual(packed["requests_in_repeated_packed_state_groups"],2)
         self.assertEqual(repeat["requests_in_repeated_frozen_path_states"],2)
         self.assertEqual(repeat["largest_repeated_states"][0]["different_simulation_slots"],2)
         self.assertEqual(cp["outcomes_by_forecast_class"]["positive"]
