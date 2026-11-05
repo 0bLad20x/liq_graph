@@ -53,7 +53,8 @@ impl Settings {
             "all"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed],
             "all_coverage"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed,PackingStrategy::Coverage],
             "coverage"=>vec![PackingStrategy::Coverage],
-            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed, all, coverage or all_coverage"),
+            "economic"=>vec![PackingStrategy::Economic],
+            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed, all, coverage, economic or all_coverage"),
         };
         let cp9d_max_pairs:usize=env::var("GRAPH_CP9D_MAX_DISTINCT_PAIRS")
             .unwrap_or_else(|_|"1".into()).parse().context("invalid GRAPH_CP9D_MAX_DISTINCT_PAIRS")?;
@@ -495,7 +496,8 @@ impl State {
                     registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,
                     match selection.packing_strategy {
                         "contrarian"=>PackingStrategy::Contrarian,"mixed"=>PackingStrategy::Mixed,
-                        "coverage"=>PackingStrategy::Coverage,_=>PackingStrategy::Baseline
+                        "coverage"=>PackingStrategy::Coverage,"economic"=>PackingStrategy::Economic,
+                        _=>PackingStrategy::Baseline
                     },&[],Some(&preferred),preparation) {
                     if repaired.amount_seed_changed {
                         let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
@@ -757,7 +759,38 @@ impl State {
         preparation.alternative_options+=alternative_profiles.len() as u64;
         preparation.alternative_lookup_ns.record(elapsed_ns(lookup));
         let ranking_started=Instant::now();
-        let ranking=if strategy==PackingStrategy::Coverage {
+        let ranking=if strategy==PackingStrategy::Economic
+            && top.kind==SignalRouteKind::Direct2 {
+            // Rank each optional leg by its modeled profit with the opposite
+            // frozen seed leg. V10 packing/capacity remains the hard boundary.
+            // This ranking never vetoes Unknown alternatives. Cross-alternative
+            // pair maxima are recorded after packing, not guessed here.
+            let settlement=top.settlement.to_string();
+            let target=top.target.to_string();
+            let direct_seed=slots.iter().find(|(_,role)|*role=="direct")
+                .map(|(slot,_)|slot/2);
+            let partner_seed=slots.iter().find(|(_,role)|*role=="partner")
+                .map(|(slot,_)|slot/2);
+            let mut scored=options.iter().enumerate().map(|(i,(_,slot,role,_))|{
+                let opposite=if *role=="direct"{partner_seed}else{direct_seed};
+                let observed=self.prices.get(slot/2).and_then(Option::as_ref)
+                    .map(|p|p.observation.as_ref());
+                let other=opposite.and_then(|id|self.prices.get(id))
+                    .and_then(Option::as_ref).map(|p|p.observation.as_ref());
+                let gain=observed.zip(other).and_then(|(new,old)|{
+                    if *role=="direct"{
+                        economic::pair_gain(new,old,&settlement,&target,&cfg.parameters)
+                    }else{
+                        economic::pair_gain(old,new,&settlement,&target,&cfg.parameters)
+                    }
+                });
+                let category=match gain{Some(n) if n>0=>0,None=>1,Some(_)=>2};
+                ((category,std::cmp::Reverse(gain.unwrap_or(0)),
+                    alternative_profiles[i].marginal_score,*slot),i)
+            }).collect::<Vec<_>>();
+            scored.sort_unstable_by_key(|(key,_)|*key);
+            scored.into_iter().map(|(_,i)|i).collect()
+        }else if strategy==PackingStrategy::Coverage {
             preparation.coverage_rankings+=1;
             preparation.coverage_key_evaluations+=alternative_profiles.len() as u64;
             diversity::coverage_order(&alternative_profiles,&slots.iter().map(|(s,_)|s/2).collect::<Vec<_>>(),
