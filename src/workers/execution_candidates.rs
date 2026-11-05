@@ -2,6 +2,7 @@
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
 mod economic;
+mod scheduling;
 #[cfg(test)]
 mod amounts_reference;
 #[cfg(test)]
@@ -192,10 +193,30 @@ pub struct Report {
     pub cp20_economic_positive:u64,pub cp20_economic_unknown:u64,
     pub cp20_active_scored:u64,pub cp20_active_model_positive:u64,
     pub cp20_active_model_unknown:u64,pub cp20_active_prioritized:u64,
+    pub cp20s_recent_fresh_deferred:u64,pub cp20s_recent_active_deferred:u64,
+    pub cp20s_repeated_packs_deferred:u64,pub cp20s_new_packs:u64,
+    pub cp20s_recheck_packs:u64,pub cp20s_unknown_fingerprint_packs:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
     pub fn packing_metrics(&self)->&ExecutionMetrics {&self.packing}
+    // The same key is used by CP20S scheduling and the compact audit.
+    // Include the full V10 execution parameters, frozen fees and direction.
+    // Missing frozen evidence disables cooldown rather than assuming stasis.
+    fn packed_state_fingerprint(&self)->Option<String>{
+        let mut parts=Vec::with_capacity(self.pools.len());
+        for p in &self.pools {
+            let (input,output)=if p.slot%2==0 {
+                (&p.observation.mint_a,&p.observation.mint_b)
+            } else {
+                (&p.observation.mint_b,&p.observation.mint_a)
+            };
+            parts.push(scheduling::frozen_leg(&p.observation,p.role,input,output)?);
+        }
+        scheduling::fingerprint(&format!("{:?}",self.route_kind),
+            &self.request.settlement.to_string(),&self.target.to_string(),
+            parts,&self.request.parameters)
+    }
     /// One frozen-model quote at a supplied amount; no search, live state or RPC.
     fn quote_frozen_leg(&self,pool:&str,input_mint:&str,output_mint:&str,amount:u64)->Result<u64,&'static str> {
         let p=self.pools.iter().find(|p|p.pool==pool).ok_or("pool_not_in_frozen_selection")?;
@@ -383,20 +404,9 @@ impl Selection {
             .context("execution evidence lacks source witness")?;
         let source=witness.legs.iter().map(|l|l.observation.pool.as_str()).collect::<Vec<_>>();
         let seed=self.pools.iter().take(source.len()).map(|p|p.pool.as_str()).collect::<Vec<_>>();
-        // Bounded 32-byte identity for ALL V10 submissions, even if no DEX
-        // CPI executes. Exclude observation slot: identical frozen state in
-        // different simulation slots must remain distinguishable analytically.
-        // Include fee rates separately in case a valuation changes without a
-        // corresponding price change. Missing evidence is NOT a stable identity.
-        let packed_facts=self.pools.iter().map(|p|{
-            let l=p.observation.liquidity.as_ref()?;
-            let v=p.observation.valuation.as_ref()?;
-            Some(serde_json::json!([&p.pool,p.role,l.content_digest,l.account_set_digest,
-                v.dex_fee_rates,v.base_fee_rate,v.variable_fee_rate,v.token_fee_status]))
-        }).collect::<Option<Vec<_>>>();
-        let packed_state_digest=packed_facts.and_then(|facts|serde_json::to_vec(&facts).ok())
-            .map(|bytes|ring::digest::digest(&ring::digest::SHA256,&bytes).as_ref().iter()
-                .map(|b|format!("{b:02x}")).collect::<String>());
+        // Identical to the fingerprint used by the in-memory scheduler.
+        // Snapshot digest excludes slots; the journal keeps simulation slots.
+        let packed_state_digest=self.packed_state_fingerprint();
         let mut value=serde_json::json!({
             "id":self.request.id,"settlement":self.request.settlement.to_string(),
             "target":self.target.to_string(),"route_kind":self.route_kind,"reverse":self.reverse,
@@ -470,6 +480,23 @@ impl State {
         if a.pool!=first.observation.pool||b.pool!=second.observation.pool{return None;}
         economic::pair_gain(a,b,&first.input_mint.to_string(),
             &first.output_mint.to_string(),params)
+    }
+    /// Fingerprint the directed source pair using CURRENT MarketState snapshots.
+    /// Its only scheduling effect is priority: final admission checks the entire
+    /// packed request, so changed alternatives are never permanently vetoed.
+    fn source_fingerprint(&self,w:&SignalWitness,
+        params:&ExecutionParameters)->Option<String> {
+        if w.legs.len()!=2{return None;}
+        let mut parts=Vec::with_capacity(2);
+        for (i,leg) in w.legs.iter().enumerate() {
+            let obs=self.prices.get(leg.slot/2)?.as_ref()?.observation.as_ref();
+            if obs.pool!=leg.observation.pool{return None;}
+            let role=if i==0{"direct"}else{"partner"};
+            parts.push(scheduling::frozen_leg(obs,role,
+                &leg.input_mint.to_string(),&leg.output_mint.to_string())?);
+        }
+        scheduling::fingerprint("Direct2",&w.legs[0].input_mint.to_string(),
+            &w.legs[0].output_mint.to_string(),parts,params)
     }
     fn amount_input(&self,id:usize,manifest_matches:bool)->Option<amounts::Input> {
         let price=self.prices.get(id)?.as_ref()?;let identity=self.pools.get(id)?;
