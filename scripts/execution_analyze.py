@@ -10,6 +10,23 @@ import statistics
 import zipfile
 
 WSOL = 'So11111111111111111111111111111111111111112'
+USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+
+
+def cp21a_usd_nano(asset, amount_raw):
+    """Integer normalization at the existing fixed $100/SOL reference."""
+    if asset == WSOL:
+        return int(amount_raw) * 100
+    if asset == USDC:
+        return int(amount_raw) * 1000
+    return None
+
+
+def cp21a_v10_profit_fee(gross_raw):
+    """Known V10 rule: 10% of positive profit, integer truncated."""
+    return max(int(gross_raw), 0) // 10
+
+
 
 
 def decode_compact(header, row):
@@ -244,6 +261,11 @@ def analyze(rows):
     cp20_frozen_states = collections.Counter()
     cp20_frozen_state_slots = collections.defaultdict(set)
     cp20_frozen_state_above_fee = collections.Counter()
+    cp21a_counts=collections.Counter()
+    cp21a_by_settlement=collections.defaultdict(collections.Counter)
+    cp21a_fee_errors=[]
+    cp21a_positive_frozen=set()
+    cp21a_gross_delta=[]
 
     def frozen_digest(leg, field):
         value = leg.get(field)
@@ -278,6 +300,40 @@ def analyze(rows):
         cp20s_schedule_counts[schedule]['requests']+=1
         cp20s_schedule_counts[schedule]['source_'+source]+=1
         economic=s.get('economic')
+        # CP21A: counterfactual uses the SAME frozen CP20/CP20S forecast and
+        # separately reports the known fee. No synthetic or replayed trades.
+        asset=q['settlement']
+        if isinstance(economic,dict) and economic.get('status')=='estimated' and all(
+                economic.get(k) is not None for k in
+                ('dex_gain_raw','reference_network_cost_raw')):
+            gross=int(economic['dex_gain_raw'])
+            reference_cost=int(economic['reference_network_cost_raw'])
+            legacy_net=gross-reference_cost
+            fee=cp21a_v10_profit_fee(gross)
+            projected_net=gross-fee-reference_cost
+            normalized=cp21a_usd_nano(asset,projected_net)
+            cp21a_counts['counterfactual_forecasts']+=1
+            group=cp21a_by_settlement[asset]
+            group['forecasts']+=1
+            group['legacy_positive']+=int(legacy_net>0)
+            group['adjusted_positive']+=int(projected_net>0)
+            group['newly_nonpositive']+=int(legacy_net>0 and projected_net<=0)
+            if normalized is not None:
+                group['adjusted_profit_usd_nano_observation_sum']+=normalized
+            # Schema 7 and later can coexist; only NEW fields authorize
+            # comparing the new predictor, never manufacture older columns.
+            if economic.get('v10_profit_fee_raw') is not None:
+                cp21a_counts['new_schema_checked']+=1
+                checks=(
+                    int(economic['v10_profit_fee_raw'])==fee and
+                    int(economic['post_v10_gain_raw'])==gross-fee and
+                    int(economic['predicted_net_gain_raw'])==projected_net and
+                    int(economic['predicted_net_gain_usd_nano'])==normalized)
+                if not checks:
+                    cp21a_counts['new_schema_mismatch']+=1
+                    bad('calibration',identity)
+        else:
+            cp21a_counts['forecasts_unavailable']+=1
         forecast_class='missing'
         if isinstance(economic, dict):
             cp20_counts['available_in_journal'] += 1
@@ -380,6 +436,33 @@ def analyze(rows):
             continue
         dex_calls += bool(r['dex_invocations'])
         c = row.get('calibration')
+        # CP21A: verify expected V10 share against observed wallet SETTLEMENT
+        # change, but only for committed, continuous complete cycles. Rent is
+        # refundable capital and cannot be inferred as a permanent network fee.
+        if sim['err'] is None and c and c.get('single_cycle'):
+            balance=(r.get('balance_changes') or {}).get('settlement_gain_raw')
+            trade_input=c.get('trade_input_raw')
+            trade_output=c.get('trade_output_raw')
+            if balance is not None and trade_input is not None and trade_output is not None:
+                gross=int(trade_output)-int(trade_input)
+                fee_expected=cp21a_v10_profit_fee(gross)
+                fee_observed=gross-int(balance)
+                cp21a_counts['wallet_fee_compared']+=1
+                if fee_observed!=fee_expected:
+                    cp21a_counts['wallet_fee_mismatch']+=1
+                    if len(cp21a_fee_errors)<12:
+                        cp21a_fee_errors.append({'id':identity,'settlement':q['settlement'],
+                            'gross':gross,'actual_wallet_gain':int(balance),
+                            'observed_fee':fee_observed,'expected_fee':fee_expected})
+                paid_fee=sim.get('fee')
+                if paid_fee is not None and q['settlement'] in (WSOL,USDC):
+                    actual_nano=cp21a_usd_nano(q['settlement'],int(balance))-int(paid_fee)*100
+                    cp21a_counts['observed_net_normalized']+=1
+                    cp21a_by_settlement[q['settlement']]['observed_committed']+=1
+                    cp21a_by_settlement[q['settlement']]['observed_positive_after_fee']+=int(actual_nano>0)
+                    cp21a_by_settlement[q['settlement']]['observed_net_usd_nano_observation_sum']+=actual_nano
+                    if actual_nano>0 and packed_key is not None:
+                        cp21a_positive_frozen.add(packed_key)
         # A path-state is an ordered, directed two-leg route plus both frozen
         # state and Prepared-account digests. Different simulation slots do not
         # create distinct observed economic states. Missing digests stay Unknown.
@@ -733,7 +816,22 @@ def analyze(rows):
                   'Only complete committed two-leg cycles can establish observed gains. '
                   'Rent capital and missing priority/tip costs require separate treatment.')
     }
+    cp21a={
+        'counts':dict(cp21a_counts),
+        'by_settlement':{k:dict(v) for k,v in sorted(cp21a_by_settlement.items())},
+        'distinct_positive_packed_frozen_states':len(cp21a_positive_frozen),
+        'v10_fee_rule_mismatch_samples':cp21a_fee_errors,
+        'usd_nano_definition':'1 unit = USD 1e-9; SOL/USD reference is fixed at 100',
+        'cost_scope':('V10 share floor(max(gross,0)/10), transaction base fee and '
+                      'configured priority fee. No hidden tips, no unmodeled loan '
+                      'fees; rent is recoverable capital, not recurring transaction fee.'),
+        'interpretation':('Summed observation net is not a realizable PnL because '
+                          'repeated simulations can refer to one frozen state. '
+                          'Positive cashflow and actually executed trades must be '
+                          'proven independently.')
+    }
     return {'schema_version': 2,
+            'cp21a_profit_accounting':cp21a,
             'cp9e_direct_route_comparison':cp9e,
             'cp9d_signal_breadth_and_coverage':cp9d,
             'cp9c_strategy_comparison': cp9c,

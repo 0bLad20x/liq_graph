@@ -1,0 +1,40 @@
+# CP21A read-only mainnet validation. Requires the user's local .env and wallet.
+# Runs V10 simulateTransaction only; never broadcasts real transactions.
+$ErrorActionPreference = 'Stop'
+Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..'))
+if ((git branch --show-current).Trim() -ne 'cp21a-net-profit-accounting') {
+    throw 'Checkout CP21A branch before running this test'
+}
+cargo test --locked --release cp20_
+if ($LASTEXITCODE -ne 0) { throw 'CP20 tests failed' }
+cargo test --locked --release cp20s_
+if ($LASTEXITCODE -ne 0) { throw 'CP20S scheduling tests failed' }
+python -m unittest discover -s scripts/tests -p 'test_cp20_economic_audit.py'
+if ($LASTEXITCODE -ne 0) { throw 'CP20 economic evidence tests failed' }
+cargo test --locked --release cp21a_
+if ($LASTEXITCODE -ne 0) { throw 'CP21A profit accounting tests failed' }
+python -m unittest discover -s scripts/tests -p 'test_cp21a_profit_audit.py'
+if ($LASTEXITCODE -ne 0) { throw 'CP21A profit audit tests failed' }
+.\scripts\runtime_live.ps1 `
+    -ExpectedBranch cp21a-net-profit-accounting `
+    -Stage Signals `
+    -EnabledVenues 'pumpswap,meteora_dlmm,raydium_cpmm' `
+    -EnabledRoutes direct2 `
+    -PoolLimit 0 `
+    -AccountBudget 10000 `
+    -WsProviders '1,2' `
+    -MinPoolTvlUsd 500 `
+    -MinDirectionNotionalUsd 50 `
+    -DirectionLiquidityMode Filter `
+    -ThresholdBps 0 `
+    -DurationSeconds 300 `
+    -TvlSourceInfo `
+    -ProfileSignals `
+    -SimulateV10 `
+    -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json') `
+    -SimulationLimit 0 `
+    -V10Parallelism 32 `
+    -CP9CPackingMode Economic `
+    -CP9DMaxPairs 3 `
+    -ExecutionDetailLimit 128
+if ($LASTEXITCODE -ne 0) { throw 'CP21A five-minute live run failed' }

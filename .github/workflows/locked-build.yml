@@ -64,6 +64,10 @@ jobs:
         run: cargo test --locked --release cp20s_
       - name: CP20R economic compact journal and frozen-state analysis regressions
         run: python -m unittest discover -s scripts/tests -p 'test_cp20_economic_audit.py' -v
+      - name: CP21A exact net-profit accounting and settlement normalisation regressions
+        run: cargo test --locked --release cp21a_
+      - name: CP21A archived-evidence profit audit regression tests
+        run: python -m unittest discover -s scripts/tests -p 'test_cp21a_profit_audit.py' -v
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py','scripts/cp13_calibration_check.py','scripts/cp14_calibration_check.py','scripts/cp14_orca_reference.py','scripts/test_cp14_orca_reference.py','scripts/cp15_clmm_reference.py','scripts/test_cp15_clmm_reference.py','scripts/cp15_clmm_calibration.py')]"
       - name: Live utility PowerShell syntax only
@@ -71,7 +75,7 @@ jobs:
         run: |
           $tokens = $null
           $errors = $null
-          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1', 'scripts/cp11_quantity_live.ps1', 'scripts/cp12_quote_live.ps1', 'scripts/cp13_cpmm_live.ps1','scripts/cp14_orca_live.ps1','scripts/cp15_clmm_live.ps1','scripts/cp15_tvl_coverage_1h.ps1','scripts/cp20_economic_live.ps1')) {
+          foreach ($path in @('scripts/runtime_live.ps1', 'scripts/v10_simulation_live.ps1', 'scripts/cp10_capacity_live.ps1', 'scripts/cp11_quantity_live.ps1', 'scripts/cp12_quote_live.ps1', 'scripts/cp13_cpmm_live.ps1','scripts/cp14_orca_live.ps1','scripts/cp15_clmm_live.ps1','scripts/cp15_tvl_coverage_1h.ps1','scripts/cp20_economic_live.ps1','scripts/cp21a_profit_live.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
