@@ -31,6 +31,9 @@ def decode_compact(header, row):
     s['request'] = {'id': s['id'], 'settlement': s['settlement'], **config}
     s.update({k: times[k] for k in ('round_elapsed_ns', 'frame_to_request_us', 'signal_to_request_us')})
     s['pools'] = [{'pool': p} for p in s['pools']]
+    # CP20R: schema 6 embeds per-request economic forecasts in selection.
+    # Older schema 4/5 journals have no economic facts; keep them explicitly unknown.
+    s.setdefault('economic', None)
     estimate = s.pop('amount_estimate')
     s['amount_assessment'] = {'decision': s.pop('amount_decision'),
         'estimate': dict(zip(('input_raw', 'output_raw', 'profit_raw'), estimate)) if estimate else None}
@@ -60,8 +63,9 @@ def decode_compact(header, row):
         leg['observed_minus_model_raw'] = str(actual - model) if model is not None and actual is not None else None
         slot = leg['observation_slot']
         leg['slots_to_simulation'] = facts['context_slot'] - slot if slot is not None and facts['context_slot'] is not None and facts['context_slot'] >= slot else None
-        if leg['snapshot_content_digest'] is not None:
-            leg['snapshot_content_digest'] = list(bytes.fromhex(leg['snapshot_content_digest']))
+        for digest_key in ('snapshot_content_digest','snapshot_account_set_digest'):
+            if leg.get(digest_key) is not None:
+                leg[digest_key] = list(bytes.fromhex(leg[digest_key]))
     if len(calls) != facts['dex_call_count']:
         raise ValueError(f"Compact trace count differs: {s['id']}")
     r['trace'] = {'status': facts['trace_status'], 'calls': calls}
@@ -91,7 +95,7 @@ def stream_records(stream):
         if not line.strip():
             continue
         row = json.loads(line)
-        if isinstance(row, dict) and row.get('schema_version') in (4, 5) and 'selection_columns' in row:
+        if isinstance(row, dict) and row.get('schema_version') in (4, 5, 6) and 'selection_columns' in row:
             if header is not None:
                 raise ValueError('Duplicate compact journal header')
             header = row
