@@ -979,6 +979,9 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
 pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>,
     evidence:mpsc::Sender<EvidenceItem>, cfg:Settings)->Result<Report> {
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
+    // Small per-run history, independent of authoritative MarketState. A fresh
+    // run starts with no prior dispatches, and no V10 worker reads this cache.
+    let mut scheduler=scheduling::Scheduler::default();
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
     let mut pending=false;
@@ -1062,7 +1065,14 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 .and_then(|w|state.economic_score(w,&cfg.parameters)),
                             _=>None,
                         };
-                        (economic::priority_key(gain),*marginal)
+                        let source_key=match event.as_ref(){
+                            SignalEvent::Candidates(batch)=>batch.candidates.get(*index)
+                                .and_then(|c|c.witness.as_ref())
+                                .and_then(|w|state.source_fingerprint(w,&cfg.parameters)),
+                            _=>None,
+                        };
+                        let recently_sent=scheduler.sources.classify(source_key.as_deref(),started).deferred();
+                        (recently_sent,economic::priority_key(gain),*marginal)
                     });
                     // CP9D: one source candidate per distinct physical token pair.
                     // First give changed, currently priced witnesses priority. Then
@@ -1071,12 +1081,24 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     type RoutePair=(SignalRouteKind,Pubkey,Pubkey);
                     let mut sources=Vec::<(SignalCandidate,Arc<SignalTrigger>,i64,&'static str,RoutePair)>::new();
                     let mut pairs=HashSet::new();
+                    // Fresh-but-recent sources are fallback candidates, allowing
+                    // new active token pairs to compete before repeating one route.
+                    let mut deferred_fresh=Vec::new();
                     for (_,event,index) in &ranked {
                         let SignalEvent::Candidates(block)=event.as_ref() else {continue};
                         let candidate=&block.candidates[*index];
                         let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
                         let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
-                        if !pairs.insert(pair){continue;}
+                        if pairs.contains(&pair){continue;}
+                        let source_key=candidate.witness.as_ref()
+                            .and_then(|w|state.source_fingerprint(w,&cfg.parameters));
+                        if scheduler.sources.classify(source_key.as_deref(),started).deferred() {
+                            report.cp20s_recent_fresh_deferred+=1;
+                            deferred_fresh.push((candidate.clone(),block.trigger.clone(),
+                                block.threshold_units,"fresh",pair));
+                            continue;
+                        }
+                        pairs.insert(pair);
                         sources.push((candidate.clone(),block.trigger.clone(),block.threshold_units,"fresh",pair));
                         if sources.len()>=cfg.cp9d_max_pairs{break;}
                     }
@@ -1105,19 +1127,45 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 report.cp20_active_scored+=1;
                                 if gain.is_some_and(|n|n>0){report.cp20_active_model_positive+=1;}
                                 if gain.is_none(){report.cp20_active_model_unknown+=1;}
-                                active_scores.push((economic::priority_key(gain),ordinal,candidate.clone(),pair));
+                                let source_key=state.source_fingerprint(w,&cfg.parameters);
+                                let recent=scheduler.sources.classify(source_key.as_deref(),started).deferred();
+                                if recent{report.cp20s_recent_active_deferred+=1;}
+                                active_scores.push((recent,economic::priority_key(gain),
+                                    ordinal,candidate.clone(),pair));
                                 if active_scores.len()>=ACTIVE_ECONOMIC_BUDGET{break;}
                             }
                             // Stable rotation acts as deterministic tie-break,
                             // but no longer determines priority ahead of net gain.
-                            active_scores.sort_unstable_by_key(|(key,ordinal,_,_)|(*key,*ordinal));
-                            for (_,_,candidate,pair) in active_scores {
+                            active_scores.sort_unstable_by_key(|(recent,key,ordinal,_,_)|
+                                (*recent,*key,*ordinal));
+                            let mut deferred_active=Vec::new();
+                            for (recent,_,_,candidate,pair) in active_scores {
+                                if recent{
+                                    deferred_active.push((candidate,e.trigger.clone(),
+                                        state.threshold,"active",pair));
+                                    continue;
+                                }
                                 if !pairs.insert(pair){continue;}
                                 sources.push((candidate,e.trigger.clone(),state.threshold,"active",pair));
                                 report.cp20_active_prioritized+=1;
                                 if sources.len()>=cfg.cp9d_max_pairs{break;}
                             }
+                            // New states first. Recent sources still reach the
+                            // pack-level check: alternatives might have changed.
+                            for (candidate,trigger,threshold,origin,pair) in deferred_fresh.drain(..)
+                                .chain(deferred_active.into_iter()) {
+                                if sources.len()>=cfg.cp9d_max_pairs{break;}
+                                if !pairs.insert(pair){continue;}
+                                sources.push((candidate,trigger,threshold,origin,pair));
+                                if origin=="active"{report.cp20_active_prioritized+=1;}
+                            }
                         }
+                    }
+                    // If active selection is disabled or empty, fresh repeated
+                    // seeds can still expose NEW alternative packed states.
+                    for source in deferred_fresh {
+                        if sources.len()>=cfg.cp9d_max_pairs{break;}
+                        if pairs.insert(source.4){sources.push(source);}
                     }
                     // Preserve a comparable Direct3 arm when current positive
                     // signals exist, even if many Direct2 entries rank ahead.
