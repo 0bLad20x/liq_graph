@@ -10,7 +10,8 @@ const SELECTION:&[&str]=&["id","settlement","target","route_kind","reverse","gra
     "packing_strategy","packing_revision_variant","cp9d_source","cp9d_pair_index","pools","source_pools",
     "seed_pools","source_log_sum_units","packing_seed_log_sum_units","threshold_units",
     "marginal_signal_bps","estimated_net_return_bps","amount_decision","amount_estimate",
-    "liquidity_checked","packing","request_ready_at_us","economic","packed_state_digest"];
+    "liquidity_checked","packing","request_ready_at_us","economic","packed_state_digest",
+    "cp20s_schedule"];
 const REPORT:&[&str]=&["context_slot","provider","err","error_name","fee","unitsConsumed",
     "balance_changes","trace_status","dex_call_count"];
 const CALIBRATION:&[&str]=&["source_path_relation","seed_path_relation","trade_input_raw","trade_output_raw",
@@ -66,7 +67,7 @@ impl Writer {
             ensure!(previous==&configuration,"execution evidence configuration changed within one run");
         }else{
             self.stats.event_bytes+=jsonline(&mut self.events,&json!({
-                "schema_version":6,"row":["payload_sha256","selection","report","calibration","timing"],
+                "schema_version":7,"row":["payload_sha256","selection","report","calibration","timing"],
                 "selection_columns":SELECTION,"report_columns":REPORT,"calibration_columns":CALIBRATION,
                 "leg_columns":LEG,"timing_columns":TIMING,"configuration":configuration,
                 "scope":"complete_simulations_with_bounded_full_examples"
