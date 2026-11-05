@@ -195,6 +195,12 @@ fn predict_pair(a:&PoolPriceObservation,b:&PoolPriceObservation,
     let cost=network_cost(settlement,params)?;
     Some((quantity,output,dex,dex-i128::from(cost)))
 }
+/// Conservative economic priority, shared by fresh and active Direct2 sources.
+/// Unknown is retained ahead of modeled nonpositive cases; never a veto.
+pub(super) fn priority_key(gain:Option<i128>)->(u8,std::cmp::Reverse<i128>) {
+    let category=match gain{Some(value) if value>0=>0,None=>1,Some(_)=>2};
+    (category,std::cmp::Reverse(gain.unwrap_or(0)))
+}
 pub(super) fn pair_gain(a:&PoolPriceObservation,b:&PoolPriceObservation,
     settlement:&str,target:&str,params:&ExecutionParameters)->Option<i128> {
     predict_pair(a,b,settlement,target,params).map(|(_,_,_,net)|net)
@@ -413,6 +419,13 @@ mod tests {
         let max=(1..5_000).map(|q|p(q as f64))
             .fold(f64::NEG_INFINITY,f64::max);
         assert!(max>0.0);
+    }
+    #[test]
+    fn cp20_economic_priority_keeps_unknown_and_orders_absolute_net() {
+        assert!(priority_key(Some(10))<priority_key(Some(1)));
+        assert!(priority_key(Some(1))<priority_key(None));
+        assert!(priority_key(None)<priority_key(Some(0)));
+        assert!(priority_key(Some(0))<priority_key(Some(-1)));
     }
     #[test]
     fn cp20_network_fee_units_are_settlement_specific() {
