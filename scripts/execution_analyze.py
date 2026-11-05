@@ -237,6 +237,9 @@ def analyze(rows):
     cp20_amount_delta_by_settlement = collections.defaultdict(list)
     cp20_quote_delta_by_settlement = collections.defaultdict(list)
     cp20_comparison_examples = []
+    cp20_packed_states = collections.Counter()
+    cp20_packed_state_slots = collections.defaultdict(set)
+    cp20_packed_positive_forecasts = collections.Counter()
     cp20_frozen_states = collections.Counter()
     cp20_frozen_state_slots = collections.defaultdict(set)
     cp20_frozen_state_above_fee = collections.Counter()
@@ -290,6 +293,15 @@ def analyze(rows):
         else:
             cp20_counts['missing_in_journal'] += 1
         cp20_outcomes[forecast_class]['requests'] += 1
+        packed_digest=s.get('packed_state_digest')
+        packed_key=None
+        if isinstance(packed_digest,str) and len(packed_digest)==64:
+            packed_key=(q['settlement'],packed_digest)
+            cp20_packed_states[packed_key]+=1
+            if forecast_class=='positive':
+                cp20_packed_positive_forecasts[packed_key]+=1
+        else:
+            cp20_counts['missing_packed_state_digest']+=1
         generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
         comparison_key = generation_revision + (q['settlement'],)
@@ -353,6 +365,8 @@ def analyze(rows):
                 r['phase'] != 'complete' or r.get('metrics') != s.get('packing')):
             bad('delivery', identity)
         report_ids.add(r['id'])
+        if packed_key is not None:
+            cp20_packed_state_slots[packed_key].add(r.get('context_slot'))
         for key in ('build_us', 'simulation_rpc_ms', 'elapsed_ms', 'trace_us'):
             if r.get(key) is not None:
                 timings[key].append(r[key])
@@ -655,6 +669,7 @@ def analyze(rows):
         for route,counter in sorted(cp9e_route_counts.items())},
         'note':'Direct2 and Direct3 source identities and economic outcomes are tracked separately. A simulation slot is not an independent trade.'}
     cp20_repeated=[n for n in cp20_frozen_states.values() if n>1]
+    cp20_packed_repeated=[n for n in cp20_packed_states.values() if n>1]
     cp20={
         'forecast_counts':dict(cp20_counts),
         'forecast_unknown_reasons':dict(cp20_unknown_reasons),
@@ -671,6 +686,20 @@ def analyze(rows):
             'actual_output_minus_predicted_at_v10_input_raw_by_settlement':{
                 k:durations(v) for k,v in cp20_quote_delta_by_settlement.items()},
             'largest_absolute_output_discrepancies':cp20_comparison_examples,
+        },
+        'packed_snapshot_repetition':{
+            'requests_with_known_packed_state':sum(cp20_packed_states.values()),
+            'different_packed_frozen_states':len(cp20_packed_states),
+            'repeated_packed_state_groups':len(cp20_packed_repeated),
+            'requests_in_repeated_packed_state_groups':sum(cp20_packed_repeated),
+            'largest_packed_state_group':max(cp20_packed_repeated,default=0),
+            'positive_forecast_packed_states':len(cp20_packed_positive_forecasts),
+            'largest_repeated_packed_states':[
+                {'settlement':key[0],'packed_state_digest':key[1],
+                 'requests':count,
+                 'different_simulation_slots':len(cp20_packed_state_slots[key]),
+                 'positive_forecasts':cp20_packed_positive_forecasts[key]}
+                for key,count in cp20_packed_states.most_common(10)]
         },
         'frozen_state_repetition':{
             'identified_complete_cycles':sum(cp20_frozen_states.values()),
