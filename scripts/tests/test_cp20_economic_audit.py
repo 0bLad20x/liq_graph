@@ -1,4 +1,4 @@
-"""CP20R compact schema-6 and economic calibration regression tests."""
+"""CP20R/CP20S compact schema 5–7 and economic scheduling regression tests."""
 import copy
 import io
 import json
@@ -32,7 +32,8 @@ def compact_record(request_id, slot=123, economic=True, with_cycle=True):
         "amount_decision":"unknown","amount_estimate":None,
         "liquidity_checked":True,"packing":[1,2,10,10,100,1000],
         "request_ready_at_us":500,"economic":prediction,
-        "packed_state_digest":"f"*64
+        "packed_state_digest":"f"*64,
+        "cp20s_schedule":"new_frozen_state"
     }
     facts={
         "context_slot":slot,"provider":"rpc","err":None,"error_name":None,
@@ -94,7 +95,7 @@ def compact_record(request_id, slot=123, economic=True, with_cycle=True):
         "simulation_rpc_ms":100,"elapsed_ms":101,"trace_us":5,"calibration_ns":100
     }
     header={
-        "schema_version":6,
+        "schema_version":7,
         "row":["payload_sha256","selection","report","calibration","timing"],
         "selection_columns":list(s),
         "report_columns":list(facts),
@@ -122,7 +123,7 @@ def decode_many(header,records):
 
 
 class CP20EconomicAuditTests(unittest.TestCase):
-    def test_compact_schema_six_preserves_all_predictions_and_leg_digests(self):
+    def test_compact_schema_seven_preserves_all_predictions_and_leg_digests(self):
         header, record=compact_record("req1")
         row=decode_many(header,[record])[0]
         self.assertEqual(row["selection"]["economic"]["status"],"estimated")
@@ -132,9 +133,19 @@ class CP20EconomicAuditTests(unittest.TestCase):
         self.assertEqual(len(row["calibration"]["legs"][0]
                              ["snapshot_account_set_digest"]),32)
 
+    def test_schema_six_economic_data_remains_readable(self):
+        header,record=compact_record("req_old")
+        idx=header["selection_columns"].index("cp20s_schedule")
+        header["selection_columns"].pop(idx)
+        record[1].pop(idx)
+        header["schema_version"]=6
+        row=decode_many(header,[record])[0]
+        self.assertEqual(row["selection"]["economic"]["predicted_net_gain_raw"],110)
+        self.assertNotIn("cp20s_schedule",row["selection"])
+
     def test_schema_five_has_no_invented_economic_data(self):
         header,record=compact_record("req1",with_cycle=False)
-        for key, segment in [("economic",1)]:
+        for key, segment in [("economic",1),("packed_state_digest",1),("cp20s_schedule",1)]:
             idx=header["selection_columns"].index(key)
             header["selection_columns"].pop(idx)
             record[segment].pop(idx)
@@ -150,10 +161,13 @@ class CP20EconomicAuditTests(unittest.TestCase):
         _,r2=compact_record("req2",slot=124)
         # Unique payload digest is not necessary for frozen-state identity.
         r2[0]="b"*64
+        r2[1][header["selection_columns"].index("cp20s_schedule")]="periodic_recheck"
         report=analyze(iter(decode_many(header,[r1,r2])))
         cp=report["cp20_economic_validation"]
         self.assertEqual(cp["forecast_counts"]["available_in_journal"],2)
         self.assertEqual(cp["forecast_counts"]["modeled"],2)
+        self.assertEqual(cp["cp20s_submissions_by_schedule"]["new_frozen_state"]["requests"],1)
+        self.assertEqual(cp["cp20s_submissions_by_schedule"]["periodic_recheck"]["requests"],1)
         self.assertEqual(cp["v10_comparison"]["same_path_quantity_compared"],2)
         repeat=cp["frozen_state_repetition"]
         self.assertEqual(repeat["different_frozen_path_states"],1)
