@@ -383,6 +383,20 @@ impl Selection {
             .context("execution evidence lacks source witness")?;
         let source=witness.legs.iter().map(|l|l.observation.pool.as_str()).collect::<Vec<_>>();
         let seed=self.pools.iter().take(source.len()).map(|p|p.pool.as_str()).collect::<Vec<_>>();
+        // Bounded 32-byte identity for ALL V10 submissions, even if no DEX
+        // CPI executes. Exclude observation slot: identical frozen state in
+        // different simulation slots must remain distinguishable analytically.
+        // Include fee rates separately in case a valuation changes without a
+        // corresponding price change. Missing evidence is NOT a stable identity.
+        let packed_facts=self.pools.iter().map(|p|{
+            let l=p.observation.liquidity.as_ref()?;
+            let v=p.observation.valuation.as_ref()?;
+            Some(serde_json::json!([&p.pool,p.role,l.content_digest,l.account_set_digest,
+                v.dex_fee_rates,v.base_fee_rate,v.variable_fee_rate,v.token_fee_status]))
+        }).collect::<Option<Vec<_>>>();
+        let packed_state_digest=packed_facts.and_then(|facts|serde_json::to_vec(&facts).ok())
+            .map(|bytes|ring::digest::digest(&ring::digest::SHA256,&bytes).as_ref().iter()
+                .map(|b|format!("{b:02x}")).collect::<String>());
         let mut value=serde_json::json!({
             "id":self.request.id,"settlement":self.request.settlement.to_string(),
             "target":self.target.to_string(),"route_kind":self.route_kind,"reverse":self.reverse,
@@ -399,6 +413,7 @@ impl Selection {
             "amount_estimate":self.amount_assessment.estimate.as_ref().map(|e|[e.input_raw,e.output_raw,e.profit_raw]),
             // CP20 schema 6: persist every forecast, not only bounded details.
             "economic":&self.economic,
+            "packed_state_digest":packed_state_digest,
             "liquidity_checked":self.pools.iter().all(|p|p.observation.venue!="meteora_dlmm"
                 ||(p.liquidity_window_checked&&p.observation.liquidity.is_some())),
             "packing":[self.packing.groups,self.packing.pool_declarations,self.packing.unique_accounts,
