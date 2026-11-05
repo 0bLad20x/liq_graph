@@ -26,7 +26,7 @@ if ($LASTEXITCODE -ne 0) { throw 'CP20 tests failed' }
     -WalletPath (Join-Path $env:USERPROFILE '.solana\meteora-arb-test.json') `
     -SimulationLimit 0 `
     -V10Parallelism 32 `
-    -CP9CPackingMode AllCoverage `
+    -CP9CPackingMode Economic `
     -CP9DMaxPairs 3 `
     -ExecutionDetailLimit 128
 if ($LASTEXITCODE -ne 0) { throw 'CP20 five-minute live run failed' }
