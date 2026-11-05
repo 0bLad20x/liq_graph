@@ -1,6 +1,8 @@
 //! Versioned compact best-candidates + current Prepared proofs -> frozen V10 jobs.
 //! Selection is downstream of calculation; no RPC, signer, decoding or sending.
 mod amounts;
+mod economic;
+mod scheduling;
 #[cfg(test)]
 mod amounts_reference;
 #[cfg(test)]
@@ -31,6 +33,8 @@ pub struct Settings {
     /// CP9C: independent alternative-packing strategies for the same signal revision.
     strategies:Vec<PackingStrategy>,
     pub cp9d_max_pairs:usize,
+    /// CP20S: zero disables repeat scheduling (and all legacy modes bypass it).
+    pub cp20s_recheck_seconds:u64,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
     pub capacity: fn(&ExecutionRequest) -> Result<ExecutionMetrics>,
 }
@@ -52,7 +56,8 @@ impl Settings {
             "all"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed],
             "all_coverage"=>vec![PackingStrategy::Baseline,PackingStrategy::Contrarian,PackingStrategy::Mixed,PackingStrategy::Coverage],
             "coverage"=>vec![PackingStrategy::Coverage],
-            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed, all, coverage or all_coverage"),
+            "economic"=>vec![PackingStrategy::Economic],
+            _=>bail!("GRAPH_CP9C_PACKING_MODE must be baseline, contrarian, mixed, all, coverage, economic or all_coverage"),
         };
         let cp9d_max_pairs:usize=env::var("GRAPH_CP9D_MAX_DISTINCT_PAIRS")
             .unwrap_or_else(|_|"1".into()).parse().context("invalid GRAPH_CP9D_MAX_DISTINCT_PAIRS")?;
@@ -60,7 +65,13 @@ impl Settings {
         ensure!((strategies==[PackingStrategy::Baseline]&&cp9d_max_pairs==1)
             ||(!routes.contains(SignalRouteKind::Triangle3)&&!routes.contains(SignalRouteKind::Triangle4)),
             "alternative packing comparisons require enabled routes direct2 and/or direct3");
-        Ok(Self {wallet,parameters,limit,routes,strategies,cp9d_max_pairs,capacity})
+        let cp20s_recheck_seconds:u64=env::var("GRAPH_CP20S_RECHECK_SECONDS")
+            .unwrap_or_else(|_|"30".into()).parse()
+            .context("invalid GRAPH_CP20S_RECHECK_SECONDS")?;
+        ensure!(cp20s_recheck_seconds<=3600,
+            "GRAPH_CP20S_RECHECK_SECONDS must be 0..=3600");
+        Ok(Self {wallet,parameters,limit,routes,strategies,cp9d_max_pairs,
+            cp20s_recheck_seconds,capacity})
     }
     fn accepts(&self,kind:SignalRouteKind)->bool {
         self.routes.contains(kind)
@@ -161,6 +172,8 @@ pub struct Selection {
     /// May differ from the source SignalCandidate after quantity seed repair.
     packing_seed_log_sum_units:i64,
     amount_assessment:amounts::Assessment,amount_seed_changed:bool,
+    economic:economic::Prediction,
+    cp20s_schedule:&'static str,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
@@ -185,10 +198,34 @@ pub struct Report {
     preparation:Preparation,
     cp10_capacity_phases:crate::workers::execution_v10::CapacityPhaseProfile,
     cp11_quantity_phases:amounts::PhaseProfile,
+    pub cp20_economic_forecasts:u64,pub cp20_economic_modeled:u64,
+    pub cp20_economic_positive:u64,pub cp20_economic_unknown:u64,
+    pub cp20_active_scored:u64,pub cp20_active_model_positive:u64,
+    pub cp20_active_model_unknown:u64,pub cp20_active_prioritized:u64,
+    pub cp20s_recent_fresh_deferred:u64,pub cp20s_recent_active_deferred:u64,
+    pub cp20s_repeated_packs_deferred:u64,pub cp20s_new_packs:u64,
+    pub cp20s_recheck_packs:u64,pub cp20s_unknown_fingerprint_packs:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
     pub fn packing_metrics(&self)->&ExecutionMetrics {&self.packing}
+    // The same key is used by CP20S scheduling and the compact audit.
+    // Include the full V10 execution parameters, frozen fees and direction.
+    // Missing frozen evidence disables cooldown rather than assuming stasis.
+    fn packed_state_fingerprint(&self)->Option<String>{
+        let mut parts=Vec::with_capacity(self.pools.len());
+        for p in &self.pools {
+            let (input,output)=if p.slot%2==0 {
+                (&p.observation.mint_a,&p.observation.mint_b)
+            } else {
+                (&p.observation.mint_b,&p.observation.mint_a)
+            };
+            parts.push(scheduling::frozen_leg(&p.observation,p.role,input,output)?);
+        }
+        scheduling::fingerprint(&format!("{:?}",self.route_kind),
+            &self.request.settlement.to_string(),&self.target.to_string(),
+            parts,&self.request.parameters)
+    }
     /// One frozen-model quote at a supplied amount; no search, live state or RPC.
     fn quote_frozen_leg(&self,pool:&str,input_mint:&str,output_mint:&str,amount:u64)->Result<u64,&'static str> {
         let p=self.pools.iter().find(|p|p.pool==pool).ok_or("pool_not_in_frozen_selection")?;
@@ -357,6 +394,8 @@ impl Selection {
                 .all(|(l,c)|Some(l.pool.as_str())==c.pool.as_deref()&&l.input_mint==c.inputs[0].mint&&l.output_mint==c.outputs[0].mint)),
             "probe_same_amount":probe.zip(initial).map(|(p,i)|p.input_raw==i),"processing_ns":elapsed_ns(started)});
         // Keep the legacy calibration macro small to avoid json! recursion depth.
+        result["economic_prediction"]=json!(&self.economic);
+        result["economic_at_v10_input"]=economic::comparison(self,report);
         result["cp9c_audit_schema"]=json!(1);
         result["packing_strategy"]=json!(self.packing_strategy);
         result["packing_revision_variant"]=json!(self.packing_revision_variant);
@@ -374,6 +413,9 @@ impl Selection {
             .context("execution evidence lacks source witness")?;
         let source=witness.legs.iter().map(|l|l.observation.pool.as_str()).collect::<Vec<_>>();
         let seed=self.pools.iter().take(source.len()).map(|p|p.pool.as_str()).collect::<Vec<_>>();
+        // Identical to the fingerprint used by the in-memory scheduler.
+        // Snapshot digest excludes slots; the journal keeps simulation slots.
+        let packed_state_digest=self.packed_state_fingerprint();
         let mut value=serde_json::json!({
             "id":self.request.id,"settlement":self.request.settlement.to_string(),
             "target":self.target.to_string(),"route_kind":self.route_kind,"reverse":self.reverse,
@@ -388,6 +430,10 @@ impl Selection {
             "estimated_net_return_bps":self.estimated_net_return_bps,
             "amount_decision":self.amount_assessment.decision,
             "amount_estimate":self.amount_assessment.estimate.as_ref().map(|e|[e.input_raw,e.output_raw,e.profit_raw]),
+            // CP20 schema 6: persist every forecast, not only bounded details.
+            "economic":&self.economic,
+            "cp20s_schedule":self.cp20s_schedule,
+            "packed_state_digest":packed_state_digest,
             "liquidity_checked":self.pools.iter().all(|p|p.observation.venue!="meteora_dlmm"
                 ||(p.liquidity_window_checked&&p.observation.liquidity.is_some())),
             "packing":[self.packing.groups,self.packing.pool_declarations,self.packing.unique_accounts,
@@ -431,6 +477,37 @@ struct State {
     prepared_logarithms:u64,
 }
 impl State {
+    /// Score the current authoritative price/fee/liquidity snapshots rather
+    /// than the potentially older witness snapshot retained for active signals.
+    fn economic_score(&self,w:&SignalWitness,params:&ExecutionParameters)->Option<i128> {
+        if w.legs.len()!=2 {return None;}
+        let first=&w.legs[0];let second=&w.legs[1];
+        if first.slot/2==second.slot/2
+            || first.output_mint!=second.input_mint
+            || first.input_mint!=second.output_mint{return None;}
+        let a=self.prices.get(first.slot/2)?.as_ref()?.observation.as_ref();
+        let b=self.prices.get(second.slot/2)?.as_ref()?.observation.as_ref();
+        if a.pool!=first.observation.pool||b.pool!=second.observation.pool{return None;}
+        economic::pair_gain(a,b,&first.input_mint.to_string(),
+            &first.output_mint.to_string(),params)
+    }
+    /// Fingerprint the directed source pair using CURRENT MarketState snapshots.
+    /// Its only scheduling effect is priority: final admission checks the entire
+    /// packed request, so changed alternatives are never permanently vetoed.
+    fn source_fingerprint(&self,w:&SignalWitness,
+        params:&ExecutionParameters)->Option<String> {
+        if w.legs.len()!=2{return None;}
+        let mut parts=Vec::with_capacity(2);
+        for (i,leg) in w.legs.iter().enumerate() {
+            let obs=self.prices.get(leg.slot/2)?.as_ref()?.observation.as_ref();
+            if obs.pool!=leg.observation.pool{return None;}
+            let role=if i==0{"direct"}else{"partner"};
+            parts.push(scheduling::frozen_leg(obs,role,
+                &leg.input_mint.to_string(),&leg.output_mint.to_string())?);
+        }
+        scheduling::fingerprint("Direct2",&w.legs[0].input_mint.to_string(),
+            &w.legs[0].output_mint.to_string(),parts,params)
+    }
     fn amount_input(&self,id:usize,manifest_matches:bool)->Option<amounts::Input> {
         let price=self.prices.get(id)?.as_ref()?;let identity=self.pools.get(id)?;
         Some(amounts::Input{slot:2*id+usize::from(identity.mint_a.to_string()!=price.observation.base_mint),
@@ -489,7 +566,8 @@ impl State {
                     registry,cfg,selection.request.id.rsplit('-').next().context("request number absent")?.parse()?,reads,
                     match selection.packing_strategy {
                         "contrarian"=>PackingStrategy::Contrarian,"mixed"=>PackingStrategy::Mixed,
-                        "coverage"=>PackingStrategy::Coverage,_=>PackingStrategy::Baseline
+                        "coverage"=>PackingStrategy::Coverage,"economic"=>PackingStrategy::Economic,
+                        _=>PackingStrategy::Baseline
                     },&[],Some(&preferred),preparation) {
                     if repaired.amount_seed_changed {
                         let next=amounts::assess(&self.packed_amount_inputs(&repaired),&repaired.request.settlement.to_string(),cfg.parameters.minimum_profit,conversion_other.as_deref());
@@ -515,7 +593,9 @@ impl State {
             }
         }
         assessment.elapsed_ns=elapsed_ns(started);report.record(&assessment);
-        selection.amount_assessment=assessment;Ok(Some(selection))
+        selection.amount_assessment=assessment;
+        selection.economic=economic::predict(&selection);
+        Ok(Some(selection))
     }
     fn apply(&mut self, s:&SignalStateUpdate, recovering:bool,preparation:&mut Preparation)->Result<()> {
         self.received_at_us=now_us();
@@ -749,7 +829,38 @@ impl State {
         preparation.alternative_options+=alternative_profiles.len() as u64;
         preparation.alternative_lookup_ns.record(elapsed_ns(lookup));
         let ranking_started=Instant::now();
-        let ranking=if strategy==PackingStrategy::Coverage {
+        let ranking=if strategy==PackingStrategy::Economic
+            && top.kind==SignalRouteKind::Direct2 {
+            // Rank each optional leg by its modeled profit with the opposite
+            // frozen seed leg. V10 packing/capacity remains the hard boundary.
+            // This ranking never vetoes Unknown alternatives. Cross-alternative
+            // pair maxima are recorded after packing, not guessed here.
+            let settlement=top.settlement.to_string();
+            let target=top.target.to_string();
+            let direct_seed=slots.iter().find(|(_,role)|*role=="direct")
+                .map(|(slot,_)|slot/2);
+            let partner_seed=slots.iter().find(|(_,role)|*role=="partner")
+                .map(|(slot,_)|slot/2);
+            let mut scored=options.iter().enumerate().map(|(i,(_,slot,role,_))|{
+                let opposite=if *role=="direct"{partner_seed}else{direct_seed};
+                let observed=self.prices.get(slot/2).and_then(Option::as_ref)
+                    .map(|p|p.observation.as_ref());
+                let other=opposite.and_then(|id|self.prices.get(id))
+                    .and_then(Option::as_ref).map(|p|p.observation.as_ref());
+                let gain=observed.zip(other).and_then(|(new,old)|{
+                    if *role=="direct"{
+                        economic::pair_gain(new,old,&settlement,&target,&cfg.parameters)
+                    }else{
+                        economic::pair_gain(old,new,&settlement,&target,&cfg.parameters)
+                    }
+                });
+                let category=match gain{Some(n) if n>0=>0,None=>1,Some(_)=>2};
+                ((category,std::cmp::Reverse(gain.unwrap_or(0)),
+                    alternative_profiles[i].marginal_score,*slot),i)
+            }).collect::<Vec<_>>();
+            scored.sort_unstable_by_key(|(key,_)|*key);
+            scored.into_iter().map(|(_,i)|i).collect()
+        }else if strategy==PackingStrategy::Coverage {
             preparation.coverage_rankings+=1;
             preparation.coverage_key_evaluations+=alternative_profiles.len() as u64;
             diversity::coverage_order(&alternative_profiles,&slots.iter().map(|(s,_)|s/2).collect::<Vec<_>>(),
@@ -824,7 +935,9 @@ impl State {
             alternatives_considered:considered,packing_rejections:rejected,
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added,packing_seed_log_sum_units:seed_sum,
-            amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed})
+            amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed,
+            economic:economic::Prediction::unknown("not_evaluated"),
+            cp20s_schedule:"not_scheduled"})
         })();
         preparation.pack_build_ns.record(elapsed_ns(started));
         result
@@ -877,6 +990,12 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
 pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>,
     evidence:mpsc::Sender<EvidenceItem>, cfg:Settings)->Result<Report> {
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
+    // Small per-run history, independent of authoritative MarketState. A fresh
+    // run starts with no prior dispatches, and no V10 worker reads this cache.
+    let cp20s_enabled=cfg.strategies==[PackingStrategy::Economic] &&
+        cfg.cp20s_recheck_seconds>0;
+    let mut scheduler=scheduling::Scheduler::new(std::time::Duration::from_secs(
+        if cp20s_enabled{cfg.cp20s_recheck_seconds}else{0}));
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
     let mut pending=false;
@@ -952,7 +1071,23 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     report.preparation.signal_to_round_start_ns.record(
                         now_us().saturating_sub(state.ready_at_us).saturating_mul(1000));
                     let mut reads=RegistryReads::default();
-                    ranked.sort_unstable_by_key(|entry|entry.0);
+                    // CP20: compute economic priority once; unknown remains eligible.
+                    ranked.sort_by_cached_key(|(marginal,event,index)|{
+                        let gain=match event.as_ref(){
+                            SignalEvent::Candidates(batch)=>batch.candidates.get(*index)
+                                .and_then(|c|c.witness.as_ref())
+                                .and_then(|w|state.economic_score(w,&cfg.parameters)),
+                            _=>None,
+                        };
+                        let source_key=match event.as_ref(){
+                            SignalEvent::Candidates(batch)=>batch.candidates.get(*index)
+                                .and_then(|c|c.witness.as_ref())
+                                .and_then(|w|state.source_fingerprint(w,&cfg.parameters)),
+                            _=>None,
+                        };
+                        let recently_sent=scheduler.sources.classify(source_key.as_deref(),started).deferred();
+                        (recently_sent,economic::priority_key(gain),*marginal)
+                    });
                     // CP9D: one source candidate per distinct physical token pair.
                     // First give changed, currently priced witnesses priority. Then
                     // rotate through authoritative active witnesses from this
@@ -960,12 +1095,24 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                     type RoutePair=(SignalRouteKind,Pubkey,Pubkey);
                     let mut sources=Vec::<(SignalCandidate,Arc<SignalTrigger>,i64,&'static str,RoutePair)>::new();
                     let mut pairs=HashSet::new();
+                    // Fresh-but-recent sources are fallback candidates, allowing
+                    // new active token pairs to compete before repeating one route.
+                    let mut deferred_fresh=Vec::new();
                     for (_,event,index) in &ranked {
                         let SignalEvent::Candidates(block)=event.as_ref() else {continue};
                         let candidate=&block.candidates[*index];
                         let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
                         let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
-                        if !pairs.insert(pair){continue;}
+                        if pairs.contains(&pair){continue;}
+                        let source_key=candidate.witness.as_ref()
+                            .and_then(|w|state.source_fingerprint(w,&cfg.parameters));
+                        if scheduler.sources.classify(source_key.as_deref(),started).deferred() {
+                            report.cp20s_recent_fresh_deferred+=1;
+                            deferred_fresh.push((candidate.clone(),block.trigger.clone(),
+                                block.threshold_units,"fresh",pair));
+                            continue;
+                        }
+                        pairs.insert(pair);
                         sources.push((candidate.clone(),block.trigger.clone(),block.threshold_units,"fresh",pair));
                         if sources.len()>=cfg.cp9d_max_pairs{break;}
                     }
@@ -973,22 +1120,66 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         let count=state.active_witnesses.len();
                         if count>0 {
                             let offset=(state.revision as usize)%count;
-                            for (_,candidate) in state.active_witnesses.iter().skip(offset)
-                                .chain(state.active_witnesses.iter().take(offset)).take(512) {
+                            // Bound prediction work per revision; the rotated 512-member
+                            // scan preserves temporal coverage. All eligible Unknown
+                            // candidates remain in the scored window, not filtered out.
+                            const ACTIVE_ECONOMIC_BUDGET:usize=96;
+                            let mut active_scores=Vec::new();
+                            for (ordinal,(_,candidate)) in state.active_witnesses.iter().skip(offset)
+                                .chain(state.active_witnesses.iter().take(offset)).take(512).enumerate() {
                                 report.cp9d_active_candidates_examined+=1;
-                                if candidate.change==SignalRangeChange::Exited {continue;}
-                                let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
+                                if candidate.change==SignalRangeChange::Exited{continue;}
+                                let Some(top)=state.plan.as_ref()
+                                    .and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
                                 if !cfg.accepts(top.kind){continue;}
                                 let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
                                 if pairs.contains(&pair){continue;}
                                 let Some(w)=candidate.witness.as_ref() else{continue};
                                 if w.log_sum_units>=state.threshold ||
                                     state.witness(candidate.topology_id,candidate.reverse,w).is_err(){continue;}
-                                pairs.insert(pair);
-                                sources.push((candidate.clone(),e.trigger.clone(),state.threshold,"active",pair));
+                                let gain=state.economic_score(w,&cfg.parameters);
+                                report.cp20_active_scored+=1;
+                                if gain.is_some_and(|n|n>0){report.cp20_active_model_positive+=1;}
+                                if gain.is_none(){report.cp20_active_model_unknown+=1;}
+                                let source_key=state.source_fingerprint(w,&cfg.parameters);
+                                let recent=scheduler.sources.classify(source_key.as_deref(),started).deferred();
+                                if recent{report.cp20s_recent_active_deferred+=1;}
+                                active_scores.push((recent,economic::priority_key(gain),
+                                    ordinal,candidate.clone(),pair));
+                                if active_scores.len()>=ACTIVE_ECONOMIC_BUDGET{break;}
+                            }
+                            // Stable rotation acts as deterministic tie-break,
+                            // but no longer determines priority ahead of net gain.
+                            active_scores.sort_unstable_by_key(|(recent,key,ordinal,_,_)|
+                                (*recent,*key,*ordinal));
+                            let mut deferred_active=Vec::new();
+                            for (recent,_,_,candidate,pair) in active_scores {
+                                if recent{
+                                    deferred_active.push((candidate,e.trigger.clone(),
+                                        state.threshold,"active",pair));
+                                    continue;
+                                }
+                                if !pairs.insert(pair){continue;}
+                                sources.push((candidate,e.trigger.clone(),state.threshold,"active",pair));
+                                report.cp20_active_prioritized+=1;
                                 if sources.len()>=cfg.cp9d_max_pairs{break;}
                             }
+                            // New states first. Recent sources still reach the
+                            // pack-level check: alternatives might have changed.
+                            for (candidate,trigger,threshold,origin,pair) in deferred_fresh.drain(..)
+                                .chain(deferred_active.into_iter()) {
+                                if sources.len()>=cfg.cp9d_max_pairs{break;}
+                                if !pairs.insert(pair){continue;}
+                                sources.push((candidate,trigger,threshold,origin,pair));
+                                if origin=="active"{report.cp20_active_prioritized+=1;}
+                            }
                         }
+                    }
+                    // If active selection is disabled or empty, fresh repeated
+                    // seeds can still expose NEW alternative packed states.
+                    for source in deferred_fresh {
+                        if sources.len()>=cfg.cp9d_max_pairs{break;}
+                        if pairs.insert(source.4){sources.push(source);}
                     }
                     // Preserve a comparable Direct3 arm when current positive
                     // signals exist, even if many Direct2 entries rank ahead.
@@ -1074,10 +1265,27 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             if sent_sets.get(pair).is_some_and(|sent|sent.contains(&pool_set)){
                                 report.cp9c_duplicate_packs+=1;continue;
                             }
+                            // Compare full frozen packed membership before CP8C
+                            // amount assessment. Once assessed, successful proof
+                            // accounting requires V10 delivery; skipping afterward
+                            // would violate its invariant.
+                            let prepack_key=selection.packed_state_fingerprint();
+                            let familiarity=scheduler.packs.classify(prepack_key.as_deref(),started);
+                            if familiarity.deferred() {
+                                report.cp20s_repeated_packs_deferred+=1;
+                                continue;
+                            }
                             let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,
                                 &mut report.amounts,&mut report.preparation)? else{
                                 continue;
                             };
+                            report.cp20_economic_forecasts+=1;
+                            if selection.economic.status=="estimated" {
+                                report.cp20_economic_modeled+=1;
+                                if selection.economic.predicted_net_gain_raw.is_some_and(|n|n>0) {
+                                    report.cp20_economic_positive+=1;
+                                }
+                            }else{report.cp20_economic_unknown+=1;}
                             let mut actual=selection.pools.iter().map(|p|p.pool.clone()).collect::<Vec<_>>();
                             actual.sort_unstable();
                             // Once the amount assessment has been accounted for,
@@ -1088,6 +1296,14 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 selection.pools.iter().map(|p|p.slot/2).collect());
                             selection.cp9d_source=*origin;
                             selection.cp9d_pair_index=pair_index as u8;
+                            selection.cp20s_schedule=match familiarity {
+                                scheduling::Familiarity::New=>"new_frozen_state",
+                                scheduling::Familiarity::Recheck=>"periodic_recheck",
+                                scheduling::Familiarity::Unverifiable=>if cp20s_enabled{
+                                    "unverified_state"
+                                }else{"disabled"},
+                                scheduling::Familiarity::Cooldown=>"impossible_deferred",
+                            };
                             selection.packing_revision_variant=variant as u8;
                             selection.round_elapsed_ns=elapsed_ns(started);
                             selection.registry_reads=reads.clone();
@@ -1112,6 +1328,20 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             evidence.try_send(EvidenceItem::Selection(Box::new(selection)))
                                 .map_err(|err|anyhow::anyhow!("V10 evidence queue unavailable (nonblocking): {err}"))?;
                             permit.send(request);report.request_count+=1;
+                            // Record only successfully handed-off submissions, not
+                            // candidates that fail preparation, amount proofs or
+                            // queue admission. V10 outcome remains independent.
+                            let source_key=candidate.witness.as_ref().and_then(|w|
+                                state.source_fingerprint(w,&cfg.parameters));
+                            scheduler.sources.record(source_key,Instant::now());
+                            scheduler.packs.record(prepack_key,Instant::now());
+                            if cp20s_enabled && familiarity==scheduling::Familiarity::New {
+                                report.cp20s_new_packs+=1;
+                            } else if cp20s_enabled && familiarity==scheduling::Familiarity::Recheck {
+                                report.cp20s_recheck_packs+=1;
+                            } else if cp20s_enabled && familiarity==scheduling::Familiarity::Unverifiable {
+                                report.cp20s_unknown_fingerprint_packs+=1;
+                            }
                         }
                     }
                     if busy_revision{report.skipped_busy_revisions+=1;}

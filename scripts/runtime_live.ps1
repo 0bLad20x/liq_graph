@@ -43,7 +43,7 @@ param(
     # Concurrent in-flight simulateTransaction jobs (1 restores serial baseline).
     [ValidateRange(1,64)][int]$V10Parallelism = 4,
     # CP9C: compare same-revision Direct2 V10 payload strategies.
-    [ValidateSet('Baseline','Contrarian','Mixed','All','Coverage','AllCoverage')][string]$CP9CPackingMode = 'Baseline',
+    [ValidateSet('Baseline','Contrarian','Mixed','All','Coverage','AllCoverage','Economic')][string]$CP9CPackingMode = 'Baseline',
     # CP9D: one fresh source plus rotating active, still-positive distinct pairs.
     [ValidateRange(1,8)][int]$CP9DMaxPairs = 1,
     [string]$ExecutionParametersPath
