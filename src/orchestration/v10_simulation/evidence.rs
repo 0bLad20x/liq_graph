@@ -10,16 +10,17 @@ const SELECTION:&[&str]=&["id","settlement","target","route_kind","reverse","gra
     "packing_strategy","packing_revision_variant","cp9d_source","cp9d_pair_index","pools","source_pools",
     "seed_pools","source_log_sum_units","packing_seed_log_sum_units","threshold_units",
     "marginal_signal_bps","estimated_net_return_bps","amount_decision","amount_estimate",
-    "liquidity_checked","packing","request_ready_at_us"];
+    "liquidity_checked","packing","request_ready_at_us","economic"];
 const REPORT:&[&str]=&["context_slot","provider","err","error_name","fee","unitsConsumed",
     "balance_changes","trace_status","dex_call_count"];
 const CALIBRATION:&[&str]=&["source_path_relation","seed_path_relation","trade_input_raw","trade_output_raw",
     "settlement_input_refund_raw","model_route_output_raw","model_route_unavailable_reason",
     "source_model_output_at_trade_input_raw","source_model_unavailable_reason",
-    "seed_model_output_at_trade_input_raw","seed_model_unavailable_reason","actual_path_marginal_bps","legs"];
+    "seed_model_output_at_trade_input_raw","seed_model_unavailable_reason","actual_path_marginal_bps","legs",
+    "economic_at_v10_input"];
 const LEG:&[&str]=&["pool","program","venue","flow_status","input_mint","output_mint","input_gross_raw",
     "input_net_raw","observed_output_raw","model_output_raw","model_unavailable_reason",
-    "snapshot_content_digest","observation_slot","component_slot_min","component_slot_max",
+    "snapshot_content_digest","snapshot_account_set_digest","observation_slot","component_slot_min","component_slot_max",
     "observation_age_at_request_us","observation_consistency","issues"];
 const TIMING:&[&str]=&["round_elapsed_ns","frame_to_request_us","signal_to_request_us","build_us",
     "simulation_rpc_ms","elapsed_ms","trace_us","calibration_ns"];
@@ -65,7 +66,7 @@ impl Writer {
             ensure!(previous==&configuration,"execution evidence configuration changed within one run");
         }else{
             self.stats.event_bytes+=jsonline(&mut self.events,&json!({
-                "schema_version":5,"row":["payload_sha256","selection","report","calibration","timing"],
+                "schema_version":6,"row":["payload_sha256","selection","report","calibration","timing"],
                 "selection_columns":SELECTION,"report_columns":REPORT,"calibration_columns":CALIBRATION,
                 "leg_columns":LEG,"timing_columns":TIMING,"configuration":configuration,
                 "scope":"complete_simulations_with_bounded_full_examples"
@@ -96,9 +97,12 @@ impl Writer {
                 facts["input_gross_raw"]=json!(call.inputs.first().map(|x|x.gross_amount_raw));
                 facts["input_net_raw"]=json!(call.inputs.first().map(|x|x.amount_raw));
                 facts["issues"]=json!(call.issues);
-                if let Some(digest)=facts["snapshot_content_digest"].as_array() {
-                    facts["snapshot_content_digest"]=json!(digest.iter().filter_map(Value::as_u64)
-                        .map(|b|format!("{b:02x}")).collect::<String>());
+                for name in ["snapshot_content_digest","snapshot_account_set_digest"] {
+                    if let Some(digest)=facts[name].as_array() {
+                        // Stable 32-byte account-state and manifest fingerprints.
+                        facts[name]=json!(digest.iter().filter_map(Value::as_u64)
+                            .map(|b|format!("{b:02x}")).collect::<String>());
+                    }
                 }
                 rows.push(columns(LEG,&facts));
             }
