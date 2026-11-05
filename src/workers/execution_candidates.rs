@@ -33,6 +33,8 @@ pub struct Settings {
     /// CP9C: independent alternative-packing strategies for the same signal revision.
     strategies:Vec<PackingStrategy>,
     pub cp9d_max_pairs:usize,
+    /// CP20S: zero disables repeat scheduling (and all legacy modes bypass it).
+    pub cp20s_recheck_seconds:u64,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
     pub capacity: fn(&ExecutionRequest) -> Result<ExecutionMetrics>,
 }
@@ -63,7 +65,13 @@ impl Settings {
         ensure!((strategies==[PackingStrategy::Baseline]&&cp9d_max_pairs==1)
             ||(!routes.contains(SignalRouteKind::Triangle3)&&!routes.contains(SignalRouteKind::Triangle4)),
             "alternative packing comparisons require enabled routes direct2 and/or direct3");
-        Ok(Self {wallet,parameters,limit,routes,strategies,cp9d_max_pairs,capacity})
+        let cp20s_recheck_seconds:u64=env::var("GRAPH_CP20S_RECHECK_SECONDS")
+            .unwrap_or_else(|_|"30".into()).parse()
+            .context("invalid GRAPH_CP20S_RECHECK_SECONDS")?;
+        ensure!(cp20s_recheck_seconds<=3600,
+            "GRAPH_CP20S_RECHECK_SECONDS must be 0..=3600");
+        Ok(Self {wallet,parameters,limit,routes,strategies,cp9d_max_pairs,
+            cp20s_recheck_seconds,capacity})
     }
     fn accepts(&self,kind:SignalRouteKind)->bool {
         self.routes.contains(kind)
@@ -984,7 +992,10 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
     // Small per-run history, independent of authoritative MarketState. A fresh
     // run starts with no prior dispatches, and no V10 worker reads this cache.
-    let mut scheduler=scheduling::Scheduler::default();
+    let cp20s_enabled=cfg.strategies==[PackingStrategy::Economic] &&
+        cfg.cp20s_recheck_seconds>0;
+    let mut scheduler=scheduling::Scheduler::new(std::time::Duration::from_secs(
+        if cp20s_enabled{cfg.cp20s_recheck_seconds}else{0}));
     // Retain compact candidate references only until Evaluated; observations stay Arc-shared.
     let mut ranked:Vec<(i64,Arc<SignalEvent>,usize)>=Vec::new();
     let mut pending=false;
@@ -1288,7 +1299,9 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             selection.cp20s_schedule=match familiarity {
                                 scheduling::Familiarity::New=>"new_frozen_state",
                                 scheduling::Familiarity::Recheck=>"periodic_recheck",
-                                scheduling::Familiarity::Unverifiable=>"unverified_state",
+                                scheduling::Familiarity::Unverifiable=>if cp20s_enabled{
+                                    "unverified_state"
+                                }else{"disabled"},
                                 scheduling::Familiarity::Cooldown=>"impossible_deferred",
                             };
                             selection.packing_revision_variant=variant as u8;
@@ -1322,11 +1335,11 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 state.source_fingerprint(w,&cfg.parameters));
                             scheduler.sources.record(source_key,Instant::now());
                             scheduler.packs.record(prepack_key,Instant::now());
-                            if familiarity==scheduling::Familiarity::New {
+                            if cp20s_enabled && familiarity==scheduling::Familiarity::New {
                                 report.cp20s_new_packs+=1;
-                            } else if familiarity==scheduling::Familiarity::Recheck {
+                            } else if cp20s_enabled && familiarity==scheduling::Familiarity::Recheck {
                                 report.cp20s_recheck_packs+=1;
-                            } else if familiarity==scheduling::Familiarity::Unverifiable {
+                            } else if cp20s_enabled && familiarity==scheduling::Familiarity::Unverifiable {
                                 report.cp20s_unknown_fingerprint_packs+=1;
                             }
                         }
