@@ -226,6 +226,29 @@ def analyze(rows):
     cp9e_route_positive_states=collections.defaultdict(set)
     cp9e_route_positive_slots=collections.defaultdict(set)
     quote_outliers = []
+    # CP20R economic diagnostics: one record per request, no bounded sampling.
+    cp20_counts = collections.Counter()
+    cp20_by_source = collections.defaultdict(collections.Counter)
+    cp20_by_strategy = collections.defaultdict(collections.Counter)
+    cp20_unknown_reasons = collections.Counter()
+    cp20_net_by_settlement = collections.defaultdict(list)
+    cp20_outcomes = collections.defaultdict(collections.Counter)
+    cp20_comparison = collections.Counter()
+    cp20_amount_delta_by_settlement = collections.defaultdict(list)
+    cp20_quote_delta_by_settlement = collections.defaultdict(list)
+    cp20_comparison_examples = []
+    cp20_frozen_states = collections.Counter()
+    cp20_frozen_state_slots = collections.defaultdict(set)
+    cp20_frozen_state_above_fee = collections.Counter()
+
+    def frozen_digest(leg, field):
+        value = leg.get(field)
+        if isinstance(value, list) and len(value) == 32 and all(
+                isinstance(n, int) and 0 <= n <= 255 for n in value):
+            return bytes(value).hex()
+        if isinstance(value, str) and len(value) == 64:
+            return value.lower()
+        return None
 
     def bad(kind, identity):
         violation_counts[kind] += 1
@@ -247,6 +270,26 @@ def analyze(rows):
         pair=compact_route_identity(s)
         cp9e_route_counts[route]['requests']+=1
         source=s.get('cp9d_source','fresh')
+        economic=s.get('economic')
+        forecast_class='missing'
+        if isinstance(economic, dict):
+            cp20_counts['available_in_journal'] += 1
+            status=economic.get('status')
+            net=economic.get('predicted_net_gain_raw')
+            if status=='estimated' and net is not None:
+                net=int(net)
+                forecast_class='positive' if net>0 else 'nonpositive'
+                cp20_counts['modeled'] += 1
+                cp20_net_by_settlement[q['settlement']].append(net)
+            else:
+                forecast_class='unknown'
+                cp20_counts['unknown'] += 1
+                cp20_unknown_reasons[economic.get('reason') or 'unspecified'] += 1
+            cp20_by_source[source][forecast_class] += 1
+            cp20_by_strategy[strategy][forecast_class] += 1
+        else:
+            cp20_counts['missing_in_journal'] += 1
+        cp20_outcomes[forecast_class]['requests'] += 1
         generation_revision=(s.get('graph_generation'),s.get('revision'),pair)
         same_revision_pools[generation_revision][strategy] = {x['pool'] for x in s['pools']}
         comparison_key = generation_revision + (q['settlement'],)
@@ -319,6 +362,59 @@ def analyze(rows):
             continue
         dex_calls += bool(r['dex_invocations'])
         c = row.get('calibration')
+        # A path-state is an ordered, directed two-leg route plus both frozen
+        # state and Prepared-account digests. Different simulation slots do not
+        # create distinct observed economic states. Missing digests stay Unknown.
+        frozen_key = None
+        if c and c.get('single_cycle') and len(c.get('legs') or ())==2:
+            parts = []
+            for leg in c['legs']:
+                content=frozen_digest(leg, 'snapshot_content_digest')
+                accounts=frozen_digest(leg, 'snapshot_account_set_digest')
+                if not content or not accounts or not leg.get('pool'):
+                    break
+                parts.append((leg['pool'], leg.get('input_mint'), leg.get('output_mint'),
+                              content, accounts))
+            if len(parts)==2:
+                frozen_key = (q['settlement'], tuple(parts))
+                cp20_frozen_states[frozen_key] += 1
+                cp20_frozen_state_slots[frozen_key].add(r.get('context_slot'))
+            else:
+                cp20_counts['complete_cycle_missing_frozen_identity'] += 1
+        if c and isinstance(c.get('economic_at_v10_input'),dict):
+            comparison=c['economic_at_v10_input']
+            cp20_comparison['records'] += 1
+            cp20_comparison['status_'+str(comparison.get('status'))] += 1
+            if comparison.get('status')=='estimated' and c.get('single_cycle'):
+                cp20_comparison['modeled_at_v10_input'] += 1
+                actual_path=tuple(leg.get('pool') for leg in c.get('legs',()))
+                forecast_path=tuple((economic or {}).get('path') or ())
+                same_path=bool(forecast_path and forecast_path==actual_path)
+                cp20_comparison['forecast_best_path_matched' if same_path else
+                                'forecast_best_path_differed'] += 1
+                # Quantity-optimum differences are meaningful ONLY on the same
+                # forecast path and when V10's full cycle did not roll back.
+                if sim['err'] is None:
+                    cp20_comparison['committed_modeled_at_v10_input'] += 1
+                    deviation=comparison.get('output_delta_actual_minus_predicted_raw')
+                    if deviation is not None:
+                        cp20_quote_delta_by_settlement[q['settlement']].append(int(deviation))
+                    if same_path:
+                        delta=comparison.get('prediction_input_delta_actual_minus_optimum_raw')
+                        if delta is not None:
+                            cp20_amount_delta_by_settlement[q['settlement']].append(int(delta))
+                            cp20_comparison['same_path_quantity_compared'] += 1
+                    if deviation is not None:
+                        sample={'id':identity,'settlement':q['settlement'],
+                            'actual_v10_input_raw':comparison.get('actual_input_raw'),
+                            'forecast_optimal_input_raw':comparison.get('prediction_optimal_input_raw'),
+                            'same_predicted_path':same_path,
+                            'actual_minus_predicted_output_raw':int(deviation),
+                            'simulation_slot':r.get('context_slot')}
+                        cp20_comparison_examples.append(sample)
+                        cp20_comparison_examples.sort(
+                            key=lambda item:abs(item['actual_minus_predicted_output_raw']),reverse=True)
+                        del cp20_comparison_examples[12:]
         if row.get('schema_version', 0) >= 3:
             trace = r.get('trace') or {}
             calls = trace.get('calls') or []
@@ -400,6 +496,7 @@ def analyze(rows):
                     quote_outliers.sort(key=lambda x: abs(x['model_vs_actual_bps']), reverse=True)
                     del quote_outliers[24:]
         if sim['err'] is not None:
+            cp20_outcomes[forecast_class]['simulation_failed'] += 1
             strategy_counts[strategy]['failures'] += 1
             error = sim.get('error_name') or next((re.search(r'Error Code: ([^.]+)', line)[1]
                           for line in sim.get('logs', []) if 'Error Code: ' in line),
@@ -407,6 +504,7 @@ def analyze(rows):
             errors[error] += 1
             continue
         successes += 1
+        cp20_outcomes[forecast_class]['simulation_no_program_error'] += 1
         successful_routes[route] += 1
         strategy_counts[strategy]['rpc_successes'] += 1
         cp9d_source_counts[source]['rpc_successes']+=1
@@ -440,6 +538,12 @@ def analyze(rows):
         gains[asset].append(gain)
         fee = sim.get('fee')
         if asset == WSOL:
+            if c and c.get('single_cycle') and fee is not None and gain > fee:
+                cp20_outcomes[forecast_class]['wsol_cycle_above_network_fee'] += 1
+                if frozen_key is not None:
+                    cp20_frozen_state_above_fee[frozen_key] += 1
+            if c and c.get('single_cycle') and native_delta is not None and gain+native_delta>0:
+                cp20_outcomes[forecast_class]['wsol_positive_wallet_cashflow'] += 1
             if path_case is not None:
                 path_case['above_network_fee'] = fee is not None and gain > fee
                 path_case['positive_cashflow'] = native_delta is not None and gain + native_delta > 0
@@ -550,10 +654,53 @@ def analyze(rows):
             'different_positive_path_slots':len(cp9e_route_positive_slots[route])}
         for route,counter in sorted(cp9e_route_counts.items())},
         'note':'Direct2 and Direct3 source identities and economic outcomes are tracked separately. A simulation slot is not an independent trade.'}
+    cp20_repeated=[n for n in cp20_frozen_states.values() if n>1]
+    cp20={
+        'forecast_counts':dict(cp20_counts),
+        'forecast_unknown_reasons':dict(cp20_unknown_reasons),
+        'forecast_by_source':{key:dict(value) for key,value in sorted(cp20_by_source.items())},
+        'forecast_by_strategy':{key:dict(value) for key,value in sorted(cp20_by_strategy.items())},
+        'predicted_max_net_gain_raw_by_settlement':{
+            k:durations(v) for k,v in cp20_net_by_settlement.items()},
+        'outcomes_by_forecast_class':{
+            key:dict(value) for key,value in sorted(cp20_outcomes.items())},
+        'v10_comparison':{
+            **dict(cp20_comparison),
+            'v10_input_minus_predicted_optimum_raw_by_settlement':{
+                k:durations(v) for k,v in cp20_amount_delta_by_settlement.items()},
+            'actual_output_minus_predicted_at_v10_input_raw_by_settlement':{
+                k:durations(v) for k,v in cp20_quote_delta_by_settlement.items()},
+            'largest_absolute_output_discrepancies':cp20_comparison_examples,
+        },
+        'frozen_state_repetition':{
+            'identified_complete_cycles':sum(cp20_frozen_states.values()),
+            'different_frozen_path_states':len(cp20_frozen_states),
+            'repeated_frozen_path_state_groups':len(cp20_repeated),
+            'requests_in_repeated_frozen_path_states':sum(cp20_repeated),
+            'largest_frozen_path_state_group':max(cp20_repeated,default=0),
+            'positive_wsol_cycle_groups_by_frozen_state':len(cp20_frozen_state_above_fee),
+            'largest_repeated_states':[
+                {'settlement':key[0],
+                 'path':[{'pool':p,'input_mint':i,'output_mint':o,
+                          'content_digest':c,'account_set_digest':a}
+                         for p,i,o,c,a in key[1]],
+                 'requests':number,
+                 'different_simulation_slots':len(cp20_frozen_state_slots[key]),
+                 'wsol_above_network_fee':cp20_frozen_state_above_fee[key]}
+                for key,number in cp20_frozen_states.most_common(10)]
+        },
+        'limits':('Profit is modeled with frozen snapshots and simplified fees. '
+                  'Amounts in WSOL and USDC raw units must never be mixed. '
+                  'A matching content digest does not prove the same Solana bank state; '
+                  'repetitions are diagnostics, not a reason for automatic exclusion. '
+                  'Only complete committed two-leg cycles can establish observed gains. '
+                  'Rent capital and missing priority/tip costs require separate treatment.')
+    }
     return {'schema_version': 2,
             'cp9e_direct_route_comparison':cp9e,
             'cp9d_signal_breadth_and_coverage':cp9d,
-            'cp9c_strategy_comparison': cp9c, 'request_count': count, 'report_count': reports,
+            'cp9c_strategy_comparison': cp9c,
+            'cp20_economic_validation': cp20, 'request_count': count, 'report_count': reports,
             'simulation_successes': successes, 'simulation_failures': sum(errors.values()),
             'dex_call_reports': dex_calls, 'errors': dict(errors), 'routes': dict(routes),
             'successful_routes': dict(successful_routes), 'violations': violations,
