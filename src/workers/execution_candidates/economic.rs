@@ -195,6 +195,10 @@ fn predict_pair(a:&PoolPriceObservation,b:&PoolPriceObservation,
     let cost=network_cost(settlement,params)?;
     Some((quantity,output,dex,dex-i128::from(cost)))
 }
+pub(super) fn pair_gain(a:&PoolPriceObservation,b:&PoolPriceObservation,
+    settlement:&str,target:&str,params:&ExecutionParameters)->Option<i128> {
+    predict_pair(a,b,settlement,target,params).map(|(_,_,_,net)|net)
+}
 pub(super) fn witness_gain(w:&SignalWitness,params:&ExecutionParameters)->Option<i128> {
     if w.legs.len()!=2{return None;}
     let first=&w.legs[0];let second=&w.legs[1];
