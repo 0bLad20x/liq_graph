@@ -15,21 +15,29 @@ impl Familiarity {
     pub(super) fn deferred(self)->bool{self==Self::Cooldown}
 }
 
-#[derive(Default)]
 pub(super) struct Recent {
+    cooldown:Duration,
     last:HashMap<String,Instant>,
     trail:VecDeque<(String,Instant)>,
 }
+impl Default for Recent{
+    fn default()->Self{Self::new(COOLDOWN)}
+}
 impl Recent {
+    fn new(cooldown:Duration)->Self{
+        Self{cooldown,last:HashMap::new(),trail:VecDeque::new()}
+    }
     pub(super) fn classify(&self,key:Option<&str>,now:Instant)->Familiarity {
+        if self.cooldown.is_zero(){return Familiarity::Unverifiable;}
         let Some(key)=key else{return Familiarity::Unverifiable};
         match self.last.get(key) {
             None=>Familiarity::New,
-            Some(last) if now.saturating_duration_since(*last)<COOLDOWN=>Familiarity::Cooldown,
+            Some(last) if now.saturating_duration_since(*last)<self.cooldown=>Familiarity::Cooldown,
             Some(_)=>Familiarity::Recheck,
         }
     }
     pub(super) fn record(&mut self,key:Option<String>,now:Instant){
+        if self.cooldown.is_zero(){return;}
         let Some(key)=key else{return};
         self.last.insert(key.clone(),now);
         self.trail.push_back((key,now));
@@ -44,10 +52,14 @@ impl Recent {
     fn len(&self)->usize {self.last.len()}
 }
 
-#[derive(Default)]
 pub(super) struct Scheduler {
     pub(super) sources:Recent,
     pub(super) packs:Recent,
+}
+impl Scheduler{
+    pub(super) fn new(cooldown:Duration)->Self{
+        Self{sources:Recent::new(cooldown),packs:Recent::new(cooldown)}
+    }
 }
 pub(super) fn sha256(data:&Value)->Option<String>{
     let bytes=serde_json::to_vec(data).ok()?;
@@ -86,6 +98,13 @@ mod cp20s_tests{
         assert_eq!(recent.classify(Some("a"),start+Duration::from_secs(30)),Familiarity::Recheck);
         assert_eq!(recent.classify(Some("b"),start),Familiarity::New);
         assert_eq!(recent.classify(None,start),Familiarity::Unverifiable);
+    }
+    #[test]
+    fn cp20s_disabled_does_not_interfere_with_legacy_modes(){
+        let mut scheduler=Scheduler::new(Duration::ZERO);
+        let now=Instant::now();
+        scheduler.packs.record(Some("abc".into()),now);
+        assert_eq!(scheduler.packs.classify(Some("abc"),now),Familiarity::Unverifiable);
     }
     #[test]
     fn cp20s_changed_snapshot_is_not_blocked_by_other_snapshot(){
