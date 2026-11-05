@@ -286,6 +286,94 @@ pub(super) fn comparison(selection:&Selection,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::market_state::{FeeValuation,PoolLiquidity,ReserveCurve,
+        LiquidityLevel,DirectedLiquidity,Consistency,PriceKind,PriceOrigin,CpmmQuoteSnapshot};
+    use std::sync::Arc;
+
+    fn fee(model:&'static str,base:f64,variable:f64)->FeeValuation {
+        FeeValuation{model,estimated_net_rates:[Some(1.0);2],
+            dex_fee_rates:[Some(base+variable);2],fees_on_input:[true;2],
+            base_fee_rate:Some(base),variable_fee_rate:Some(variable),
+            lp_fee_bps:None,protocol_fee_bps:None,creator_fee_bps:None,
+            fee_schedule:None,market_cap_raw:None,chain_timestamp:1,chain_epoch:0,
+            token_fee_status:["verified_no_standard_transfer_fee";2],
+            unknown_reason:None,scope:"test"}
+    }
+    fn dir(a:&str,b:&str,levels:Vec<LiquidityLevel>)->DirectedLiquidity {
+        DirectedLiquidity{input_mint:a.into(),output_mint:b.into(),
+            input_decimals:9,output_decimals:9,status:"available",
+            coverage:"execution_window_end",next_required_account:None,
+            first_source_position:Some(0),marginal_net_rate:Some(1.0),
+            monotone_rate_tail:true,input_capacity_raw:None,
+            output_capacity_raw:"100000000".into(),levels,reason:None}
+    }
+    fn observed(model:&'static str,directions:[DirectedLiquidity;2],
+        cpmm:Option<CpmmQuoteSnapshot>,pump:Option<ReserveCurve>,
+        valuation:FeeValuation)->PoolPriceObservation {
+        PoolPriceObservation{origin:PriceOrigin::Baseline,pool:"P".into(),venue:model,
+            mint_a:"S".into(),mint_b:"T".into(),base_mint:"S".into(),quote_mint:"T".into(),
+            price_quote_per_base:1.0,valuation:Some(valuation),
+            liquidity:Some(Arc::new(PoolLiquidity{model,revision:1,
+                content_digest:[0;32],account_set_digest:[1;32],execution_accounts:vec![],
+                reserve_curve:pump,cpmm_quote:cpmm,orca_quote:None,clmm_quote:None,
+                directions})),
+            previous_price:None,delta_bps:None,price_kind:PriceKind::ReserveSpot,
+            best_bid_quote_per_base:None,best_ask_quote_per_base:None,
+            consistency:Consistency::SingleAccount,slot:1,received_at_us:0,sequence:1,
+            component_slot_min:1,component_slot_max:1,component_received_at_us_min:0,
+            component_received_at_us_max:0,trigger_field:None,pipeline:None}
+    }
+    fn bin(id:i32,rate:u128,capacity:u64,fee_rate:u64)->LiquidityLevel {
+        LiquidityLevel{source_position:id,gross_rate:rate as f64,
+            net_rate:rate as f64*(1.0-fee_rate as f64/1e9),
+            fee_rate:fee_rate as f64/1e9,fees_on_input:true,
+            rate_numerator:rate,rate_denominator:1,
+            output_parts_raw:[capacity,0,0],fee_numerator:fee_rate,
+            fee_denominator:1_000_000_000,maximum_rebate_bps:0,
+            full_level_net_rate:None,input_raw:None,output_raw:capacity,
+            minimum_input_raw:Some(1),fee_raw:None}
+    }
+
+    #[test]
+    fn cp20_dlmm_crosses_bins_and_freezes_current_dynamic_fee() {
+        let obs=observed("dlmm_execution_window_v2",
+            [dir("S","T",vec![bin(0,2,10,100_000_000),
+                              bin(1,1,10,350_000_000)]),
+             dir("T","S",vec![bin(0,1,10,100_000_000)])],
+            None,None,fee("dlmm",0.06,0.04));
+        let one=reserve_quote(&obs,"S","T",5.0).unwrap();
+        let two=reserve_quote(&obs,"S","T",10.0).unwrap();
+        assert!((one-9.0).abs()<1e-8);
+        // Second level uses the initial 10% fee, NOT its 35% fee.
+        assert!((two-14.0).abs()<1e-8, "unexpected second-bin quote {two}");
+        assert!(reserve_quote(&obs,"S","T",100.0).is_none());
+    }
+
+    #[test]
+    fn cp20_cpmm_predicts_optimum_from_reserves_not_fixed_input_grid() {
+        let first=observed("raydium_cpmm_directional_v1",
+            [dir("S","T",vec![]),dir("T","S",vec![])],
+            Some(CpmmQuoteSnapshot{mint_0:"S".into(),mint_1:"T".into(),
+                reserve_0_raw:1_000_000,reserve_1_raw:1_200_000,
+                trade_fee_rate:0,creator_fee_rate:0,
+                creator_fee_on_input_0_to_1:true,creator_fee_on_input_1_to_0:true}),
+            None,fee("cpmm",0.0,0.0));
+        let second=observed("raydium_cpmm_directional_v1",
+            [dir("S","T",vec![]),dir("T","S",vec![])],
+            Some(CpmmQuoteSnapshot{mint_0:"T".into(),mint_1:"S".into(),
+                reserve_0_raw:1_000_000,reserve_1_raw:1_200_000,
+                trade_fee_rate:0,creator_fee_rate:0,
+                creator_fee_on_input_0_to_1:true,creator_fee_on_input_1_to_0:true}),
+            None,fee("cpmm",0.0,0.0));
+        let (quantity,output,gain)=optimum(&first,&second,"S","T").unwrap();
+        assert!(quantity>1 && output>quantity && gain>0);
+        // Test-only independent dense reference, NOT a production-size grid.
+        let reference=(1..=4_000).map(|i|i*100).filter_map(|x|
+            route(&first,&second,"S","T",x as f64)
+                .map(|out|out-x as f64)).fold(0.0_f64,f64::max);
+        assert!(gain as f64 >= reference*0.99, "optimizer {gain} vs reference {reference}");
+    }
+
     #[test]
     fn cp20_frozen_reserve_curve_has_finite_profit_peak() {
         let a=|x:f64|100_000.0*x/(100_000.0+x)*1.01;
