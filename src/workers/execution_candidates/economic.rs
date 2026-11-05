@@ -3,7 +3,7 @@
 //! PumpSwap and CPMM use frozen reserve curves; DLMM traverses the observed bin
 //! execution window with the CURRENT base+variable fee held fixed across bins.
 //! Continuous arithmetic is deliberately approximate. No RPC, no persistent cache.
-use super::{PoolEvidence,Selection};
+use super::Selection;
 use crate::core::execution::ExecutionParameters;
 use crate::core::market_state::{PoolPriceObservation,DirectedLiquidity};
 use crate::core::signals::SignalWitness;
@@ -277,7 +277,7 @@ pub(super) fn comparison(selection:&Selection,
         "prediction_optimal_input_raw":selection.economic.input_raw,
         "prediction_optimal_net_gain_raw":selection.economic.predicted_net_gain_raw.map(|v|v.to_string()),
         "fee_assumption":"DLMM current base+variable held fixed; protocol fees frozen",
-        "comparison_limit":"same slot is not atomic bank identity; rent and flashloan charges are not modeled"});
+        "comparison_limit":"same slot is not atomic bank identity; rent and flashloan charges are not modeled"})
 }
 #[cfg(test)]
 mod tests {
