@@ -165,6 +165,7 @@ pub struct Selection {
     packing_seed_log_sum_units:i64,
     amount_assessment:amounts::Assessment,amount_seed_changed:bool,
     economic:economic::Prediction,
+    cp20s_schedule:&'static str,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Report {
@@ -423,6 +424,7 @@ impl Selection {
             "amount_estimate":self.amount_assessment.estimate.as_ref().map(|e|[e.input_raw,e.output_raw,e.profit_raw]),
             // CP20 schema 6: persist every forecast, not only bounded details.
             "economic":&self.economic,
+            "cp20s_schedule":self.cp20s_schedule,
             "packed_state_digest":packed_state_digest,
             "liquidity_checked":self.pools.iter().all(|p|p.observation.venue!="meteora_dlmm"
                 ||(p.liquidity_window_checked&&p.observation.liquidity.is_some())),
@@ -926,7 +928,8 @@ impl State {
             unavailable_alternatives:unavailable,last_alternative_rejection:last_rejection,
             alternative_pools_added,packing_seed_log_sum_units:seed_sum,
             amount_assessment:amounts::Assessment::unknown("not_evaluated"),amount_seed_changed,
-            economic:economic::Prediction::unknown("not_evaluated")})
+            economic:economic::Prediction::unknown("not_evaluated"),
+            cp20s_schedule:"not_scheduled"})
         })();
         preparation.pack_build_ns.record(elapsed_ns(started));
         result
@@ -1251,6 +1254,16 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             if sent_sets.get(pair).is_some_and(|sent|sent.contains(&pool_set)){
                                 report.cp9c_duplicate_packs+=1;continue;
                             }
+                            // Compare full frozen packed membership before CP8C
+                            // amount assessment. Once assessed, successful proof
+                            // accounting requires V10 delivery; skipping afterward
+                            // would violate its invariant.
+                            let prepack_key=selection.packed_state_fingerprint();
+                            let familiarity=scheduler.packs.classify(prepack_key.as_deref(),started);
+                            if familiarity.deferred() {
+                                report.cp20s_repeated_packs_deferred+=1;
+                                continue;
+                            }
                             let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,&mut reads,
                                 &mut report.amounts,&mut report.preparation)? else{
                                 continue;
@@ -1272,6 +1285,12 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                                 selection.pools.iter().map(|p|p.slot/2).collect());
                             selection.cp9d_source=*origin;
                             selection.cp9d_pair_index=pair_index as u8;
+                            selection.cp20s_schedule=match familiarity {
+                                scheduling::Familiarity::New=>"new_frozen_state",
+                                scheduling::Familiarity::Recheck=>"periodic_recheck",
+                                scheduling::Familiarity::Unverifiable=>"unverified_state",
+                                scheduling::Familiarity::Cooldown=>"impossible_deferred",
+                            };
                             selection.packing_revision_variant=variant as u8;
                             selection.round_elapsed_ns=elapsed_ns(started);
                             selection.registry_reads=reads.clone();
@@ -1296,6 +1315,20 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                             evidence.try_send(EvidenceItem::Selection(Box::new(selection)))
                                 .map_err(|err|anyhow::anyhow!("V10 evidence queue unavailable (nonblocking): {err}"))?;
                             permit.send(request);report.request_count+=1;
+                            // Record only successfully handed-off submissions, not
+                            // candidates that fail preparation, amount proofs or
+                            // queue admission. V10 outcome remains independent.
+                            let source_key=candidate.witness.as_ref().and_then(|w|
+                                state.source_fingerprint(w,&cfg.parameters));
+                            scheduler.sources.record(source_key,Instant::now());
+                            scheduler.packs.record(prepack_key,Instant::now());
+                            if familiarity==scheduling::Familiarity::New {
+                                report.cp20s_new_packs+=1;
+                            } else if familiarity==scheduling::Familiarity::Recheck {
+                                report.cp20s_recheck_packs+=1;
+                            } else if familiarity==scheduling::Familiarity::Unverifiable {
+                                report.cp20s_unknown_fingerprint_packs+=1;
+                            }
                         }
                     }
                     if busy_revision{report.skipped_busy_revisions+=1;}
