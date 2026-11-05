@@ -544,7 +544,7 @@ mod tests {
     fn cp21a_refuses_unknown_costs_and_integer_overflow(){
         let p=ExecutionParameters::default();
         assert!(normalize_usd_nano(USDC,i128::MAX).is_none());
-        assert!(net_accounting(WSOL,i128::MIN,&p).is_some());
+        assert!(net_accounting(WSOL,i128::MIN,&p).is_none());
     }
     #[test]
     fn cp20_network_fee_units_are_settlement_specific() {
