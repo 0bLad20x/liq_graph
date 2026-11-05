@@ -395,6 +395,8 @@ impl Selection {
             "estimated_net_return_bps":self.estimated_net_return_bps,
             "amount_decision":self.amount_assessment.decision,
             "amount_estimate":self.amount_assessment.estimate.as_ref().map(|e|[e.input_raw,e.output_raw,e.profit_raw]),
+            // CP20 schema 6: persist every forecast, not only bounded details.
+            "economic":&self.economic,
             "liquidity_checked":self.pools.iter().all(|p|p.observation.venue!="meteora_dlmm"
                 ||(p.liquidity_window_checked&&p.observation.liquidity.is_some())),
             "packing":[self.packing.groups,self.packing.pool_declarations,self.packing.unique_accounts,
