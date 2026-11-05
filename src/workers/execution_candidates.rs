@@ -190,6 +190,8 @@ pub struct Report {
     cp11_quantity_phases:amounts::PhaseProfile,
     pub cp20_economic_forecasts:u64,pub cp20_economic_modeled:u64,
     pub cp20_economic_positive:u64,pub cp20_economic_unknown:u64,
+    pub cp20_active_scored:u64,pub cp20_active_model_positive:u64,
+    pub cp20_active_model_unknown:u64,pub cp20_active_prioritized:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -440,6 +442,20 @@ struct State {
     prepared_logarithms:u64,
 }
 impl State {
+    /// Score the current authoritative price/fee/liquidity snapshots rather
+    /// than the potentially older witness snapshot retained for active signals.
+    fn economic_score(&self,w:&SignalWitness,params:&ExecutionParameters)->Option<i128> {
+        if w.legs.len()!=2 {return None;}
+        let first=&w.legs[0];let second=&w.legs[1];
+        if first.slot/2==second.slot/2
+            || first.output_mint!=second.input_mint
+            || first.input_mint!=second.output_mint{return None;}
+        let a=self.prices.get(first.slot/2)?.as_ref()?.observation.as_ref();
+        let b=self.prices.get(second.slot/2)?.as_ref()?.observation.as_ref();
+        if a.pool!=first.observation.pool||b.pool!=second.observation.pool{return None;}
+        economic::pair_gain(a,b,&first.input_mint.to_string(),
+            &first.output_mint.to_string(),params)
+    }
     fn amount_input(&self,id:usize,manifest_matches:bool)->Option<amounts::Input> {
         let price=self.prices.get(id)?.as_ref()?;let identity=self.pools.get(id)?;
         Some(amounts::Input{slot:2*id+usize::from(identity.mint_a.to_string()!=price.observation.base_mint),
@@ -1001,11 +1017,10 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         let gain=match event.as_ref(){
                             SignalEvent::Candidates(batch)=>batch.candidates.get(*index)
                                 .and_then(|c|c.witness.as_ref())
-                                .and_then(|w|economic::witness_gain(w,&cfg.parameters)),
+                                .and_then(|w|state.economic_score(w,&cfg.parameters)),
                             _=>None,
                         };
-                        let category=match gain{Some(n) if n>0=>0,None=>1,Some(_)=>2};
-                        (category,std::cmp::Reverse(gain.unwrap_or(0)),*marginal)
+                        (economic::priority_key(gain),*marginal)
                     });
                     // CP9D: one source candidate per distinct physical token pair.
                     // First give changed, currently priced witnesses priority. Then
@@ -1027,19 +1042,37 @@ pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sen
                         let count=state.active_witnesses.len();
                         if count>0 {
                             let offset=(state.revision as usize)%count;
-                            for (_,candidate) in state.active_witnesses.iter().skip(offset)
-                                .chain(state.active_witnesses.iter().take(offset)).take(512) {
+                            // Bound prediction work per revision; the rotated 512-member
+                            // scan preserves temporal coverage. All eligible Unknown
+                            // candidates remain in the scored window, not filtered out.
+                            const ACTIVE_ECONOMIC_BUDGET:usize=96;
+                            let mut active_scores=Vec::new();
+                            for (ordinal,(_,candidate)) in state.active_witnesses.iter().skip(offset)
+                                .chain(state.active_witnesses.iter().take(offset)).take(512).enumerate() {
                                 report.cp9d_active_candidates_examined+=1;
-                                if candidate.change==SignalRangeChange::Exited {continue;}
-                                let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
+                                if candidate.change==SignalRangeChange::Exited{continue;}
+                                let Some(top)=state.plan.as_ref()
+                                    .and_then(|p|p.compact_topologies.get(candidate.topology_id)) else{continue};
                                 if !cfg.accepts(top.kind){continue;}
                                 let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
                                 if pairs.contains(&pair){continue;}
                                 let Some(w)=candidate.witness.as_ref() else{continue};
                                 if w.log_sum_units>=state.threshold ||
                                     state.witness(candidate.topology_id,candidate.reverse,w).is_err(){continue;}
-                                pairs.insert(pair);
-                                sources.push((candidate.clone(),e.trigger.clone(),state.threshold,"active",pair));
+                                let gain=state.economic_score(w,&cfg.parameters);
+                                report.cp20_active_scored+=1;
+                                if gain.is_some_and(|n|n>0){report.cp20_active_model_positive+=1;}
+                                if gain.is_none(){report.cp20_active_model_unknown+=1;}
+                                active_scores.push((economic::priority_key(gain),ordinal,candidate.clone(),pair));
+                                if active_scores.len()>=ACTIVE_ECONOMIC_BUDGET{break;}
+                            }
+                            // Stable rotation acts as deterministic tie-break,
+                            // but no longer determines priority ahead of net gain.
+                            active_scores.sort_unstable_by_key(|(key,ordinal,_,_)|(*key,*ordinal));
+                            for (_,_,candidate,pair) in active_scores {
+                                if !pairs.insert(pair){continue;}
+                                sources.push((candidate,e.trigger.clone(),state.threshold,"active",pair));
+                                report.cp20_active_prioritized+=1;
                                 if sources.len()>=cfg.cp9d_max_pairs{break;}
                             }
                         }
