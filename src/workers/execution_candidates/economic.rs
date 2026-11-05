@@ -355,24 +355,37 @@ pub(super) fn comparison(selection:&Selection,
         route(&first.observation,&second.observation,&settlement,&target,input as f64)
     }else{None};
     let output=model.map(|n|n.floor() as u64);
-    let network=network_cost(&settlement,&selection.request.parameters);
-    json!({"status":if output.is_some(){"estimated"}else{"unknown"},
+    let predicted_gross=output.map(|o|i128::from(o)-i128::from(input));
+    let predicted_accounting=predicted_gross
+        .and_then(|gain|net_accounting(&settlement,gain,&selection.request.parameters));
+    // Actual DEX gross is observed from the CPI trace; the V10 fee below is
+    // EXPECTED from its documented rule, not an independently observed debit.
+    let expected_actual_v10_fee=actual_gain.map(v10_profit_fee);
+    json!({"status":if predicted_accounting.is_some(){"estimated"}else{"unknown"},
         "scope":"frozen_snapshot_same_executed_pair_at_v10_chosen_amount",
         "actual_input_raw":input,"actual_output_raw":actual,
         "predicted_output_at_v10_input_raw":output,
-        "predicted_dex_gain_at_v10_input_raw":output.map(|o|i128::from(o)-i128::from(input)).map(|x|x.to_string()),
+        "predicted_dex_gain_at_v10_input_raw":predicted_gross.map(|x|x.to_string()),
+        "predicted_v10_profit_fee_at_v10_input_raw":predicted_accounting.map(|a|a.v10_profit_fee_raw.to_string()),
+        "predicted_post_v10_gain_at_v10_input_raw":predicted_accounting.map(|a|a.post_v10_gain_raw.to_string()),
         "actual_dex_gain_raw":actual_gain.map(|x|x.to_string()),
+        "expected_v10_profit_fee_on_actual_gross_raw":expected_actual_v10_fee.map(|x|x.to_string()),
         "settlement_input_refund_raw":refund,
         "prediction_input_delta_actual_minus_optimum_raw":selection.economic.input_raw
             .map(|q|(i128::from(input)-i128::from(q)).to_string()),
-        "predicted_net_gain_at_v10_input_raw":output.zip(network)
-            .map(|(o,c)|(i128::from(o)-i128::from(input)-i128::from(c)).to_string()),
+        "predicted_net_gain_at_v10_input_raw":predicted_accounting.map(|a|a.net_gain_raw.to_string()),
+        "predicted_net_gain_at_v10_input_usd_nano":predicted_accounting
+            .map(|a|a.net_gain_usd_nano.to_string()),
+        "predicted_network_cost_at_v10_input_raw":predicted_accounting.map(|a|a.network_cost_raw),
+        "expected_post_v10_gain_on_actual_gross_raw":actual_gain.zip(expected_actual_v10_fee)
+            .map(|(gross,fee)|(gross-fee).to_string()),
         "output_delta_actual_minus_predicted_raw":actual.zip(output)
             .map(|(a,p)|(i128::from(a)-i128::from(p)).to_string()),
         "prediction_optimal_input_raw":selection.economic.input_raw,
         "prediction_optimal_net_gain_raw":selection.economic.predicted_net_gain_raw.map(|v|v.to_string()),
-        "fee_assumption":"DLMM current base+variable held fixed; protocol fees frozen",
-        "comparison_limit":"same slot is not atomic bank identity; rent and flashloan charges are not modeled"})
+        "prediction_optimal_net_gain_usd_nano":selection.economic.predicted_net_gain_usd_nano.map(|v|v.to_string()),
+        "fee_assumption":"DLMM current base+variable held fixed; V10 positive gross profit share floor(gain/10)",
+        "comparison_limit":"slot is not bank identity; simulated network cost is a reference; refundable rent capital, unconfigured tips and unmodeled charges are excluded"})
 }
 #[cfg(test)]
 mod tests {
@@ -484,6 +497,54 @@ mod tests {
         assert!(priority_key(Some(1))<priority_key(None));
         assert!(priority_key(None)<priority_key(Some(0)));
         assert!(priority_key(Some(0))<priority_key(Some(-1)));
+    }
+    #[test]
+    fn cp21a_known_v10_share_matches_integer_profit_accounting() {
+        // CP20R archived PumpSwap route: 12,188 gross => 1,218 fee,
+        // 10,970 wallet settlement gain, 5,970 after network fee.
+        let accounting=net_accounting(WSOL,12_188,&ExecutionParameters::default()).unwrap();
+        assert_eq!(accounting.v10_profit_fee_raw,1_218);
+        assert_eq!(accounting.post_v10_gain_raw,10_970);
+        assert_eq!(accounting.network_cost_raw,5_000);
+        assert_eq!(accounting.net_gain_raw,5_970);
+        assert_eq!(accounting.net_gain_usd_nano,597_000);
+        assert_eq!(v10_profit_fee(0),0);
+        assert_eq!(v10_profit_fee(-13),0);
+        assert_eq!(v10_profit_fee(9),0);
+        assert_eq!(v10_profit_fee(19),1);
+    }
+    #[test]
+    fn cp21a_cross_settlement_priority_does_not_compare_raw_atoms(){
+        let a=normalize_usd_nano(WSOL,10_000).unwrap();
+        let b=normalize_usd_nano(USDC,2_000).unwrap();
+        // 10,000 lamports = $0.001, 2,000 microUSDC = $0.002.
+        assert!(a<b);
+        assert!(priority_key(Some(b))<priority_key(Some(a)));
+        assert_eq!(normalize_usd_nano(WSOL,-10_000),Some(-1_000_000));
+        assert_eq!(normalize_usd_nano(USDC,-2_000),Some(-2_000_000));
+        assert_eq!(normalize_usd_nano("target",10),None);
+    }
+    #[test]
+    fn cp21a_usdc_and_wsol_costs_have_exact_integer_ceiling() {
+        let mut p=ExecutionParameters::default();
+        assert_eq!(network_cost(USDC,&p),Some(500));
+        p.priority_fee_lamports=1;
+        assert_eq!(network_cost(WSOL,&p),Some(5_001));
+        assert_eq!(network_cost(USDC,&p),Some(501));
+        let wsol=net_accounting(WSOL,10_000,&p).unwrap();
+        let usdc=net_accounting(USDC,10_000,&p).unwrap();
+        assert_eq!(wsol.net_gain_raw,3_999);
+        assert_eq!(usdc.net_gain_raw,8_499);
+        assert_eq!(wsol.net_gain_usd_nano,399_900);
+        assert_eq!(usdc.net_gain_usd_nano,8_499_000);
+        p.additional_fee_bp=50;
+        assert!(net_accounting(WSOL,10_000,&p).is_none());
+    }
+    #[test]
+    fn cp21a_refuses_unknown_costs_and_integer_overflow(){
+        let p=ExecutionParameters::default();
+        assert!(normalize_usd_nano(USDC,i128::MAX).is_none());
+        assert!(net_accounting(WSOL,i128::MIN,&p).is_some());
     }
     #[test]
     fn cp20_network_fee_units_are_settlement_specific() {
