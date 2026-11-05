@@ -7,6 +7,8 @@ if ((git branch --show-current).Trim() -ne 'cp20-direct2-economic-predictor') {
 }
 cargo test --locked --release cp20_
 if ($LASTEXITCODE -ne 0) { throw 'CP20 tests failed' }
+cargo test --locked --release cp20s_
+if ($LASTEXITCODE -ne 0) { throw 'CP20S scheduling tests failed' }
 python -m unittest discover -s scripts/tests -p 'test_cp20_economic_audit.py'
 if ($LASTEXITCODE -ne 0) { throw 'CP20 economic evidence tests failed' }
 .\scripts\runtime_live.ps1 `
