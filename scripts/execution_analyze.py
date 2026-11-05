@@ -95,7 +95,7 @@ def stream_records(stream):
         if not line.strip():
             continue
         row = json.loads(line)
-        if isinstance(row, dict) and row.get('schema_version') in (4, 5, 6) and 'selection_columns' in row:
+        if isinstance(row, dict) and row.get('schema_version') in (4, 5, 6, 7) and 'selection_columns' in row:
             if header is not None:
                 raise ValueError('Duplicate compact journal header')
             header = row
@@ -227,6 +227,7 @@ def analyze(rows):
     cp9e_route_positive_slots=collections.defaultdict(set)
     quote_outliers = []
     # CP20R economic diagnostics: one record per request, no bounded sampling.
+    cp20s_schedule_counts = collections.defaultdict(collections.Counter)
     cp20_counts = collections.Counter()
     cp20_by_source = collections.defaultdict(collections.Counter)
     cp20_by_strategy = collections.defaultdict(collections.Counter)
@@ -273,6 +274,9 @@ def analyze(rows):
         pair=compact_route_identity(s)
         cp9e_route_counts[route]['requests']+=1
         source=s.get('cp9d_source','fresh')
+        schedule=s.get('cp20s_schedule') or 'pre_cp20s'
+        cp20s_schedule_counts[schedule]['requests']+=1
+        cp20s_schedule_counts[schedule]['source_'+source]+=1
         economic=s.get('economic')
         forecast_class='missing'
         if isinstance(economic, dict):
@@ -510,6 +514,7 @@ def analyze(rows):
                     quote_outliers.sort(key=lambda x: abs(x['model_vs_actual_bps']), reverse=True)
                     del quote_outliers[24:]
         if sim['err'] is not None:
+            cp20s_schedule_counts[schedule]['simulation_failed']+=1
             cp20_outcomes[forecast_class]['simulation_failed'] += 1
             strategy_counts[strategy]['failures'] += 1
             error = sim.get('error_name') or next((re.search(r'Error Code: ([^.]+)', line)[1]
@@ -518,6 +523,7 @@ def analyze(rows):
             errors[error] += 1
             continue
         successes += 1
+        cp20s_schedule_counts[schedule]['simulation_no_program_error']+=1
         cp20_outcomes[forecast_class]['simulation_no_program_error'] += 1
         successful_routes[route] += 1
         strategy_counts[strategy]['rpc_successes'] += 1
@@ -553,6 +559,7 @@ def analyze(rows):
         fee = sim.get('fee')
         if asset == WSOL:
             if c and c.get('single_cycle') and fee is not None and gain > fee:
+                cp20s_schedule_counts[schedule]['wsol_cycle_above_network_fee']+=1
                 cp20_outcomes[forecast_class]['wsol_cycle_above_network_fee'] += 1
                 if frozen_key is not None:
                     cp20_frozen_state_above_fee[frozen_key] += 1
@@ -671,6 +678,7 @@ def analyze(rows):
     cp20_repeated=[n for n in cp20_frozen_states.values() if n>1]
     cp20_packed_repeated=[n for n in cp20_packed_states.values() if n>1]
     cp20={
+        'cp20s_submissions_by_schedule':{key:dict(val) for key,val in sorted(cp20s_schedule_counts.items())},
         'forecast_counts':dict(cp20_counts),
         'forecast_unknown_reasons':dict(cp20_unknown_reasons),
         'forecast_by_source':{key:dict(value) for key,value in sorted(cp20_by_source.items())},
