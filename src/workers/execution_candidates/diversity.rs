@@ -5,10 +5,10 @@ use std::collections::{HashSet,VecDeque};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq,serde::Serialize)]
 #[serde(rename_all="snake_case")]
-pub(super) enum Strategy {Baseline,Contrarian,Mixed,Coverage}
+pub(super) enum Strategy {Baseline,Contrarian,Mixed,Coverage,Economic}
 impl Strategy {
     pub(super) fn label(self)->&'static str {
-        match self {Self::Baseline=>"baseline",Self::Contrarian=>"contrarian",Self::Mixed=>"mixed",Self::Coverage=>"coverage"}
+        match self {Self::Baseline=>"baseline",Self::Contrarian=>"contrarian",Self::Mixed=>"mixed",Self::Coverage=>"coverage",Self::Economic=>"economic"}
     }
 }
 
@@ -94,7 +94,7 @@ pub(super) fn strategy_schedule(strategies:&[Strategy],revision:u64)->Vec<Strate
 pub(super) fn order(strategy:Strategy,alternatives:&[Alternative])->Vec<usize> {
     let mut baseline=(0..alternatives.len()).collect::<Vec<_>>();
     baseline.sort_unstable_by_key(|&i|(alternatives[i].marginal_score,alternatives[i].slot,alternatives[i].role));
-    if strategy==Strategy::Baseline{return baseline;}
+    if strategy==Strategy::Baseline||strategy==Strategy::Economic{return baseline;}
     let mut lanes=Vec::new();
     // Keep role directions separate: a depth measured in SOL atoms must not
     // be ranked against depth measured in USDC atoms.
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn rankings_cover_every_candidate_once_and_are_deterministic() {
         let values=alternatives();
-        for mode in [Strategy::Baseline,Strategy::Contrarian,Strategy::Mixed,Strategy::Coverage] {
+        for mode in [Strategy::Baseline,Strategy::Contrarian,Strategy::Mixed,Strategy::Coverage,Strategy::Economic] {
             let order=order(mode,&values);
             assert_eq!(order.len(),values.len());
             assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(),values.len());
