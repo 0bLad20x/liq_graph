@@ -427,6 +427,119 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
 #[cfg(test)]
 mod tests{
     use super::*;
+    use crate::core::market_state::{FeeValuation,PoolLiquidity,DirectedLiquidity,
+        Consistency,PriceKind,PoolPriceObservation,CpmmQuoteSnapshot};
+
+    fn fixture_direct2(n:usize)->(State,Arc<SignalTrigger>){
+        let settlement=Pubkey::new_from_array([10;32]);
+        let target=Pubkey::new_from_array([20;32]);
+        let a=settlement.min(target);let b=settlement.max(target);
+        let top=SignalTopology{kind:SignalRouteKind::Direct2,settlement,target,
+            bridge:None,roles:[(settlement,target),(target,settlement),
+                (settlement,settlement),(settlement,settlement)],length:2};
+        let plan=Arc::new(SignalPlan{score_basis:SIGNAL_SCORE_BASIS,
+            graph_generation:1,log_weight_scale:SIGNAL_LOG_SCALE,
+            compact_topologies:Arc::from(vec![top]),
+            route_options:(n*(n-1)) as u64});
+        let mut state=State{plan:Some(plan),generation:1,revision:1,
+            ready_at_us:1,threshold:0,..Default::default()};
+        for id in 0..n {
+            let address=Pubkey::new_from_array([(id+30) as u8;32]);
+            state.pools.push(SignalPool{address,mint_a:a,mint_b:b});
+            let am=a.to_string();let bm=b.to_string();
+            let res_a=if a==settlement {10_000_000_000}
+                else {1_000_000_000+id as u64*100_000_000};
+            let res_b=if a==settlement {1_000_000_000+id as u64*100_000_000}
+                else {10_000_000_000};
+            let d=|input:String,output:String|DirectedLiquidity{
+                input_mint:input,output_mint:output,input_decimals:9,output_decimals:6,
+                status:"available",coverage:"execution_window_end",
+                next_required_account:None,first_source_position:Some(0),
+                marginal_net_rate:Some(1.0),monotone_rate_tail:true,
+                input_capacity_raw:None,output_capacity_raw:"2000000000".into(),
+                levels:vec![],reason:None
+            };
+            let liquidity=PoolLiquidity{
+                model:"raydium_cpmm_directional_v1",revision:1,
+                content_digest:[id as u8;32],account_set_digest:[(id+40) as u8;32],
+                execution_accounts:vec![],reserve_curve:None,
+                cpmm_quote:Some(CpmmQuoteSnapshot{
+                    mint_0:am.clone(),mint_1:bm.clone(),
+                    reserve_0_raw:res_a,reserve_1_raw:res_b,
+                    trade_fee_rate:0,creator_fee_rate:0,
+                    creator_fee_on_input_0_to_1:true,
+                    creator_fee_on_input_1_to_0:true
+                }),
+                orca_quote:None,clmm_quote:None,
+                directions:[d(am.clone(),bm.clone()),d(bm.clone(),am.clone())]
+            };
+            let valuation=FeeValuation{
+                model:"cpmm",estimated_net_rates:[Some(1.0);2],
+                dex_fee_rates:[Some(0.0);2],fees_on_input:[true;2],
+                base_fee_rate:Some(0.0),variable_fee_rate:Some(0.0),
+                lp_fee_bps:None,protocol_fee_bps:None,creator_fee_bps:None,
+                fee_schedule:None,market_cap_raw:None,chain_timestamp:1,
+                chain_epoch:0,token_fee_status:["verified_no_standard_transfer_fee";2],
+                unknown_reason:None,scope:"test"
+            };
+            let obs=PoolPriceObservation{
+                origin:PriceOrigin::Websocket,pool:address.to_string(),
+                venue:"raydium_cpmm",mint_a:am.clone(),mint_b:bm.clone(),
+                base_mint:am,quote_mint:bm,price_quote_per_base:1.0,
+                valuation:Some(valuation),liquidity:Some(Arc::new(liquidity)),
+                previous_price:None,delta_bps:None,price_kind:PriceKind::ReserveSpot,
+                best_bid_quote_per_base:None,best_ask_quote_per_base:None,
+                consistency:Consistency::SingleAccount,slot:10,received_at_us:10,
+                sequence:1,component_slot_min:10,component_slot_max:10,
+                component_received_at_us_min:10,component_received_at_us_max:10,
+                trigger_field:None,pipeline:None
+            };
+            state.prices.push(Some(Arc::new(SignalPoolPrice{
+                log_weight_units:[Some(-1),Some(-1)],
+                direction_liquidity_status:["eligible","eligible"],
+                observation:Arc::new(obs)
+            })));
+        }
+        state.pair_pools.insert((a,b),(0..n).collect());
+        (state,Arc::new(SignalTrigger::Price{pool:state.pools[0].address,
+            sequence:1,origin:PriceOrigin::Websocket,received_at_us:10}))
+    }
+    #[test]
+    fn cp21s_a_real_pair_index_matches_full_cpmm_recalculation_after_change(){
+        let (mut state,trigger)=fixture_direct2(7);
+        let params=ExecutionParameters::default();
+        let mut index=Index::default();
+        let mut report=Report::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        assert_eq!(index.entries.len(),42);
+        assert_eq!(report.cp21s_pair_refreshes,42);
+        state.revision=2;state.ready_at_us=20;
+        let old=state.prices[6].as_ref().unwrap().as_ref();
+        let mut observation=old.observation.as_ref().clone();
+        let p=Arc::make_mut(observation.liquidity.as_mut().unwrap());
+        p.content_digest=[77;32];
+        p.cpmm_quote.as_mut().unwrap().reserve_0_raw+=777_000_000;
+        state.prices[6]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:old.log_weight_units,
+            direction_liquidity_status:old.direction_liquidity_status,
+            observation:Arc::new(observation)
+        }));
+        index.refresh_changed(&state,&params,&[6],&mut report,trigger,true);
+        assert_eq!(report.cp21s_pair_refreshes,42+12);
+        for (&key,entry) in &index.entries{
+            let witness=witness(&state,key).unwrap();
+            let reference=state.economic_score(&witness,&params);
+            assert_eq!(entry.net,reference,
+                "no directed pair may retain an obsolete economic quote");
+            if key.direct==6 || key.partner==6 {
+                assert_eq!(entry.revision,2);
+                assert_eq!(entry.rank.is_some(),reference.is_some_and(|n|n>0)
+                    ||(reference.is_none()&&witness.log_sum_units<state.threshold));
+            }else{
+                assert_eq!(entry.revision,1);
+            }
+        }
+    }
     #[test]
     fn cp21s_a_no_three_ninety_six_or_five_hundred_twelve_cutoff(){
         for n in [5,97,513,1_001] {
