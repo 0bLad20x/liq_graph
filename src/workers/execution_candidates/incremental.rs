@@ -57,12 +57,20 @@ fn witness(state:&State,key:Key)->Option<SignalWitness>{
     let ids=[key.direct,key.partner];
     let mut legs=Vec::with_capacity(2);
     let mut sum:i128=0;
+    let mut marginal_complete=true;
     for (j,&id) in ids.iter().enumerate(){
         let (a,b)=top.roles[j];
         let pool=state.pools.get(id)?;
         let slot=directions(pool,a,b,id)?;
         let p=state.prices.get(id)?.as_ref()?;
-        let weight=p.log_weight_units[slot%2]?;
+        // CP21S-A.1: a missing *marginal* log is NOT an economic quote
+        // rejection. Economic estimation uses the actual directed frozen
+        // liquidity data, independently of the marginal signal generator.
+        // Missing marginal weights use a zero placeholder ONLY for the
+        // legacy SignalLeg wire type; witness bps remains None.
+        let weight=p.log_weight_units[slot%2].unwrap_or_else(||{
+            marginal_complete=false;0
+        });
         sum+=i128::from(weight);
         legs.push(SignalLeg{
             slot,input_mint:a,output_mint:b,log_weight_units:weight,
@@ -73,8 +81,44 @@ fn witness(state:&State,key:Key)->Option<SignalWitness>{
     let bps=(-(total as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10_000.0;
     Some(SignalWitness{
         legs,log_sum_units:total,
-        estimated_net_return_bps:bps.is_finite().then_some(bps),
+        estimated_net_return_bps:(marginal_complete && bps.is_finite()).then_some(bps),
     })
+}
+/// Lossless, deterministic diagnosis from actual price/fee/liquidity facts.
+/// This describes the FIRST known reason. A complete economic quote is still
+/// attempted whenever both pool observations exist, even if marginal logs
+/// are absent; missing marginal logs are an orthogonal diagnostic.
+fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
+    let Some(plan)=state.plan.as_ref()else{return "plan_missing"};
+    let Some(top)=plan.compact_topologies.get(key.topology)else{return "topology_missing"};
+    if key.direct==key.partner{return "same_pool"};
+    for (i,id) in [key.direct,key.partner].iter().enumerate(){
+        let (a,b)=top.roles[i];
+        let Some(pool)=state.pools.get(*id)else{return "pool_identity_missing"};
+        let Some(slot)=directions(pool,a,b,*id)else{return "direction_identity_mismatch"};
+        let Some(p)=state.prices.get(*id).and_then(Option::as_ref)else {
+            return if i==0{"direct_price_missing"}else{"partner_price_missing"};
+        };
+        let Some(liq)=p.observation.liquidity.as_ref()else {
+            return if i==0{"direct_liquidity_missing"}else{"partner_liquidity_missing"};
+        };
+        let Some(dir)=liq.directions.iter().find(|d|
+            d.input_mint==a.to_string()&&d.output_mint==b.to_string())else{
+            return "liquidity_direction_missing";
+        };
+        if dir.status!="available"{return "liquidity_direction_unavailable";}
+        if p.observation.valuation.is_none(){return "fee_valuation_missing";}
+        if !p.observation.valuation.as_ref().unwrap().token_fee_status.iter()
+            .all(|s|*s=="verified_no_standard_transfer_fee"){
+            return "token_transfer_fee_unresolved";
+        }
+        if p.log_weight_units[slot%2].is_none(){
+            // This is a useful contributing fact, not an economic veto.
+            // Only report it if the economic model cannot supply a quote.
+            return if i==0{"direct_marginal_missing"}else{"partner_marginal_missing"};
+        }
+    }
+    "economic_model_quote_unavailable"
 }
 impl Index {
     fn reset(&mut self,state:&State,params:&ExecutionParameters,
