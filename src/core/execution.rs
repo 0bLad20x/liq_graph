@@ -129,8 +129,12 @@ pub struct ExecutionReport {
     pub simulation_rpc_ms: Option<u64>,
     /// UTC microseconds. These are host-clock observations, not Solana block times.
     pub v10_worker_received_at_us:Option<u64>,
-    pub rpc_sent_at_us:Option<u64>,
-    pub rpc_answer_at_us:Option<u64>,
+    /// First-party RPC scheduler call start/finish; includes queueing and failover.
+    pub rpc_call_started_at_us:Option<u64>,
+    pub rpc_call_completed_at_us:Option<u64>,
+    /// Selected provider's final HTTP request start/response-body completion.
+    pub http_request_started_at_us:Option<u64>,
+    pub http_response_received_at_us:Option<u64>,
     /// Actual minContextSlot requested for the last simulation attempt.
     pub min_context_slot_requested:Option<u64>,
     pub elapsed_ms: u64,
