@@ -230,6 +230,11 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             report.catalog_snapshot_candidates+=snapshot.candidates.len() as u64;
                             reset=true;allow_dispatch=false;
                         }
+                        if s.clear {
+                            // WS gaps invalidate ALL earlier economic rankings.
+                            index=Index::default();
+                            reset=true;allow_dispatch=false;
+                        }
                         changed=s.changes.iter().map(|x|x.pool_id).collect();
                         if report.awaiting_snapshot{
                             report.resynchronizations+=1;report.awaiting_snapshot=false;
@@ -275,6 +280,12 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             if !changed.is_empty() && e.ranges.iter().sum::<u64>()==0{
                                 report.cp21s_no_signal_updates+=1;
                             }
+                        }else if matches!(e.trigger.as_ref(),SignalTrigger::Coverage{..})
+                            && !changed.is_empty(){
+                            // Unavailable/removed pools also invalidate all affected
+                            // economic pairs even when they are not best marginal.
+                            index.refresh_changed(&state,&cfg.parameters,&changed,
+                                &mut report,e.trigger.clone(),false);
                         }
                         changed.clear();
                     }
