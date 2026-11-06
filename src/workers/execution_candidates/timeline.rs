@@ -20,6 +20,10 @@ pub(super) fn open()->Result<Option<Timeline>>{
         Ok(_)|Err(std::env::VarError::NotPresent)=>return Ok(None),
         Err(e)=>return Err(e.into()),
     };
+    Ok(Some(Timeline::at_path(path)?))
+}
+impl Timeline{
+    fn at_path(path:PathBuf)->Result<Self>{
     // This bounds only the audit IO backlog, NEVER the economic candidate set.
     // Overflow fails evidence completeness, and is not a discovery exclusion.
     let (sender,rx)=mpsc::sync_channel::<Value>(32_768);
@@ -47,9 +51,8 @@ pub(super) fn open()->Result<Option<Timeline>>{
             summary.durable_syncs+=1;
             Ok(summary)
         }).context("spawn CP21S-A.1 timeline writer")?;
-    Ok(Some(Timeline{sender,worker}))
-}
-impl Timeline{
+    Ok(Timeline{sender,worker})
+    }
     pub(super) fn sender(&self)->SyncSender<Value>{self.sender.clone()}
     pub(super) fn finish(self,report:&mut Report)->Result<()>{
         // Caller MUST drop all indexed clones of sender first.
@@ -72,5 +75,36 @@ pub(super) fn emit(sender:Option<&SyncSender<Value>>,record:Value,report:&mut Re
         Ok(())=>report.cp21a1_timeline_emitted+=1,
         Err(TrySendError::Full(_)|TrySendError::Disconnected(_))=>
             report.cp21a1_timeline_lost+=1,
+    }
+}
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cp21a1_timeline_is_durable_complete_and_order_preserving(){
+        let path=std::env::temp_dir().join(format!(
+            "cp21a1-timeline-{}-{:?}.jsonl",std::process::id(),std::thread::current().id()));
+        let writer=Timeline::at_path(path.clone()).unwrap();
+        let sender=writer.sender();
+        let mut report=Report::default();
+        for i in 0..10_000_u64 {
+            emit(Some(&sender),json!({"schema":1,"kind":"economic_pair","at_us":i,
+                "action":"evaluated","direct_pool":"D","partner_pool":"P",
+                "direct_slot":5,"partner_slot":5}),&mut report);
+        }
+        drop(sender);
+        writer.finish(&mut report).unwrap();
+        assert_eq!(report.cp21a1_timeline_emitted,10_000);
+        assert_eq!(report.cp21a1_timeline_written,10_000);
+        assert_eq!(report.cp21a1_timeline_lost,0);
+        let content=std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(),10_000);
+        let first:Value=serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let last:Value=serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        assert_eq!(first["at_us"],0);
+        assert_eq!(last["at_us"],9_999);
+        std::fs::remove_file(&path).unwrap();
     }
 }
