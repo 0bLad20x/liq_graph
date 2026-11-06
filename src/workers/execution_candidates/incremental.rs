@@ -70,6 +70,11 @@ fn witness(state:&State,key:Key)->Option<SignalWitness>{
         let pool=state.pools.get(id)?;
         let slot=directions(pool,a,b,id)?;
         let p=state.prices.get(id)?.as_ref()?;
+        // Preserve the deliberately configured direction-notional Filter.
+        // In Audit mode the legacy producer still exposes a marginal weight,
+        // so the exact condition below only rejects filtered dust.
+        if p.direction_liquidity_status[slot%2]=="dust"
+            && p.log_weight_units[slot%2].is_none(){return None;}
         // CP21S-A.1: a missing *marginal* log is NOT an economic quote
         // rejection. Economic estimation uses the actual directed frozen
         // liquidity data, independently of the marginal signal generator.
@@ -102,10 +107,14 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
     for (i,id) in [key.direct,key.partner].iter().enumerate(){
         let (a,b)=top.roles[i];
         let Some(pool)=state.pools.get(*id)else{return "pool_identity_missing"};
-        let Some(_slot)=directions(pool,a,b,*id)else{return "direction_identity_mismatch"};
+        let Some(slot)=directions(pool,a,b,*id)else{return "direction_identity_mismatch"};
         let Some(p)=state.prices.get(*id).and_then(Option::as_ref)else {
             return if i==0{"direct_price_missing"}else{"partner_price_missing"};
         };
+        if p.direction_liquidity_status[slot%2]=="dust"
+            && p.log_weight_units[slot%2].is_none(){
+            return "direction_notional_filter_dust";
+        }
         let Some(liq)=p.observation.liquidity.as_ref()else {
             return if i==0{"direct_liquidity_missing"}else{"partner_liquidity_missing"};
         };
@@ -925,6 +934,20 @@ mod tests{
         let trigger=Arc::new(SignalTrigger::Price{
             pool:first_pool,sequence:1,origin:PriceOrigin::Websocket,received_at_us:10});
         (state,trigger)
+    }
+    #[test]
+    fn cp21a1_deliberate_direction_dust_filter_remains_intact(){
+        let (mut state,_trigger)=fixture_direct2(3);
+        let old=state.prices[0].as_ref().unwrap().as_ref();
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:[None,None],
+            direction_liquidity_status:["dust","dust"],
+            observation:old.observation.clone(),
+        }));
+        let key=Key{topology:0,direct:0,partner:1};
+        assert!(witness(&state,key).is_none());
+        assert_eq!(pair_unavailable_reason(&state,key),
+            "direction_notional_filter_dust");
     }
     #[test]
     fn cp21a1_missing_marginal_does_not_veto_amount_dependent_cpmm(){
