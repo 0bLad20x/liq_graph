@@ -539,7 +539,18 @@ impl State {
     }
     fn amount_universe(&self,top:&SignalTopology,registry:&PoolRegistry,wallet:Pubkey,reads:&mut RegistryReads)->Vec<amounts::Input> {
         let mints=top.roles[..top.length].iter().flat_map(|&(a,b)|[a,b]).collect::<HashSet<_>>();
-        self.pools.iter().enumerate().filter_map(|(id,p)|{
+        // CP21S-A: Direct2 amount proofs must not re-scan the entire
+        // WatchCatalog on each possibly excluded economic candidate.
+        // Reuse the existing canonical pair identity index; other route
+        // shapes retain their original broader universe semantics.
+        let ids:Box<dyn Iterator<Item=usize>+'_>=if top.kind==SignalRouteKind::Direct2{
+            let key=(top.settlement.min(top.target),top.settlement.max(top.target));
+            Box::new(self.pair_pools.get(&key).into_iter().flat_map(|v|v.iter().copied()))
+        }else{
+            Box::new(0..self.pools.len())
+        };
+        ids.filter_map(|id|{
+            let p=self.pools.get(id)?;
             if !mints.contains(&p.mint_a)||!mints.contains(&p.mint_b){return None;}
             let mut input=self.amount_input(id,false)?;
             let (state,wait,hold)=registry.measured_get(p.address);reads.record(wait,hold);
