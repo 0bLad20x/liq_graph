@@ -6,8 +6,12 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env,
     sync::{Arc, Mutex as StdMutex, atomic::{AtomicU64, AtomicUsize, Ordering}},
-    time::Duration,
+    time::{Duration,SystemTime,UNIX_EPOCH},
 };
+fn http_utc_us()->u64{
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_micros().min(u128::from(u64::MAX)) as u64
+}
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
@@ -367,7 +371,7 @@ impl HttpProvider {
             self.observe_gate(operation.bit(),wait_started.elapsed());
             let id=self.request_id.fetch_add(1,Ordering::Relaxed);
             let sent=Instant::now();
-            let sent_us=now_us();
+            let sent_us=http_utc_us();
             let outcome=self.client.post(&self.cfg.url)
                 .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
                 .send().await;
@@ -406,7 +410,7 @@ impl HttpProvider {
                 }
             };
             self.observe_http(operation.bit(),sent.elapsed());
-            let received_us=now_us();
+            let received_us=http_utc_us();
             let value:Value=serde_json::from_slice(&body).context("invalid RPC response JSON")?;
             ensure!(value.get("jsonrpc").and_then(Value::as_str)==Some("2.0")
                 && value.get("id")==Some(&json!(id)), "JSON-RPC envelope id/version mismatch");
