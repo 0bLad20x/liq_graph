@@ -86,20 +86,21 @@ impl Index {
                 self.topology.insert((top.settlement,top.target),i);
             }
         }
-        // One-time index initialization. Each ordered pair is visited ONCE;
-        // later price revisions touch only the changed pool's counterpart IDs.
-        let mut batch=HashSet::new();
+        // One-time complete index initialization without a second O(n²)
+        // temporary HashSet: each canonical mint-pair and directed topology
+        // is enumerated exactly once by the stable State.pair_pools index.
         for (&(a,b),ids) in &state.pair_pools{
             for (settlement,target) in [(a,b),(b,a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
                 for &direct in ids{
                     for &partner in ids{
-                        if direct!=partner {batch.insert(Key{topology,direct,partner});}
+                        if direct==partner{continue;}
+                        self.refresh_one(state,params,Key{topology,direct,partner},
+                            report,trigger.clone(),false);
                     }
                 }
             }
         }
-        for key in batch{self.refresh_one(state,params,key,report,trigger.clone(),false);}
         report.cp21s_entries=self.entries.len();
         report.cp21s_pending_peak=report.cp21s_pending_peak.max(self.ready.len());
     }
