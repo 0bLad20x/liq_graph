@@ -18,6 +18,7 @@ if ($LASTEXITCODE -ne 0) { throw 'CP21A profit audit tests failed' }
 cargo test --locked --release cp21s_a_ -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'CP21S-A completeness tests failed' }
 # Explicit opt-in: this flag chooses the unbounded incremental Direct2 engine.
+# Legacy -CP9DMaxPairs is ignored in this new path.
 $hadFlag = Test-Path Env:GRAPH_CP21S_INCREMENTAL_SIGNALS
 $oldFlag = $env:GRAPH_CP21S_INCREMENTAL_SIGNALS
 $env:GRAPH_CP21S_INCREMENTAL_SIGNALS = 'true'
@@ -43,7 +44,6 @@ try {
     -V10Parallelism 32 `
     -CP9CPackingMode Economic `
     -CP9DMaxPairs 1 `
-    # CP21S-A ignores this legacy CP9D value; test also asserts 1000+ partners in Rust
     -ExecutionDetailLimit 128
 if ($LASTEXITCODE -ne 0) { throw 'CP21S-A five-minute live run failed' }
 } finally {
