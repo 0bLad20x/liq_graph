@@ -226,7 +226,7 @@ pub struct Report {
     pub cp21s_seed_rejections:u64,pub cp21s_amount_exclusions:u64,
     pub cp21s_cooldowns:u64,pub cp21s_no_signal_updates:u64,
     pub cp21s_dispatched:u64,pub cp21s_score_timing:Timing,
-    pub cp21s_drain_timing:Timing,
+    pub cp21s_refresh_timing:Timing,pub cp21s_drain_timing:Timing,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
