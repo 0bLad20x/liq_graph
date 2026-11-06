@@ -263,12 +263,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                         if reset{
                             index.reset(&state,&cfg.parameters,&mut report,e.trigger.clone());
                             reset=false;
-                        }else if matches!(e.trigger.as_ref(),SignalTrigger::Price{
-                            origin:PriceOrigin::Websocket|PriceOrigin::Revaluation,..})
-                            && !e.price_pipeline.is_some_and(|p|p.initialization_replay){
+                        }else if let SignalTrigger::Price{origin,..}=e.trigger.as_ref(){
+                            // Even initialization/baseline observations MUST
+                            // enter the index; only their V10 submission is
+                            // disabled until a live or revalued observation.
+                            let live=matches!(origin,PriceOrigin::Websocket|PriceOrigin::Revaluation)
+                                && !e.price_pipeline.is_some_and(|p|p.initialization_replay);
                             index.refresh_changed(&state,&cfg.parameters,&changed,
-                                &mut report,e.trigger.clone(),true);
-                            allow_dispatch=true;
+                                &mut report,e.trigger.clone(),live);
+                            if live{allow_dispatch=true;}
                             if !changed.is_empty() && e.ranges.iter().sum::<u64>()==0{
                                 report.cp21s_no_signal_updates+=1;
                             }
