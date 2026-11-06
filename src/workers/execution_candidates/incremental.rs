@@ -411,6 +411,10 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 // qualified pairs. No candidate is lost because a source was
                 // fourth, 97th or 513th in an arbitrary scan.
                 report.cp21s_pending_peak=report.cp21s_pending_peak.max(index.ready.len());
+                // Ingress takes precedence as soon as a newer market revision
+                // is waiting. Never drain a long ready index ahead of fresh
+                // WebSocket state; queued work remains live in the BTreeSet.
+                if !input.is_empty(){break;}
             }
         }
         Ok(())
