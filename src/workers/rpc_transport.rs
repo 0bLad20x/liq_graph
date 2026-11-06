@@ -343,7 +343,8 @@ impl HttpProvider {
         let rate=(1_000_u128*assigned).div_ceil(self.cfg.rps as u128);
         service.max(rate)
     }
-    async fn request(&self,operation:&RpcOperation,params:&Value)->Result<Value> {
+    async fn request(&self,operation:&RpcOperation,params:&Value)
+        ->Result<(Value,u64,u64)> {
         let method=operation.method();
         let mut previous=None;
         for attempt in 0..self.cfg.retries {
@@ -366,6 +367,7 @@ impl HttpProvider {
             self.observe_gate(operation.bit(),wait_started.elapsed());
             let id=self.request_id.fetch_add(1,Ordering::Relaxed);
             let sent=Instant::now();
+            let sent_us=now_us();
             let outcome=self.client.post(&self.cfg.url)
                 .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
                 .send().await;
@@ -404,6 +406,7 @@ impl HttpProvider {
                 }
             };
             self.observe_http(operation.bit(),sent.elapsed());
+            let received_us=now_us();
             let value:Value=serde_json::from_slice(&body).context("invalid RPC response JSON")?;
             ensure!(value.get("jsonrpc").and_then(Value::as_str)==Some("2.0")
                 && value.get("id")==Some(&json!(id)), "JSON-RPC envelope id/version mismatch");
@@ -419,7 +422,8 @@ impl HttpProvider {
                 }
                 bail!("RPC rejected method={method} code={code} provider={}",self.cfg.name);
             }
-            return value.get("result").cloned().context("RPC response missing result");
+            return Ok((value.get("result").cloned()
+                .context("RPC response missing result")?,sent_us,received_us));
         }
         Err(previous.unwrap_or_else(||anyhow!("RPC attempts exhausted provider={}",self.cfg.name)))
     }
@@ -679,12 +683,14 @@ async fn http_run(settings:Settings, mut rx:mpsc::Receiver<Call>)->Result<()> {
                     // Drop the assignment before selecting a failover provider.
                     drop(lease);
                     match result {
-                        Ok(value)=>match interpret(operation.clone(),value) {
+                        Ok((value,sent_us,received_us))=>match interpret(operation.clone(),value) {
                             Ok(answer)=>{
                                 record_rpc(&stats,&provider.cfg.name,operation.method(),started.elapsed(),None);
                                 return Ok(RpcResponse {
                                     provider:provider.cfg.name.clone(),
                                     received_at_ms:now_unix_ms()?,
+                                    http_request_started_at_us:sent_us,
+                                    http_response_received_at_us:received_us,
                                     answer,
                                 });
                             }
