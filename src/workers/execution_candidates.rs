@@ -855,7 +855,7 @@ impl State {
             "quantity seed is not net qualified");
         let mut request=ExecutionRequest{id:format!("graph-{}-{}-{number}",self.generation,self.revision),
             wallet:cfg.wallet,settlement:top.settlement,groups:Vec::new(),conversion:None,
-            parameters:cfg.parameters.clone()};
+            parameters:cfg.parameters.clone(),min_context_slot:None};
         let mut pools=Vec::new();
         for &(slot,r) in &slots{
             let resolving=Instant::now();let next=self.pool(slot,r,registry,cfg.wallet,reads,cfg.cp21s_full_incremental);
@@ -992,6 +992,10 @@ impl State {
             }
         }
         install_compact(&mut request,top,&pools);
+        if cfg.cp21s_full_incremental{
+            request.min_context_slot=pools.iter().map(|(_,p)|
+                p.observation.component_slot_max.max(p.observation.slot)).max();
+        }
         let ready=now_us();
         let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
         let alternative_pools_added=pools.len()-slots.len();
@@ -1494,6 +1498,7 @@ mod cp10_packing_tests {
                 id:"cp10-direct2".into(),wallet,settlement,
                 groups:vec![ExecutionGroup::Direct{target,pools:vec![d1.clone(),p1.clone()]}],
                 conversion:None,parameters:ExecutionParameters::default(),
+                min_context_slot:None,
             };
             let original=serde_json::to_vec(&current).unwrap();
             let initial=crate::workers::execution_v10::validate(&current).unwrap();
