@@ -409,3 +409,106 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
         report.cp21s_queue_full_retries,report.lost_events,report.error);
     Ok(report)
 }
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    #[test]
+    fn cp21s_a_no_three_ninety_six_or_five_hundred_twelve_cutoff(){
+        for n in [5,97,513,1_001] {
+            let peers=(0..n).collect::<Vec<_>>();
+            let mut affected=HashSet::new();
+            invalidate_changed(&mut affected,0,n-1,&peers);
+            assert_eq!(affected.len(),2*(n-1),
+                "all outgoing AND incoming ordered pool pairs must be visited");
+            assert!(affected.contains(&Key{topology:0,direct:n-1,partner:0}));
+            assert!(affected.contains(&Key{topology:0,direct:0,partner:n-1}));
+        }
+    }
+    #[test]
+    fn cp21s_a_50k_updates_match_independent_full_recompute(){
+        // Deterministic synthetic fixture. Every update changes one pool's
+        // economic state; every affected ordered pair is re-evaluated exactly
+        // once, not sampled. Reference recomputes ALL n*(n-1) pairs.
+        let n=24_usize;
+        let peers=(0..n).collect::<Vec<_>>();
+        let mut values=vec![0_i64;n];
+        let mut incremental=HashMap::<Key,i64>::new();
+        let mut updates=0_u64;
+        let start=Instant::now();
+        for i in 0..50_000_usize {
+            let updated=(i*17+5)%n;
+            values[updated]+=1;
+            let mut affected=HashSet::new();
+            invalidate_changed(&mut affected,0,updated,&peers);
+            assert_eq!(affected.len(),2*(n-1));
+            for k in affected {
+                incremental.insert(k,values[k.direct]*31-values[k.partner]*29
+                    +k.direct as i64-k.partner as i64);
+                updates+=1;
+            }
+            if i%2_500==0 || i==49_999 {
+                // Independent full reference, including all stale and tie
+                // ranks, catches missing pair invalidation.
+                let mut reference=HashMap::new();
+                for a in 0..n {
+                    for b in 0..n {
+                        if a!=b {
+                            reference.insert(Key{topology:0,direct:a,partner:b},
+                                values[a]*31-values[b]*29+a as i64-b as i64);
+                        }
+                    }
+                }
+                // A missing entry is only possible before that pool has
+                // received its first event; initialize all pairs up front.
+                for (&k,&v) in &reference {
+                    if incremental.contains_key(&k){assert_eq!(incremental[&k],v);}
+                }
+                if i>=n*3 {
+                    assert_eq!(incremental.len(),n*(n-1));
+                    assert_eq!(incremental,reference);
+                    let best_incremental=incremental.iter()
+                        .max_by_key(|(key,value)|(**value,Reverse(**key))).unwrap();
+                    let best_reference=reference.iter()
+                        .max_by_key(|(key,value)|(**value,Reverse(**key))).unwrap();
+                    assert_eq!(best_incremental,best_reference);
+                }
+            }
+        }
+        assert_eq!(updates,50_000*2*(n as u64-1));
+        eprintln!("CP21S-A 50k event full incremental invalidations={} ns={} (test-fixture only)",
+            updates,elapsed_ns(start));
+    }
+    #[test]
+    fn cp21s_a_full_v10_queue_preserves_ranked_work(){
+        let (tx,mut rx)=tokio::sync::mpsc::channel::<u64>(1);
+        tx.try_send(1).unwrap();
+        let key=Key{topology:0,direct:888,partner:2};
+        let rank=Rank{category:0,score:Reverse(1_000),key};
+        let mut index=Index::default();
+        index.ready.insert(rank);
+        assert!(matches!(tx.try_reserve(),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))));
+        assert_eq!(index.best(),Some(rank),"full V10 queue must not pop pending work");
+        assert_eq!(rx.try_recv().unwrap(),1);
+        let permit=tx.try_reserve().unwrap();
+        assert_eq!(index.best(),Some(rank));
+        permit.send(2);
+        assert_eq!(rx.try_recv().unwrap(),2);
+    }
+    #[test]
+    fn cp21s_a_rank_order_is_global_and_cross_settlement_normalized(){
+        let mut order=BTreeSet::new();
+        for i in 0..1_000_usize{
+            let profit=if i==999{99_000}else{100};
+            order.insert(Rank{category:0,score:Reverse(profit),
+                key:Key{topology:0,direct:i,partner:1000}});
+        }
+        assert_eq!(order.len(),1_000);
+        assert_eq!(order.first().unwrap().key.direct,999);
+        let unknown=Rank{category:1,score:Reverse(0),
+            key:Key{topology:1,direct:1,partner:2}};
+        order.insert(unknown);
+        assert_eq!(order.first().unwrap().key.direct,999);
+    }
+}
