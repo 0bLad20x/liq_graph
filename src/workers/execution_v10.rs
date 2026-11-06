@@ -592,16 +592,19 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
         };
         let simulation_started=Instant::now();
         report.min_context_slot_requested=Some(if settings.fast{min_slot}else{min_slot.max(slot)});
-        report.rpc_sent_at_us=Some(utc_us());
+        report.rpc_call_started_at_us=Some(utc_us());
         let response=rpc.call(operation).await;
-        report.rpc_answer_at_us=Some(utc_us());
+        report.rpc_call_completed_at_us=Some(utc_us());
         let simulation_ms=simulation_started.elapsed().as_millis();
         report.simulation_rpc_ms=Some(report.simulation_rpc_ms.unwrap_or(0).saturating_add(simulation_ms.min(u128::from(u64::MAX)) as u64));
         let response=response?;
         crate::log_event!(Debug,"v10 timing request_id={:?} fast={} build_us={build_us} simulation_rpc_ms={simulation_ms} provider={}",
             request.id,settings.fast,response.provider);
         let RpcAnswer::Simulation{slot,value}=response.answer else {bail!("unexpected simulation response")};
-        report.context_slot=Some(slot); report.provider=Some(response.provider);
+        report.context_slot=Some(slot);
+        report.http_request_started_at_us=Some(response.http_request_started_at_us);
+        report.http_response_received_at_us=Some(response.http_response_received_at_us);
+        report.provider=Some(response.provider);
         if !settings.fast && attempt==0 && value.get("err").and_then(Value::as_str)==Some("BlockhashNotFound") {
             report.blockhash_retried=true; continue;
         }
@@ -679,7 +682,8 @@ pub async fn run_parallel(settings: Settings,rpc:RpcHandle,mut input:mpsc::Recei
                             blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None,
                             build_us:None,simulation_rpc_ms:None,
                             v10_worker_received_at_us:Some(utc_us()),
-                            rpc_sent_at_us:None,rpc_answer_at_us:None,
+                            rpc_call_started_at_us:None,rpc_call_completed_at_us:None,
+                            http_request_started_at_us:None,http_response_received_at_us:None,
                             min_context_slot_requested:None,
                             elapsed_ms:0,trace_us:0,trace:ExecutionTrace::default()};
                         if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
