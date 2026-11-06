@@ -167,6 +167,9 @@ try {
         GRAPH_EXECUTION_MAX_REQUESTS = "$SimulationLimit"
         GRAPH_EXECUTION_PARAMETERS_PATH = $ExecutionParametersPath
         GRAPH_EXECUTION_REPORT_PATH = $executionPath
+        GRAPH_CP21S_TIMELINE_PATH = $(if ($env:GRAPH_CP21S_A1_TIMELINE -eq 'true') {
+            Join-Path $folder 'economic_timeline.jsonl'
+        } else { $null })
         GRAPH_DIAGNOSTIC_JSONL_PATH = $(if ($GraphAudit) { $auditPath } else { $null })
         CP6C_REFERENCE_EVERY = $(if ($GraphAudit -and $Stage -eq 'Graph') { '1' } elseif ($GraphAudit) { '10' } else { '0' })
         LIQ_GRAPH_LOG = (@(
@@ -230,6 +233,8 @@ try {
         cp9c_packing_mode=$CP9CPackingMode.ToLowerInvariant()
         cp9d_max_distinct_pairs=$CP9DMaxPairs
         cp21s_full_incremental=($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -in @('true','1'))
+        cp21s_a1_timeline_enabled=($env:GRAPH_CP21S_A1_TIMELINE -eq 'true')
+        cp21s_a1_timeline_path=$values.GRAPH_CP21S_TIMELINE_PATH
         cp21s_legacy_pair_limit_applied=($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -notin @('true','1'))
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
@@ -286,6 +291,23 @@ try {
         if ([long]$executionAnalysis.request_count -ne [long]$execution.request_count -or
             [long]$executionAnalysis.report_count -ne [long]$execution.report_count) {
             throw 'Execution summary/event counts differ.'
+        }
+    }
+    if ($SimulateV10 -and $env:GRAPH_CP21S_A1_TIMELINE -eq 'true') {
+        $timelinePath = Join-Path $folder 'economic_timeline.jsonl'
+        $timelineSummaryPath = Join-Path $folder 'economic_timeline_analysis.json'
+        if (-not (Test-Path -LiteralPath $timelinePath)) {
+            throw "CP21S-A.1 timeline missing; inspect $folder"
+        }
+        & python (Join-Path $PSScriptRoot 'analyze_cp21a1_timeline.py') `
+            --timeline $timelinePath --output $timelineSummaryPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "CP21S-A.1 timeline incomplete or malformed; inspect $timelineSummaryPath"
+        }
+        $timelineSummary = Read-OptionalJson $timelineSummaryPath
+        if ([long]$timelineSummary.counts.total -ne
+            [long]$execution.execution_candidates.cp21a1_timeline_written) {
+            throw "CP21S-A.1 timeline count mismatch; inspect $timelineSummaryPath"
         }
     }
     $production = Read-OptionalJson $producerPath
@@ -618,6 +640,9 @@ try {
     if ($SimulateV10) {
         if ($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -in @('true','1')) {
             $worker = $execution.execution_candidates
+            if ($env:GRAPH_CP21S_A1_TIMELINE -eq 'true') {
+                Write-Host "CP21S-A.1: durable_timeline=$($values.GRAPH_CP21S_TIMELINE_PATH) events=$($worker.cp21a1_timeline_written) lost=$($worker.cp21a1_timeline_lost) catalog_pairs_reused=$($worker.cp21a1_catalog_reused) catalog_pairs_recomputed=$($worker.cp21a1_catalog_recomputed) economic_without_marginal=$($worker.cp21a1_missing_marginal_scored)"
+            }
             Write-Host "CP21S-A: market_updates=$($worker.cp21s_updates) evaluated_directed_pairs=$($worker.cp21s_pair_refreshes) current_pairs=$($worker.cp21s_entries) pending_at_shutdown=$($worker.cp21s_pending_at_shutdown) request_count=$($worker.cp21s_dispatched) queue_full_retries=$($worker.cp21s_queue_full_retries) lost_events=$($worker.lost_events)"
         }
         Write-Host "V10: Uebergabe an Simulation nachgewiesen; erfolgreiche Simulationen=$($execution.simulation_successes), fehlgeschlagene=$($execution.simulation_failures), DEX-Aufrufberichte=$($execution.simulation_dex_calls_observed)."

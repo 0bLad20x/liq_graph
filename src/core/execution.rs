@@ -77,6 +77,11 @@ pub struct ExecutionRequest {
     pub groups: Vec<ExecutionGroup>,
     pub conversion: Option<ExecutionPool>,
     pub parameters: ExecutionParameters,
+    /// Newest observation component slot used by the frozen Direct2 model.
+    /// Not a proof that all pool accounts came from one atomic Bank snapshot.
+    /// Optional for older saved request artifacts and legacy execution paths.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub min_context_slot:Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -127,6 +132,16 @@ pub struct ExecutionReport {
     /// Worker timing, accumulated across signed-mode retries; no queue time.
     pub build_us: Option<u64>,
     pub simulation_rpc_ms: Option<u64>,
+    /// UTC microseconds. These are host-clock observations, not Solana block times.
+    pub v10_worker_received_at_us:Option<u64>,
+    /// First-party RPC scheduler call start/finish; includes queueing and failover.
+    pub rpc_call_started_at_us:Option<u64>,
+    pub rpc_call_completed_at_us:Option<u64>,
+    /// Selected provider's final HTTP request start/response-body completion.
+    pub http_request_started_at_us:Option<u64>,
+    pub http_response_received_at_us:Option<u64>,
+    /// Actual minContextSlot requested for the last simulation attempt.
+    pub min_context_slot_requested:Option<u64>,
     pub elapsed_ms: u64,
     pub trace_us:u64,
     /// Complete RPC simulation value, including err/logs/innerInstructions/accounts.

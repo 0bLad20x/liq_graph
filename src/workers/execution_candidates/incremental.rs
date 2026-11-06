@@ -12,6 +12,8 @@
 //! CP20S's dedup remains a transient execution guard, not a discovery filter.
 use super::*;
 use std::collections::{BTreeSet,HashMap,HashSet};
+use std::sync::mpsc::SyncSender;
+use serde_json::{Value,json};
 use std::cmp::Reverse;
 use std::time::Duration;
 use crate::core::signals::SignalLeg;
@@ -23,6 +25,9 @@ struct Rank { category:u8,score:Reverse<i128>,key:Key }
 #[derive(Clone)]
 struct Entry {
     net:Option<i128>,
+    input_raw:Option<u64>,
+    output_raw:Option<u64>,
+    gross_raw:Option<i128>,
     fingerprint:Option<String>,
     rank:Option<Rank>,
     revision:u64,
@@ -36,6 +41,8 @@ struct Index {
     entries:HashMap<Key,Entry>,
     ready:BTreeSet<Rank>,
     dispatched:u64,
+    journal:Option<SyncSender<Value>>,
+    watched:HashSet<Pubkey>,
 }
 fn directions(pool:&SignalPool,a:Pubkey,b:Pubkey,id:usize)->Option<usize>{
     if pool.mint_a==a&&pool.mint_b==b {Some(2*id)}
@@ -57,12 +64,25 @@ fn witness(state:&State,key:Key)->Option<SignalWitness>{
     let ids=[key.direct,key.partner];
     let mut legs=Vec::with_capacity(2);
     let mut sum:i128=0;
+    let mut marginal_complete=true;
     for (j,&id) in ids.iter().enumerate(){
         let (a,b)=top.roles[j];
         let pool=state.pools.get(id)?;
         let slot=directions(pool,a,b,id)?;
         let p=state.prices.get(id)?.as_ref()?;
-        let weight=p.log_weight_units[slot%2]?;
+        // Preserve the deliberately configured direction-notional Filter.
+        // In Audit mode the legacy producer still exposes a marginal weight,
+        // so the exact condition below only rejects filtered dust.
+        if p.direction_liquidity_status[slot%2]=="dust"
+            && p.log_weight_units[slot%2].is_none(){return None;}
+        // CP21S-A.1: a missing *marginal* log is NOT an economic quote
+        // rejection. Economic estimation uses the actual directed frozen
+        // liquidity data, independently of the marginal signal generator.
+        // Missing marginal weights use a zero placeholder ONLY for the
+        // legacy SignalLeg wire type; witness bps remains None.
+        let weight=p.log_weight_units[slot%2].unwrap_or_else(||{
+            marginal_complete=false;0
+        });
         sum+=i128::from(weight);
         legs.push(SignalLeg{
             slot,input_mint:a,output_mint:b,log_weight_units:weight,
@@ -73,10 +93,277 @@ fn witness(state:&State,key:Key)->Option<SignalWitness>{
     let bps=(-(total as f64)/SIGNAL_LOG_SCALE as f64).exp_m1()*10_000.0;
     Some(SignalWitness{
         legs,log_sum_units:total,
-        estimated_net_return_bps:bps.is_finite().then_some(bps),
+        estimated_net_return_bps:(marginal_complete && bps.is_finite()).then_some(bps),
     })
 }
+/// Lossless, deterministic diagnosis from actual price/fee/liquidity facts.
+/// This describes the FIRST known reason. A complete economic quote is still
+/// attempted whenever both pool observations exist, even if marginal logs
+/// are absent; missing marginal logs are an orthogonal diagnostic.
+fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
+    let Some(plan)=state.plan.as_ref()else{return "plan_missing"};
+    let Some(top)=plan.compact_topologies.get(key.topology)else{return "topology_missing"};
+    if key.direct==key.partner{return "same_pool"};
+    for (i,id) in [key.direct,key.partner].iter().enumerate(){
+        let (a,b)=top.roles[i];
+        let Some(pool)=state.pools.get(*id)else{return "pool_identity_missing"};
+        let Some(slot)=directions(pool,a,b,*id)else{return "direction_identity_mismatch"};
+        let Some(p)=state.prices.get(*id).and_then(Option::as_ref)else {
+            return if i==0{"direct_price_missing"}else{"partner_price_missing"};
+        };
+        if p.direction_liquidity_status[slot%2]=="dust"
+            && p.log_weight_units[slot%2].is_none(){
+            return "direction_notional_filter_dust";
+        }
+        let Some(liq)=p.observation.liquidity.as_ref()else {
+            return if i==0{"direct_liquidity_missing"}else{"partner_liquidity_missing"};
+        };
+        let Some(dir)=liq.directions.iter().find(|d|
+            d.input_mint==a.to_string()&&d.output_mint==b.to_string())else{
+            return "liquidity_direction_missing";
+        };
+        if dir.status!="available"{return "liquidity_direction_unavailable";}
+        if p.observation.valuation.is_none(){return "fee_valuation_missing";}
+        if !p.observation.valuation.as_ref().unwrap().token_fee_status.iter()
+            .all(|s|*s=="verified_no_standard_transfer_fee"){
+            return "token_transfer_fee_unresolved";
+        }
+        if liq.cpmm_quote.is_none() && liq.reserve_curve.is_none()
+            && liq.model!="dlmm_execution_window_v2"{
+            return "economic_quote_model_not_implemented";
+        }
+        if liq.model=="dlmm_execution_window_v2" {
+            let valuation=p.observation.valuation.as_ref().unwrap();
+            if valuation.base_fee_rate.is_none()||
+                valuation.variable_fee_rate.is_none(){
+                return "dlmm_dynamic_fee_unavailable";
+            }
+            if dir.levels.is_empty(){return "dlmm_execution_window_empty";}
+            // A nonempty window can still be too shallow for a particular
+            // amount; this is not proof the pool has no deeper bins.
+        }
+        if let Some(q)=liq.cpmm_quote.as_ref() {
+            if q.reserve_0_raw==0||q.reserve_1_raw==0{
+                return "cpmm_reserve_empty";
+            }
+        }
+    }
+    "economic_quote_or_depth_unavailable"
+}
 impl Index {
+    /// Every economic refresh and final scheduling decision is correlated
+    /// by stable addresses, snapshot slots, UTC microseconds and revision.
+    fn trace(&self,state:&State,key:Key,action:&'static str,
+        reason:&str,score:Option<i128>,input:Option<u64>,
+        gross:Option<i128>,trigger:&SignalTrigger,request_id:Option<&str>,
+        report:&mut Report){
+        let Some(sender)=self.journal.as_ref()else{return;};
+        let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(key.topology))else{return;};
+        let direct=state.pools.get(key.direct).map(|p|p.address.to_string());
+        let partner=state.pools.get(key.partner).map(|p|p.address.to_string());
+        let first=state.prices.get(key.direct).and_then(Option::as_ref)
+            .map(|p|p.observation.as_ref());
+        let second=state.prices.get(key.partner).and_then(Option::as_ref)
+            .map(|p|p.observation.as_ref());
+        let phase=if matches!(trigger,SignalTrigger::Catalog{..}){"catalog"}
+            else if matches!(trigger,SignalTrigger::Coverage{..}){"coverage"}
+            else{"price"};
+        timeline::emit(Some(sender),json!({
+            "schema":1,"kind":"economic_pair","phase":phase,"at_us":now_us(),
+            "graph_generation":state.generation,"revision":state.revision,
+            "trigger":trigger,"action":action,"reason":reason,
+            "settlement":top.settlement.to_string(),"target":top.target.to_string(),
+            "direct_pool":direct,"partner_pool":partner,
+            "direct_slot":first.map(|p|p.slot),"partner_slot":second.map(|p|p.slot),
+            "direct_component_slot_min":first.map(|p|p.component_slot_min),
+            "direct_component_slot_max":first.map(|p|p.component_slot_max),
+            "partner_component_slot_min":second.map(|p|p.component_slot_min),
+            "partner_component_slot_max":second.map(|p|p.component_slot_max),
+            "direct_received_at_us":first.map(|p|p.received_at_us),
+            "partner_received_at_us":second.map(|p|p.received_at_us),
+            "direct_component_received_at_us_min":first.map(|p|p.component_received_at_us_min),
+            "partner_component_received_at_us_min":second.map(|p|p.component_received_at_us_min),
+            "frame_received_at_us":state.price_pipeline.map(|p|p.frame_received_at_us),
+            "signal_ready_at_us":state.ready_at_us,
+            "direct_marginal_known":state.prices.get(key.direct).and_then(Option::as_ref)
+                .and_then(|p|state.pools.get(key.direct).and_then(|pool|
+                    directions(pool,top.roles[0].0,top.roles[0].1,key.direct)
+                        .and_then(|slot|p.log_weight_units[slot%2]))).is_some(),
+            "partner_marginal_known":state.prices.get(key.partner).and_then(Option::as_ref)
+                .and_then(|p|state.pools.get(key.partner).and_then(|pool|
+                    directions(pool,top.roles[1].0,top.roles[1].1,key.partner)
+                        .and_then(|slot|p.log_weight_units[slot%2]))).is_some(),
+            "economic_score_usd_nano":score.map(|x|x.to_string()),
+            "optimal_input_raw":input,
+            "gross_gain_raw":gross.map(|x|x.to_string()),
+            "request_id":request_id,
+        }),report);
+    }
+    /// Exact selection sets from MarketState, not inferred from the graph
+    /// catalog or from which pools happened to receive price observations.
+    fn record_selection(&mut self,state:&State,selected:&[String],
+        report:&mut Report)->Result<()>{
+        let current=selected.iter().map(|s|s.parse::<Pubkey>()
+            .with_context(||format!("invalid MarketState selected pool {s}")))
+            .collect::<Result<HashSet<_>>>()?;
+        for address in current.difference(&self.watched){
+            let pool=state.pools.iter().find(|p|p.address==*address);
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"watchset","action":"entered",
+                "layer":"market_state_selected_not_ws_ack",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"slot":null,
+                "pool":address.to_string(),
+                "mint_a":pool.map(|p|p.mint_a.to_string()),
+                "mint_b":pool.map(|p|p.mint_b.to_string())
+            }),report);
+        }
+        for address in self.watched.difference(&current){
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"watchset","action":"exited",
+                "layer":"market_state_selected_not_ws_ack",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"slot":null,
+                "pool":address.to_string()
+            }),report);
+        }
+        timeline::emit(self.journal.as_ref(),json!({
+            "schema":1,"kind":"watchset_snapshot",
+            "layer":"market_state_selected_not_ws_ack",
+            "at_us":now_us(),"graph_generation":state.generation,
+            "revision":state.revision,"selected_count":current.len(),
+            "changed_by_set_diff":self.watched.symmetric_difference(&current).count()
+        }),report);
+        self.watched=current;
+        Ok(())
+    }
+
+    /// Reconcile a new graph generation using stable on-chain pool addresses.
+    /// Preserve the economic score AND pending V10 priority when the frozen
+    /// account fingerprint is identical. Different IDs/order no longer force
+    /// price re-optimization or loss of pending opportunities.
+    fn reconcile_snapshot(&mut self,old_pools:&[SignalPool],
+        old_prices:&[Option<Arc<SignalPoolPrice>>],
+        old_plan:Option<&Arc<SignalPlan>>,state:&State,params:&ExecutionParameters,
+        report:&mut Report,trigger:Arc<SignalTrigger>){
+        // Exact no-op catalogs must not even visit the combinatorial index.
+        // Graph generations are identity-based, not forced price revisions.
+        let unchanged=old_pools==state.pools
+            && old_plan.zip(state.plan.as_ref()).is_some_and(|(before,after)|
+                before.compact_topologies.len()==after.compact_topologies.len()
+                && before.compact_topologies.iter().zip(after.compact_topologies.iter())
+                    .all(|(a,b)|a.kind==b.kind&&a.settlement==b.settlement
+                        &&a.target==b.target&&a.roles==b.roles&&a.length==b.length))
+            && old_prices.len()==state.prices.len()
+            && old_prices.iter().zip(&state.prices).all(|(a,b)|match (a,b){
+                (None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),
+                _=>false,
+            });
+        if unchanged{
+            report.cp21a1_catalog_unchanged+=1;
+            report.cp21a1_catalog_reused+=self.entries.len() as u64;
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"catalog_reconciliation",
+                "action":"no_op","at_us":now_us(),
+                "graph_generation":state.generation,"revision":state.revision,
+                "total_pools":state.pools.len(),"pairs_reused":self.entries.len(),
+                "pairs_recomputed":0,"pending_preserved":self.ready.len(),
+                "identity_and_observation_arcs_unchanged":true
+            }),report);
+            return;
+        }
+        let old=std::mem::take(self);
+        self.journal=old.journal.clone();
+        self.watched=old.watched.clone();
+        let old_addresses=old_pools.iter().map(|p|p.address).collect::<HashSet<_>>();
+        let current_addresses=state.pools.iter().map(|p|p.address).collect::<HashSet<_>>();
+        let mut entered=0_u64;let mut removed=0_u64;
+        for pool in &state.pools{
+            if old_addresses.contains(&pool.address){continue;}
+            entered+=1;
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"catalog_pool","action":"entered",
+                "layer":"graph_signal_catalog",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"pool":pool.address.to_string(),
+                "mint_a":pool.mint_a.to_string(),"mint_b":pool.mint_b.to_string(),
+                "price_available":state.pools.iter().position(|p|p.address==pool.address)
+                    .and_then(|id|state.prices.get(id)).and_then(Option::as_ref).is_some()
+            }),report);
+        }
+        for pool in old_pools{
+            if current_addresses.contains(&pool.address){continue;}
+            removed+=1;
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"catalog_pool","action":"exited",
+                "layer":"graph_signal_catalog",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"pool":pool.address.to_string()
+            }),report);
+        }
+        let mut old_entries=HashMap::<(Pubkey,Pubkey,Pubkey,Pubkey),Entry>::new();
+        if let Some(old_plan)=old_plan {
+            for (key,entry) in old.entries{
+                if let (Some(t),Some(a),Some(b))=(
+                    old_plan.compact_topologies.get(key.topology),
+                    old_pools.get(key.direct),old_pools.get(key.partner)){
+                    old_entries.insert((t.settlement,t.target,a.address,b.address),entry);
+                }
+            }
+        }
+        let Some(plan)=state.plan.as_ref()else{return;};
+        for (i,top) in plan.compact_topologies.iter().enumerate(){
+            if top.kind==SignalRouteKind::Direct2{
+                self.topology.insert((top.settlement,top.target),i);
+            }
+        }
+        let mut reused=0_u64;let mut recomputed=0_u64;
+        for (&(a,b),ids) in &state.pair_pools{
+            for (settlement,target) in [(a,b),(b,a)]{
+                let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
+                for &direct in ids{
+                    for &partner in ids{
+                        if direct==partner{continue;}
+                        let key=Key{topology,direct,partner};
+                        let stable=(settlement,target,state.pools[direct].address,
+                            state.pools[partner].address);
+                        let previous=old_entries.remove(&stable);
+                        if let Some(mut entry)=previous{
+                            let current=witness(state,key).and_then(|w|
+                                state.source_fingerprint(&w,params));
+                            if current.is_some() && current==entry.fingerprint{
+                                if let Some(mut rank)=entry.rank{
+                                    rank.key=key;
+                                    self.ready.insert(rank);
+                                    entry.rank=Some(rank);
+                                }
+                                self.entries.insert(key,entry);
+                                reused+=1;
+                                continue;
+                            }
+                        }
+                        recomputed+=1;
+                        self.refresh_one(state,params,key,report,trigger.clone(),false);
+                    }
+                }
+            }
+        }
+        report.cp21a1_catalog_reused+=reused;
+        report.cp21a1_catalog_recomputed+=recomputed;
+        report.cp21a1_catalog_reindexed+=1;
+        if entered==0 && removed==0 {report.cp21a1_catalog_unchanged+=1;}
+        report.cp21s_entries=self.entries.len();
+        report.cp21s_pending_peak=report.cp21s_pending_peak.max(self.ready.len());
+        timeline::emit(self.journal.as_ref(),json!({
+            "schema":1,"kind":"catalog_reconciliation",
+            "at_us":now_us(),"graph_generation":state.generation,
+            "revision":state.revision,"entered":entered,"exited":removed,
+            "retained_pools":old_addresses.intersection(&current_addresses).count(),
+            "total_pools":state.pools.len(),"pairs_reused":reused,
+            "pairs_recomputed":recomputed,
+            "pending_preserved":self.ready.len()
+        }),report);
+    }
     fn reset(&mut self,state:&State,params:&ExecutionParameters,
         report:&mut Report,trigger:Arc<SignalTrigger>){
         self.topology.clear();self.entries.clear();self.ready.clear();
@@ -130,44 +417,88 @@ impl Index {
         trigger:Arc<SignalTrigger>,allow_schedule:bool){
         report.cp21s_pair_refreshes+=1;
         let Some(w)=witness(state,key)else{
+            let reason=pair_unavailable_reason(state,key);
             report.cp21s_unpriced+=1;
+            *report.cp21a1_unpriced_reasons.entry(format!("{}:{reason}",
+                if allow_schedule{"live"}else{"catalog_or_warmup"})).or_default()+=1;
             if let Some(old)=self.entries.remove(&key){
                 if let Some(rank)=old.rank{self.ready.remove(&rank);}
                 report.cp21s_state_superseded+=1;
             }
+            self.trace(state,key,"unpriced",reason,None,None,None,
+                trigger.as_ref(),None,report);
             return;
         };
         let started=Instant::now();
-        let score=state.economic_score(&w,params);
+        let estimate=economic::witness_estimate(&w,params);
+        let score=estimate.map(|v|v.0);
+        let input_raw=estimate.map(|v|v.1);
+        let output_raw=estimate.map(|v|v.2);
+        let gross_raw=estimate.map(|v|v.3);
         report.cp21s_score_timing.record(elapsed_ns(started));
+        if w.estimated_net_return_bps.is_none(){
+            report.cp21a1_missing_marginal_scored+=1;
+            if score.is_some_and(|n|n>0){
+                report.cp21a1_missing_marginal_positive+=1;
+            }
+        }
+        let reason=if score.is_none(){pair_unavailable_reason(state,key)}
+            else if w.estimated_net_return_bps.is_none(){"marginal_unknown_economic_available"}
+            else{"economic_model_available"};
         match score{
             Some(n) if n>0=>report.cp21s_model_positive+=1,
             Some(_)=>report.cp21s_model_nonpositive+=1,
-            None=>report.cp21s_model_unknown+=1,
+            None=>{
+                report.cp21s_model_unknown+=1;
+                *report.cp21a1_model_unknown_reasons.entry(format!("{}:{reason}",
+                    if allow_schedule{"live"}else{"catalog_or_warmup"})).or_default()+=1;
+            },
         }
         let fingerprint=state.source_fingerprint(&w,params);
         let old=self.entries.remove(&key);
-        if let Some(previous)=&old{
+        if let Some(mut previous)=old{
             if previous.fingerprint.is_some() && previous.fingerprint==fingerprint
                 && previous.net==score {
                 report.cp21s_identical_state_reuses+=1;
-                self.entries.insert(key,previous.clone());
+                // CP21S-A bugfix: an unchanged baseline quote was previously
+                // not schedulable on its first live update because rank=None.
+                if allow_schedule && previous.rank.is_none() &&
+                    (score.is_some_and(|n|n>0) ||
+                     (score.is_none() && w.estimated_net_return_bps.is_some()
+                         && w.log_sum_units<state.threshold)) {
+                    let (category,priority)=economic::priority_key(score);
+                    let rank=Rank{category,score:priority,key};
+                    self.ready.insert(rank);previous.rank=Some(rank);
+                    previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
+                    previous.pipeline=state.price_pipeline;
+                }
+                let action=if previous.rank.is_some(){"retained_ready"}else{"retained"};
+                self.entries.insert(key,previous);
+                self.trace(state,key,action,reason,score,input_raw,gross_raw,
+                    trigger.as_ref(),None,report);
                 return;
             }
             if let Some(rank)=previous.rank{self.ready.remove(&rank);}
             report.cp21s_state_superseded+=1;
         }
         let rank=if allow_schedule && (score.is_some_and(|value|value>0)
-            || (score.is_none() && w.log_sum_units<state.threshold)){
-            let (category,score)=economic::priority_key(score);
-            let rank=Rank{category,score,key};
+            || (score.is_none() && w.estimated_net_return_bps.is_some()
+                && w.log_sum_units<state.threshold)){
+            let (category,priority)=economic::priority_key(score);
+            let rank=Rank{category,score:priority,key};
             self.ready.insert(rank);
             Some(rank)
         }else{None};
+        let action=if rank.is_some(){"queued"}else if score.is_none(){"model_unknown"}
+            else if score.is_some_and(|n|n<=0){"nonpositive"}else{"baseline"};
         self.entries.insert(key,Entry{
-            net:score,fingerprint,rank,revision:state.revision,
-            trigger,ready_us:state.ready_at_us,pipeline:state.price_pipeline,
+            net:score,input_raw,output_raw,gross_raw,
+            fingerprint,rank,revision:state.revision,
+            trigger:trigger.clone(),ready_us:state.ready_at_us,
+            pipeline:state.price_pipeline,
         });
+        self.trace(state,key,action,reason,score,input_raw,gross_raw,
+            trigger.as_ref(),None,report);
     }
     fn best(&self)->Option<Rank>{self.ready.first().copied()}
     fn pop(&mut self,key:Key){
@@ -182,12 +513,17 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
     cfg:Settings)->Result<Report>{
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()};
     let mut state=State::default();
-    let mut index=Index::default();
+    let timeline=timeline::open()?;
+    let sender=timeline.as_ref().map(|writer|writer.sender());
+    let mut index=Index{journal:sender.clone(),..Default::default()};
     let mut scheduler=scheduling::Scheduler::new(Duration::from_secs(cfg.cp20s_recheck_seconds));
     let mut sequence=0_u64;
     let mut evaluation_pending=false;
     let mut changed=Vec::<usize>::new();
     let mut reset=false;
+    let mut prior_catalog:Option<(Vec<SignalPool>,Vec<Option<Arc<SignalPoolPrice>>>,
+        Option<Arc<SignalPlan>>) >=None;
+    let mut resume_pending=false;
     let mut allow_dispatch=false;
     let mut ticker=tokio::time::interval(Duration::from_millis(5));
     let mut distinct_pairs=HashSet::<(Pubkey,Pubkey)>::new();
@@ -206,8 +542,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Err(broadcast::error::RecvError::Closed)=>break,
                     Err(broadcast::error::RecvError::Lagged(n))=>{
                         report.lost_events+=n;report.awaiting_snapshot=true;
-                        state=State::default();index=Index::default();
-                        changed.clear();evaluation_pending=false;allow_dispatch=false;
+                        timeline::emit(sender.as_ref(),json!({
+                            "schema":1,"kind":"watchset_uncertain","action":"signal_stream_lag",
+                            "at_us":now_us(),"lost_events":n,
+                            "last_graph_generation":state.generation
+                        }),&mut report);
+                        state=State::default();
+                        index=Index{journal:sender.clone(),..Default::default()};
+                        changed.clear();prior_catalog=None;resume_pending=false;
+                        evaluation_pending=false;allow_dispatch=false;
                         crate::log_event!(Warn,
                             "CP21S-A signal stream lagged={n}; awaiting authoritative snapshot");
                         continue;
@@ -228,15 +571,30 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     SignalEvent::State(s)=>{
                         report.state_updates+=1;
                         ensure!(!evaluation_pending,"state replaced before evaluation completed");
+                        if s.snapshot.is_some(){
+                            prior_catalog=Some((state.pools.clone(),state.prices.clone(),
+                                state.plan.clone()));
+                            resume_pending=allow_dispatch;
+                        }
                         state.apply(s,report.awaiting_snapshot,&mut report.preparation)?;
+                        if let Some(selected)=&s.selected_watch_pools{
+                            index.record_selection(&state,selected,&mut report)?;
+                        }
                         if let Some(snapshot)=&s.snapshot{
                             report.catalog_snapshots+=1;
                             report.catalog_snapshot_candidates+=snapshot.candidates.len() as u64;
                             reset=true;allow_dispatch=false;
                         }
                         if s.clear {
-                            // WS gaps invalidate ALL earlier economic rankings.
-                            index=Index::default();
+                            // A Gap invalidates observed prices. Do not claim
+                            // that earlier selections are known to remain live.
+                            timeline::emit(sender.as_ref(),json!({
+                                "schema":1,"kind":"watchset_uncertain",
+                                "action":"price_stream_clear","at_us":now_us(),
+                                "graph_generation":state.generation,"revision":state.revision
+                            }),&mut report);
+                            index=Index{journal:sender.clone(),..Default::default()};
+                            prior_catalog=None;
                             reset=true;allow_dispatch=false;
                         }
                         changed=s.changes.iter().map(|x|x.pool_id).collect();
@@ -270,8 +628,14 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             }
                         }
                         if reset{
-                            index.reset(&state,&cfg.parameters,&mut report,e.trigger.clone());
-                            reset=false;
+                            if let Some((pools,prices,plan))=prior_catalog.take(){
+                                index.reconcile_snapshot(&pools,&prices,plan.as_ref(),
+                                    &state,&cfg.parameters,&mut report,e.trigger.clone());
+                                allow_dispatch=resume_pending&&!index.ready.is_empty();
+                            }else{
+                                index.reset(&state,&cfg.parameters,&mut report,e.trigger.clone());
+                            }
+                            reset=false;resume_pending=false;
                         }else if let SignalTrigger::Price{origin,..}=e.trigger.as_ref(){
                             // Even initialization/baseline observations MUST
                             // enter the index; only their V10 submission is
@@ -292,6 +656,8 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                                 &mut report,e.trigger.clone(),false);
                         }
                         changed.clear();
+                        report.cp21a1_live_index_last_active=index.entries.len();
+                        report.cp21a1_live_pending_last_active=index.ready.len();
                     }
                 }
                 if evaluation_pending{continue;}
@@ -307,6 +673,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Ok(p)=>p,
                     Err(mpsc::error::TrySendError::Full(_))=>{
                         report.cp21s_queue_full_retries+=1;
+                        if report.cp21s_queue_full_retries==1 {
+                            if let Some(rank)=index.best(){
+                                if let Some(e)=index.entries.get(&rank.key){
+                                    index.trace(&state,rank.key,"waiting","v10_queue_full",
+                                        e.net,e.input_raw,e.gross_raw,e.trigger.as_ref(),
+                                        None,&mut report);
+                                }
+                            }
+                        }
                         break;
                     },
                     Err(mpsc::error::TrySendError::Closed(_))=>
@@ -319,6 +694,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Ok(p)=>p,
                     Err(mpsc::error::TrySendError::Full(_))=>{
                         report.cp21s_evidence_full_retries+=1;
+                        if report.cp21s_evidence_full_retries==1{
+                            if let Some(rank)=index.best(){
+                                if let Some(e)=index.entries.get(&rank.key){
+                                    index.trace(&state,rank.key,"waiting","evidence_queue_full",
+                                        e.net,e.input_raw,e.gross_raw,e.trigger.as_ref(),
+                                        None,&mut report);
+                                }
+                            }
+                        }
                         break;
                     },
                     Err(mpsc::error::TrySendError::Closed(_))=>
@@ -329,6 +713,9 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     index.ready.remove(&rank);continue;
                 };
                 let Some(w)=witness(&state,key)else{
+                    index.trace(&state,key,"not_dispatched","price_missing_at_dispatch",
+                        entry.net,entry.input_raw,entry.gross_raw,entry.trigger.as_ref(),
+                        None,&mut report);
                     index.pop(key);
                     report.cp21s_unpriced+=1;
                     continue;
@@ -352,7 +739,11 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Err(e)=>{
                         report.cp21s_seed_rejections+=1;
                         report.skipped_invalid_seed+=1;
-                        report.last_rejection=Some(format!("{e:#}"));
+                        let message=format!("{e:#}");
+                        report.last_rejection=Some(message.clone());
+                        index.trace(&state,key,"not_dispatched",&message,
+                            entry.net,entry.input_raw,entry.gross_raw,
+                            entry.trigger.as_ref(),None,&mut report);
                         index.pop(key);
                         continue;
                     }
@@ -363,6 +754,9 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 // the ranked pair until the newer observation is applied.
                 if !input.is_empty(){
                     report.cp21s_preempted_for_new_market_state+=1;
+                    index.trace(&state,key,"waiting","new_market_state_preempts_pack",
+                        entry.net,entry.input_raw,entry.gross_raw,
+                        entry.trigger.as_ref(),None,&mut report);
                     break;
                 }
                 let fingerprint=selection.packed_state_fingerprint();
@@ -370,11 +764,17 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 if familiar.deferred(){
                     index.pop(key);
                     report.cp21s_cooldowns+=1;
+                    index.trace(&state,key,"not_dispatched","cp20s_frozen_state_cooldown",
+                        entry.net,entry.input_raw,entry.gross_raw,
+                        entry.trigger.as_ref(),None,&mut report);
                     continue;
                 }
                 let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,
                     &mut reads,&mut report.amounts,&mut report.preparation)? else {
                     report.cp21s_amount_exclusions+=1;
+                    index.trace(&state,key,"not_dispatched","conservative_amount_exclusion",
+                        entry.net,entry.input_raw,entry.gross_raw,
+                        entry.trigger.as_ref(),None,&mut report);
                     index.pop(key);
                     continue;
                 };
@@ -411,9 +811,13 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 report.cp21s_dispatched+=1;
                 report.preparation.round_work_ns.record(elapsed_ns(started));
                 report.cp21s_drain_timing.record(elapsed_ns(started));
+                let request_id=selection.request.id.clone();
                 let request=selection.request.clone();
                 evidence_permit.send(EvidenceItem::Selection(Box::new(selection)));
                 permit.send(request);
+                index.trace(&state,key,"v10_submitted","economic_priority_selected",
+                    entry.net,entry.input_raw,entry.gross_raw,
+                    entry.trigger.as_ref(),Some(&request_id),&mut report);
                 report.request_count+=1;
                 scheduler.packs.record(fingerprint,Instant::now());
                 let source_fingerprint=state.source_fingerprint(source.witness.as_ref()
@@ -441,6 +845,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
     report.cp21s_entries=index.entries.len();
     report.cp21s_pending_at_shutdown=index.ready.len();
     report.error=outcome.err().map(|e|format!("{e:#}"));
+    // Join the durable timeline writer only after ALL sender clones are gone.
+    index.journal=None;
+    drop(index);
+    drop(sender);
+    if let Some(writer)=timeline {
+        if let Err(error)=writer.finish(&mut report){
+            report.error=Some(format!("CP21S-A.1 timeline evidence failure: {error:#}"));
+        }
+    }
     report.cp10_capacity_phases=super::super::execution_v10::capacity_phase_profile();
     report.cp11_quantity_phases=amounts::phase_profile();
     crate::log_event!(Info,
@@ -532,6 +945,85 @@ mod tests{
         let trigger=Arc::new(SignalTrigger::Price{
             pool:first_pool,sequence:1,origin:PriceOrigin::Websocket,received_at_us:10});
         (state,trigger)
+    }
+    #[test]
+    fn cp21a1_deliberate_direction_dust_filter_remains_intact(){
+        let (mut state,_trigger)=fixture_direct2(3);
+        let old=state.prices[0].as_ref().unwrap().as_ref();
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:[None,None],
+            direction_liquidity_status:["dust","dust"],
+            observation:old.observation.clone(),
+        }));
+        let key=Key{topology:0,direct:0,partner:1};
+        assert!(witness(&state,key).is_none());
+        assert_eq!(pair_unavailable_reason(&state,key),
+            "direction_notional_filter_dust");
+    }
+    #[test]
+    fn cp21a1_missing_marginal_does_not_veto_amount_dependent_cpmm(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let base=state.prices[0].as_ref().unwrap().as_ref();
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:[None,None],
+            direction_liquidity_status:["unknown","unknown"],
+            observation:base.observation.clone(),
+        }));
+        let key=Key{topology:0,direct:0,partner:4};
+        let w=witness(&state,key).expect("economic witness needs pool prices, not marginal logs");
+        assert_eq!(w.estimated_net_return_bps,None);
+        let score=state.economic_score(&w,&ExecutionParameters::default());
+        assert!(score.is_some(),"the exact CPMM quote survives absent marginal logs");
+        let mut report=Report::default();
+        let mut index=Index::default();
+        index.reset(&state,&ExecutionParameters::default(),&mut report,trigger);
+        assert_eq!(index.entries.len(),20);
+        assert!(report.cp21a1_missing_marginal_scored>=8);
+        assert_eq!(report.cp21s_unpriced,0);
+        assert_eq!(index.entries[&key].net,score);
+    }
+
+    #[test]
+    fn cp21a1_identical_catalog_keeps_all_prior_scores_without_recalculation(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let p=ExecutionParameters::default();
+        index.reset(&state,&p,&mut report,trigger.clone());
+        let before=report.cp21s_pair_refreshes;
+        let original_pools=state.pools.clone();
+        let original_prices=state.prices.clone();
+        let original_plan=state.plan.clone();
+        state.generation+=1;state.revision+=1;
+        index.reconcile_snapshot(&original_pools,&original_prices,
+            original_plan.as_ref(),&state,&p,&mut report,trigger);
+        assert_eq!(report.cp21s_pair_refreshes,before);
+        assert_eq!(report.cp21a1_catalog_unchanged,1);
+        assert_eq!(report.cp21a1_catalog_reused,20);
+        assert_eq!(index.entries.len(),20);
+    }
+
+    #[test]
+    fn cp21a1_catalog_pool_id_reordering_keeps_stable_route_economics(){
+        let (mut state,trigger)=fixture_direct2(6);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let p=ExecutionParameters::default();
+        index.reset(&state,&p,&mut report,trigger.clone());
+        let original_pools=state.pools.clone();
+        let original_prices=state.prices.clone();
+        let original_plan=state.plan.clone();
+        state.pools.swap(0,5);state.prices.swap(0,5);
+        state.generation+=1;state.revision+=1;
+        index.reconcile_snapshot(&original_pools,&original_prices,
+            original_plan.as_ref(),&state,&p,&mut report,trigger);
+        assert_eq!(index.entries.len(),30);
+        assert_eq!(report.cp21a1_catalog_reused,30);
+        assert_eq!(report.cp21a1_catalog_recomputed,0);
+        for (&key,entry) in &index.entries{
+            let w=witness(&state,key).unwrap();
+            assert_eq!(entry.net,state.economic_score(&w,&p));
+        }
     }
     #[test]
     fn cp21s_a_real_pair_index_matches_full_cpmm_recalculation_after_change(){

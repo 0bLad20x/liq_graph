@@ -4,6 +4,7 @@ mod amounts;
 mod economic;
 mod scheduling;
 mod incremental;
+mod timeline;
 #[cfg(test)]
 mod amounts_reference;
 #[cfg(test)]
@@ -158,6 +159,8 @@ struct PoolEvidence {
     observation: Arc<crate::core::market_state::PoolPriceObservation>,
     manifest_validated_slot: u64, manifest_checked_at_ms: Option<u64>,
     liquidity_window_checked:bool,
+    /// The marginal signal may be unavailable while exact amount quotes exist.
+    marginal_weight_available:bool,
     /// CP9A: eligible/dust/unknown at the original directed signal slot.
     direction_liquidity_status:&'static str,
 }
@@ -229,6 +232,16 @@ pub struct Report {
     pub cp21s_cooldowns:u64,pub cp21s_no_signal_updates:u64,
     pub cp21s_dispatched:u64,pub cp21s_score_timing:Timing,
     pub cp21s_refresh_timing:Timing,pub cp21s_drain_timing:Timing,
+    pub cp21a1_unpriced_reasons:BTreeMap<String,u64>,
+    pub cp21a1_model_unknown_reasons:BTreeMap<String,u64>,
+    pub cp21a1_missing_marginal_scored:u64,
+    pub cp21a1_missing_marginal_positive:u64,
+    pub cp21a1_catalog_reused:u64,pub cp21a1_catalog_recomputed:u64,
+    pub cp21a1_catalog_reindexed:u64,pub cp21a1_catalog_unchanged:u64,
+    pub cp21a1_live_index_last_active:usize,pub cp21a1_live_pending_last_active:usize,
+    pub cp21a1_timeline_emitted:u64,pub cp21a1_timeline_written:u64,
+    pub cp21a1_timeline_lost:u64,pub cp21a1_timeline_bytes:u64,
+    pub cp21a1_timeline_syncs:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -480,6 +493,11 @@ impl Report {
         ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
+        ensure!(self.cp21a1_timeline_lost==0
+            && self.cp21a1_timeline_emitted==self.cp21a1_timeline_written,
+            "timeline journal incomplete: emitted={} written={} lost={}",
+            self.cp21a1_timeline_emitted,self.cp21a1_timeline_written,
+            self.cp21a1_timeline_lost);
         ensure!(self.amounts.attempts==self.amounts.possible+self.amounts.unknown+self.amounts.excluded
             && self.amounts.possible+self.amounts.unknown==self.request_count,
             "quantity decision accounting mismatch");
@@ -733,8 +751,8 @@ impl State {
         }
         Ok(())
     }
-    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey,reads:&mut RegistryReads)
-        ->Result<(ExecutionPool,PoolEvidence)> {
+    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey,reads:&mut RegistryReads,
+        allow_missing_marginal:bool)->Result<(ExecutionPool,PoolEvidence)> {
         let identity=self.pools.get(slot/2).context("candidate slot identity missing")?;
         let price=self.prices.get(slot/2).and_then(|p|p.as_ref()).context("candidate price unavailable")?;
         let (state,wait,hold)=registry.measured_get(identity.address);
@@ -761,7 +779,10 @@ impl State {
             true
         }else{false};
         let evidence=PoolEvidence {pool:identity.address.to_string(),role,slot,
-            log_weight_units:self.weight(slot).context("candidate direction unavailable")?,
+            log_weight_units:if allow_missing_marginal{
+                self.weight(slot).unwrap_or(0)
+            }else{self.weight(slot).context("candidate direction unavailable")?},
+            marginal_weight_available:self.weight(slot).is_some(),
             observation:price.observation.clone(),manifest_validated_slot:manifest.validated_slot,
             manifest_checked_at_ms:state.completion_checked_at_ms,liquidity_window_checked,
             direction_liquidity_status:price.direction_liquidity_status[slot%2]};
@@ -799,7 +820,9 @@ impl State {
             let (input,output)=if c.reverse{(b,a)}else{(a,b)};
             ensure!((leg.input_mint,leg.output_mint)==(input,output)
                 && used.insert(leg.slot/2),"compact witness has wrong or duplicate pools");
-            ensure!(self.weight(leg.slot)==Some(leg.log_weight_units),
+            ensure!(self.weight(leg.slot)==Some(leg.log_weight_units)
+                || (cfg.cp21s_full_incremental && self.weight(leg.slot).is_none()
+                    && leg.log_weight_units==0),
                 "compact candidate is stale relative to price revision");
             slots.push((leg.slot,role(j)));
         }
@@ -821,16 +844,21 @@ impl State {
                 used=seen;
             }
         }
-        let seed_sum=slots.iter().try_fold(0_i128,|sum,(slot,_)|Ok::<_,anyhow::Error>(sum+i128::from(self.weight(*slot).context("seed net weight unavailable")?)))?;
+        let seed_sum=slots.iter().try_fold(0_i128,|sum,(slot,_)|
+            Ok::<_,anyhow::Error>(sum+i128::from(if cfg.cp21s_full_incremental{
+                self.weight(*slot).unwrap_or(0)
+            }else{
+                self.weight(*slot).context("seed net weight unavailable")?
+            })))?;
         let seed_sum=i64::try_from(seed_sum).context("seed net sum overflow")?;
         ensure!(seed_sum<threshold || cfg.cp21s_full_incremental,
             "quantity seed is not net qualified");
         let mut request=ExecutionRequest{id:format!("graph-{}-{}-{number}",self.generation,self.revision),
             wallet:cfg.wallet,settlement:top.settlement,groups:Vec::new(),conversion:None,
-            parameters:cfg.parameters.clone()};
+            parameters:cfg.parameters.clone(),min_context_slot:None};
         let mut pools=Vec::new();
         for &(slot,r) in &slots{
-            let resolving=Instant::now();let next=self.pool(slot,r,registry,cfg.wallet,reads);
+            let resolving=Instant::now();let next=self.pool(slot,r,registry,cfg.wallet,reads,cfg.cp21s_full_incremental);
             preparation.pool_resolution_ns.record(elapsed_ns(resolving));
             pools.push(next?);
         }
@@ -920,7 +948,7 @@ impl State {
             let (_,slot,role_name,_)=options[index];
             if used.contains(&(slot/2)){continue;}
             considered+=1;
-            let resolving=Instant::now();let next=self.pool(slot,role_name,registry,cfg.wallet,reads);
+            let resolving=Instant::now();let next=self.pool(slot,role_name,registry,cfg.wallet,reads,cfg.cp21s_full_incremental);
             preparation.pool_resolution_ns.record(elapsed_ns(resolving));
             let pool=match next{
                 Ok(pool)=>pool,Err(error)=>{
@@ -964,6 +992,10 @@ impl State {
             }
         }
         install_compact(&mut request,top,&pools);
+        if cfg.cp21s_full_incremental{
+            request.min_context_slot=pools.iter().map(|(_,p)|
+                p.observation.component_slot_max.max(p.observation.slot)).max();
+        }
         let ready=now_us();
         let frame=self.price_pipeline.map(|t|t.frame_received_at_us);
         let alternative_pools_added=pools.len()-slots.len();
@@ -972,7 +1004,10 @@ impl State {
             cp9d_source:"fresh",cp9d_pair_index:0,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,target:top.target,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
-            estimated_net_return_bps:estimated_net_return_bps.is_finite().then_some(estimated_net_return_bps),
+            estimated_net_return_bps:(
+                (!cfg.cp21s_full_incremental || witness.estimated_net_return_bps.is_some())
+                    && estimated_net_return_bps.is_finite()
+            ).then_some(estimated_net_return_bps),
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
             signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
@@ -1463,6 +1498,7 @@ mod cp10_packing_tests {
                 id:"cp10-direct2".into(),wallet,settlement,
                 groups:vec![ExecutionGroup::Direct{target,pools:vec![d1.clone(),p1.clone()]}],
                 conversion:None,parameters:ExecutionParameters::default(),
+                min_context_slot:None,
             };
             let original=serde_json::to_vec(&current).unwrap();
             let initial=crate::workers::execution_v10::validate(&current).unwrap();

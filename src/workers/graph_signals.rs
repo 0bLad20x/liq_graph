@@ -385,6 +385,7 @@ impl CompactIndex {
 }
 struct Work {
     started:Instant,stats:SignalEvaluation,
+    watch_selection:Option<Vec<String>>,
 }
 struct Engine {
     prices:Prices,plan:Arc<SignalPlan>,index:CompactIndex,
@@ -401,7 +402,7 @@ impl Engine {
     fn begin(&mut self,trigger:SignalTrigger,started:Instant,received:u64,
         pipeline:Option<PricePipelineTiming>,queue:usize)->Work{
         self.revision+=1;
-        Work{started,stats:SignalEvaluation{sequence:0,revision:self.revision,
+        Work{started,watch_selection:None,stats:SignalEvaluation{sequence:0,revision:self.revision,
             graph_generation:self.plan.graph_generation,trigger:Arc::new(trigger),
             price_pipeline:pipeline,worker_received_at_us:received,completed_at_us:0,
             price_queue_depth:queue,groups_visited:0,logical_routes_affected:0,
@@ -422,7 +423,8 @@ impl Engine {
             candidates:self.index.snapshot_candidates(&self.plan,&self.prices)?})}else{None};
         let update=SignalStateUpdate{sequence:self.next_sequence(),revision:self.revision,
             graph_generation:self.plan.graph_generation,trigger:work.stats.trigger.clone(),
-            ready_at_us,price_pipeline:work.stats.price_pipeline,snapshot,clear,changes};
+            ready_at_us,price_pipeline:work.stats.price_pipeline,snapshot,clear,
+            selected_watch_pools:work.watch_selection.take(),changes};
         work.stats.event_build_ns+=nanos(started);
         self.production.counts.state(&update);
         let started=Instant::now();
@@ -623,6 +625,9 @@ pub async fn run(mut input:PriceEventStream,mut graphs:watch::Receiver<Arc<Graph
                         }
                         let mut work=e.begin(SignalTrigger::Coverage{sequence:*sequence,
                             reason:"observation selection reconciled".into()},started,received,None,input.len());
+                        let mut addresses=selected.iter().map(Pubkey::to_string).collect::<Vec<_>>();
+                        addresses.sort_unstable();
+                        work.watch_selection=Some(addresses);
                         e.state(&mut work,false,false,changes)?;
                         for address in affected{e.candidates(&mut work,address,false)?;}
                         e.evaluate(work)?;

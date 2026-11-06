@@ -260,6 +260,21 @@ pub(super) fn pair_gain(a:&PoolPriceObservation,b:&PoolPriceObservation,
     let (_,_,_,net)=predict_pair(a,b,settlement,target,params)?;
     normalize_usd_nano(settlement,net)
 }
+/// Single frozen pair estimate for the complete timeline, computed only
+/// once per pair refresh. The score is normalized USD nanounits; input and
+/// output remain original settlement atoms. None is NOT a negative proof.
+pub(super) fn witness_estimate(w:&SignalWitness,params:&ExecutionParameters)
+    ->Option<(i128,u64,u64,i128)> {
+    if w.legs.len()!=2{return None;}
+    let first=&w.legs[0];let second=&w.legs[1];
+    if first.observation.pool==second.observation.pool{return None;}
+    let settlement=first.input_mint.to_string();
+    let target=first.output_mint.to_string();
+    if second.input_mint!=first.output_mint||second.output_mint!=first.input_mint{return None;}
+    let (input,output,gross,net)=predict_pair(&first.observation,&second.observation,
+        &settlement,&target,params)?;
+    Some((normalize_usd_nano(&settlement,net)?,input,output,gross))
+}
 pub(super) fn witness_gain(w:&SignalWitness,params:&ExecutionParameters)->Option<i128> {
     if w.legs.len()!=2{return None;}
     let first=&w.legs[0];let second=&w.legs[1];

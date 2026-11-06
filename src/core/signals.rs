@@ -163,6 +163,9 @@ pub struct SignalStateUpdate {
     pub trigger: Arc<SignalTrigger>, pub ready_at_us: u64,
     pub price_pipeline: Option<PricePipelineTiming>,
     pub snapshot: Option<SignalSnapshot>, pub clear: bool,
+    /// Exact MarketState selected-pool set when a Selection event occurs.
+    /// This is live selection intent, NOT a WebSocket subscription ACK.
+    pub selected_watch_pools:Option<Vec<String>>,
     pub changes: Vec<SignalPriceChange>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
