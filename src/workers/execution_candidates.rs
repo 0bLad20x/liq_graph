@@ -580,6 +580,12 @@ impl State {
                     "trigger":selection.trigger,"source_witness":candidate.witness
                 }));return Ok(None);
             }
+            // CP21S-A's economic result belongs to one exact directed
+            // pair. The legacy amount-seed repair may substitute a DIFFERENT
+            // pair, which would invalidate that score and its calibration.
+            // Preserve the exact candidate; conservative amount exclusions
+            // still apply, and are accounted for explicitly.
+            if !cfg.cp21s_full_incremental {
             let repair_started=Instant::now();
             let witness=candidate.witness.as_ref().context("quantity witness missing")?;
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
@@ -600,6 +606,7 @@ impl State {
                 }
             }
             preparation.cp11_seed_repair_ns.record(elapsed_ns(repair_started));
+            }
             // Unknown alternatives do not change the proof for this packed set.
             // Only an actually rebuilt, re-assessed request can replace it.
             if assessment.decision==amounts::Decision::Excluded {
