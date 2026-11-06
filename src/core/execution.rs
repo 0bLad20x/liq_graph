@@ -77,6 +77,11 @@ pub struct ExecutionRequest {
     pub groups: Vec<ExecutionGroup>,
     pub conversion: Option<ExecutionPool>,
     pub parameters: ExecutionParameters,
+    /// Newest observation component slot used by the frozen Direct2 model.
+    /// Not a proof that all pool accounts came from one atomic Bank snapshot.
+    /// Optional for older saved request artifacts and legacy execution paths.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub min_context_slot:Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
