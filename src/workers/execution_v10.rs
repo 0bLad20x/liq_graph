@@ -1,6 +1,9 @@
 //! Complete typed execution job -> signed V10/Solana-v1 simulation -> typed report.
 //! No DB, Registry, graph lookup, pool selection, protocol decoding or broadcasting.
-use std::{cell::RefCell, collections::{HashMap, HashSet}, path::Path, time::Instant, sync::{Arc, LazyLock, atomic::{AtomicU64, Ordering}}};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, path::Path,
+    time::{Instant,SystemTime,UNIX_EPOCH}, sync::{Arc, LazyLock, atomic::{AtomicU64, Ordering}}};
+fn utc_us()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+    .as_micros().min(u128::from(u64::MAX)) as u64}
 use anyhow::{Context, Result, bail, ensure};
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde_json::Value;
@@ -588,7 +591,10 @@ async fn execute(settings: &Settings, rpc: &RpcHandle, request: &ExecutionReques
                 accounts:ix.projections.clone()}
         };
         let simulation_started=Instant::now();
+        report.min_context_slot_requested=Some(if settings.fast{min_slot}else{min_slot.max(slot)});
+        report.rpc_sent_at_us=Some(utc_us());
         let response=rpc.call(operation).await;
+        report.rpc_answer_at_us=Some(utc_us());
         let simulation_ms=simulation_started.elapsed().as_millis();
         report.simulation_rpc_ms=Some(report.simulation_rpc_ms.unwrap_or(0).saturating_add(simulation_ms.min(u128::from(u64::MAX)) as u64));
         let response=response?;
@@ -671,7 +677,11 @@ pub async fn run_parallel(settings: Settings,rpc:RpcHandle,mut input:mpsc::Recei
                             phase:"validate".into(),error:None,metrics:None,simulated_signature:None,
                             blockhash:None,last_valid_block_height:None,context_slot:None,provider:None,
                             blockhash_retried:false,executor_invoked:false,dex_invocations:Vec::new(),simulation:None,
-                            build_us:None,simulation_rpc_ms:None,elapsed_ms:0,trace_us:0,trace:ExecutionTrace::default()};
+                            build_us:None,simulation_rpc_ms:None,
+                            v10_worker_received_at_us:Some(utc_us()),
+                            rpc_sent_at_us:None,rpc_answer_at_us:None,
+                            min_context_slot_requested:None,
+                            elapsed_ms:0,trace_us:0,trace:ExecutionTrace::default()};
                         if let Err(error)=execute(&settings,&rpc,&request,&mut report).await {
                             report.error=Some(format!("{error:#}"));
                         }
