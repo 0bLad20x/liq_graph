@@ -101,7 +101,7 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
     for (i,id) in [key.direct,key.partner].iter().enumerate(){
         let (a,b)=top.roles[i];
         let Some(pool)=state.pools.get(*id)else{return "pool_identity_missing"};
-        let Some(slot)=directions(pool,a,b,*id)else{return "direction_identity_mismatch"};
+        let Some(_slot)=directions(pool,a,b,*id)else{return "direction_identity_mismatch"};
         let Some(p)=state.prices.get(*id).and_then(Option::as_ref)else {
             return if i==0{"direct_price_missing"}else{"partner_price_missing"};
         };
@@ -118,13 +118,27 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
             .all(|s|*s=="verified_no_standard_transfer_fee"){
             return "token_transfer_fee_unresolved";
         }
-        if p.log_weight_units[slot%2].is_none(){
-            // This is a useful contributing fact, not an economic veto.
-            // Only report it if the economic model cannot supply a quote.
-            return if i==0{"direct_marginal_missing"}else{"partner_marginal_missing"};
+        if liq.cpmm_quote.is_none() && liq.reserve_curve.is_none()
+            && liq.model!="dlmm_execution_window_v2"{
+            return "economic_quote_model_not_implemented";
+        }
+        if liq.model=="dlmm_execution_window_v2" {
+            let valuation=p.observation.valuation.as_ref().unwrap();
+            if valuation.base_fee_rate.is_none()||
+                valuation.variable_fee_rate.is_none(){
+                return "dlmm_dynamic_fee_unavailable";
+            }
+            if dir.levels.is_empty(){return "dlmm_execution_window_empty";}
+            // A nonempty window can still be too shallow for a particular
+            // amount; this is not proof the pool has no deeper bins.
+        }
+        if let Some(q)=liq.cpmm_quote.as_ref() {
+            if q.reserve_0_raw==0||q.reserve_1_raw==0{
+                return "cpmm_reserve_empty";
+            }
         }
     }
-    "economic_model_quote_unavailable"
+    "economic_quote_or_depth_unavailable"
 }
 impl Index {
     /// Every economic refresh and final scheduling decision is correlated
