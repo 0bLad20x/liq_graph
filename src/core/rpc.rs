@@ -61,6 +61,10 @@ pub enum RpcAnswer {
 pub struct RpcResponse {
     pub provider: String,
     pub received_at_ms: u64,
+    /// Final successful provider attempt, measured around reqwest HTTP IO.
+    /// Does not infer validator bank time or TCP packet arrival time.
+    pub http_request_started_at_us:u64,
+    pub http_response_received_at_us:u64,
     pub answer: RpcAnswer,
 }
 
