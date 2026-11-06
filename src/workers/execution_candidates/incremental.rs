@@ -42,6 +42,15 @@ fn directions(pool:&SignalPool,a:Pubkey,b:Pubkey,id:usize)->Option<usize>{
     else if pool.mint_b==a&&pool.mint_a==b {Some(2*id+1)}
     else {None}
 }
+/// Pure complete invalidation set: every ordered pair touching the changed
+/// pool, with no budget, sampling or dependence on current marginal winner.
+fn invalidate_changed(affected:&mut HashSet<Key>,topology:usize,updated:usize,peers:&[usize]){
+    for &other in peers{
+        if other==updated{continue;}
+        affected.insert(Key{topology,direct:updated,partner:other});
+        affected.insert(Key{topology,direct:other,partner:updated});
+    }
+}
 fn witness(state:&State,key:Key)->Option<SignalWitness>{
     let top=state.plan.as_ref()?.compact_topologies.get(key.topology)?;
     if top.kind!=SignalRouteKind::Direct2 || key.direct==key.partner{return None;}
@@ -103,11 +112,7 @@ impl Index {
             let Some(peers)=state.pair_pools.get(&(p.mint_a,p.mint_b))else{continue};
             for (settlement,target) in [(p.mint_a,p.mint_b),(p.mint_b,p.mint_a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
-                for &other in peers {
-                    if other==updated{continue;}
-                    affected.insert(Key{topology,direct:updated,partner:other});
-                    affected.insert(Key{topology,direct:other,partner:updated});
-                }
+                invalidate_changed(&mut affected,topology,updated,peers);
             }
         }
         // No truncation: every changed-pool/direct-partner combination is
