@@ -223,6 +223,7 @@ pub struct Report {
     pub cp21s_identical_state_reuses:u64,pub cp21s_entries:usize,
     pub cp21s_pending_peak:usize,pub cp21s_pending_at_shutdown:usize,
     pub cp21s_queue_full_retries:u64,pub cp21s_evidence_full_retries:u64,
+    pub cp21s_preempted_for_new_market_state:u64,
     pub cp21s_state_superseded:u64,
     pub cp21s_seed_rejections:u64,pub cp21s_amount_exclusions:u64,
     pub cp21s_cooldowns:u64,pub cp21s_no_signal_updates:u64,
