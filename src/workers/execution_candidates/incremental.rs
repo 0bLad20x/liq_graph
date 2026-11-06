@@ -68,7 +68,8 @@ fn witness(state:&State,key:Key)->Option<SignalWitness>{
     })
 }
 impl Index {
-    fn reset(&mut self,state:&State,report:&mut Report,trigger:Arc<SignalTrigger>){
+    fn reset(&mut self,state:&State,params:&ExecutionParameters,
+        report:&mut Report,trigger:Arc<SignalTrigger>){
         self.topology.clear();self.entries.clear();self.ready.clear();
         let Some(plan)=state.plan.as_ref()else{return;};
         for (i,top) in plan.compact_topologies.iter().enumerate(){
@@ -80,7 +81,7 @@ impl Index {
         // later price revisions touch only the changed pool's counterpart IDs.
         let mut batch=HashSet::new();
         for (&(a,b),ids) in &state.pair_pools{
-            for (&settlement,&target) in [(a,b),(b,a)].iter(){
+            for (settlement,target) in [(a,b),(b,a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
                 for &direct in ids{
                     for &partner in ids{
@@ -89,17 +90,18 @@ impl Index {
                 }
             }
         }
-        for key in batch{self.refresh_one(state,key,report,trigger.clone(),false);}
+        for key in batch{self.refresh_one(state,params,key,report,trigger.clone(),false);}
         report.cp21s_entries=self.entries.len();
         report.cp21s_pending_peak=report.cp21s_pending_peak.max(self.ready.len());
     }
-    fn refresh_changed(&mut self,state:&State,ids:&[usize],report:&mut Report,
+    fn refresh_changed(&mut self,state:&State,params:&ExecutionParameters,
+        ids:&[usize],report:&mut Report,
         trigger:Arc<SignalTrigger>,allow_schedule:bool){
         let mut affected=HashSet::new();
         for &updated in ids{
             let Some(p)=state.pools.get(updated)else{continue};
             let Some(peers)=state.pair_pools.get(&(p.mint_a,p.mint_b))else{continue};
-            for (&settlement,&target) in [(p.mint_a,p.mint_b),(p.mint_b,p.mint_a)].iter(){
+            for (settlement,target) in [(p.mint_a,p.mint_b),(p.mint_b,p.mint_a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
                 for &other in peers {
                     if other==updated{continue;}
@@ -110,12 +112,13 @@ impl Index {
         }
         // No truncation: every changed-pool/direct-partner combination is
         // exactly revalued once for this State revision, including negatives.
-        for key in affected {self.refresh_one(state,key,report,trigger.clone(),allow_schedule);}
+        for key in affected {self.refresh_one(state,params,key,report,trigger.clone(),allow_schedule);}
         report.cp21s_updates+=1;
         report.cp21s_entries=self.entries.len();
         report.cp21s_pending_peak=report.cp21s_pending_peak.max(self.ready.len());
     }
-    fn refresh_one(&mut self,state:&State,key:Key,report:&mut Report,
+    fn refresh_one(&mut self,state:&State,params:&ExecutionParameters,
+        key:Key,report:&mut Report,
         trigger:Arc<SignalTrigger>,allow_schedule:bool){
         report.cp21s_pair_refreshes+=1;
         let Some(w)=witness(state,key)else{
@@ -127,16 +130,14 @@ impl Index {
             return;
         };
         let started=Instant::now();
-        let score=state.economic_score(&w,&state_config_params(state));
-        // This helper is replaced in the caller path with the configured
-        // execution parameters; no implicit hard-coded trade sizes or fees.
+        let score=state.economic_score(&w,params);
         report.cp21s_score_timing.record(elapsed_ns(started));
         match score{
             Some(n) if n>0=>report.cp21s_model_positive+=1,
             Some(_)=>report.cp21s_model_nonpositive+=1,
             None=>report.cp21s_model_unknown+=1,
         }
-        let fingerprint=state.source_fingerprint(&w,&state_config_params(state));
+        let fingerprint=state.source_fingerprint(&w,params);
         let old=self.entries.remove(&key);
         if let Some(previous)=&old{
             if previous.fingerprint.is_some() && previous.fingerprint==fingerprint
@@ -166,13 +167,6 @@ impl Index {
             if let Some(rank)=entry.rank.take(){self.ready.remove(&rank);}
         }
     }
-}
-
-/// Production params are always passed explicitly; only the currently
-/// frozen V10 config is valid for a quote. Avoid implicit fallback values.
-fn state_config_params(_state:&State)->ExecutionParameters{
-    // Placeholder removed before CI: will be parameterized by &Settings.
-    ExecutionParameters::default()
 }
 
 pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
@@ -262,12 +256,13 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             }
                         }
                         if reset{
-                            index.reset(&state,&mut report,e.trigger.clone());
+                            index.reset(&state,&cfg.parameters,&mut report,e.trigger.clone());
                             reset=false;
                         }else if matches!(e.trigger.as_ref(),SignalTrigger::Price{
                             origin:PriceOrigin::Websocket|PriceOrigin::Revaluation,..})
                             && !e.price_pipeline.is_some_and(|p|p.initialization_replay){
-                            index.refresh_changed(&state,&changed,&mut report,e.trigger.clone(),true);
+                            index.refresh_changed(&state,&cfg.parameters,&changed,
+                                &mut report,e.trigger.clone(),true);
                             allow_dispatch=true;
                             if !changed.is_empty() && e.ranges.iter().sum::<u64>()==0{
                                 report.cp21s_no_signal_updates+=1;
