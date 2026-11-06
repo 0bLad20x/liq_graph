@@ -173,6 +173,104 @@ impl Index {
             "request_id":request_id,
         }),report);
     }
+    /// Reconcile a new graph generation using stable on-chain pool addresses.
+    /// Preserve the economic score AND pending V10 priority when the frozen
+    /// account fingerprint is identical. Different IDs/order no longer force
+    /// price re-optimization or loss of pending opportunities.
+    fn reconcile_snapshot(&mut self,old_pools:&[SignalPool],
+        old_plan:Option<&Arc<SignalPlan>>,state:&State,params:&ExecutionParameters,
+        report:&mut Report,trigger:Arc<SignalTrigger>){
+        let old=std::mem::take(self);
+        self.journal=old.journal.clone();
+        let old_addresses=old_pools.iter().map(|p|p.address).collect::<HashSet<_>>();
+        let current_addresses=state.pools.iter().map(|p|p.address).collect::<HashSet<_>>();
+        let mut entered=0_u64;let mut removed=0_u64;
+        for pool in &state.pools{
+            if old_addresses.contains(&pool.address){continue;}
+            entered+=1;
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"watchset","action":"entered",
+                "layer":"graph_signal_catalog_not_ws_ack",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"pool":pool.address.to_string(),
+                "mint_a":pool.mint_a.to_string(),"mint_b":pool.mint_b.to_string(),
+                "price_available":state.pools.iter().position(|p|p.address==pool.address)
+                    .and_then(|id|state.prices.get(id)).and_then(Option::as_ref).is_some()
+            }),report);
+        }
+        for pool in old_pools{
+            if current_addresses.contains(&pool.address){continue;}
+            removed+=1;
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"watchset","action":"exited",
+                "layer":"graph_signal_catalog_not_ws_ack",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"pool":pool.address.to_string()
+            }),report);
+        }
+        let mut old_entries=HashMap::<(Pubkey,Pubkey,Pubkey,Pubkey),Entry>::new();
+        if let Some(old_plan)=old_plan {
+            for (key,entry) in old.entries{
+                if let (Some(t),Some(a),Some(b))=(
+                    old_plan.compact_topologies.get(key.topology),
+                    old_pools.get(key.direct),old_pools.get(key.partner)){
+                    old_entries.insert((t.settlement,t.target,a.address,b.address),entry);
+                }
+            }
+        }
+        let Some(plan)=state.plan.as_ref()else{return;};
+        for (i,top) in plan.compact_topologies.iter().enumerate(){
+            if top.kind==SignalRouteKind::Direct2{
+                self.topology.insert((top.settlement,top.target),i);
+            }
+        }
+        let mut reused=0_u64;let mut recomputed=0_u64;
+        for (&(a,b),ids) in &state.pair_pools{
+            for (settlement,target) in [(a,b),(b,a)]{
+                let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
+                for &direct in ids{
+                    for &partner in ids{
+                        if direct==partner{continue;}
+                        let key=Key{topology,direct,partner};
+                        let stable=(settlement,target,state.pools[direct].address,
+                            state.pools[partner].address);
+                        let previous=old_entries.remove(&stable);
+                        if let Some(mut entry)=previous{
+                            let current=witness(state,key).and_then(|w|
+                                state.source_fingerprint(&w,params));
+                            if current.is_some() && current==entry.fingerprint{
+                                if let Some(mut rank)=entry.rank{
+                                    rank.key=key;
+                                    self.ready.insert(rank);
+                                    entry.rank=Some(rank);
+                                }
+                                self.entries.insert(key,entry);
+                                reused+=1;
+                                continue;
+                            }
+                        }
+                        recomputed+=1;
+                        self.refresh_one(state,params,key,report,trigger.clone(),false);
+                    }
+                }
+            }
+        }
+        report.cp21a1_catalog_reused+=reused;
+        report.cp21a1_catalog_recomputed+=recomputed;
+        report.cp21a1_catalog_reindexed+=1;
+        if entered==0 && removed==0 {report.cp21a1_catalog_unchanged+=1;}
+        report.cp21s_entries=self.entries.len();
+        report.cp21s_pending_peak=report.cp21s_pending_peak.max(self.ready.len());
+        timeline::emit(self.journal.as_ref(),json!({
+            "schema":1,"kind":"catalog_reconciliation",
+            "at_us":now_us(),"graph_generation":state.generation,
+            "revision":state.revision,"entered":entered,"exited":removed,
+            "retained_pools":old_addresses.intersection(&current_addresses).count(),
+            "total_pools":state.pools.len(),"pairs_reused":reused,
+            "pairs_recomputed":recomputed,
+            "pending_preserved":self.ready.len()
+        }),report);
+    }
     fn reset(&mut self,state:&State,params:&ExecutionParameters,
         report:&mut Report,trigger:Arc<SignalTrigger>){
         self.topology.clear();self.entries.clear();self.ready.clear();
