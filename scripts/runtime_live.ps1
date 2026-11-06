@@ -293,6 +293,23 @@ try {
             throw 'Execution summary/event counts differ.'
         }
     }
+    if ($SimulateV10 -and $env:GRAPH_CP21S_A1_TIMELINE -eq 'true') {
+        $timelinePath = Join-Path $folder 'economic_timeline.jsonl'
+        $timelineSummaryPath = Join-Path $folder 'economic_timeline_analysis.json'
+        if (-not (Test-Path -LiteralPath $timelinePath)) {
+            throw "CP21S-A.1 timeline missing; inspect $folder"
+        }
+        & python (Join-Path $PSScriptRoot 'analyze_cp21a1_timeline.py') `
+            --timeline $timelinePath --output $timelineSummaryPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "CP21S-A.1 timeline incomplete or malformed; inspect $timelineSummaryPath"
+        }
+        $timelineSummary = Read-OptionalJson $timelineSummaryPath
+        if ([long]$timelineSummary.counts.total -ne
+            [long]$execution.execution_candidates.cp21a1_timeline_written) {
+            throw "CP21S-A.1 timeline count mismatch; inspect $timelineSummaryPath"
+        }
+    }
     $production = Read-OptionalJson $producerPath
     $refreshRecord = Select-String -LiteralPath $log -Pattern 'lifecycle stats final=true .*? prepared_refreshes=(\d+)' | Select-Object -Last 1
     $refreshes = if ($null -ne $refreshRecord) { [long]$refreshRecord.Matches[0].Groups[1].Value } else { 0 }
