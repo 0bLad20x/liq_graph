@@ -439,6 +439,43 @@ mod tests {
     }
 
     #[test]
+    fn cp21s_a_50k_cpmm_economic_updates_profile_real_forecaster() {
+        let mut buy=observed("raydium_cpmm_directional_v1",
+            [dir(WSOL,USDC,vec![]),dir(USDC,WSOL,vec![])],
+            Some(CpmmQuoteSnapshot{
+                mint_0:WSOL.into(),mint_1:USDC.into(),
+                reserve_0_raw:10_000_000_000,reserve_1_raw:1_100_000_000,
+                trade_fee_rate:2500,creator_fee_rate:0,
+                creator_fee_on_input_0_to_1:true,creator_fee_on_input_1_to_0:true}),
+            None,fee("cpmm",0.0,0.0));
+        let sell=observed("raydium_cpmm_directional_v1",
+            [dir(USDC,WSOL,vec![]),dir(WSOL,USDC,vec![])],
+            Some(CpmmQuoteSnapshot{
+                mint_0:USDC.into(),mint_1:WSOL.into(),
+                reserve_0_raw:1_000_000_000,reserve_1_raw:10_000_000_000,
+                trade_fee_rate:2500,creator_fee_rate:0,
+                creator_fee_on_input_0_to_1:true,creator_fee_on_input_1_to_0:true}),
+            None,fee("cpmm",0.0,0.0));
+        let params=ExecutionParameters::default();
+        let mut elapsed=Vec::with_capacity(50_000);
+        let mut modeled=0_u64;
+        for i in 0..50_000_u64 {
+            // Every event changes reserve state, so no memoized same-snapshot
+            // shortcut can hide predictor performance.
+            let q=buy.liquidity.as_mut().unwrap();
+            Arc::make_mut(q).cpmm_quote.as_mut().unwrap().reserve_1_raw=
+                1_100_000_000+i%10_001;
+            let begin=std::time::Instant::now();
+            let score=pair_gain(&buy,&sell,WSOL,USDC,&params);
+            elapsed.push(begin.elapsed().as_nanos() as u64);
+            modeled+=u64::from(score.is_some());
+        }
+        elapsed.sort_unstable();
+        assert_eq!(modeled,50_000);
+        eprintln!("CP21S-A 50,000 real CPMM amount-aware quotes: p50={}ns p95={}ns p99={}ns",
+            elapsed[25_000],elapsed[47_500],elapsed[49_500]);
+    }
+    #[test]
     fn cp20_dlmm_crosses_bins_and_freezes_current_dynamic_fee() {
         let obs=observed("dlmm_execution_window_v2",
             [dir("S","T",vec![bin(0,2,10,100_000_000),
