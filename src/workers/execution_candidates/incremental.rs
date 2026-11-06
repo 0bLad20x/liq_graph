@@ -357,6 +357,14 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                         continue;
                     }
                 };
+                // A newer State/Candidate/Evaluated event arrived while the
+                // packet was being constructed. Do not run the amount-proof
+                // accountant or dispatch a possibly stale V10 packet; retain
+                // the ranked pair until the newer observation is applied.
+                if !input.is_empty(){
+                    report.cp21s_preempted_for_new_market_state+=1;
+                    break;
+                }
                 let fingerprint=selection.packed_state_fingerprint();
                 let familiar=scheduler.packs.classify(fingerprint.as_deref(),started);
                 if familiar.deferred(){
