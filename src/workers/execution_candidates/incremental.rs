@@ -226,44 +226,88 @@ impl Index {
         trigger:Arc<SignalTrigger>,allow_schedule:bool){
         report.cp21s_pair_refreshes+=1;
         let Some(w)=witness(state,key)else{
+            let reason=pair_unavailable_reason(state,key);
             report.cp21s_unpriced+=1;
+            *report.cp21a1_unpriced_reasons.entry(format!("{}:{reason}",
+                if allow_schedule{"live"}else{"catalog_or_warmup"})).or_default()+=1;
             if let Some(old)=self.entries.remove(&key){
                 if let Some(rank)=old.rank{self.ready.remove(&rank);}
                 report.cp21s_state_superseded+=1;
             }
+            self.trace(state,key,"unpriced",reason,None,None,None,
+                trigger.as_ref(),None,report);
             return;
         };
         let started=Instant::now();
-        let score=state.economic_score(&w,params);
+        let estimate=economic::witness_estimate(&w,params);
+        let score=estimate.map(|v|v.0);
+        let input_raw=estimate.map(|v|v.1);
+        let output_raw=estimate.map(|v|v.2);
+        let gross_raw=estimate.map(|v|v.3);
         report.cp21s_score_timing.record(elapsed_ns(started));
+        if w.estimated_net_return_bps.is_none(){
+            report.cp21a1_missing_marginal_scored+=1;
+            if score.is_some_and(|n|n>0){
+                report.cp21a1_missing_marginal_positive+=1;
+            }
+        }
+        let reason=if score.is_none(){pair_unavailable_reason(state,key)}
+            else if w.estimated_net_return_bps.is_none(){"marginal_unknown_economic_available"}
+            else{"economic_model_available"};
         match score{
             Some(n) if n>0=>report.cp21s_model_positive+=1,
             Some(_)=>report.cp21s_model_nonpositive+=1,
-            None=>report.cp21s_model_unknown+=1,
+            None=>{
+                report.cp21s_model_unknown+=1;
+                *report.cp21a1_model_unknown_reasons.entry(format!("{}:{reason}",
+                    if allow_schedule{"live"}else{"catalog_or_warmup"})).or_default()+=1;
+            },
         }
         let fingerprint=state.source_fingerprint(&w,params);
         let old=self.entries.remove(&key);
-        if let Some(previous)=&old{
+        if let Some(mut previous)=old{
             if previous.fingerprint.is_some() && previous.fingerprint==fingerprint
                 && previous.net==score {
                 report.cp21s_identical_state_reuses+=1;
-                self.entries.insert(key,previous.clone());
+                // CP21S-A bugfix: an unchanged baseline quote was previously
+                // not schedulable on its first live update because rank=None.
+                if allow_schedule && previous.rank.is_none() &&
+                    (score.is_some_and(|n|n>0) ||
+                     (score.is_none() && w.estimated_net_return_bps.is_some()
+                         && w.log_sum_units<state.threshold)) {
+                    let (category,priority)=economic::priority_key(score);
+                    let rank=Rank{category,score:priority,key};
+                    self.ready.insert(rank);previous.rank=Some(rank);
+                    previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
+                    previous.pipeline=state.price_pipeline;
+                }
+                let action=if previous.rank.is_some(){"retained_ready"}else{"retained"};
+                self.entries.insert(key,previous);
+                self.trace(state,key,action,reason,score,input_raw,gross_raw,
+                    trigger.as_ref(),None,report);
                 return;
             }
             if let Some(rank)=previous.rank{self.ready.remove(&rank);}
             report.cp21s_state_superseded+=1;
         }
         let rank=if allow_schedule && (score.is_some_and(|value|value>0)
-            || (score.is_none() && w.log_sum_units<state.threshold)){
-            let (category,score)=economic::priority_key(score);
-            let rank=Rank{category,score,key};
+            || (score.is_none() && w.estimated_net_return_bps.is_some()
+                && w.log_sum_units<state.threshold)){
+            let (category,priority)=economic::priority_key(score);
+            let rank=Rank{category,score:priority,key};
             self.ready.insert(rank);
             Some(rank)
         }else{None};
+        let action=if rank.is_some(){"queued"}else if score.is_none(){"model_unknown"}
+            else if score.is_some_and(|n|n<=0){"nonpositive"}else{"baseline"};
         self.entries.insert(key,Entry{
-            net:score,fingerprint,rank,revision:state.revision,
-            trigger,ready_us:state.ready_at_us,pipeline:state.price_pipeline,
+            net:score,input_raw,output_raw,gross_raw,
+            fingerprint,rank,revision:state.revision,
+            trigger:trigger.clone(),ready_us:state.ready_at_us,
+            pipeline:state.price_pipeline,
         });
+        self.trace(state,key,action,reason,score,input_raw,gross_raw,
+            trigger.as_ref(),None,report);
     }
     fn best(&self)->Option<Rank>{self.ready.first().copied()}
     fn pop(&mut self,key:Key){
