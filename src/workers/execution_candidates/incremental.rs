@@ -501,8 +501,10 @@ mod tests{
             })));
         }
         state.pair_pools.insert((a,b),(0..n).collect());
-        (state,Arc::new(SignalTrigger::Price{pool:state.pools[0].address,
-            sequence:1,origin:PriceOrigin::Websocket,received_at_us:10}))
+        let first_pool=state.pools[0].address;
+        let trigger=Arc::new(SignalTrigger::Price{
+            pool:first_pool,sequence:1,origin:PriceOrigin::Websocket,received_at_us:10});
+        (state,trigger)
     }
     #[test]
     fn cp21s_a_real_pair_index_matches_full_cpmm_recalculation_after_change(){
