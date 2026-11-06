@@ -42,6 +42,7 @@ struct Index {
     ready:BTreeSet<Rank>,
     dispatched:u64,
     journal:Option<SyncSender<Value>>,
+    watched:HashSet<Pubkey>,
 }
 fn directions(pool:&SignalPool,a:Pubkey,b:Pubkey,id:usize)->Option<usize>{
     if pool.mint_a==a&&pool.mint_b==b {Some(2*id)}
@@ -189,6 +190,45 @@ impl Index {
             "request_id":request_id,
         }),report);
     }
+    /// Exact selection sets from MarketState, not inferred from the graph
+    /// catalog or from which pools happened to receive price observations.
+    fn record_selection(&mut self,state:&State,selected:&[String],
+        report:&mut Report)->Result<()>{
+        let current=selected.iter().map(|s|s.parse::<Pubkey>()
+            .with_context(||format!("invalid MarketState selected pool {s}")))
+            .collect::<Result<HashSet<_>>>()?;
+        for address in current.difference(&self.watched){
+            let pool=state.pools.iter().find(|p|p.address==*address);
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"watchset","action":"entered",
+                "layer":"market_state_selected_not_ws_ack",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"slot":null,
+                "pool":address.to_string(),
+                "mint_a":pool.map(|p|p.mint_a.to_string()),
+                "mint_b":pool.map(|p|p.mint_b.to_string())
+            }),report);
+        }
+        for address in self.watched.difference(&current){
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"watchset","action":"exited",
+                "layer":"market_state_selected_not_ws_ack",
+                "at_us":now_us(),"graph_generation":state.generation,
+                "revision":state.revision,"slot":null,
+                "pool":address.to_string()
+            }),report);
+        }
+        timeline::emit(self.journal.as_ref(),json!({
+            "schema":1,"kind":"watchset_snapshot",
+            "layer":"market_state_selected_not_ws_ack",
+            "at_us":now_us(),"graph_generation":state.generation,
+            "revision":state.revision,"selected_count":current.len(),
+            "changed_by_set_diff":self.watched.symmetric_difference(&current).count()
+        }),report);
+        self.watched=current;
+        Ok(())
+    }
+
     /// Reconcile a new graph generation using stable on-chain pool addresses.
     /// Preserve the economic score AND pending V10 priority when the frozen
     /// account fingerprint is identical. Different IDs/order no longer force
@@ -225,6 +265,7 @@ impl Index {
         }
         let old=std::mem::take(self);
         self.journal=old.journal.clone();
+        self.watched=old.watched.clone();
         let old_addresses=old_pools.iter().map(|p|p.address).collect::<HashSet<_>>();
         let current_addresses=state.pools.iter().map(|p|p.address).collect::<HashSet<_>>();
         let mut entered=0_u64;let mut removed=0_u64;
@@ -232,8 +273,8 @@ impl Index {
             if old_addresses.contains(&pool.address){continue;}
             entered+=1;
             timeline::emit(self.journal.as_ref(),json!({
-                "schema":1,"kind":"watchset","action":"entered",
-                "layer":"graph_signal_catalog_not_ws_ack",
+                "schema":1,"kind":"catalog_pool","action":"entered",
+                "layer":"graph_signal_catalog",
                 "at_us":now_us(),"graph_generation":state.generation,
                 "revision":state.revision,"pool":pool.address.to_string(),
                 "mint_a":pool.mint_a.to_string(),"mint_b":pool.mint_b.to_string(),
@@ -245,8 +286,8 @@ impl Index {
             if current_addresses.contains(&pool.address){continue;}
             removed+=1;
             timeline::emit(self.journal.as_ref(),json!({
-                "schema":1,"kind":"watchset","action":"exited",
-                "layer":"graph_signal_catalog_not_ws_ack",
+                "schema":1,"kind":"catalog_pool","action":"exited",
+                "layer":"graph_signal_catalog",
                 "at_us":now_us(),"graph_generation":state.generation,
                 "revision":state.revision,"pool":pool.address.to_string()
             }),report);
@@ -522,6 +563,9 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             resume_pending=allow_dispatch;
                         }
                         state.apply(s,report.awaiting_snapshot,&mut report.preparation)?;
+                        if let Some(selected)=&s.selected_watch_pools{
+                            index.record_selection(&state,selected,&mut report)?;
+                        }
                         if let Some(snapshot)=&s.snapshot{
                             report.catalog_snapshots+=1;
                             report.catalog_snapshot_candidates+=snapshot.candidates.len() as u64;
