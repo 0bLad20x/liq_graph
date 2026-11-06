@@ -1000,7 +1000,10 @@ impl State {
             cp9d_source:"fresh",cp9d_pair_index:0,graph_generation:self.generation,revision:self.revision,
             topology_id:Some(c.topology_id),route_kind:top.kind,target:top.target,reverse:c.reverse,
             trigger,candidate:Some(c.clone()),threshold_units:threshold,
-            estimated_net_return_bps:estimated_net_return_bps.is_finite().then_some(estimated_net_return_bps),
+            estimated_net_return_bps:(
+                (!cfg.cp21s_full_incremental || witness.estimated_net_return_bps.is_some())
+                    && estimated_net_return_bps.is_finite()
+            ).then_some(estimated_net_return_bps),
             pools:pools.into_iter().map(|(_,e)|e).collect(),packing,
             signal_ready_at_us:self.ready_at_us,candidate_received_at_us:self.received_at_us,
             request_ready_at_us:ready,price_pipeline:self.price_pipeline,
