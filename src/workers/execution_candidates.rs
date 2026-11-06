@@ -3,6 +3,7 @@
 mod amounts;
 mod economic;
 mod scheduling;
+mod incremental;
 #[cfg(test)]
 mod amounts_reference;
 #[cfg(test)]
@@ -33,6 +34,8 @@ pub struct Settings {
     /// CP9C: independent alternative-packing strategies for the same signal revision.
     strategies:Vec<PackingStrategy>,
     pub cp9d_max_pairs:usize,
+    /// CP21S-A only: full incremental Direct2 evaluation; legacy modes unchanged.
+    pub cp21s_full_incremental:bool,
     /// CP20S: zero disables repeat scheduling (and all legacy modes bypass it).
     pub cp20s_recheck_seconds:u64,
     /// Public typed packing boundary, supplied by orchestration. Never a signer.
@@ -70,8 +73,17 @@ impl Settings {
             .context("invalid GRAPH_CP20S_RECHECK_SECONDS")?;
         ensure!(cp20s_recheck_seconds<=3600,
             "GRAPH_CP20S_RECHECK_SECONDS must be 0..=3600");
+        let cp21s_full_incremental=match env::var("GRAPH_CP21S_INCREMENTAL_SIGNALS").as_deref() {
+            Ok("true"|"1")=>true,Ok("false"|"0")|Err(_)=>false,
+            Ok(value)=>bail!("GRAPH_CP21S_INCREMENTAL_SIGNALS must be true/false, got {value}"),
+        };
+        ensure!(!cp21s_full_incremental ||
+            (strategies==[PackingStrategy::Economic]
+                && routes.contains(SignalRouteKind::Direct2)
+                && routes.names()==["direct2"]),
+            "CP21S-A requires Direct2-only Economic packing");
         Ok(Self {wallet,parameters,limit,routes,strategies,cp9d_max_pairs,
-            cp20s_recheck_seconds,capacity})
+            cp21s_full_incremental,cp20s_recheck_seconds,capacity})
     }
     fn accepts(&self,kind:SignalRouteKind)->bool {
         self.routes.contains(kind)
@@ -205,6 +217,18 @@ pub struct Report {
     pub cp20s_recent_fresh_deferred:u64,pub cp20s_recent_active_deferred:u64,
     pub cp20s_repeated_packs_deferred:u64,pub cp20s_new_packs:u64,
     pub cp20s_recheck_packs:u64,pub cp20s_unknown_fingerprint_packs:u64,
+    pub cp21s_updates:u64,pub cp21s_pair_refreshes:u64,
+    pub cp21s_model_positive:u64,pub cp21s_model_nonpositive:u64,
+    pub cp21s_model_unknown:u64,pub cp21s_unpriced:u64,
+    pub cp21s_identical_state_reuses:u64,pub cp21s_entries:usize,
+    pub cp21s_pending_peak:usize,pub cp21s_pending_at_shutdown:usize,
+    pub cp21s_queue_full_retries:u64,pub cp21s_evidence_full_retries:u64,
+    pub cp21s_preempted_for_new_market_state:u64,
+    pub cp21s_state_superseded:u64,
+    pub cp21s_seed_rejections:u64,pub cp21s_amount_exclusions:u64,
+    pub cp21s_cooldowns:u64,pub cp21s_no_signal_updates:u64,
+    pub cp21s_dispatched:u64,pub cp21s_score_timing:Timing,
+    pub cp21s_refresh_timing:Timing,pub cp21s_drain_timing:Timing,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -515,7 +539,18 @@ impl State {
     }
     fn amount_universe(&self,top:&SignalTopology,registry:&PoolRegistry,wallet:Pubkey,reads:&mut RegistryReads)->Vec<amounts::Input> {
         let mints=top.roles[..top.length].iter().flat_map(|&(a,b)|[a,b]).collect::<HashSet<_>>();
-        self.pools.iter().enumerate().filter_map(|(id,p)|{
+        // CP21S-A: Direct2 amount proofs must not re-scan the entire
+        // WatchCatalog on each possibly excluded economic candidate.
+        // Reuse the existing canonical pair identity index; other route
+        // shapes retain their original broader universe semantics.
+        let ids:Box<dyn Iterator<Item=usize>+'_>=if top.kind==SignalRouteKind::Direct2{
+            let key=(top.settlement.min(top.target),top.settlement.max(top.target));
+            Box::new(self.pair_pools.get(&key).into_iter().flat_map(|v|v.iter().copied()))
+        }else{
+            Box::new(0..self.pools.len())
+        };
+        ids.filter_map(|id|{
+            let p=self.pools.get(id)?;
             if !mints.contains(&p.mint_a)||!mints.contains(&p.mint_b){return None;}
             let mut input=self.amount_input(id,false)?;
             let (state,wait,hold)=registry.measured_get(p.address);reads.record(wait,hold);
@@ -558,6 +593,12 @@ impl State {
                     "trigger":selection.trigger,"source_witness":candidate.witness
                 }));return Ok(None);
             }
+            // CP21S-A's economic result belongs to one exact directed
+            // pair. The legacy amount-seed repair may substitute a DIFFERENT
+            // pair, which would invalidate that score and its calibration.
+            // Preserve the exact candidate; conservative amount exclusions
+            // still apply, and are accounted for explicitly.
+            if !cfg.cp21s_full_incremental {
             let repair_started=Instant::now();
             let witness=candidate.witness.as_ref().context("quantity witness missing")?;
             let pairs=witness.legs.iter().map(|l|(l.input_mint.to_string(),l.output_mint.to_string())).collect::<Vec<_>>();
@@ -578,6 +619,7 @@ impl State {
                 }
             }
             preparation.cp11_seed_repair_ns.record(elapsed_ns(repair_started));
+            }
             // Unknown alternatives do not change the proof for this packed set.
             // Only an actually rebuilt, re-assessed request can replace it.
             if assessment.decision==amounts::Decision::Excluded {
@@ -738,7 +780,8 @@ impl State {
         ensure!(c.change!=SignalRangeChange::Exited,"cannot pack exited candidate");
         let witness=c.witness.as_ref().context("compact candidate witness missing")?;
         ensure!(witness.legs.len()==top.length
-            &&witness.log_sum_units<threshold,"invalid compact candidate length/score");
+            &&(witness.log_sum_units<threshold || cfg.cp21s_full_incremental),
+            "invalid compact candidate length/score");
         let role=|index:usize|->&'static str{
             match top.kind {
                 SignalRouteKind::Direct2=>if index==0{"direct"}else{"partner"},
@@ -780,7 +823,8 @@ impl State {
         }
         let seed_sum=slots.iter().try_fold(0_i128,|sum,(slot,_)|Ok::<_,anyhow::Error>(sum+i128::from(self.weight(*slot).context("seed net weight unavailable")?)))?;
         let seed_sum=i64::try_from(seed_sum).context("seed net sum overflow")?;
-        ensure!(seed_sum<threshold,"quantity seed is not net qualified");
+        ensure!(seed_sum<threshold || cfg.cp21s_full_incremental,
+            "quantity seed is not net qualified");
         let mut request=ExecutionRequest{id:format!("graph-{}-{}-{number}",self.generation,self.revision),
             wallet:cfg.wallet,settlement:top.settlement,groups:Vec::new(),conversion:None,
             parameters:cfg.parameters.clone()};
@@ -801,6 +845,9 @@ impl State {
         // Only direct/partner roles accept parallel alternatives in the current
         // V10 group contract. Intermediate/conversion remain the best chosen pool.
         for (i,&(selected,role_name)) in slots.iter().enumerate(){
+            // CP21S-A submits the exact evaluated pair: unrelated greedy
+            // alternatives cannot silently change the economic signal.
+            if cfg.cp21s_full_incremental && strategy==PackingStrategy::Economic {continue;}
             if role_name!="direct"&&role_name!="partner"{continue;}
             let target=self.pools.get(selected/2).context("candidate identity missing")?;
             let (a,b)=(target.mint_a,target.mint_b);
@@ -989,6 +1036,9 @@ fn install_compact(request:&mut ExecutionRequest,top:&SignalTopology,
 
 pub async fn run(mut input:SignalStream, registry:PoolRegistry, output:mpsc::Sender<ExecutionRequest>,
     evidence:mpsc::Sender<EvidenceItem>, cfg:Settings)->Result<Report> {
+    if cfg.cp21s_full_incremental {
+        return incremental::run(input,registry,output,evidence,cfg).await;
+    }
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()}; let mut state=State::default(); let mut sequence=0;
     // Small per-run history, independent of authoritative MarketState. A fresh
     // run starts with no prior dispatches, and no V10 worker reads this cache.

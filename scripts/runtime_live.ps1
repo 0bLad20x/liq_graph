@@ -229,6 +229,8 @@ try {
         v10_simulation_parallelism=$V10Parallelism
         cp9c_packing_mode=$CP9CPackingMode.ToLowerInvariant()
         cp9d_max_distinct_pairs=$CP9DMaxPairs
+        cp21s_full_incremental=($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -in @('true','1'))
+        cp21s_legacy_pair_limit_applied=($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -notin @('true','1'))
         require_catalog_reconciliation=[bool]$RequireCatalogReconciliation
         completion_pool_limit=0; completion_refresh_seconds=$CompletionRefreshSeconds
         completion_recheck_seconds=$CompletionRecheckSeconds
@@ -238,7 +240,12 @@ try {
     $checkout | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $folder 'checkout.json') -Encoding UTF8
     Write-Host "Output: $folder"
     Write-Host "Pipeline=runtime completion_refresh=true stage=$Stage simulation=$([bool]$SimulateV10) broadcasts=false"
-    if ($signals) { Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 routes=$($plan.enabled_routes -join ',') packing=$CP9CPackingMode cp9d_max_pairs=$CP9DMaxPairs" }
+    if ($signals) {
+        $cp21s = ($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -in @('true','1'))
+        $sourcePolicy = if ($cp21s) { 'complete_incremental_direct2 (legacy source limits ignored)' }
+            else { "legacy_cp9d_max_pairs=$CP9DMaxPairs" }
+        Write-Host "Signals: marginal_dex_net threshold_bps=$ThresholdBps gross_fallback=false direction_notional=$MinDirectionNotionalUsd USD mode=$DirectionLiquidityMode fixed_SOL_USD=100 routes=$($plan.enabled_routes -join ',') packing=$CP9CPackingMode source_policy=$sourcePolicy"
+    }
     Write-Host "Pool TVL minimum=$MinPoolTvlUsd USD, PumpSwap exempt; detail samples <= $ExecutionDetailLimit"
     Write-Host "Protocols=$($plan.enabled_venues -join ',') completion_workers=$(@($plan.completion_protocols).Count)"
     if ($RequirePreparedEvidence -and @($plan.enabled_venues | Where-Object { $_ -notin @('meteora_dlmm','pumpswap') }).Count -gt 0) {
@@ -609,6 +616,10 @@ try {
     if (-not $orchestrationPassed) { throw "Orchestrierungsnachweis unvollstaendig; Details: $folder" }
     Write-Host "Orchestrierungsnachweis bestanden. Artefakte: $folder"
     if ($SimulateV10) {
+        if ($env:GRAPH_CP21S_INCREMENTAL_SIGNALS -in @('true','1')) {
+            $worker = $execution.execution_candidates
+            Write-Host "CP21S-A: market_updates=$($worker.cp21s_updates) evaluated_directed_pairs=$($worker.cp21s_pair_refreshes) current_pairs=$($worker.cp21s_entries) pending_at_shutdown=$($worker.cp21s_pending_at_shutdown) request_count=$($worker.cp21s_dispatched) queue_full_retries=$($worker.cp21s_queue_full_retries) lost_events=$($worker.lost_events)"
+        }
         Write-Host "V10: Uebergabe an Simulation nachgewiesen; erfolgreiche Simulationen=$($execution.simulation_successes), fehlgeschlagene=$($execution.simulation_failures), DEX-Aufrufberichte=$($execution.simulation_dex_calls_observed)."
         Write-Host 'Erfolgreiche Handelsausfuehrung und Profitabilitaet bleiben gesondert nachzuweisen (CP8).'
     } else {
