@@ -312,6 +312,18 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Err(mpsc::error::TrySendError::Closed(_))=>
                         bail!("V10 request receiver stopped"),
                 };
+                // Reserve audit capacity BEFORE preparing/sending a V10
+                // request. A transient slow journal must not crash the worker
+                // or make request/report delivery incomplete.
+                let evidence_permit=match evidence.try_reserve(){
+                    Ok(p)=>p,
+                    Err(mpsc::error::TrySendError::Full(_))=>{
+                        report.cp21s_evidence_full_retries+=1;
+                        break;
+                    },
+                    Err(mpsc::error::TrySendError::Closed(_))=>
+                        bail!("CP21S-A evidence writer stopped"),
+                };
                 let key=rank.key;
                 let Some(entry)=index.entries.get(&key).cloned()else{
                     index.ready.remove(&rank);continue;
@@ -392,9 +404,7 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 report.preparation.round_work_ns.record(elapsed_ns(started));
                 report.cp21s_drain_timing.record(elapsed_ns(started));
                 let request=selection.request.clone();
-                evidence.try_send(EvidenceItem::Selection(Box::new(selection)))
-                    .map_err(|e|anyhow::anyhow!(
-                        "CP21S-A V10 evidence queue unavailable (nonblocking): {e}"))?;
+                evidence_permit.send(EvidenceItem::Selection(Box::new(selection)));
                 permit.send(request);
                 report.request_count+=1;
                 scheduler.packs.record(fingerprint,Instant::now());
