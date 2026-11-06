@@ -447,12 +447,17 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
     cfg:Settings)->Result<Report>{
     let mut report=Report{score_basis:SIGNAL_SCORE_BASIS,..Default::default()};
     let mut state=State::default();
-    let mut index=Index::default();
+    let timeline=timeline::open()?;
+    let sender=timeline.as_ref().map(|writer|writer.sender());
+    let mut index=Index{journal:sender.clone(),..Default::default()};
     let mut scheduler=scheduling::Scheduler::new(Duration::from_secs(cfg.cp20s_recheck_seconds));
     let mut sequence=0_u64;
     let mut evaluation_pending=false;
     let mut changed=Vec::<usize>::new();
     let mut reset=false;
+    let mut prior_catalog:Option<(Vec<SignalPool>,Vec<Option<Arc<SignalPoolPrice>>>,
+        Option<Arc<SignalPlan>>) >=None;
+    let mut resume_pending=false;
     let mut allow_dispatch=false;
     let mut ticker=tokio::time::interval(Duration::from_millis(5));
     let mut distinct_pairs=HashSet::<(Pubkey,Pubkey)>::new();
@@ -471,8 +476,10 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Err(broadcast::error::RecvError::Closed)=>break,
                     Err(broadcast::error::RecvError::Lagged(n))=>{
                         report.lost_events+=n;report.awaiting_snapshot=true;
-                        state=State::default();index=Index::default();
-                        changed.clear();evaluation_pending=false;allow_dispatch=false;
+                        state=State::default();
+                        index=Index{journal:sender.clone(),..Default::default()};
+                        changed.clear();prior_catalog=None;resume_pending=false;
+                        evaluation_pending=false;allow_dispatch=false;
                         crate::log_event!(Warn,
                             "CP21S-A signal stream lagged={n}; awaiting authoritative snapshot");
                         continue;
@@ -493,6 +500,11 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     SignalEvent::State(s)=>{
                         report.state_updates+=1;
                         ensure!(!evaluation_pending,"state replaced before evaluation completed");
+                        if s.snapshot.is_some(){
+                            prior_catalog=Some((state.pools.clone(),state.prices.clone(),
+                                state.plan.clone()));
+                            resume_pending=allow_dispatch;
+                        }
                         state.apply(s,report.awaiting_snapshot,&mut report.preparation)?;
                         if let Some(snapshot)=&s.snapshot{
                             report.catalog_snapshots+=1;
@@ -501,7 +513,8 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                         }
                         if s.clear {
                             // WS gaps invalidate ALL earlier economic rankings.
-                            index=Index::default();
+                            index=Index{journal:sender.clone(),..Default::default()};
+                            prior_catalog=None;
                             reset=true;allow_dispatch=false;
                         }
                         changed=s.changes.iter().map(|x|x.pool_id).collect();
@@ -535,8 +548,14 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             }
                         }
                         if reset{
-                            index.reset(&state,&cfg.parameters,&mut report,e.trigger.clone());
-                            reset=false;
+                            if let Some((pools,prices,plan))=prior_catalog.take(){
+                                index.reconcile_snapshot(&pools,&prices,plan.as_ref(),
+                                    &state,&cfg.parameters,&mut report,e.trigger.clone());
+                                allow_dispatch=resume_pending&&!index.ready.is_empty();
+                            }else{
+                                index.reset(&state,&cfg.parameters,&mut report,e.trigger.clone());
+                            }
+                            reset=false;resume_pending=false;
                         }else if let SignalTrigger::Price{origin,..}=e.trigger.as_ref(){
                             // Even initialization/baseline observations MUST
                             // enter the index; only their V10 submission is
@@ -557,6 +576,8 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                                 &mut report,e.trigger.clone(),false);
                         }
                         changed.clear();
+                        report.cp21a1_live_index_last_active=index.entries.len();
+                        report.cp21a1_live_pending_last_active=index.ready.len();
                     }
                 }
                 if evaluation_pending{continue;}
@@ -706,6 +727,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
     report.cp21s_entries=index.entries.len();
     report.cp21s_pending_at_shutdown=index.ready.len();
     report.error=outcome.err().map(|e|format!("{e:#}"));
+    // Join the durable timeline writer only after ALL sender clones are gone.
+    index.journal=None;
+    drop(index);
+    drop(sender);
+    if let Some(writer)=timeline {
+        if let Err(error)=writer.finish(&mut report){
+            report.error=Some(format!("CP21S-A.1 timeline evidence failure: {error:#}"));
+        }
+    }
     report.cp10_capacity_phases=super::super::execution_v10::capacity_phase_profile();
     report.cp11_quantity_phases=amounts::phase_profile();
     crate::log_event!(Info,
