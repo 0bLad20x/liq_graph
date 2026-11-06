@@ -17,6 +17,9 @@ class CP21A1TimelineAuditTests(unittest.TestCase):
                  "pool": "POOL_A", "at_us": 100},
                 {"schema": 1, "kind": "watchset", "action": "entered",
                  "pool": "POOL_B", "at_us": 101},
+                {"schema": 1, "kind": "watchset_snapshot",
+                 "layer": "market_state_selected_not_ws_ack",
+                 "selected_count": 2, "at_us": 101},
                 {"schema": 1, "kind": "economic_pair", "action": "queued",
                  "direct_pool": "POOL_A", "partner_pool": "POOL_B",
                  "settlement": "WSOL", "target": "TOKEN", "at_us": 102,
@@ -31,7 +34,8 @@ class CP21A1TimelineAuditTests(unittest.TestCase):
             ]
             path.write_text("\n".join(json.dumps(x) for x in rows)+"\n")
             all_results = analyze(path)
-            self.assertEqual(all_results["counts"]["total"], 5)
+            self.assertEqual(all_results["counts"]["total"], 6)
+            self.assertTrue(all_results["watchset_membership_known"])
             self.assertEqual(all_results["watchset_active_at_end"], 1)
             self.assertEqual(all_results["missing_required_fields"], 0)
             filtered = analyze(path, pool="POOL_A")
@@ -40,6 +44,22 @@ class CP21A1TimelineAuditTests(unittest.TestCase):
                              "graph-1-1-1")
             self.assertEqual(len(analyze(path, pool="POOL_B",
                                          since_us=102)["filtered_events"]), 2)
+
+    def test_gap_does_not_silently_claim_selection_membership(self):
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/"gap.jsonl"
+            events=[
+                {"schema":1,"kind":"watchset","action":"entered",
+                 "pool":"A","at_us":1},
+                {"schema":1,"kind":"watchset_snapshot",
+                 "selected_count":1,"at_us":2},
+                {"schema":1,"kind":"watchset_uncertain",
+                 "action":"price_stream_clear","at_us":3},
+            ]
+            path.write_text("\n".join(json.dumps(e) for e in events)+"\n")
+            report=analyze(path)
+            self.assertFalse(report["watchset_membership_known"])
+            self.assertIsNone(report["watchset_active_at_end"])
 
     def test_bad_json_or_schema_fails_loudly(self):
         with tempfile.TemporaryDirectory() as root:
