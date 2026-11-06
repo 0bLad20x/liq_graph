@@ -13,7 +13,7 @@ const SELECTION:&[&str]=&["id","settlement","target","route_kind","reverse","gra
     "liquidity_checked","packing","request_ready_at_us","economic","packed_state_digest",
     "cp20s_schedule"];
 const REPORT:&[&str]=&["context_slot","provider","err","error_name","fee","unitsConsumed",
-    "balance_changes","trace_status","dex_call_count"];
+    "balance_changes","trace_status","dex_call_count","min_context_slot_requested"];
 const CALIBRATION:&[&str]=&["source_path_relation","seed_path_relation","trade_input_raw","trade_output_raw",
     "settlement_input_refund_raw","model_route_output_raw","model_route_unavailable_reason",
     "source_model_output_at_trade_input_raw","source_model_unavailable_reason",
@@ -24,7 +24,8 @@ const LEG:&[&str]=&["pool","program","venue","flow_status","input_mint","output_
     "snapshot_content_digest","snapshot_account_set_digest","observation_slot","component_slot_min","component_slot_max",
     "observation_age_at_request_us","observation_consistency","issues"];
 const TIMING:&[&str]=&["round_elapsed_ns","frame_to_request_us","signal_to_request_us","build_us",
-    "simulation_rpc_ms","elapsed_ms","trace_us","calibration_ns"];
+    "simulation_rpc_ms","elapsed_ms","trace_us","calibration_ns",
+    "v10_worker_received_at_us","rpc_sent_at_us","rpc_answer_at_us"];
 
 #[derive(Default,serde::Serialize)]
 pub(super) struct Summary {
@@ -86,7 +87,9 @@ impl Writer {
             .find_map(|line|line.split_once("Error Code: ").map(|(_,tail)|tail.split('.').next().unwrap_or(tail))));
         let report=json!({"context_slot":r.context_slot,"provider":r.provider,"err":sim["err"],
             "error_name":error_name,"fee":sim["fee"],"unitsConsumed":sim["unitsConsumed"],
-            "balance_changes":balances,"trace_status":r.trace.status,"dex_call_count":r.dex_invocations.len()});
+            "balance_changes":balances,"trace_status":r.trace.status,
+            "dex_call_count":r.dex_invocations.len(),
+            "min_context_slot_requested":r.min_context_slot_requested});
         // Without a DEX call there is no observed trade quantity to quote.
         let mut calibration=(!r.trace.calls.is_empty()).then(||s.calibration(&r));
         if let Some(calibration)=&mut calibration {
@@ -112,7 +115,9 @@ impl Writer {
         let timing=json!({"round_elapsed_ns":compact["round_elapsed_ns"],"frame_to_request_us":compact["frame_to_request_us"],
             "signal_to_request_us":compact["signal_to_request_us"],"build_us":r.build_us,
             "simulation_rpc_ms":r.simulation_rpc_ms,"elapsed_ms":r.elapsed_ms,"trace_us":r.trace_us,
-            "calibration_ns":calibration.as_ref().map_or(json!(0),|c|c["processing_ns"].clone())});
+            "calibration_ns":calibration.as_ref().map_or(json!(0),|c|c["processing_ns"].clone()),
+            "v10_worker_received_at_us":r.v10_worker_received_at_us,
+            "rpc_sent_at_us":r.rpc_sent_at_us,"rpc_answer_at_us":r.rpc_answer_at_us});
         self.stats.event_bytes+=jsonline(&mut self.events,&json!([hash,columns(SELECTION,&compact),
             columns(REPORT,&report),calibration.as_ref().map(|c|columns(CALIBRATION,c)),
             columns(TIMING,&timing)]))?;
