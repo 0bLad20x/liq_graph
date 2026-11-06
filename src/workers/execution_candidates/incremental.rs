@@ -595,6 +595,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Ok(p)=>p,
                     Err(mpsc::error::TrySendError::Full(_))=>{
                         report.cp21s_queue_full_retries+=1;
+                        if report.cp21s_queue_full_retries==1 {
+                            if let Some(rank)=index.best(){
+                                if let Some(e)=index.entries.get(&rank.key){
+                                    index.trace(&state,rank.key,"waiting","v10_queue_full",
+                                        e.net,e.input_raw,e.gross_raw,e.trigger.as_ref(),
+                                        None,&mut report);
+                                }
+                            }
+                        }
                         break;
                     },
                     Err(mpsc::error::TrySendError::Closed(_))=>
@@ -607,6 +616,15 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Ok(p)=>p,
                     Err(mpsc::error::TrySendError::Full(_))=>{
                         report.cp21s_evidence_full_retries+=1;
+                        if report.cp21s_evidence_full_retries==1{
+                            if let Some(rank)=index.best(){
+                                if let Some(e)=index.entries.get(&rank.key){
+                                    index.trace(&state,rank.key,"waiting","evidence_queue_full",
+                                        e.net,e.input_raw,e.gross_raw,e.trigger.as_ref(),
+                                        None,&mut report);
+                                }
+                            }
+                        }
                         break;
                     },
                     Err(mpsc::error::TrySendError::Closed(_))=>
@@ -617,6 +635,9 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     index.ready.remove(&rank);continue;
                 };
                 let Some(w)=witness(&state,key)else{
+                    index.trace(&state,key,"not_dispatched","price_missing_at_dispatch",
+                        entry.net,entry.input_raw,entry.gross_raw,entry.trigger.as_ref(),
+                        None,&mut report);
                     index.pop(key);
                     report.cp21s_unpriced+=1;
                     continue;
@@ -640,7 +661,11 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Err(e)=>{
                         report.cp21s_seed_rejections+=1;
                         report.skipped_invalid_seed+=1;
-                        report.last_rejection=Some(format!("{e:#}"));
+                        let message=format!("{e:#}");
+                        report.last_rejection=Some(message.clone());
+                        index.trace(&state,key,"not_dispatched",&message,
+                            entry.net,entry.input_raw,entry.gross_raw,
+                            entry.trigger.as_ref(),None,&mut report);
                         index.pop(key);
                         continue;
                     }
@@ -651,6 +676,9 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 // the ranked pair until the newer observation is applied.
                 if !input.is_empty(){
                     report.cp21s_preempted_for_new_market_state+=1;
+                    index.trace(&state,key,"waiting","new_market_state_preempts_pack",
+                        entry.net,entry.input_raw,entry.gross_raw,
+                        entry.trigger.as_ref(),None,&mut report);
                     break;
                 }
                 let fingerprint=selection.packed_state_fingerprint();
@@ -658,11 +686,17 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 if familiar.deferred(){
                     index.pop(key);
                     report.cp21s_cooldowns+=1;
+                    index.trace(&state,key,"not_dispatched","cp20s_frozen_state_cooldown",
+                        entry.net,entry.input_raw,entry.gross_raw,
+                        entry.trigger.as_ref(),None,&mut report);
                     continue;
                 }
                 let Some(mut selection)=state.assess_selection(selection,&registry,&cfg,
                     &mut reads,&mut report.amounts,&mut report.preparation)? else {
                     report.cp21s_amount_exclusions+=1;
+                    index.trace(&state,key,"not_dispatched","conservative_amount_exclusion",
+                        entry.net,entry.input_raw,entry.gross_raw,
+                        entry.trigger.as_ref(),None,&mut report);
                     index.pop(key);
                     continue;
                 };
@@ -699,9 +733,13 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 report.cp21s_dispatched+=1;
                 report.preparation.round_work_ns.record(elapsed_ns(started));
                 report.cp21s_drain_timing.record(elapsed_ns(started));
+                let request_id=selection.request.id.clone();
                 let request=selection.request.clone();
                 evidence_permit.send(EvidenceItem::Selection(Box::new(selection)));
                 permit.send(request);
+                index.trace(&state,key,"v10_submitted","economic_priority_selected",
+                    entry.net,entry.input_raw,entry.gross_raw,
+                    entry.trigger.as_ref(),Some(&request_id),&mut report);
                 report.request_count+=1;
                 scheduler.packs.record(fingerprint,Instant::now());
                 let source_fingerprint=state.source_fingerprint(source.witness.as_ref()
