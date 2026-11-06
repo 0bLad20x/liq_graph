@@ -130,7 +130,7 @@ impl Index {
     /// Every economic refresh and final scheduling decision is correlated
     /// by stable addresses, snapshot slots, UTC microseconds and revision.
     fn trace(&self,state:&State,key:Key,action:&'static str,
-        reason:&'static str,score:Option<i128>,input:Option<u64>,
+        reason:&str,score:Option<i128>,input:Option<u64>,
         gross:Option<i128>,trigger:&SignalTrigger,request_id:Option<&str>,
         report:&mut Report){
         let Some(sender)=self.journal.as_ref()else{return;};
@@ -162,11 +162,13 @@ impl Index {
             "frame_received_at_us":state.price_pipeline.map(|p|p.frame_received_at_us),
             "signal_ready_at_us":state.ready_at_us,
             "direct_marginal_known":state.prices.get(key.direct).and_then(Option::as_ref)
-                .and_then(|p|directions(&state.pools[key.direct],top.roles[0].0,
-                    top.roles[0].1,key.direct).and_then(|slot|p.log_weight_units[slot%2])).is_some(),
+                .and_then(|p|state.pools.get(key.direct).and_then(|pool|
+                    directions(pool,top.roles[0].0,top.roles[0].1,key.direct)
+                        .and_then(|slot|p.log_weight_units[slot%2]))).is_some(),
             "partner_marginal_known":state.prices.get(key.partner).and_then(Option::as_ref)
-                .and_then(|p|directions(&state.pools[key.partner],top.roles[1].0,
-                    top.roles[1].1,key.partner).and_then(|slot|p.log_weight_units[slot%2])).is_some(),
+                .and_then(|p|state.pools.get(key.partner).and_then(|pool|
+                    directions(pool,top.roles[1].0,top.roles[1].1,key.partner)
+                        .and_then(|slot|p.log_weight_units[slot%2]))).is_some(),
             "economic_score_usd_nano":score.map(|x|x.to_string()),
             "optimal_input_raw":input,
             "gross_gain_raw":gross.map(|x|x.to_string()),
