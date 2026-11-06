@@ -4,6 +4,7 @@ mod amounts;
 mod economic;
 mod scheduling;
 mod incremental;
+mod timeline;
 #[cfg(test)]
 mod amounts_reference;
 #[cfg(test)]
@@ -231,6 +232,16 @@ pub struct Report {
     pub cp21s_cooldowns:u64,pub cp21s_no_signal_updates:u64,
     pub cp21s_dispatched:u64,pub cp21s_score_timing:Timing,
     pub cp21s_refresh_timing:Timing,pub cp21s_drain_timing:Timing,
+    pub cp21a1_unpriced_reasons:BTreeMap<String,u64>,
+    pub cp21a1_model_unknown_reasons:BTreeMap<String,u64>,
+    pub cp21a1_missing_marginal_scored:u64,
+    pub cp21a1_missing_marginal_positive:u64,
+    pub cp21a1_catalog_reused:u64,pub cp21a1_catalog_recomputed:u64,
+    pub cp21a1_catalog_reindexed:u64,pub cp21a1_catalog_unchanged:u64,
+    pub cp21a1_live_index_last_active:usize,pub cp21a1_live_pending_last_active:usize,
+    pub cp21a1_timeline_emitted:u64,pub cp21a1_timeline_written:u64,
+    pub cp21a1_timeline_lost:u64,pub cp21a1_timeline_bytes:u64,
+    pub cp21a1_timeline_syncs:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
@@ -482,6 +493,11 @@ impl Report {
         ensure!(self.score_basis==SIGNAL_SCORE_BASIS,"execution candidate score basis differs from net contract");
         ensure!(self.lost_events==0 && !self.awaiting_snapshot,
             "execution candidate input delivery incomplete: lost={} awaiting_snapshot={}",self.lost_events,self.awaiting_snapshot);
+        ensure!(self.cp21a1_timeline_lost==0
+            && self.cp21a1_timeline_emitted==self.cp21a1_timeline_written,
+            "timeline journal incomplete: emitted={} written={} lost={}",
+            self.cp21a1_timeline_emitted,self.cp21a1_timeline_written,
+            self.cp21a1_timeline_lost);
         ensure!(self.amounts.attempts==self.amounts.possible+self.amounts.unknown+self.amounts.excluded
             && self.amounts.possible+self.amounts.unknown==self.request_count,
             "quantity decision accounting mismatch");
