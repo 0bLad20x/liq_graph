@@ -12,6 +12,8 @@
 //! CP20S's dedup remains a transient execution guard, not a discovery filter.
 use super::*;
 use std::collections::{BTreeSet,HashMap,HashSet};
+use std::sync::mpsc::SyncSender;
+use serde_json::{Value,json};
 use std::cmp::Reverse;
 use std::time::Duration;
 use crate::core::signals::SignalLeg;
@@ -23,6 +25,9 @@ struct Rank { category:u8,score:Reverse<i128>,key:Key }
 #[derive(Clone)]
 struct Entry {
     net:Option<i128>,
+    input_raw:Option<u64>,
+    output_raw:Option<u64>,
+    gross_raw:Option<i128>,
     fingerprint:Option<String>,
     rank:Option<Rank>,
     revision:u64,
@@ -36,6 +41,7 @@ struct Index {
     entries:HashMap<Key,Entry>,
     ready:BTreeSet<Rank>,
     dispatched:u64,
+    journal:Option<SyncSender<Value>>,
 }
 fn directions(pool:&SignalPool,a:Pubkey,b:Pubkey,id:usize)->Option<usize>{
     if pool.mint_a==a&&pool.mint_b==b {Some(2*id)}
@@ -121,6 +127,52 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
     "economic_model_quote_unavailable"
 }
 impl Index {
+    /// Every economic refresh and final scheduling decision is correlated
+    /// by stable addresses, snapshot slots, UTC microseconds and revision.
+    fn trace(&self,state:&State,key:Key,action:&'static str,
+        reason:&'static str,score:Option<i128>,input:Option<u64>,
+        gross:Option<i128>,trigger:&SignalTrigger,request_id:Option<&str>,
+        report:&mut Report){
+        let Some(sender)=self.journal.as_ref()else{return;};
+        let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(key.topology))else{return;};
+        let direct=state.pools.get(key.direct).map(|p|p.address.to_string());
+        let partner=state.pools.get(key.partner).map(|p|p.address.to_string());
+        let first=state.prices.get(key.direct).and_then(Option::as_ref)
+            .map(|p|p.observation.as_ref());
+        let second=state.prices.get(key.partner).and_then(Option::as_ref)
+            .map(|p|p.observation.as_ref());
+        let phase=if matches!(trigger,SignalTrigger::Catalog{..}){"catalog"}
+            else if matches!(trigger,SignalTrigger::Coverage{..}){"coverage"}
+            else{"price"};
+        timeline::emit(Some(sender),json!({
+            "schema":1,"kind":"economic_pair","phase":phase,"at_us":now_us(),
+            "graph_generation":state.generation,"revision":state.revision,
+            "trigger":trigger,"action":action,"reason":reason,
+            "settlement":top.settlement.to_string(),"target":top.target.to_string(),
+            "direct_pool":direct,"partner_pool":partner,
+            "direct_slot":first.map(|p|p.slot),"partner_slot":second.map(|p|p.slot),
+            "direct_component_slot_min":first.map(|p|p.component_slot_min),
+            "direct_component_slot_max":first.map(|p|p.component_slot_max),
+            "partner_component_slot_min":second.map(|p|p.component_slot_min),
+            "partner_component_slot_max":second.map(|p|p.component_slot_max),
+            "direct_received_at_us":first.map(|p|p.received_at_us),
+            "partner_received_at_us":second.map(|p|p.received_at_us),
+            "direct_component_received_at_us_min":first.map(|p|p.component_received_at_us_min),
+            "partner_component_received_at_us_min":second.map(|p|p.component_received_at_us_min),
+            "frame_received_at_us":state.price_pipeline.map(|p|p.frame_received_at_us),
+            "signal_ready_at_us":state.ready_at_us,
+            "direct_marginal_known":state.prices.get(key.direct).and_then(Option::as_ref)
+                .and_then(|p|directions(&state.pools[key.direct],top.roles[0].0,
+                    top.roles[0].1,key.direct).and_then(|slot|p.log_weight_units[slot%2])).is_some(),
+            "partner_marginal_known":state.prices.get(key.partner).and_then(Option::as_ref)
+                .and_then(|p|directions(&state.pools[key.partner],top.roles[1].0,
+                    top.roles[1].1,key.partner).and_then(|slot|p.log_weight_units[slot%2])).is_some(),
+            "economic_score_usd_nano":score.map(|x|x.to_string()),
+            "optimal_input_raw":input,
+            "gross_gain_raw":gross.map(|x|x.to_string()),
+            "request_id":request_id,
+        }),report);
+    }
     fn reset(&mut self,state:&State,params:&ExecutionParameters,
         report:&mut Report,trigger:Arc<SignalTrigger>){
         self.topology.clear();self.entries.clear();self.ready.clear();
