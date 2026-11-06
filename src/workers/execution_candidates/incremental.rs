@@ -542,6 +542,11 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     Err(broadcast::error::RecvError::Closed)=>break,
                     Err(broadcast::error::RecvError::Lagged(n))=>{
                         report.lost_events+=n;report.awaiting_snapshot=true;
+                        timeline::emit(sender.as_ref(),json!({
+                            "schema":1,"kind":"watchset_uncertain","action":"signal_stream_lag",
+                            "at_us":now_us(),"lost_events":n,
+                            "last_graph_generation":state.generation
+                        }),&mut report);
                         state=State::default();
                         index=Index{journal:sender.clone(),..Default::default()};
                         changed.clear();prior_catalog=None;resume_pending=false;
@@ -581,7 +586,13 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                             reset=true;allow_dispatch=false;
                         }
                         if s.clear {
-                            // WS gaps invalidate ALL earlier economic rankings.
+                            // A Gap invalidates observed prices. Do not claim
+                            // that earlier selections are known to remain live.
+                            timeline::emit(sender.as_ref(),json!({
+                                "schema":1,"kind":"watchset_uncertain",
+                                "action":"price_stream_clear","at_us":now_us(),
+                                "graph_generation":state.generation,"revision":state.revision
+                            }),&mut report);
                             index=Index{journal:sender.clone(),..Default::default()};
                             prior_catalog=None;
                             reset=true;allow_dispatch=false;
