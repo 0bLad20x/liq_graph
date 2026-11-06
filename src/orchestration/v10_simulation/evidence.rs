@@ -25,7 +25,8 @@ const LEG:&[&str]=&["pool","program","venue","flow_status","input_mint","output_
     "observation_age_at_request_us","observation_consistency","issues"];
 const TIMING:&[&str]=&["round_elapsed_ns","frame_to_request_us","signal_to_request_us","build_us",
     "simulation_rpc_ms","elapsed_ms","trace_us","calibration_ns",
-    "v10_worker_received_at_us","rpc_sent_at_us","rpc_answer_at_us"];
+    "v10_worker_received_at_us","rpc_call_started_at_us","rpc_call_completed_at_us",
+    "http_request_started_at_us","http_response_received_at_us"];
 
 #[derive(Default,serde::Serialize)]
 pub(super) struct Summary {
@@ -117,7 +118,10 @@ impl Writer {
             "simulation_rpc_ms":r.simulation_rpc_ms,"elapsed_ms":r.elapsed_ms,"trace_us":r.trace_us,
             "calibration_ns":calibration.as_ref().map_or(json!(0),|c|c["processing_ns"].clone()),
             "v10_worker_received_at_us":r.v10_worker_received_at_us,
-            "rpc_sent_at_us":r.rpc_sent_at_us,"rpc_answer_at_us":r.rpc_answer_at_us});
+            "rpc_call_started_at_us":r.rpc_call_started_at_us,
+            "rpc_call_completed_at_us":r.rpc_call_completed_at_us,
+            "http_request_started_at_us":r.http_request_started_at_us,
+            "http_response_received_at_us":r.http_response_received_at_us});
         self.stats.event_bytes+=jsonline(&mut self.events,&json!([hash,columns(SELECTION,&compact),
             columns(REPORT,&report),calibration.as_ref().map(|c|columns(CALIBRATION,c)),
             columns(TIMING,&timing)]))?;
