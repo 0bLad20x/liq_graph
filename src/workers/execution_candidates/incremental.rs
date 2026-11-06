@@ -431,8 +431,8 @@ mod tests{
         Consistency,PriceKind,PoolPriceObservation,CpmmQuoteSnapshot};
 
     fn fixture_direct2(n:usize)->(State,Arc<SignalTrigger>){
-        let settlement=Pubkey::new_from_array([10;32]);
-        let target=Pubkey::new_from_array([20;32]);
+        let settlement:Pubkey="So11111111111111111111111111111111111111112".parse().unwrap();
+        let target:Pubkey="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
         let a=settlement.min(target);let b=settlement.max(target);
         let top=SignalTopology{kind:SignalRouteKind::Direct2,settlement,target,
             bridge:None,roles:[(settlement,target),(target,settlement),
