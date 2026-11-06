@@ -117,7 +117,9 @@ impl Index {
         }
         // No truncation: every changed-pool/direct-partner combination is
         // exactly revalued once for this State revision, including negatives.
+        let refresh_started=Instant::now();
         for key in affected {self.refresh_one(state,params,key,report,trigger.clone(),allow_schedule);}
+        report.cp21s_refresh_timing.record(elapsed_ns(refresh_started));
         report.cp21s_updates+=1;
         report.cp21s_entries=self.entries.len();
         report.cp21s_pending_peak=report.cp21s_pending_peak.max(self.ready.len());
@@ -187,6 +189,7 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
     let mut reset=false;
     let mut allow_dispatch=false;
     let mut ticker=tokio::time::interval(Duration::from_millis(5));
+    let mut distinct_pairs=HashSet::<(Pubkey,Pubkey)>::new();
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let outcome:Result<()>=async {
         loop {
@@ -325,7 +328,6 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                     .and_then(|p|p.compact_topologies.get(key.topology))else{
                     index.pop(key);continue;
                 };
-                let pair=(top.kind,top.settlement.min(top.target),top.settlement.max(top.target));
                 let mut reads=RegistryReads::default();
                 let started=Instant::now();
                 report.cp9c_pack_attempts+=1;
@@ -382,9 +384,12 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 report.registry_reads.merge(&reads);
                 *report.cp9c_by_strategy.entry("economic".into()).or_default()+=1;
                 report.cp9c_packs_dispatched+=1;
-                report.cp9d_distinct_pairs_dispatched+=1;
+                if distinct_pairs.insert((top.settlement,top.target)){
+                    report.cp9d_distinct_pairs_dispatched+=1;
+                }
                 report.cp21s_dispatched+=1;
                 report.preparation.round_work_ns.record(elapsed_ns(started));
+                report.cp21s_drain_timing.record(elapsed_ns(started));
                 let request=selection.request.clone();
                 evidence.try_send(EvidenceItem::Selection(Box::new(selection)))
                     .map_err(|e|anyhow::anyhow!(
@@ -406,7 +411,6 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
                 // qualified pairs. No candidate is lost because a source was
                 // fourth, 97th or 513th in an arbitrary scan.
                 report.cp21s_pending_peak=report.cp21s_pending_peak.max(index.ready.len());
-                let _=pair; // Queue work is keyed by the exact directed pair.
             }
         }
         Ok(())
