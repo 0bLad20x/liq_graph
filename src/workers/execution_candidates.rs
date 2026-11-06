@@ -158,6 +158,8 @@ struct PoolEvidence {
     observation: Arc<crate::core::market_state::PoolPriceObservation>,
     manifest_validated_slot: u64, manifest_checked_at_ms: Option<u64>,
     liquidity_window_checked:bool,
+    /// The marginal signal may be unavailable while exact amount quotes exist.
+    marginal_weight_available:bool,
     /// CP9A: eligible/dust/unknown at the original directed signal slot.
     direction_liquidity_status:&'static str,
 }
@@ -733,8 +735,8 @@ impl State {
         }
         Ok(())
     }
-    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey,reads:&mut RegistryReads)
-        ->Result<(ExecutionPool,PoolEvidence)> {
+    fn pool(&self, slot:usize, role:&'static str, registry:&PoolRegistry, wallet:Pubkey,reads:&mut RegistryReads,
+        allow_missing_marginal:bool)->Result<(ExecutionPool,PoolEvidence)> {
         let identity=self.pools.get(slot/2).context("candidate slot identity missing")?;
         let price=self.prices.get(slot/2).and_then(|p|p.as_ref()).context("candidate price unavailable")?;
         let (state,wait,hold)=registry.measured_get(identity.address);
@@ -761,7 +763,10 @@ impl State {
             true
         }else{false};
         let evidence=PoolEvidence {pool:identity.address.to_string(),role,slot,
-            log_weight_units:self.weight(slot).context("candidate direction unavailable")?,
+            log_weight_units:if allow_missing_marginal{
+                self.weight(slot).unwrap_or(0)
+            }else{self.weight(slot).context("candidate direction unavailable")?},
+            marginal_weight_available:self.weight(slot).is_some(),
             observation:price.observation.clone(),manifest_validated_slot:manifest.validated_slot,
             manifest_checked_at_ms:state.completion_checked_at_ms,liquidity_window_checked,
             direction_liquidity_status:price.direction_liquidity_status[slot%2]};
@@ -799,7 +804,9 @@ impl State {
             let (input,output)=if c.reverse{(b,a)}else{(a,b)};
             ensure!((leg.input_mint,leg.output_mint)==(input,output)
                 && used.insert(leg.slot/2),"compact witness has wrong or duplicate pools");
-            ensure!(self.weight(leg.slot)==Some(leg.log_weight_units),
+            ensure!(self.weight(leg.slot)==Some(leg.log_weight_units)
+                || (cfg.cp21s_full_incremental && self.weight(leg.slot).is_none()
+                    && leg.log_weight_units==0),
                 "compact candidate is stale relative to price revision");
             slots.push((leg.slot,role(j)));
         }
@@ -821,7 +828,12 @@ impl State {
                 used=seen;
             }
         }
-        let seed_sum=slots.iter().try_fold(0_i128,|sum,(slot,_)|Ok::<_,anyhow::Error>(sum+i128::from(self.weight(*slot).context("seed net weight unavailable")?)))?;
+        let seed_sum=slots.iter().try_fold(0_i128,|sum,(slot,_)|
+            Ok::<_,anyhow::Error>(sum+i128::from(if cfg.cp21s_full_incremental{
+                self.weight(*slot).unwrap_or(0)
+            }else{
+                self.weight(*slot).context("seed net weight unavailable")?
+            })))?;
         let seed_sum=i64::try_from(seed_sum).context("seed net sum overflow")?;
         ensure!(seed_sum<threshold || cfg.cp21s_full_incremental,
             "quantity seed is not net qualified");
@@ -830,7 +842,7 @@ impl State {
             parameters:cfg.parameters.clone()};
         let mut pools=Vec::new();
         for &(slot,r) in &slots{
-            let resolving=Instant::now();let next=self.pool(slot,r,registry,cfg.wallet,reads);
+            let resolving=Instant::now();let next=self.pool(slot,r,registry,cfg.wallet,reads,cfg.cp21s_full_incremental);
             preparation.pool_resolution_ns.record(elapsed_ns(resolving));
             pools.push(next?);
         }
@@ -920,7 +932,7 @@ impl State {
             let (_,slot,role_name,_)=options[index];
             if used.contains(&(slot/2)){continue;}
             considered+=1;
-            let resolving=Instant::now();let next=self.pool(slot,role_name,registry,cfg.wallet,reads);
+            let resolving=Instant::now();let next=self.pool(slot,role_name,registry,cfg.wallet,reads,cfg.cp21s_full_incremental);
             preparation.pool_resolution_ns.record(elapsed_ns(resolving));
             let pool=match next{
                 Ok(pool)=>pool,Err(error)=>{
