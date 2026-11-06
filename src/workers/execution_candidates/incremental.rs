@@ -178,8 +178,35 @@ impl Index {
     /// account fingerprint is identical. Different IDs/order no longer force
     /// price re-optimization or loss of pending opportunities.
     fn reconcile_snapshot(&mut self,old_pools:&[SignalPool],
+        old_prices:&[Option<Arc<SignalPoolPrice>>],
         old_plan:Option<&Arc<SignalPlan>>,state:&State,params:&ExecutionParameters,
         report:&mut Report,trigger:Arc<SignalTrigger>){
+        // Exact no-op catalogs must not even visit the combinatorial index.
+        // Graph generations are identity-based, not forced price revisions.
+        let unchanged=old_pools==state.pools
+            && old_plan.zip(state.plan.as_ref()).is_some_and(|(before,after)|
+                before.compact_topologies.len()==after.compact_topologies.len()
+                && before.compact_topologies.iter().zip(after.compact_topologies.iter())
+                    .all(|(a,b)|a.kind==b.kind&&a.settlement==b.settlement
+                        &&a.target==b.target&&a.roles==b.roles&&a.length==b.length))
+            && old_prices.len()==state.prices.len()
+            && old_prices.iter().zip(&state.prices).all(|(a,b)|match (a,b){
+                (None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),
+                _=>false,
+            });
+        if unchanged{
+            report.cp21a1_catalog_unchanged+=1;
+            report.cp21a1_catalog_reused+=self.entries.len() as u64;
+            timeline::emit(self.journal.as_ref(),json!({
+                "schema":1,"kind":"catalog_reconciliation",
+                "action":"no_op","at_us":now_us(),
+                "graph_generation":state.generation,"revision":state.revision,
+                "total_pools":state.pools.len(),"pairs_reused":self.entries.len(),
+                "pairs_recomputed":0,"pending_preserved":self.ready.len(),
+                "identity_and_observation_arcs_unchanged":true
+            }),report);
+            return;
+        }
         let old=std::mem::take(self);
         self.journal=old.journal.clone();
         let old_addresses=old_pools.iter().map(|p|p.address).collect::<HashSet<_>>();
