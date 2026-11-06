@@ -44,9 +44,15 @@ V10 pack/account capacity and all min-profit configuration.
 6. **Complete V10 time/slot report:** Every successful-or-failed simulated
    V10 request in `execution_events.jsonl` carries the actual RPC
    `min_context_slot_requested`, local UTC microsecond
-   `v10_worker_received_at_us`, `rpc_sent_at_us`, and
-   `rpc_answer_at_us`, plus provider and reported simulation context
-   slot, quantity, route and outcome.
+   `v10_worker_received_at_us`, `rpc_call_started_at_us`,
+   `rpc_call_completed_at_us`, `http_request_started_at_us`, and
+   `http_response_received_at_us`, plus provider and reported simulation
+   context slot, quantity, route and outcome. Scheduler time and final
+   provider HTTP request-to-body latency are measured separately.
+   `ExecutionRequest.min_context_slot` is set from the highest observed
+   pool-component slot. The V10 simulation requires the maximum of that
+   slot and the Prepared manifest validation slots, and rejects returned
+   simulation slots below that requirement.
 
 ## Economic timeline format
 
