@@ -869,6 +869,71 @@ mod tests{
         (state,trigger)
     }
     #[test]
+    fn cp21a1_missing_marginal_does_not_veto_amount_dependent_cpmm(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let base=state.prices[0].as_ref().unwrap().as_ref();
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:[None,None],
+            direction_liquidity_status:["unknown","unknown"],
+            observation:base.observation.clone(),
+        }));
+        let key=Key{topology:0,direct:0,partner:4};
+        let w=witness(&state,key).expect("economic witness needs pool prices, not marginal logs");
+        assert_eq!(w.estimated_net_return_bps,None);
+        let score=state.economic_score(&w,&ExecutionParameters::default());
+        assert!(score.is_some(),"the exact CPMM quote survives absent marginal logs");
+        let mut report=Report::default();
+        let mut index=Index::default();
+        index.reset(&state,&ExecutionParameters::default(),&mut report,trigger);
+        assert_eq!(index.entries.len(),20);
+        assert!(report.cp21a1_missing_marginal_scored>=8);
+        assert_eq!(report.cp21s_unpriced,0);
+        assert_eq!(index.entries[&key].net,score);
+    }
+
+    #[test]
+    fn cp21a1_identical_catalog_keeps_all_prior_scores_without_recalculation(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let p=ExecutionParameters::default();
+        index.reset(&state,&p,&mut report,trigger.clone());
+        let before=report.cp21s_pair_refreshes;
+        let original_pools=state.pools.clone();
+        let original_prices=state.prices.clone();
+        let original_plan=state.plan.clone();
+        state.generation+=1;state.revision+=1;
+        index.reconcile_snapshot(&original_pools,&original_prices,
+            original_plan.as_ref(),&state,&p,&mut report,trigger);
+        assert_eq!(report.cp21s_pair_refreshes,before);
+        assert_eq!(report.cp21a1_catalog_unchanged,1);
+        assert_eq!(report.cp21a1_catalog_reused,20);
+        assert_eq!(index.entries.len(),20);
+    }
+
+    #[test]
+    fn cp21a1_catalog_pool_id_reordering_keeps_stable_route_economics(){
+        let (mut state,trigger)=fixture_direct2(6);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let p=ExecutionParameters::default();
+        index.reset(&state,&p,&mut report,trigger.clone());
+        let original_pools=state.pools.clone();
+        let original_prices=state.prices.clone();
+        let original_plan=state.plan.clone();
+        state.pools.swap(0,5);state.prices.swap(0,5);
+        state.generation+=1;state.revision+=1;
+        index.reconcile_snapshot(&original_pools,&original_prices,
+            original_plan.as_ref(),&state,&p,&mut report,trigger);
+        assert_eq!(index.entries.len(),30);
+        assert_eq!(report.cp21a1_catalog_reused,30);
+        assert_eq!(report.cp21a1_catalog_recomputed,0);
+        for (&key,entry) in &index.entries{
+            let w=witness(&state,key).unwrap();
+            assert_eq!(entry.net,state.economic_score(&w,&p));
+        }
+    }
+    #[test]
     fn cp21s_a_real_pair_index_matches_full_cpmm_recalculation_after_change(){
         let (mut state,trigger)=fixture_direct2(7);
         let params=ExecutionParameters::default();
