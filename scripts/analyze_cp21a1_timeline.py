@@ -13,6 +13,7 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
     counts = collections.Counter()
     reasons = collections.Counter()
     watchset = set()
+    watchset_known = False
     members_entered = set()
     members_exited = set()
     visible = []
@@ -48,6 +49,14 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
             reason = event.get("reason")
             if reason:
                 reasons[f"{kind}:{reason}"] += 1
+            if kind == "watchset_uncertain":
+                watchset.clear()
+                watchset_known = False
+            if kind == "watchset_snapshot":
+                # A delta stream is complete only if it starts after the
+                # latest gap, or if a subsequent explicit Selection state
+                # replaces it. We are seeing that authoritative state now.
+                watchset_known = True
             if kind == "watchset":
                 address = event.get("pool")
                 if not address:
@@ -79,7 +88,8 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
         "missing_required_fields": missing_fields,
         "watchset_entered_unique": len(members_entered),
         "watchset_exited_unique": len(members_exited),
-        "watchset_active_at_end": len(watchset),
+        "watchset_active_at_end": len(watchset) if watchset_known else None,
+        "watchset_membership_known": watchset_known,
         "filter_pool": pool,
         "filtered_events": visible if pool is not None else None,
         "source_notice": (
