@@ -43,7 +43,6 @@ try {
     -SimulationLimit 0 `
     -V10Parallelism 32 `
     -CP9CPackingMode Economic `
-    -CP9DMaxPairs 1 `
     -ExecutionDetailLimit 128
 if ($LASTEXITCODE -ne 0) { throw 'CP21S-A five-minute live run failed' }
 } finally {
