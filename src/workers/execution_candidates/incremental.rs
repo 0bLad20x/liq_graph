@@ -552,6 +552,48 @@ mod tests{
         }
     }
     #[test]
+    fn cp21s_a_50k_full_economic_index_updates_are_reference_complete(){
+        // End-to-end local worker-index benchmark: actual frozen CPMM quotes,
+        // source fingerprints, removal/reinsertion into ranked state, and
+        // replacement of newer observations. No RPC or V10 required.
+        let (mut state,trigger)=fixture_direct2(5);
+        let params=ExecutionParameters::default();
+        let mut index=Index::default();
+        let mut report=Report::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        let mut samples=Vec::with_capacity(50_000);
+        for i in 0..50_000_usize {
+            let id=i%5;
+            let old=state.prices[id].as_ref().unwrap().as_ref();
+            let mut observation=old.observation.as_ref().clone();
+            let liq=Arc::make_mut(observation.liquidity.as_mut().unwrap());
+            liq.content_digest=[((i%251)+1) as u8;32];
+            liq.cpmm_quote.as_mut().unwrap().reserve_0_raw+=1;
+            state.prices[id]=Some(Arc::new(SignalPoolPrice{
+                log_weight_units:old.log_weight_units,
+                direction_liquidity_status:old.direction_liquidity_status,
+                observation:Arc::new(observation)
+            }));
+            state.revision+=1;state.ready_at_us+=1;
+            let start=Instant::now();
+            index.refresh_changed(&state,&params,&[id],&mut report,trigger.clone(),true);
+            samples.push(elapsed_ns(start));
+            if i%10_000==0 || i==49_999{
+                assert_eq!(index.entries.len(),20);
+                // Reference never uses cached index scores.
+                for (&key,entry) in &index.entries{
+                    let reference=state.economic_score(&witness(&state,key).unwrap(),&params);
+                    assert_eq!(entry.net,reference);
+                }
+            }
+        }
+        assert_eq!(report.cp21s_updates,50_000);
+        assert_eq!(report.cp21s_pair_refreshes,20+50_000*8);
+        samples.sort_unstable();
+        eprintln!("CP21S-A 50k real full-economy index updates (5 pools, 8 affected directed pairs/update): p50={}us p95={}us p99={}us",
+            samples[25_000]/1_000,samples[47_500]/1_000,samples[49_500]/1_000);
+    }
+    #[test]
     fn cp21s_a_no_three_ninety_six_or_five_hundred_twelve_cutoff(){
         for n in [5,97,513,1_001] {
             let peers=(0..n).collect::<Vec<_>>();
