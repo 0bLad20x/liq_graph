@@ -242,6 +242,11 @@ pub struct Report {
     pub cp21a1_timeline_emitted:u64,pub cp21a1_timeline_written:u64,
     pub cp21a1_timeline_lost:u64,pub cp21a1_timeline_bytes:u64,
     pub cp21a1_timeline_syncs:u64,
+    // CP21S-A.2: blocked pairs are represented by their two durable
+    // direction observations rather than redundant economic_pair records.
+    pub cp21a2_blocked_pair_skips:u64,
+    pub cp21a2_direction_observations:u64,
+    pub cp21a2_gate_transitions:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
