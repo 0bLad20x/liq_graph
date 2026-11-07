@@ -309,6 +309,17 @@ try {
             [long]$execution.execution_candidates.cp21a1_timeline_written) {
             throw "CP21S-A.1 timeline count mismatch; inspect $timelineSummaryPath"
         }
+        # Archive only AFTER writer fsync, full timeline schema analysis and
+        # exact producer/writer count equality. The Python script independently
+        # verifies SHA256 and every gzip row before removing the raw JSONL.
+        if ($env:GRAPH_CP21S_A2_ARCHIVE -eq 'true') {
+            & python (Join-Path $PSScriptRoot 'archive_cp21a2_timeline.py') `
+                --timeline $timelinePath `
+                --expected-events ([long]$timelineSummary.counts.total)
+            if ($LASTEXITCODE -ne 0) {
+                throw "CP21S-A.2 timeline archiving failed; original JSONL retained: $timelinePath"
+            }
+        }
     }
     $production = Read-OptionalJson $producerPath
     $refreshRecord = Select-String -LiteralPath $log -Pattern 'lifecycle stats final=true .*? prepared_refreshes=(\d+)' | Select-Object -Last 1
