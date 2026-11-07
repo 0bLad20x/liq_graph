@@ -69,6 +69,37 @@ impl Timeline{
         Ok(())
     }
 }
+/// Compact journal is the default. Full replay is an explicit opt-in; focus
+/// pools retain per-pair detail only when one leg matches a selected pool.
+/// This changes audit storage, never the economic index or V10 decisions.
+#[derive(Default)]
+struct Policy{
+    full:bool,
+    focus:std::collections::HashSet<String>,
+}
+fn policy()->&'static Policy{
+    static POLICY:std::sync::OnceLock<Policy>=std::sync::OnceLock::new();
+    POLICY.get_or_init(||Policy{
+        full:std::env::var("GRAPH_CP21S_TIMELINE_MODE")
+            .is_ok_and(|v|v.eq_ignore_ascii_case("full")),
+        focus:std::env::var("GRAPH_CP21S_TIMELINE_FOCUS_POOLS")
+            .unwrap_or_default().split(',')
+            .map(str::trim).filter(|s|!s.is_empty())
+            .map(str::to_owned).collect(),
+    })
+}
+pub(super) fn economic_detail_for<T:ToString>(
+    action:&str,direct:Option<&T>,partner:Option<&T>)->bool{
+    // Never suppress economically actionable transitions, admissions,
+    // dispatch failures, queue wait or other exceptional classifications.
+    if !matches!(action,"unpriced"|"nonpositive"|"retained"){return true;}
+    let p=policy();
+    if p.full{return true;}
+    if p.focus.is_empty(){return false;}
+    direct.is_some_and(|x|p.focus.contains(&x.to_string()))||
+        partner.is_some_and(|x|p.focus.contains(&x.to_string()))
+}
+
 pub(super) fn emit(sender:Option<&SyncSender<Value>>,record:Value,report:&mut Report){
     let Some(sender)=sender else{return;};
     match sender.try_send(record){
