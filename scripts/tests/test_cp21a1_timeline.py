@@ -61,6 +61,29 @@ class CP21A1TimelineAuditTests(unittest.TestCase):
             self.assertFalse(report["watchset_membership_known"])
             self.assertIsNone(report["watchset_active_at_end"])
 
+    def test_compacted_rollup_counts_not_confused_with_dropped_events(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "compact.jsonl"
+            rows = [
+                {"schema": 1, "kind": "economic_pair", "action": "queued",
+                 "direct_pool": "A", "partner_pool": "B",
+                 "settlement": "WSOL", "target": "TOKEN", "at_us": 100},
+                {"schema": 1, "kind": "economic_rollup", "action": "completed",
+                 "suppressed": {"unpriced": 3000, "nonpositive": 42,
+                                "retained": 20}, "at_us": 101},
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            report = analyze(path)
+            self.assertEqual(report["counts"]["total"], 2)
+            self.assertEqual(report["suppressed_economic_pair_events"], 3062)
+            self.assertEqual(report["accounted_economic_pair_events"], 3063)
+            self.assertEqual(report["timestamp_ordering_anomalies"], 0)
+            self.assertEqual(report["missing_required_fields"], 0)
+            rows[1]["suppressed"]["nonpositive"] = -1
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaises(ValueError):
+                analyze(path)
+
     def test_bad_json_or_schema_fails_loudly(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "broken.jsonl"

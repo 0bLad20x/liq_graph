@@ -69,6 +69,40 @@ impl Timeline{
         Ok(())
     }
 }
+/// Compact journal is the default. Full replay is an explicit opt-in; focus
+/// pools retain per-pair detail only when one leg matches a selected pool.
+/// This changes audit storage, never the economic index or V10 decisions.
+#[derive(Default)]
+struct Policy{
+    full:bool,
+    focus:std::collections::HashSet<String>,
+}
+fn policy()->&'static Policy{
+    static POLICY:std::sync::OnceLock<Policy>=std::sync::OnceLock::new();
+    POLICY.get_or_init(||Policy{
+        full:std::env::var("GRAPH_CP21S_TIMELINE_MODE")
+            .is_ok_and(|v|v.eq_ignore_ascii_case("full")),
+        focus:std::env::var("GRAPH_CP21S_TIMELINE_FOCUS_POOLS")
+            .unwrap_or_default().split(',')
+            .map(str::trim).filter(|s|!s.is_empty())
+            .map(str::to_owned).collect(),
+    })
+}
+fn policy_check<T:ToString>(
+    p:&Policy,action:&str,direct:Option<&T>,partner:Option<&T>)->bool{
+    // Never suppress economically actionable transitions, admissions,
+    // dispatch failures, queue wait or other exceptional classifications.
+    if !matches!(action,"unpriced"|"nonpositive"|"retained"){return true;}
+    if p.full{return true;}
+    if p.focus.is_empty(){return false;}
+    direct.is_some_and(|x|p.focus.contains(&x.to_string()))||
+        partner.is_some_and(|x|p.focus.contains(&x.to_string()))
+}
+pub(super) fn economic_detail_for<T:ToString>(
+    action:&str,direct:Option<&T>,partner:Option<&T>)->bool{
+    policy_check(policy(),action,direct,partner)
+}
+
 pub(super) fn emit(sender:Option<&SyncSender<Value>>,record:Value,report:&mut Report){
     let Some(sender)=sender else{return;};
     match sender.try_send(record){
@@ -82,6 +116,22 @@ pub(super) fn emit(sender:Option<&SyncSender<Value>>,record:Value,report:&mut Re
 mod tests{
     use super::*;
     use serde_json::json;
+    #[test]
+    fn cp21a2_compact_keeps_all_dispatch_decisions_and_focused_pool_details(){
+        let compact=Policy::default();
+        for action in ["unpriced","nonpositive","retained"]{
+            assert!(!policy_check(&compact,action,Some(&"POOL_A"),Some(&"POOL_B")));
+        }
+        for action in ["queued","v10_submitted","model_unknown","waiting",
+                       "retained_ready","not_dispatched","baseline"]{
+            assert!(policy_check(&compact,action,Some(&"POOL_A"),Some(&"POOL_B")));
+        }
+        let focused=Policy{focus:["POOL_B".to_string()].into(),..Default::default()};
+        assert!(policy_check(&focused,"unpriced",Some(&"POOL_A"),Some(&"POOL_B")));
+        assert!(!policy_check(&focused,"unpriced",Some(&"POOL_A"),Some(&"POOL_C")));
+        let full=Policy{full:true,..Default::default()};
+        assert!(policy_check(&full,"unpriced",Some(&"POOL_A"),Some(&"POOL_C")));
+    }
     #[test]
     fn cp21a1_timeline_is_durable_complete_and_order_preserving(){
         let path=std::env::temp_dir().join(format!(

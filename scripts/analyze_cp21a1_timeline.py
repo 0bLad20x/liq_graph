@@ -1,4 +1,4 @@
-"""CP21S-A.1 streaming audit of complete Direct2 signal decisions.
+"""CP21S-A.2 streaming audit of detailed actions and compact rollup counts.
 
 The journal records *observations*, not executed trades. UTC timestamps are
 local host receive/send times, slots are chain context. No guessed chain times.
@@ -12,6 +12,7 @@ from pathlib import Path
 def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
     counts = collections.Counter()
     reasons = collections.Counter()
+    suppressed = collections.Counter()
     watchset = set()
     watchset_known = False
     members_entered = set()
@@ -41,6 +42,15 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
                 if previous is not None and when < previous:
                     ordering_errors += 1
                 previous = when
+            if event.get("kind") == "economic_rollup":
+                suppressed_map = event.get("suppressed")
+                if not isinstance(suppressed_map, dict):
+                    raise ValueError(f"{timeline}:{line_number}: missing compact rollup")
+                for action in ("unpriced", "nonpositive", "retained"):
+                    number = suppressed_map.get(action)
+                    if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+                        raise ValueError(f"{timeline}:{line_number}: invalid rollup {action}")
+                    suppressed[action] += number
             kind = event.get("kind", "unknown")
             action = event.get("action", "unspecified")
             counts["total"] += 1
@@ -82,6 +92,10 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
     return {
         "schema": 1, "timeline_file": timeline.name,
         "counts": dict(sorted(counts.items())),
+        "suppressed_by_action": dict(sorted(suppressed.items())),
+        "suppressed_economic_pair_events": sum(suppressed.values()),
+        "accounted_economic_pair_events":
+            counts["kind:economic_pair"] + sum(suppressed.values()),
         "reasons": dict(sorted(reasons.items())),
         "first_utc_us": first, "last_utc_us": last,
         "timestamp_ordering_anomalies": ordering_errors,
@@ -116,6 +130,7 @@ def main():
     print(f"CP21S-A.1 timeline: events={report['counts']['total']} "
           f"active_watchset={report['watchset_active_at_end']} "
           f"clock_anomalies={report['timestamp_ordering_anomalies']} "
+          f"accounted_pairs={report['accounted_economic_pair_events']} "
           f"output={args.output}")
 
 

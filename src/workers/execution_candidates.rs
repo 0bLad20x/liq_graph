@@ -242,6 +242,8 @@ pub struct Report {
     pub cp21a1_timeline_emitted:u64,pub cp21a1_timeline_written:u64,
     pub cp21a1_timeline_lost:u64,pub cp21a1_timeline_bytes:u64,
     pub cp21a1_timeline_syncs:u64,
+    pub cp21a2_suppressed_unpriced:u64,pub cp21a2_suppressed_nonpositive:u64,
+    pub cp21a2_suppressed_retained:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
