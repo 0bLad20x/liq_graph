@@ -1255,6 +1255,7 @@ mod tests{
         assert_eq!(index.entries.len(),30);
         assert_eq!(report.cp21a1_catalog_reused,30);
         assert_eq!(report.cp21a1_catalog_recomputed,0);
+        assert_eq!(report.cp21a2_catalog_id_remaps,1);
         for (&key,entry) in &index.entries{
             let w=witness(&state,key).unwrap();
             assert_eq!(entry.net,state.economic_score(&w,&p));
