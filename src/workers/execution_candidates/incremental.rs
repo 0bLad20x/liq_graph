@@ -185,6 +185,20 @@ fn direction_gate(state:&State,topology:usize,id:usize,role:usize)->&'static str
     }
     "available"
 }
+/// Cause-specific accounting for pair work avoided by a structural gate.
+/// If both legs are blocked, dust is reported first; these are skipped
+/// evaluation attempts, not distinct pools or proven nonprofitable routes.
+fn record_gate_skip(report:&mut Report,direct:&str,partner:&str){
+    report.cp21a2_blocked_pair_skips+=1;
+    if direct=="direction_notional_filter_dust"||
+        partner=="direction_notional_filter_dust"{
+        report.cp21a2_skipped_dust_pairs+=1;
+    }else if direct=="price_missing"||partner=="price_missing"{
+        report.cp21a2_skipped_missing_price_pairs+=1;
+    }else{
+        report.cp21a2_skipped_other_pairs+=1;
+    }
+}
 impl Index {
     /// A compact direction journal replaces redundant per-pair dust/missing-price
     /// rows. A status transition and each new observation are separately
@@ -520,9 +534,10 @@ impl Index {
         }
         let mut recomputed=0_u64;
         for key in affected{
-            if direction_gate(state,key.topology,key.direct,0)!="available"
-                ||direction_gate(state,key.topology,key.partner,1)!="available"{
-                report.cp21a2_blocked_pair_skips+=1;
+            let dg=direction_gate(state,key.topology,key.direct,0);
+            let pg=direction_gate(state,key.topology,key.partner,1);
+            if dg!="available"||pg!="available"{
+                record_gate_skip(report,dg,pg);
                 // The gate transition journal already makes this exclusion
                 // reconstructable; no duplicate per-partner record is needed.
                 continue;
@@ -568,9 +583,10 @@ impl Index {
                 for &direct in ids{
                     for &partner in ids{
                         if direct==partner{continue;}
-                        if direction_gate(state,topology,direct,0)!="available"
-                            ||direction_gate(state,topology,partner,1)!="available"{
-                            report.cp21a2_blocked_pair_skips+=1;
+                        let dg=direction_gate(state,topology,direct,0);
+                        let pg=direction_gate(state,topology,partner,1);
+                        if dg!="available"||pg!="available"{
+                            record_gate_skip(report,dg,pg);
                             continue;
                         }
                         self.refresh_one(state,params,Key{topology,direct,partner},
@@ -599,9 +615,10 @@ impl Index {
         // exactly revalued once for this State revision, including negatives.
         let refresh_started=Instant::now();
         for key in affected {
-            if direction_gate(state,key.topology,key.direct,0)!="available"
-                ||direction_gate(state,key.topology,key.partner,1)!="available"{
-                report.cp21a2_blocked_pair_skips+=1;
+            let dg=direction_gate(state,key.topology,key.direct,0);
+            let pg=direction_gate(state,key.topology,key.partner,1);
+            if dg!="available"||pg!="available"{
+                record_gate_skip(report,dg,pg);
                 // A previously available route must be invalidated exactly
                 // once when its direction becomes dust or loses a price.
                 if !self.entries.contains_key(&key){continue;}
