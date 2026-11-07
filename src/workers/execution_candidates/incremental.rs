@@ -1074,6 +1074,58 @@ mod tests{
         (state,trigger)
     }
     #[test]
+    fn cp21a2_blocked_directions_do_not_expand_to_redundant_pairs(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let params=ExecutionParameters::default();
+        let mut index=Index::default();
+        let mut report=Report::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        assert_eq!(index.entries.len(),20);
+        let before=report.cp21s_pair_refreshes;
+        let original=state.prices[0].clone().unwrap();
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:[None,None],
+            direction_liquidity_status:["dust","dust"],
+            observation:original.observation.clone()
+        }));
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger.clone(),true);
+        assert_eq!(index.entries.len(),12,"all routes touching dust must be invalidated");
+        assert_eq!(report.cp21s_pair_refreshes,before+8,
+            "first transition invalidates previously priced routes once");
+        let after_transition=report.cp21s_pair_refreshes;
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger.clone(),true);
+        assert_eq!(report.cp21s_pair_refreshes,after_transition,
+            "unchanged dust cannot cause another economic pair refresh");
+        assert!(report.cp21a2_blocked_pair_skips>=16);
+        state.prices[0]=Some(original);
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger,true);
+        assert_eq!(index.entries.len(),20,"newly eligible routes must return");
+        for (&key,entry) in &index.entries{
+            let w=witness(&state,key).unwrap();
+            assert_eq!(entry.net,state.economic_score(&w,&params));
+        }
+    }
+
+    #[test]
+    fn cp21a2_reuses_identical_frozen_quote_without_reoptimizing(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let params=ExecutionParameters::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[4],&mut report,trigger,true);
+        assert_eq!(report.cp21a2_reused_quote_calculations,8);
+        assert_eq!(index.entries.len(),20);
+        for (&key,entry) in &index.entries{
+            assert_eq!(entry.net,state.economic_score(&witness(&state,key).unwrap(),&params));
+        }
+    }
+
+    #[test]
     fn cp21a1_deliberate_direction_dust_filter_remains_intact(){
         let (mut state,_trigger)=fixture_direct2(3);
         let old=state.prices[0].as_ref().unwrap().as_ref();
