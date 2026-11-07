@@ -245,6 +245,9 @@ pub struct Report {
     // CP21S-A.2: blocked pairs are represented by their two durable
     // direction observations rather than redundant economic_pair records.
     pub cp21a2_blocked_pair_skips:u64,
+    pub cp21a2_skipped_dust_pairs:u64,
+    pub cp21a2_skipped_missing_price_pairs:u64,
+    pub cp21a2_skipped_other_pairs:u64,
     pub cp21a2_direction_observations:u64,
     pub cp21a2_gate_transitions:u64,
     pub cp21a2_reused_quote_calculations:u64,
