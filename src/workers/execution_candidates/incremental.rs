@@ -151,8 +151,8 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
     "economic_quote_or_depth_unavailable"
 }
 impl Index {
-    /// Every economic refresh and final scheduling decision is correlated
-    /// by stable addresses, snapshot slots, UTC microseconds and revision.
+    /// Actionable transitions always retain full causal metadata. Routine
+    /// refreshes are counted in compact mode, or kept for focused pools.
     fn trace(&self,state:&State,key:Key,action:&'static str,
         reason:&str,score:Option<i128>,input:Option<u64>,
         gross:Option<i128>,trigger:&SignalTrigger,request_id:Option<&str>,
