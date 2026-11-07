@@ -523,6 +523,32 @@ impl Index {
                 trigger.as_ref(),None,report);
             return;
         };
+        // The fingerprint covers the complete frozen economic inputs and
+        // execution parameters. Re-quoting an identical state is pure waste.
+        // Still retain the exact causal evaluation and initial live readiness.
+        let fingerprint=state.source_fingerprint(&w,params);
+        if fingerprint.is_some() && self.entries.get(&key)
+            .is_some_and(|e|e.fingerprint==fingerprint){
+            let mut previous=self.entries.remove(&key).expect("checked entry");
+            report.cp21s_identical_state_reuses+=1;
+            report.cp21a2_reused_quote_calculations+=1;
+            if allow_schedule && previous.rank.is_none() &&
+                (previous.net.is_some_and(|n|n>0) ||
+                 (previous.net.is_none() && w.estimated_net_return_bps.is_some()
+                     && w.log_sum_units<state.threshold)){
+                let (category,priority)=economic::priority_key(previous.net);
+                let rank=Rank{category,score:priority,key};
+                self.ready.insert(rank);previous.rank=Some(rank);
+                previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
+                previous.pipeline=state.price_pipeline;
+            }
+            let action=if previous.rank.is_some(){"retained_ready"}else{"retained"};
+            let score=previous.net;let input=previous.input_raw;let gross=previous.gross_raw;
+            self.entries.insert(key,previous);
+            self.trace(state,key,action,"identical_frozen_state",
+                score,input,gross,trigger.as_ref(),None,report);
+            return;
+        }
         let started=Instant::now();
         let estimate=economic::witness_estimate(&w,params);
         let score=estimate.map(|v|v.0);
