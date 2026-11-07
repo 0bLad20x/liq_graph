@@ -43,6 +43,10 @@ struct Index {
     dispatched:u64,
     journal:Option<SyncSender<Value>>,
     watched:HashSet<Pubkey>,
+    // CP21S-A.2: a direction has one gate and observation history,
+    // regardless of how many Direct2 partners reference it.
+    direction_statuses:HashMap<(Pubkey,Pubkey,Pubkey),
+        (&'static str,Option<u64>,Option<u64>)>,
 }
 fn directions(pool:&SignalPool,a:Pubkey,b:Pubkey,id:usize)->Option<usize>{
     if pool.mint_a==a&&pool.mint_b==b {Some(2*id)}
@@ -150,7 +154,67 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
     }
     "economic_quote_or_depth_unavailable"
 }
+
+/// Only *structural* exclusions are allowed to short-circuit pair work.
+/// Unsupported economic quotes remain UNKNOWN and can reach V10 when marginal
+/// evidence is positive. Do not extend this to fees, model depth or TVL.
+fn direction_gate(state:&State,topology:usize,id:usize,role:usize)->&'static str{
+    let Some(top)=state.plan.as_ref()
+        .and_then(|p|p.compact_topologies.get(topology))else{return "topology_missing"};
+    let Some(pool)=state.pools.get(id)else{return "pool_identity_missing"};
+    let (a,b)=top.roles[role];
+    let Some(slot)=directions(pool,a,b,id)else{return "direction_identity_mismatch"};
+    let Some(price)=state.prices.get(id).and_then(Option::as_ref)
+        else{return "price_missing"};
+    if price.direction_liquidity_status[slot%2]=="dust"
+        && price.log_weight_units[slot%2].is_none(){
+        return "direction_notional_filter_dust";
+    }
+    "available"
+}
 impl Index {
+    /// A compact direction journal replaces redundant per-pair dust/missing-price
+    /// rows. A status transition and each new observation are separately
+    /// durable; arbitrary pairs can be reconstructed from the catalog and
+    /// their two directional histories.
+    fn record_direction_state(&mut self,state:&State,topology:usize,id:usize,
+        role:usize,report:&mut Report){
+        let Some(top)=state.plan.as_ref()
+            .and_then(|p|p.compact_topologies.get(topology))else{return};
+        let Some(pool)=state.pools.get(id)else{return};
+        let (a,b)=top.roles[role];
+        let status=direction_gate(state,topology,id,role);
+        let observation=state.prices.get(id).and_then(Option::as_ref);
+        let signature=(status,observation.map(|p|p.observation.slot),
+            observation.map(|p|p.observation.received_at_us));
+        let old=self.direction_statuses.insert((pool.address,a,b),signature);
+        if old==Some(signature){return;}
+        report.cp21a2_direction_observations+=1;
+        let transition=old.is_none_or(|prior|prior.0!=status);
+        if transition{report.cp21a2_gate_transitions+=1;}
+        timeline::emit(self.journal.as_ref(),json!({
+            "schema":1,"kind":"direction_observation","action":
+                if transition{"gate_transition"}else{"observed"},
+            "at_us":now_us(),"graph_generation":state.generation,
+            "revision":state.revision,"pool":pool.address.to_string(),
+            "input_mint":a.to_string(),"output_mint":b.to_string(),
+            "status":status,"slot":signature.1,
+            "received_at_us":signature.2,
+            "component_slot_min":observation.map(|p|p.observation.component_slot_min),
+            "component_slot_max":observation.map(|p|p.observation.component_slot_max)
+        }),report);
+    }
+    fn record_pool_directions(&mut self,state:&State,id:usize,report:&mut Report){
+        let Some(pool)=state.pools.get(id)else{return};
+        for (settlement,target) in [(pool.mint_a,pool.mint_b),
+            (pool.mint_b,pool.mint_a)]{
+            if let Some(&topology)=self.topology.get(&(settlement,target)){
+                for role in 0..2{
+                    self.record_direction_state(state,topology,id,role,report);
+                }
+            }
+        }
+    }
     /// Every economic refresh and final scheduling decision is correlated
     /// by stable addresses, snapshot slots, UTC microseconds and revision.
     fn trace(&self,state:&State,key:Key,action:&'static str,
@@ -275,6 +339,7 @@ impl Index {
         let old=std::mem::take(self);
         self.journal=old.journal.clone();
         self.watched=old.watched.clone();
+        self.direction_statuses=old.direction_statuses.clone();
         let old_addresses=old_pools.iter().map(|p|p.address).collect::<HashSet<_>>();
         let current_addresses=state.pools.iter().map(|p|p.address).collect::<HashSet<_>>();
         let mut entered=0_u64;let mut removed=0_u64;
@@ -318,6 +383,11 @@ impl Index {
             }
         }
         let mut reused=0_u64;let mut recomputed=0_u64;
+        for id in 0..state.pools.len(){
+            self.record_pool_directions(state,id,report);
+        }
+        self.direction_statuses.retain(|(address,_,_),_|
+            current_addresses.contains(address));
         for (&(a,b),ids) in &state.pair_pools{
             for (settlement,target) in [(a,b),(b,a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
@@ -325,6 +395,11 @@ impl Index {
                     for &partner in ids{
                         if direct==partner{continue;}
                         let key=Key{topology,direct,partner};
+                        if direction_gate(state,topology,direct,0)!="available"
+                            ||direction_gate(state,topology,partner,1)!="available"{
+                            report.cp21a2_blocked_pair_skips+=1;
+                            continue;
+                        }
                         let stable=(settlement,target,state.pools[direct].address,
                             state.pools[partner].address);
                         let previous=old_entries.remove(&stable);
@@ -367,11 +442,15 @@ impl Index {
     fn reset(&mut self,state:&State,params:&ExecutionParameters,
         report:&mut Report,trigger:Arc<SignalTrigger>){
         self.topology.clear();self.entries.clear();self.ready.clear();
+        self.direction_statuses.clear();
         let Some(plan)=state.plan.as_ref()else{return;};
         for (i,top) in plan.compact_topologies.iter().enumerate(){
             if top.kind==SignalRouteKind::Direct2{
                 self.topology.insert((top.settlement,top.target),i);
             }
+        }
+        for id in 0..state.pools.len(){
+            self.record_pool_directions(state,id,report);
         }
         // One-time complete index initialization without a second O(n²)
         // temporary HashSet: each canonical mint-pair and directed topology
@@ -382,6 +461,11 @@ impl Index {
                 for &direct in ids{
                     for &partner in ids{
                         if direct==partner{continue;}
+                        if direction_gate(state,topology,direct,0)!="available"
+                            ||direction_gate(state,topology,partner,1)!="available"{
+                            report.cp21a2_blocked_pair_skips+=1;
+                            continue;
+                        }
                         self.refresh_one(state,params,Key{topology,direct,partner},
                             report,trigger.clone(),false);
                     }
@@ -396,6 +480,7 @@ impl Index {
         trigger:Arc<SignalTrigger>,allow_schedule:bool){
         let mut affected=HashSet::new();
         for &updated in ids{
+            self.record_pool_directions(state,updated,report);
             let Some(p)=state.pools.get(updated)else{continue};
             let Some(peers)=state.pair_pools.get(&(p.mint_a,p.mint_b))else{continue};
             for (settlement,target) in [(p.mint_a,p.mint_b),(p.mint_b,p.mint_a)]{
@@ -406,7 +491,16 @@ impl Index {
         // No truncation: every changed-pool/direct-partner combination is
         // exactly revalued once for this State revision, including negatives.
         let refresh_started=Instant::now();
-        for key in affected {self.refresh_one(state,params,key,report,trigger.clone(),allow_schedule);}
+        for key in affected {
+            if direction_gate(state,key.topology,key.direct,0)!="available"
+                ||direction_gate(state,key.topology,key.partner,1)!="available"{
+                report.cp21a2_blocked_pair_skips+=1;
+                // A previously available route must be invalidated exactly
+                // once when its direction becomes dust or loses a price.
+                if !self.entries.contains_key(&key){continue;}
+            }
+            self.refresh_one(state,params,key,report,trigger.clone(),allow_schedule);
+        }
         report.cp21s_refresh_timing.record(elapsed_ns(refresh_started));
         report.cp21s_updates+=1;
         report.cp21s_entries=self.entries.len();
