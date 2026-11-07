@@ -17,13 +17,30 @@ use serde_json::{Value,json};
 use std::cmp::Reverse;
 use std::time::Duration;
 use crate::core::signals::SignalLeg;
+use crate::core::market_state::PoolPriceObservation;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 struct Key { topology:usize,direct:usize,partner:usize }
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
 struct Rank { category:u8,score:Reverse<i128>,key:Key }
+/// Economic positives rank by *normalized USD net*; unverifiable
+/// positives rank only against other unverifiable candidates by actual
+/// marginal log advantage. These scores are never mixed as dollar profits.
+fn candidate_rank(net:Option<i128>,marginal_log_sum:i64,key:Key)->Rank{
+    let (category,mut score)=economic::priority_key(net);
+    if net.is_none(){
+        // A more negative marginal log sum represents greater apparent
+        // DEX-net advantage; no fabricated monetary gain is implied.
+        score=Reverse(-i128::from(marginal_log_sum));
+    }
+    Rank{category,score,key}
+}
+
 #[derive(Clone)]
 struct Entry {
+    // Exact Arc identity prevents a digest-only cache hit if a provider
+    // supplies different reserves with an accidentally reused content digest.
+    observations:[Arc<PoolPriceObservation>;2],
     net:Option<i128>,
     input_raw:Option<u64>,
     output_raw:Option<u64>,
@@ -43,6 +60,10 @@ struct Index {
     dispatched:u64,
     journal:Option<SyncSender<Value>>,
     watched:HashSet<Pubkey>,
+    // CP21S-A.2: a direction has one gate and observation history,
+    // regardless of how many Direct2 partners reference it.
+    direction_statuses:HashMap<(Pubkey,Pubkey,Pubkey),
+        (&'static str,Option<u64>,Option<u64>)>,
 }
 fn directions(pool:&SignalPool,a:Pubkey,b:Pubkey,id:usize)->Option<usize>{
     if pool.mint_a==a&&pool.mint_b==b {Some(2*id)}
@@ -150,7 +171,81 @@ fn pair_unavailable_reason(state:&State,key:Key)->&'static str{
     }
     "economic_quote_or_depth_unavailable"
 }
+
+/// Only *structural* exclusions are allowed to short-circuit pair work.
+/// Unsupported economic quotes remain UNKNOWN and can reach V10 when marginal
+/// evidence is positive. Do not extend this to fees, model depth or TVL.
+fn direction_gate(state:&State,topology:usize,id:usize,role:usize)->&'static str{
+    let Some(top)=state.plan.as_ref()
+        .and_then(|p|p.compact_topologies.get(topology))else{return "topology_missing"};
+    let Some(pool)=state.pools.get(id)else{return "pool_identity_missing"};
+    let (a,b)=top.roles[role];
+    let Some(slot)=directions(pool,a,b,id)else{return "direction_identity_mismatch"};
+    let Some(price)=state.prices.get(id).and_then(Option::as_ref)
+        else{return "price_missing"};
+    if price.direction_liquidity_status[slot%2]=="dust"
+        && price.log_weight_units[slot%2].is_none(){
+        return "direction_notional_filter_dust";
+    }
+    "available"
+}
+/// Cause-specific accounting for pair work avoided by a structural gate.
+/// If both legs are blocked, dust is reported first; these are skipped
+/// evaluation attempts, not distinct pools or proven nonprofitable routes.
+fn record_gate_skip(report:&mut Report,direct:&str,partner:&str){
+    report.cp21a2_blocked_pair_skips+=1;
+    if direct=="direction_notional_filter_dust"||
+        partner=="direction_notional_filter_dust"{
+        report.cp21a2_skipped_dust_pairs+=1;
+    }else if direct=="price_missing"||partner=="price_missing"{
+        report.cp21a2_skipped_missing_price_pairs+=1;
+    }else{
+        report.cp21a2_skipped_other_pairs+=1;
+    }
+}
 impl Index {
+    /// A compact direction journal replaces redundant per-pair dust/missing-price
+    /// rows. A status transition and each new observation are separately
+    /// durable; arbitrary pairs can be reconstructed from the catalog and
+    /// their two directional histories.
+    fn record_direction_state(&mut self,state:&State,topology:usize,id:usize,
+        role:usize,report:&mut Report){
+        let Some(top)=state.plan.as_ref()
+            .and_then(|p|p.compact_topologies.get(topology))else{return};
+        let Some(pool)=state.pools.get(id)else{return};
+        let (a,b)=top.roles[role];
+        let status=direction_gate(state,topology,id,role);
+        let observation=state.prices.get(id).and_then(Option::as_ref);
+        let signature=(status,observation.map(|p|p.observation.slot),
+            observation.map(|p|p.observation.received_at_us));
+        let old=self.direction_statuses.insert((pool.address,a,b),signature);
+        if old==Some(signature){return;}
+        report.cp21a2_direction_observations+=1;
+        let transition=old.is_none_or(|prior|prior.0!=status);
+        if transition{report.cp21a2_gate_transitions+=1;}
+        timeline::emit(self.journal.as_ref(),json!({
+            "schema":1,"kind":"direction_observation","action":
+                if transition{"gate_transition"}else{"observed"},
+            "at_us":now_us(),"graph_generation":state.generation,
+            "revision":state.revision,"pool":pool.address.to_string(),
+            "input_mint":a.to_string(),"output_mint":b.to_string(),
+            "status":status,"slot":signature.1,
+            "received_at_us":signature.2,
+            "component_slot_min":observation.map(|p|p.observation.component_slot_min),
+            "component_slot_max":observation.map(|p|p.observation.component_slot_max)
+        }),report);
+    }
+    fn record_pool_directions(&mut self,state:&State,id:usize,report:&mut Report){
+        let Some(pool)=state.pools.get(id)else{return};
+        for (settlement,target) in [(pool.mint_a,pool.mint_b),
+            (pool.mint_b,pool.mint_a)]{
+            if let Some(&topology)=self.topology.get(&(settlement,target)){
+                for role in 0..2{
+                    self.record_direction_state(state,topology,id,role,report);
+                }
+            }
+        }
+    }
     /// Every economic refresh and final scheduling decision is correlated
     /// by stable addresses, snapshot slots, UTC microseconds and revision.
     fn trace(&self,state:&State,key:Key,action:&'static str,
@@ -272,9 +367,66 @@ impl Index {
             }),report);
             return;
         }
+        // A catalog may merely permute compact pool/topology IDs. Detect
+        // identical *on-chain* addresses and Arc-frozen price observations
+        // before walking any Cartesian product. Remap the live index in O(n)
+        // without a single quote, while retaining pending V10 priorities.
+        if let (Some(before),Some(after))=(old_plan,state.plan.as_ref()){
+            let new_ids:HashMap<Pubkey,usize>=state.pools.iter().enumerate()
+                .map(|(id,p)|(p.address,id)).collect();
+            let new_tops:HashMap<(Pubkey,Pubkey),usize>=after.compact_topologies.iter()
+                .enumerate().filter(|(_,t)|t.kind==SignalRouteKind::Direct2)
+                .map(|(id,t)|((t.settlement,t.target),id)).collect();
+            let same_topologies=before.compact_topologies.len()==after.compact_topologies.len()
+                && before.compact_topologies.iter().all(|t|{
+                    new_tops.get(&(t.settlement,t.target)).is_some_and(|&id|{
+                        let fresh=&after.compact_topologies[id];
+                        fresh.kind==t.kind && fresh.roles==t.roles && fresh.length==t.length
+                    })
+                });
+            let same_observations=same_topologies
+                && old_pools.len()==state.pools.len() && new_ids.len()==state.pools.len()
+                && old_prices.len()==old_pools.len()
+                && old_pools.iter().enumerate().all(|(id,p)|{
+                    new_ids.get(&p.address).is_some_and(|&new_id|{
+                        match (&old_prices[id],&state.prices[new_id]){
+                            (None,None)=>true,
+                            (Some(a),Some(b))=>Arc::ptr_eq(a,b),
+                            _=>false
+                        }
+                    })
+                });
+            if same_observations{
+                let old_lookup:HashMap<usize,usize>=old_pools.iter().enumerate()
+                    .map(|(id,p)|(id,new_ids[&p.address])).collect();
+                let mut remapped=HashMap::with_capacity(self.entries.len());
+                let mut pending=BTreeSet::new();
+                for (old_key,mut entry) in self.entries.drain(){
+                    let old_top=&before.compact_topologies[old_key.topology];
+                    let key=Key{topology:new_tops[&(old_top.settlement,old_top.target)],
+                        direct:old_lookup[&old_key.direct],partner:old_lookup[&old_key.partner]};
+                    if let Some(mut rank)=entry.rank{
+                        rank.key=key;pending.insert(rank);entry.rank=Some(rank);
+                    }
+                    remapped.insert(key,entry);
+                }
+                self.entries=remapped;self.ready=pending;self.topology=new_tops;
+                report.cp21a1_catalog_unchanged+=1;
+                report.cp21a1_catalog_reused+=self.entries.len() as u64;
+                report.cp21a2_catalog_id_remaps+=1;
+                timeline::emit(self.journal.as_ref(),json!({
+                    "schema":1,"kind":"catalog_reconciliation","action":"id_remap_only",
+                    "at_us":now_us(),"graph_generation":state.generation,
+                    "revision":state.revision,"pairs_reused":self.entries.len(),
+                    "pairs_recomputed":0,"pending_preserved":self.ready.len()
+                }),report);
+                return;
+            }
+        }
         let old=std::mem::take(self);
         self.journal=old.journal.clone();
         self.watched=old.watched.clone();
+        self.direction_statuses=old.direction_statuses.clone();
         let old_addresses=old_pools.iter().map(|p|p.address).collect::<HashSet<_>>();
         let current_addresses=state.pools.iter().map(|p|p.address).collect::<HashSet<_>>();
         let mut entered=0_u64;let mut removed=0_u64;
@@ -302,51 +454,100 @@ impl Index {
             }),report);
         }
         let mut old_entries=HashMap::<(Pubkey,Pubkey,Pubkey,Pubkey),Entry>::new();
-        if let Some(old_plan)=old_plan {
+        if let Some(previous_plan)=old_plan {
             for (key,entry) in old.entries{
                 if let (Some(t),Some(a),Some(b))=(
-                    old_plan.compact_topologies.get(key.topology),
+                    previous_plan.compact_topologies.get(key.topology),
                     old_pools.get(key.direct),old_pools.get(key.partner)){
                     old_entries.insert((t.settlement,t.target,a.address,b.address),entry);
                 }
             }
         }
         let Some(plan)=state.plan.as_ref()else{return;};
+        let prior_topologies=old_plan.into_iter().flat_map(|p|p.compact_topologies.iter())
+            .filter(|t|t.kind==SignalRouteKind::Direct2)
+            .map(|t|((t.settlement,t.target),t)).collect::<HashMap<_,_>>();
+        let mut changed_topologies=HashSet::new();
         for (i,top) in plan.compact_topologies.iter().enumerate(){
-            if top.kind==SignalRouteKind::Direct2{
-                self.topology.insert((top.settlement,top.target),i);
+            if top.kind!=SignalRouteKind::Direct2{continue;}
+            self.topology.insert((top.settlement,top.target),i);
+            if !prior_topologies.get(&(top.settlement,top.target)).is_some_and(|prior|
+                prior.kind==top.kind && prior.roles==top.roles && prior.length==top.length){
+                changed_topologies.insert((top.settlement,top.target));
             }
         }
-        let mut reused=0_u64;let mut recomputed=0_u64;
+        let old_ids=old_pools.iter().enumerate()
+            .map(|(id,p)|(p.address,id)).collect::<HashMap<_,_>>();
+        let new_ids=state.pools.iter().enumerate()
+            .map(|(id,p)|(p.address,id)).collect::<HashMap<_,_>>();
+        let mut changed_ids=HashSet::new();
+        for (id,p) in state.pools.iter().enumerate(){
+            let unchanged=old_ids.get(&p.address).is_some_and(|&old_id|{
+                let previous=&old_pools[old_id];
+                previous.mint_a==p.mint_a && previous.mint_b==p.mint_b
+                    && match (old_prices.get(old_id),state.prices.get(id)){
+                        (Some(None),Some(None))=>true,
+                        (Some(Some(a)),Some(Some(b)))=>Arc::ptr_eq(a,b),
+                        _=>false
+                    }
+            });
+            if !unchanged{changed_ids.insert(id);}
+        }
+        for id in 0..state.pools.len(){
+            self.record_pool_directions(state,id,report);
+        }
+        self.direction_statuses.retain(|(address,_,_),_|
+            current_addresses.contains(address));
+        let mut affected=HashSet::<Key>::new();
+        // Only changed/new pool identities and actual changed price states
+        // contribute new pair evaluations. A new/changed topology necessarily
+        // touches all of its members; unchanged topologies do NOT.
         for (&(a,b),ids) in &state.pair_pools{
             for (settlement,target) in [(a,b),(b,a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
-                for &direct in ids{
-                    for &partner in ids{
-                        if direct==partner{continue;}
-                        let key=Key{topology,direct,partner};
-                        let stable=(settlement,target,state.pools[direct].address,
-                            state.pools[partner].address);
-                        let previous=old_entries.remove(&stable);
-                        if let Some(mut entry)=previous{
-                            let current=witness(state,key).and_then(|w|
-                                state.source_fingerprint(&w,params));
-                            if current.is_some() && current==entry.fingerprint{
-                                if let Some(mut rank)=entry.rank{
-                                    rank.key=key;
-                                    self.ready.insert(rank);
-                                    entry.rank=Some(rank);
-                                }
-                                self.entries.insert(key,entry);
-                                reused+=1;
-                                continue;
-                            }
+                if changed_topologies.contains(&(settlement,target)){
+                    for &direct in ids{
+                        for &partner in ids{
+                            if direct!=partner{affected.insert(Key{topology,direct,partner});}
                         }
-                        recomputed+=1;
-                        self.refresh_one(state,params,key,report,trigger.clone(),false);
+                    }
+                }else{
+                    for &updated in ids{
+                        if changed_ids.contains(&updated){
+                            invalidate_changed(&mut affected,topology,updated,ids);
+                        }
                     }
                 }
             }
+        }
+        let mut reused=0_u64;
+        for ((settlement,target,direct_address,partner_address),mut entry) in old_entries{
+            let (Some(&topology),Some(&direct),Some(&partner))=(
+                self.topology.get(&(settlement,target)),
+                new_ids.get(&direct_address),new_ids.get(&partner_address))else{continue};
+            let key=Key{topology,direct,partner};
+            // Blocked pairs are represented by their two direction histories;
+            // no stale priority must survive a missing-price/dust transition.
+            if direction_gate(state,topology,direct,0)!="available"
+                ||direction_gate(state,topology,partner,1)!="available"{continue;}
+            if let Some(mut rank)=entry.rank{
+                rank.key=key;self.ready.insert(rank);entry.rank=Some(rank);
+            }
+            self.entries.insert(key,entry);
+            if !affected.contains(&key){reused+=1;}
+        }
+        let mut recomputed=0_u64;
+        for key in affected{
+            let dg=direction_gate(state,key.topology,key.direct,0);
+            let pg=direction_gate(state,key.topology,key.partner,1);
+            if dg!="available"||pg!="available"{
+                record_gate_skip(report,dg,pg);
+                // The gate transition journal already makes this exclusion
+                // reconstructable; no duplicate per-partner record is needed.
+                continue;
+            }
+            recomputed+=1;
+            self.refresh_one(state,params,key,report,trigger.clone(),false);
         }
         report.cp21a1_catalog_reused+=reused;
         report.cp21a1_catalog_recomputed+=recomputed;
@@ -367,11 +568,15 @@ impl Index {
     fn reset(&mut self,state:&State,params:&ExecutionParameters,
         report:&mut Report,trigger:Arc<SignalTrigger>){
         self.topology.clear();self.entries.clear();self.ready.clear();
+        self.direction_statuses.clear();
         let Some(plan)=state.plan.as_ref()else{return;};
         for (i,top) in plan.compact_topologies.iter().enumerate(){
             if top.kind==SignalRouteKind::Direct2{
                 self.topology.insert((top.settlement,top.target),i);
             }
+        }
+        for id in 0..state.pools.len(){
+            self.record_pool_directions(state,id,report);
         }
         // One-time complete index initialization without a second O(n²)
         // temporary HashSet: each canonical mint-pair and directed topology
@@ -382,6 +587,12 @@ impl Index {
                 for &direct in ids{
                     for &partner in ids{
                         if direct==partner{continue;}
+                        let dg=direction_gate(state,topology,direct,0);
+                        let pg=direction_gate(state,topology,partner,1);
+                        if dg!="available"||pg!="available"{
+                            record_gate_skip(report,dg,pg);
+                            continue;
+                        }
                         self.refresh_one(state,params,Key{topology,direct,partner},
                             report,trigger.clone(),false);
                     }
@@ -396,6 +607,7 @@ impl Index {
         trigger:Arc<SignalTrigger>,allow_schedule:bool){
         let mut affected=HashSet::new();
         for &updated in ids{
+            self.record_pool_directions(state,updated,report);
             let Some(p)=state.pools.get(updated)else{continue};
             let Some(peers)=state.pair_pools.get(&(p.mint_a,p.mint_b))else{continue};
             for (settlement,target) in [(p.mint_a,p.mint_b),(p.mint_b,p.mint_a)]{
@@ -406,7 +618,17 @@ impl Index {
         // No truncation: every changed-pool/direct-partner combination is
         // exactly revalued once for this State revision, including negatives.
         let refresh_started=Instant::now();
-        for key in affected {self.refresh_one(state,params,key,report,trigger.clone(),allow_schedule);}
+        for key in affected {
+            let dg=direction_gate(state,key.topology,key.direct,0);
+            let pg=direction_gate(state,key.topology,key.partner,1);
+            if dg!="available"||pg!="available"{
+                record_gate_skip(report,dg,pg);
+                // A previously available route must be invalidated exactly
+                // once when its direction becomes dust or loses a price.
+                if !self.entries.contains_key(&key){continue;}
+            }
+            self.refresh_one(state,params,key,report,trigger.clone(),allow_schedule);
+        }
         report.cp21s_refresh_timing.record(elapsed_ns(refresh_started));
         report.cp21s_updates+=1;
         report.cp21s_entries=self.entries.len();
@@ -429,6 +651,33 @@ impl Index {
                 trigger.as_ref(),None,report);
             return;
         };
+        // The fingerprint covers the complete frozen economic inputs and
+        // execution parameters. Re-quoting an identical state is pure waste.
+        // Still retain the exact causal evaluation and initial live readiness.
+        let fingerprint=state.source_fingerprint(&w,params);
+        if fingerprint.is_some() && self.entries.get(&key)
+            .is_some_and(|e|e.fingerprint==fingerprint &&
+                e.observations.iter().zip(&w.legs).all(|(prior,leg)|
+                    Arc::ptr_eq(prior,&leg.observation))){
+            let mut previous=self.entries.remove(&key).expect("checked entry");
+            report.cp21s_identical_state_reuses+=1;
+            report.cp21a2_reused_quote_calculations+=1;
+            if allow_schedule && previous.rank.is_none() &&
+                (previous.net.is_some_and(|n|n>0) ||
+                 (previous.net.is_none() && w.estimated_net_return_bps.is_some()
+                     && w.log_sum_units<state.threshold)){
+                let rank=candidate_rank(previous.net,w.log_sum_units,key);
+                self.ready.insert(rank);previous.rank=Some(rank);
+                previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
+                previous.pipeline=state.price_pipeline;
+            }
+            let action=if previous.rank.is_some(){"retained_ready"}else{"retained"};
+            let score=previous.net;let input=previous.input_raw;let gross=previous.gross_raw;
+            self.entries.insert(key,previous);
+            self.trace(state,key,action,"identical_frozen_state",
+                score,input,gross,trigger.as_ref(),None,report);
+            return;
+        }
         let started=Instant::now();
         let estimate=economic::witness_estimate(&w,params);
         let score=estimate.map(|v|v.0);
@@ -454,7 +703,7 @@ impl Index {
                     if allow_schedule{"live"}else{"catalog_or_warmup"})).or_default()+=1;
             },
         }
-        let fingerprint=state.source_fingerprint(&w,params);
+        // Reuse the exact fingerprint already calculated before quoting.
         let old=self.entries.remove(&key);
         if let Some(mut previous)=old{
             if previous.fingerprint.is_some() && previous.fingerprint==fingerprint
@@ -466,13 +715,14 @@ impl Index {
                     (score.is_some_and(|n|n>0) ||
                      (score.is_none() && w.estimated_net_return_bps.is_some()
                          && w.log_sum_units<state.threshold)) {
-                    let (category,priority)=economic::priority_key(score);
-                    let rank=Rank{category,score:priority,key};
+                    let rank=candidate_rank(score,w.log_sum_units,key);
                     self.ready.insert(rank);previous.rank=Some(rank);
                     previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
                     previous.pipeline=state.price_pipeline;
                 }
                 let action=if previous.rank.is_some(){"retained_ready"}else{"retained"};
+                previous.observations=[w.legs[0].observation.clone(),
+                    w.legs[1].observation.clone()];
                 self.entries.insert(key,previous);
                 self.trace(state,key,action,reason,score,input_raw,gross_raw,
                     trigger.as_ref(),None,report);
@@ -484,14 +734,14 @@ impl Index {
         let rank=if allow_schedule && (score.is_some_and(|value|value>0)
             || (score.is_none() && w.estimated_net_return_bps.is_some()
                 && w.log_sum_units<state.threshold)){
-            let (category,priority)=economic::priority_key(score);
-            let rank=Rank{category,score:priority,key};
+            let rank=candidate_rank(score,w.log_sum_units,key);
             self.ready.insert(rank);
             Some(rank)
         }else{None};
         let action=if rank.is_some(){"queued"}else if score.is_none(){"model_unknown"}
             else if score.is_some_and(|n|n<=0){"nonpositive"}else{"baseline"};
         self.entries.insert(key,Entry{
+            observations:[w.legs[0].observation.clone(),w.legs[1].observation.clone()],
             net:score,input_raw,output_raw,gross_raw,
             fingerprint,rank,revision:state.revision,
             trigger:trigger.clone(),ready_us:state.ready_at_us,
@@ -666,6 +916,13 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
             // No per-revision pair cap. Work remains in the globally ordered
             // index if V10 capacity is unavailable. The next event/tick retries.
             while let Some(rank)=index.best(){
+                // Fresh observations win before capacity reservations and
+                // expensive packing. Keep the candidate indexed for the
+                // subsequent revision; retain the post-pack race guard too.
+                if !input.is_empty(){
+                    report.cp21a2_prepack_preemptions+=1;
+                    break;
+                }
                 if cfg.limit>0 && report.request_count as usize>=cfg.limit{
                     break;
                 }
@@ -947,6 +1204,137 @@ mod tests{
         (state,trigger)
     }
     #[test]
+    fn cp21a2_catalog_delta_revalues_only_pairs_touching_new_pool(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let params=ExecutionParameters::default();
+        let mut index=Index::default();
+        let mut report=Report::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        let old_pools=state.pools.clone();
+        let old_prices=state.prices.clone();
+        let old_plan=state.plan.clone();
+        let mut new_pool=state.pools[0].clone();
+        new_pool.address=Pubkey::new_from_array([99;32]);
+        let source=state.prices[0].as_ref().unwrap();
+        let mut new_obs=source.observation.as_ref().clone();
+        new_obs.pool=new_pool.address.to_string();
+        new_obs.slot+=1;
+        new_obs.received_at_us+=1;
+        state.pools.push(new_pool);
+        state.prices.push(Some(Arc::new(SignalPoolPrice{
+            log_weight_units:source.log_weight_units,
+            direction_liquidity_status:source.direction_liquidity_status,
+            observation:Arc::new(new_obs)
+        })));
+        let pair=(state.pools[0].mint_a,state.pools[0].mint_b);
+        state.pair_pools.get_mut(&pair).unwrap().push(5);
+        state.generation+=1;
+        state.revision+=1;
+        index.reconcile_snapshot(&old_pools,&old_prices,old_plan.as_ref(),
+            &state,&params,&mut report,trigger);
+        assert_eq!(index.entries.len(),30);
+        assert_eq!(report.cp21a1_catalog_recomputed,10,
+            "five existing pools x two directed routes, not all thirty");
+        assert_eq!(report.cp21a1_catalog_reused,20);
+        for (&key,entry) in &index.entries{
+            assert_eq!(entry.net,state.economic_score(&witness(&state,key).unwrap(),&params));
+        }
+    }
+
+    #[test]
+    fn cp21a2_unknown_routes_are_ranked_by_real_marginal_evidence(){
+        let a=Key{topology:0,direct:9,partner:0};
+        let b=Key{topology:0,direct:0,partner:9};
+        let strong=candidate_rank(None,-5000,a);
+        let weak=candidate_rank(None,-10,b);
+        let modeled=candidate_rank(Some(1_000),0,b);
+        assert!(strong<weak,"stronger unknown marginal signal should rank first");
+        assert!(modeled<strong,"modeled positive net always precedes unknown");
+        assert_eq!(strong.category,1);
+    }
+
+    #[test]
+    fn cp21a2_blocked_directions_do_not_expand_to_redundant_pairs(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let params=ExecutionParameters::default();
+        let mut index=Index::default();
+        let mut report=Report::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        assert_eq!(index.entries.len(),20);
+        let before=report.cp21s_pair_refreshes;
+        let original=state.prices[0].clone().unwrap();
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:[None,None],
+            direction_liquidity_status:["dust","dust"],
+            observation:original.observation.clone()
+        }));
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger.clone(),true);
+        assert_eq!(index.entries.len(),12,"all routes touching dust must be invalidated");
+        assert_eq!(report.cp21s_pair_refreshes,before+8,
+            "first transition invalidates previously priced routes once");
+        let after_transition=report.cp21s_pair_refreshes;
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger.clone(),true);
+        assert_eq!(report.cp21s_pair_refreshes,after_transition,
+            "unchanged dust cannot cause another economic pair refresh");
+        assert!(report.cp21a2_blocked_pair_skips>=16);
+        assert_eq!(report.cp21a2_skipped_dust_pairs,
+            report.cp21a2_blocked_pair_skips);
+        assert_eq!(report.cp21a2_skipped_missing_price_pairs,0);
+        state.prices[0]=Some(original);
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger,true);
+        assert_eq!(index.entries.len(),20,"newly eligible routes must return");
+        for (&key,entry) in &index.entries{
+            let w=witness(&state,key).unwrap();
+            assert_eq!(entry.net,state.economic_score(&w,&params));
+        }
+    }
+
+    #[test]
+    fn cp21a2_stale_digest_cannot_hide_changed_reserves(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let params=ExecutionParameters::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        let old=state.prices[0].as_ref().unwrap();
+        let mut observation=old.observation.as_ref().clone();
+        // Deliberately simulate a buggy source digest that does not change.
+        let liq=Arc::make_mut(observation.liquidity.as_mut().unwrap());
+        liq.cpmm_quote.as_mut().unwrap().reserve_0_raw+=3_000_000_000;
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:old.log_weight_units,
+            direction_liquidity_status:old.direction_liquidity_status,
+            observation:Arc::new(observation)
+        }));
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger,true);
+        assert_eq!(report.cp21a2_reused_quote_calculations,0,
+            "new immutable observations must be re-quoted even if digest collides");
+        for (&key,entry) in &index.entries{
+            assert_eq!(entry.net,state.economic_score(&witness(&state,key).unwrap(),&params));
+        }
+    }
+
+    #[test]
+    fn cp21a2_reuses_identical_frozen_quote_without_reoptimizing(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let params=ExecutionParameters::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[4],&mut report,trigger,true);
+        assert_eq!(report.cp21a2_reused_quote_calculations,8);
+        assert_eq!(index.entries.len(),20);
+        for (&key,entry) in &index.entries{
+            assert_eq!(entry.net,state.economic_score(&witness(&state,key).unwrap(),&params));
+        }
+    }
+
+    #[test]
     fn cp21a1_deliberate_direction_dust_filter_remains_intact(){
         let (mut state,_trigger)=fixture_direct2(3);
         let old=state.prices[0].as_ref().unwrap().as_ref();
@@ -1020,6 +1408,7 @@ mod tests{
         assert_eq!(index.entries.len(),30);
         assert_eq!(report.cp21a1_catalog_reused,30);
         assert_eq!(report.cp21a1_catalog_recomputed,0);
+        assert_eq!(report.cp21a2_catalog_id_remaps,1);
         for (&key,entry) in &index.entries{
             let w=witness(&state,key).unwrap();
             assert_eq!(entry.net,state.economic_score(&w,&p));

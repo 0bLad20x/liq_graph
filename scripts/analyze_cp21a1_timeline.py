@@ -5,6 +5,7 @@ local host receive/send times, slots are chain context. No guessed chain times.
 """
 import argparse
 import collections
+import gzip
 import json
 from pathlib import Path
 
@@ -22,7 +23,8 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
     previous = None
     ordering_errors = 0
     missing_fields = 0
-    with timeline.open(encoding="utf-8") as stream:
+    opener = gzip.open if timeline.suffix == ".gz" else Path.open
+    with opener(timeline, mode="rt", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             try:
                 event = json.loads(line)
@@ -67,6 +69,10 @@ def analyze(timeline: Path, pool=None, since_us=None, until_us=None):
                 elif action == "exited":
                     watchset.discard(address)
                     members_exited.add(address)
+            elif kind == "direction_observation":
+                if not all(event.get(key) for key in
+                           ("pool", "input_mint", "output_mint", "status")):
+                    missing_fields += 1
             elif kind == "economic_pair":
                 if not (event.get("direct_pool") and event.get("partner_pool")
                         and event.get("settlement") and event.get("target")):
