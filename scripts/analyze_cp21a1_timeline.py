@@ -1,4 +1,4 @@
-"""CP21S-A.1 streaming audit of complete Direct2 signal decisions.
+"""CP21S-A.2 streaming audit of detailed actions and compact rollup counts.
 
 The journal records *observations*, not executed trades. UTC timestamps are
 local host receive/send times, slots are chain context. No guessed chain times.
