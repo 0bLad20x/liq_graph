@@ -78,6 +78,8 @@ jobs:
         run: cargo test --locked --release cp21a2_ -- --nocapture
       - name: CP21S-A.2 gzip timeline integrity and reconstruction regressions
         run: python -m unittest discover -s scripts/tests -p 'test_cp21a2_timeline_archive.py' -v
+      - name: CP21S-A.2 known V10 economic-outcome regression
+        run: python -m unittest discover -s scripts/tests -p 'test_cp21a2_economic_outcome.py' -v
       - name: Live utility Python syntax only
         run: python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('scripts/graph_live_analyze.py','scripts/execution_analyze.py','scripts/cp13_calibration_check.py','scripts/cp14_calibration_check.py','scripts/cp14_orca_reference.py','scripts/test_cp14_orca_reference.py','scripts/cp15_clmm_reference.py','scripts/test_cp15_clmm_reference.py','scripts/cp15_clmm_calibration.py')]"
       - name: Live utility PowerShell syntax only
