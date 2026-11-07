@@ -703,7 +703,7 @@ impl Index {
                     if allow_schedule{"live"}else{"catalog_or_warmup"})).or_default()+=1;
             },
         }
-        let fingerprint=state.source_fingerprint(&w,params);
+        // Reuse the exact fingerprint already calculated before quoting.
         let old=self.entries.remove(&key);
         if let Some(mut previous)=old{
             if previous.fingerprint.is_some() && previous.fingerprint==fingerprint
