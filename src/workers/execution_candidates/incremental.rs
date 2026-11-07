@@ -1293,6 +1293,32 @@ mod tests{
     }
 
     #[test]
+    fn cp21a2_stale_digest_cannot_hide_changed_reserves(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let mut index=Index::default();
+        let mut report=Report::default();
+        let params=ExecutionParameters::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        let old=state.prices[0].as_ref().unwrap();
+        let mut observation=old.observation.as_ref().clone();
+        // Deliberately simulate a buggy source digest that does not change.
+        let liq=Arc::make_mut(observation.liquidity.as_mut().unwrap());
+        liq.cpmm_quote.as_mut().unwrap().reserve_0_raw+=3_000_000_000;
+        state.prices[0]=Some(Arc::new(SignalPoolPrice{
+            log_weight_units:old.log_weight_units,
+            direction_liquidity_status:old.direction_liquidity_status,
+            observation:Arc::new(observation)
+        }));
+        state.revision+=1;
+        index.refresh_changed(&state,&params,&[0],&mut report,trigger,true);
+        assert_eq!(report.cp21a2_reused_quote_calculations,0,
+            "new immutable observations must be re-quoted even if digest collides");
+        for (&key,entry) in &index.entries{
+            assert_eq!(entry.net,state.economic_score(&witness(&state,key).unwrap(),&params));
+        }
+    }
+
+    #[test]
     fn cp21a2_reuses_identical_frozen_quote_without_reoptimizing(){
         let (mut state,trigger)=fixture_direct2(5);
         let mut index=Index::default();
