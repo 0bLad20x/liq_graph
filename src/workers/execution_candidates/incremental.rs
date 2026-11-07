@@ -786,6 +786,13 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
             // No per-revision pair cap. Work remains in the globally ordered
             // index if V10 capacity is unavailable. The next event/tick retries.
             while let Some(rank)=index.best(){
+                // Fresh observations win before capacity reservations and
+                // expensive packing. Keep the candidate indexed for the
+                // subsequent revision; retain the post-pack race guard too.
+                if !input.is_empty(){
+                    report.cp21a2_prepack_preemptions+=1;
+                    break;
+                }
                 if cfg.limit>0 && report.request_count as usize>=cfg.limit{
                     break;
                 }
