@@ -249,6 +249,7 @@ pub struct Report {
     pub cp21a2_gate_transitions:u64,
     pub cp21a2_reused_quote_calculations:u64,
     pub cp21a2_prepack_preemptions:u64,
+    pub cp21a2_catalog_id_remaps:u64,
 }
 pub enum EvidenceItem { Selection(Box<Selection>), Report(Box<ExecutionReport>) }
 impl Selection {
