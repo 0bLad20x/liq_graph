@@ -25,6 +25,8 @@ cargo test --locked --release cp21a2_ -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'CP21S-A.2 incremental direction regressions failed' }
 python -m unittest discover -s scripts/tests -p 'test_cp21a2_timeline_archive.py'
 if ($LASTEXITCODE -ne 0) { throw 'CP21S-A.2 gzip archiving and reconstruction tests failed' }
+python -m unittest discover -s scripts/tests -p 'test_cp21a2_economic_outcome.py'
+if ($LASTEXITCODE -ne 0) { throw 'CP21S-A.2 V10 economic outcome tests failed' }
 # Explicit opt-in: this flag chooses the unbounded incremental Direct2 engine.
 # Legacy -CP9DMaxPairs is ignored in this new path.
 $hadFlag = Test-Path Env:GRAPH_CP21S_INCREMENTAL_SIGNALS
