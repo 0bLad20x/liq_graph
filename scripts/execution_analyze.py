@@ -13,6 +13,12 @@ WSOL = 'So11111111111111111111111111111111111111112'
 USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
 
+def cp21a2_v10_no_economic_route(err):
+    """Known MEV-executor Custom(1): no profitable executable route."""
+    return (isinstance(err, dict) and
+            err.get("InstructionError") == [0, {"Custom": 1}])
+
+
 def cp21a_usd_nano(asset, amount_raw):
     """Integer normalization at the existing fixed $100/SOL reference."""
     if asset == WSOL:
@@ -208,6 +214,7 @@ def analyze(rows):
     count = reports = successes = dex_calls = 0
     ids, report_ids = set(), set()
     payloads, errors, routes, successful_routes = (collections.Counter() for _ in range(4))
+    v10_economic_outcomes = collections.Counter()
     timings = collections.defaultdict(list)
     gains = collections.defaultdict(list)
     above_fee = collections.Counter()
@@ -597,6 +604,9 @@ def analyze(rows):
                     quote_outliers.sort(key=lambda x: abs(x['model_vs_actual_bps']), reverse=True)
                     del quote_outliers[24:]
         if sim['err'] is not None:
+            outcome = ("no_economic_route" if cp21a2_v10_no_economic_route(sim['err'])
+                       else "other_program_or_rpc_failure")
+            v10_economic_outcomes[outcome] += 1
             cp20s_schedule_counts[schedule]['simulation_failed']+=1
             cp20_outcomes[forecast_class]['simulation_failed'] += 1
             strategy_counts[strategy]['failures'] += 1
@@ -606,6 +616,7 @@ def analyze(rows):
             errors[error] += 1
             continue
         successes += 1
+        v10_economic_outcomes["no_program_error"] += 1
         cp20s_schedule_counts[schedule]['simulation_no_program_error']+=1
         cp20_outcomes[forecast_class]['simulation_no_program_error'] += 1
         successful_routes[route] += 1
@@ -837,7 +848,8 @@ def analyze(rows):
             'cp9c_strategy_comparison': cp9c,
             'cp20_economic_validation': cp20, 'request_count': count, 'report_count': reports,
             'simulation_successes': successes, 'simulation_failures': sum(errors.values()),
-            'dex_call_reports': dex_calls, 'errors': dict(errors), 'routes': dict(routes),
+            'dex_call_reports': dex_calls, 'errors': dict(errors),
+            'v10_economic_outcomes': dict(v10_economic_outcomes), 'routes': dict(routes),
             'successful_routes': dict(successful_routes), 'violations': violations,
             'calibration': {'counts': dict(calibration), 'path_relations': dict(path_relations),
                             'model_route_statuses': dict(model_statuses), 'leg_unavailable_reasons': dict(leg_reasons),
