@@ -24,9 +24,10 @@
    recomputation. The existing 50k-update test remains the full reference.
 3. **Pure catalog ID permutation** uses a stable-address O(n) remap of
    entries and ready priorities when every pool's frozen price Arc and
-   directed topology are unchanged. Actual content/participant changes use
-   the existing conservative reconciliation path, with blocked directions
-   skipped rather than rematerializing millions of unavailable pairs.
+   directed topology are unchanged. Actual changed/new pools revalue only
+   their affected directed peer combinations; unrelated scores and pending
+   priorities remain indexed. A changed topology revalues all of its own
+   combinations, while blocked directions use observation-level evidence.
 4. **Prioritize model-unknown candidates** by their observed marginal
    log advantage *within the unknown category*. This value is not a
    fabricated dollar gain. Every positive modeled normalized USD net result
