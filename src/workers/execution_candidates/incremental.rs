@@ -436,61 +436,99 @@ impl Index {
             }),report);
         }
         let mut old_entries=HashMap::<(Pubkey,Pubkey,Pubkey,Pubkey),Entry>::new();
-        if let Some(old_plan)=old_plan {
+        if let Some(previous_plan)=old_plan {
             for (key,entry) in old.entries{
                 if let (Some(t),Some(a),Some(b))=(
-                    old_plan.compact_topologies.get(key.topology),
+                    previous_plan.compact_topologies.get(key.topology),
                     old_pools.get(key.direct),old_pools.get(key.partner)){
                     old_entries.insert((t.settlement,t.target,a.address,b.address),entry);
                 }
             }
         }
         let Some(plan)=state.plan.as_ref()else{return;};
+        let prior_topologies=old_plan.into_iter().flat_map(|p|p.compact_topologies.iter())
+            .filter(|t|t.kind==SignalRouteKind::Direct2)
+            .map(|t|((t.settlement,t.target),t)).collect::<HashMap<_,_>>();
+        let mut changed_topologies=HashSet::new();
         for (i,top) in plan.compact_topologies.iter().enumerate(){
-            if top.kind==SignalRouteKind::Direct2{
-                self.topology.insert((top.settlement,top.target),i);
+            if top.kind!=SignalRouteKind::Direct2{continue;}
+            self.topology.insert((top.settlement,top.target),i);
+            if !prior_topologies.get(&(top.settlement,top.target)).is_some_and(|prior|
+                prior.kind==top.kind && prior.roles==top.roles && prior.length==top.length){
+                changed_topologies.insert((top.settlement,top.target));
             }
         }
-        let mut reused=0_u64;let mut recomputed=0_u64;
+        let old_ids=old_pools.iter().enumerate()
+            .map(|(id,p)|(p.address,id)).collect::<HashMap<_,_>>();
+        let new_ids=state.pools.iter().enumerate()
+            .map(|(id,p)|(p.address,id)).collect::<HashMap<_,_>>();
+        let mut changed_ids=HashSet::new();
+        for (id,p) in state.pools.iter().enumerate(){
+            let unchanged=old_ids.get(&p.address).is_some_and(|&old_id|{
+                let previous=&old_pools[old_id];
+                previous.mint_a==p.mint_a && previous.mint_b==p.mint_b
+                    && match (old_prices.get(old_id),state.prices.get(id)){
+                        (Some(None),Some(None))=>true,
+                        (Some(Some(a)),Some(Some(b)))=>Arc::ptr_eq(a,b),
+                        _=>false
+                    }
+            });
+            if !unchanged{changed_ids.insert(id);}
+        }
         for id in 0..state.pools.len(){
             self.record_pool_directions(state,id,report);
         }
         self.direction_statuses.retain(|(address,_,_),_|
             current_addresses.contains(address));
+        let mut affected=HashSet::<Key>::new();
+        // Only changed/new pool identities and actual changed price states
+        // contribute new pair evaluations. A new/changed topology necessarily
+        // touches all of its members; unchanged topologies do NOT.
         for (&(a,b),ids) in &state.pair_pools{
             for (settlement,target) in [(a,b),(b,a)]{
                 let Some(&topology)=self.topology.get(&(settlement,target))else{continue};
-                for &direct in ids{
-                    for &partner in ids{
-                        if direct==partner{continue;}
-                        let key=Key{topology,direct,partner};
-                        if direction_gate(state,topology,direct,0)!="available"
-                            ||direction_gate(state,topology,partner,1)!="available"{
-                            report.cp21a2_blocked_pair_skips+=1;
-                            continue;
+                if changed_topologies.contains(&(settlement,target)){
+                    for &direct in ids{
+                        for &partner in ids{
+                            if direct!=partner{affected.insert(Key{topology,direct,partner});}
                         }
-                        let stable=(settlement,target,state.pools[direct].address,
-                            state.pools[partner].address);
-                        let previous=old_entries.remove(&stable);
-                        if let Some(mut entry)=previous{
-                            let current=witness(state,key).and_then(|w|
-                                state.source_fingerprint(&w,params));
-                            if current.is_some() && current==entry.fingerprint{
-                                if let Some(mut rank)=entry.rank{
-                                    rank.key=key;
-                                    self.ready.insert(rank);
-                                    entry.rank=Some(rank);
-                                }
-                                self.entries.insert(key,entry);
-                                reused+=1;
-                                continue;
-                            }
+                    }
+                }else{
+                    for &updated in ids{
+                        if changed_ids.contains(&updated){
+                            invalidate_changed(&mut affected,topology,updated,ids);
                         }
-                        recomputed+=1;
-                        self.refresh_one(state,params,key,report,trigger.clone(),false);
                     }
                 }
             }
+        }
+        let mut reused=0_u64;
+        for ((settlement,target,direct_address,partner_address),mut entry) in old_entries{
+            let (Some(&topology),Some(&direct),Some(&partner))=(
+                self.topology.get(&(settlement,target)),
+                new_ids.get(&direct_address),new_ids.get(&partner_address))else{continue};
+            let key=Key{topology,direct,partner};
+            // Blocked pairs are represented by their two direction histories;
+            // no stale priority must survive a missing-price/dust transition.
+            if direction_gate(state,topology,direct,0)!="available"
+                ||direction_gate(state,topology,partner,1)!="available"{continue;}
+            if let Some(mut rank)=entry.rank{
+                rank.key=key;self.ready.insert(rank);entry.rank=Some(rank);
+            }
+            self.entries.insert(key,entry);
+            if !affected.contains(&key){reused+=1;}
+        }
+        let mut recomputed=0_u64;
+        for key in affected{
+            if direction_gate(state,key.topology,key.direct,0)!="available"
+                ||direction_gate(state,key.topology,key.partner,1)!="available"{
+                report.cp21a2_blocked_pair_skips+=1;
+                // The gate transition journal already makes this exclusion
+                // reconstructable; no duplicate per-partner record is needed.
+                continue;
+            }
+            recomputed+=1;
+            self.refresh_one(state,params,key,report,trigger.clone(),false);
         }
         report.cp21a1_catalog_reused+=reused;
         report.cp21a1_catalog_recomputed+=recomputed;
