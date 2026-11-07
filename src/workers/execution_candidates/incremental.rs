@@ -158,6 +158,19 @@ impl Index {
         gross:Option<i128>,trigger:&SignalTrigger,request_id:Option<&str>,
         report:&mut Report){
         let Some(sender)=self.journal.as_ref()else{return;};
+        let direct_address=state.pools.get(key.direct).map(|p|&p.address);
+        let partner_address=state.pools.get(key.partner).map(|p|&p.address);
+        if !timeline::economic_detail_for(action,direct_address,partner_address){
+            // No per-pair JSON allocation or filesystem work on this hot
+            // path. All suppressed events are counted in the final rollup.
+            match action{
+                "unpriced"=>report.cp21a2_suppressed_unpriced+=1,
+                "nonpositive"=>report.cp21a2_suppressed_nonpositive+=1,
+                "retained"=>report.cp21a2_suppressed_retained+=1,
+                _=>unreachable!("only routine economic actions are compacted"),
+            }
+            return;
+        }
         let Some(top)=state.plan.as_ref().and_then(|p|p.compact_topologies.get(key.topology))else{return;};
         let direct=state.pools.get(key.direct).map(|p|p.address.to_string());
         let partner=state.pools.get(key.partner).map(|p|p.address.to_string());
@@ -845,6 +858,26 @@ pub(super) async fn run(mut input:SignalStream,registry:PoolRegistry,
     report.cp21s_entries=index.entries.len();
     report.cp21s_pending_at_shutdown=index.ready.len();
     report.error=outcome.err().map(|e|format!("{e:#}"));
+    if sender.is_some(){
+        // These are complete counts of intentionally omitted routine
+        // observations, not lost records and not a random sample.
+        let rollup=json!({
+            "schema":1,"kind":"economic_rollup","action":"completed",
+            "at_us":now_us(),"mode":if std::env::var("GRAPH_CP21S_TIMELINE_MODE")
+                .is_ok_and(|v|v.eq_ignore_ascii_case("full")){"full"}else{"compact"},
+            "suppressed":{
+                "unpriced":report.cp21a2_suppressed_unpriced,
+                "nonpositive":report.cp21a2_suppressed_nonpositive,
+                "retained":report.cp21a2_suppressed_retained
+            },
+            "pair_refreshes":report.cp21s_pair_refreshes,
+            "unpriced_by_phase_reason":&report.cp21a1_unpriced_reasons,
+            "model_unknown_by_phase_reason":&report.cp21a1_model_unknown_reasons,
+            "proof_scope":"suppressed actions counted exactly; full per-pair history \
+                only for explicitly focused pools or full mode"
+        });
+        timeline::emit(sender.as_ref(),rollup,&mut report);
+    }
     // Join the durable timeline writer only after ALL sender clones are gone.
     index.journal=None;
     drop(index);
