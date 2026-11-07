@@ -22,6 +22,19 @@ use crate::core::signals::SignalLeg;
 struct Key { topology:usize,direct:usize,partner:usize }
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
 struct Rank { category:u8,score:Reverse<i128>,key:Key }
+/// Economic positives rank by *normalized USD net*; unverifiable
+/// positives rank only against other unverifiable candidates by actual
+/// marginal log advantage. These scores are never mixed as dollar profits.
+fn candidate_rank(net:Option<i128>,marginal_log_sum:i64,key:Key)->Rank{
+    let (category,mut score)=economic::priority_key(net);
+    if net.is_none(){
+        // A more negative marginal log sum represents greater apparent
+        // DEX-net advantage; no fabricated monetary gain is implied.
+        score=Reverse(-i128::from(marginal_log_sum));
+    }
+    Rank{category,score,key}
+}
+
 #[derive(Clone)]
 struct Entry {
     net:Option<i128>,
@@ -592,8 +605,7 @@ impl Index {
                 (previous.net.is_some_and(|n|n>0) ||
                  (previous.net.is_none() && w.estimated_net_return_bps.is_some()
                      && w.log_sum_units<state.threshold)){
-                let (category,priority)=economic::priority_key(previous.net);
-                let rank=Rank{category,score:priority,key};
+                let rank=candidate_rank(previous.net,w.log_sum_units,key);
                 self.ready.insert(rank);previous.rank=Some(rank);
                 previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
                 previous.pipeline=state.price_pipeline;
@@ -642,8 +654,7 @@ impl Index {
                     (score.is_some_and(|n|n>0) ||
                      (score.is_none() && w.estimated_net_return_bps.is_some()
                          && w.log_sum_units<state.threshold)) {
-                    let (category,priority)=economic::priority_key(score);
-                    let rank=Rank{category,score:priority,key};
+                    let rank=candidate_rank(score,w.log_sum_units,key);
                     self.ready.insert(rank);previous.rank=Some(rank);
                     previous.trigger=trigger.clone();previous.ready_us=state.ready_at_us;
                     previous.pipeline=state.price_pipeline;
@@ -660,8 +671,7 @@ impl Index {
         let rank=if allow_schedule && (score.is_some_and(|value|value>0)
             || (score.is_none() && w.estimated_net_return_bps.is_some()
                 && w.log_sum_units<state.threshold)){
-            let (category,priority)=economic::priority_key(score);
-            let rank=Rank{category,score:priority,key};
+            let rank=candidate_rank(score,w.log_sum_units,key);
             self.ready.insert(rank);
             Some(rank)
         }else{None};
@@ -1129,6 +1139,18 @@ mod tests{
             pool:first_pool,sequence:1,origin:PriceOrigin::Websocket,received_at_us:10});
         (state,trigger)
     }
+    #[test]
+    fn cp21a2_unknown_routes_are_ranked_by_real_marginal_evidence(){
+        let a=Key{topology:0,direct:9,partner:0};
+        let b=Key{topology:0,direct:0,partner:9};
+        let strong=candidate_rank(None,-5000,a);
+        let weak=candidate_rank(None,-10,b);
+        let modeled=candidate_rank(Some(1_000),0,b);
+        assert!(strong<weak,"stronger unknown marginal signal should rank first");
+        assert!(modeled<strong,"modeled positive net always precedes unknown");
+        assert_eq!(strong.category,1);
+    }
+
     #[test]
     fn cp21a2_blocked_directions_do_not_expand_to_redundant_pairs(){
         let (mut state,trigger)=fixture_direct2(5);
