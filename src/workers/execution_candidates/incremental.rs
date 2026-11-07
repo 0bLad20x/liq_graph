@@ -17,6 +17,7 @@ use serde_json::{Value,json};
 use std::cmp::Reverse;
 use std::time::Duration;
 use crate::core::signals::SignalLeg;
+use crate::core::market_state::PoolPriceObservation;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 struct Key { topology:usize,direct:usize,partner:usize }
@@ -37,6 +38,9 @@ fn candidate_rank(net:Option<i128>,marginal_log_sum:i64,key:Key)->Rank{
 
 #[derive(Clone)]
 struct Entry {
+    // Exact Arc identity prevents a digest-only cache hit if a provider
+    // supplies different reserves with an accidentally reused content digest.
+    observations:[Arc<PoolPriceObservation>;2],
     net:Option<i128>,
     input_raw:Option<u64>,
     output_raw:Option<u64>,
@@ -652,7 +656,9 @@ impl Index {
         // Still retain the exact causal evaluation and initial live readiness.
         let fingerprint=state.source_fingerprint(&w,params);
         if fingerprint.is_some() && self.entries.get(&key)
-            .is_some_and(|e|e.fingerprint==fingerprint){
+            .is_some_and(|e|e.fingerprint==fingerprint &&
+                e.observations.iter().zip(&w.legs).all(|(prior,leg)|
+                    Arc::ptr_eq(prior,&leg.observation))){
             let mut previous=self.entries.remove(&key).expect("checked entry");
             report.cp21s_identical_state_reuses+=1;
             report.cp21a2_reused_quote_calculations+=1;
@@ -715,6 +721,8 @@ impl Index {
                     previous.pipeline=state.price_pipeline;
                 }
                 let action=if previous.rank.is_some(){"retained_ready"}else{"retained"};
+                previous.observations=[w.legs[0].observation.clone(),
+                    w.legs[1].observation.clone()];
                 self.entries.insert(key,previous);
                 self.trace(state,key,action,reason,score,input_raw,gross_raw,
                     trigger.as_ref(),None,report);
@@ -733,6 +741,7 @@ impl Index {
         let action=if rank.is_some(){"queued"}else if score.is_none(){"model_unknown"}
             else if score.is_some_and(|n|n<=0){"nonpositive"}else{"baseline"};
         self.entries.insert(key,Entry{
+            observations:[w.legs[0].observation.clone(),w.legs[1].observation.clone()],
             net:score,input_raw,output_raw,gross_raw,
             fingerprint,rank,revision:state.revision,
             trigger:trigger.clone(),ready_us:state.ready_at_us,
