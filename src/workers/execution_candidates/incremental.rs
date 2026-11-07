@@ -1270,6 +1270,9 @@ mod tests{
         assert_eq!(report.cp21s_pair_refreshes,after_transition,
             "unchanged dust cannot cause another economic pair refresh");
         assert!(report.cp21a2_blocked_pair_skips>=16);
+        assert_eq!(report.cp21a2_skipped_dust_pairs,
+            report.cp21a2_blocked_pair_skips);
+        assert_eq!(report.cp21a2_skipped_missing_price_pairs,0);
         state.prices[0]=Some(original);
         state.revision+=1;
         index.refresh_changed(&state,&params,&[0],&mut report,trigger,true);
