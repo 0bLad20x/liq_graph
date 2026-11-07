@@ -336,6 +336,62 @@ impl Index {
             }),report);
             return;
         }
+        // A catalog may merely permute compact pool/topology IDs. Detect
+        // identical *on-chain* addresses and Arc-frozen price observations
+        // before walking any Cartesian product. Remap the live index in O(n)
+        // without a single quote, while retaining pending V10 priorities.
+        if let (Some(before),Some(after))=(old_plan,state.plan.as_ref()){
+            let new_ids:HashMap<Pubkey,usize>=state.pools.iter().enumerate()
+                .map(|(id,p)|(p.address,id)).collect();
+            let new_tops:HashMap<(Pubkey,Pubkey),usize>=after.compact_topologies.iter()
+                .enumerate().filter(|(_,t)|t.kind==SignalRouteKind::Direct2)
+                .map(|(id,t)|((t.settlement,t.target),id)).collect();
+            let same_topologies=before.compact_topologies.len()==after.compact_topologies.len()
+                && before.compact_topologies.iter().all(|t|{
+                    new_tops.get(&(t.settlement,t.target)).is_some_and(|&id|{
+                        let fresh=&after.compact_topologies[id];
+                        fresh.kind==t.kind && fresh.roles==t.roles && fresh.length==t.length
+                    })
+                });
+            let same_observations=same_topologies
+                && old_pools.len()==state.pools.len() && new_ids.len()==state.pools.len()
+                && old_prices.len()==old_pools.len()
+                && old_pools.iter().enumerate().all(|(id,p)|{
+                    new_ids.get(&p.address).is_some_and(|&new_id|{
+                        match (&old_prices[id],&state.prices[new_id]){
+                            (None,None)=>true,
+                            (Some(a),Some(b))=>Arc::ptr_eq(a,b),
+                            _=>false
+                        }
+                    })
+                });
+            if same_observations{
+                let old_lookup:HashMap<usize,usize>=old_pools.iter().enumerate()
+                    .map(|(id,p)|(id,new_ids[&p.address])).collect();
+                let mut remapped=HashMap::with_capacity(self.entries.len());
+                let mut pending=BTreeSet::new();
+                for (old_key,mut entry) in self.entries.drain(){
+                    let old_top=&before.compact_topologies[old_key.topology];
+                    let key=Key{topology:new_tops[&(old_top.settlement,old_top.target)],
+                        direct:old_lookup[&old_key.direct],partner:old_lookup[&old_key.partner]};
+                    if let Some(mut rank)=entry.rank{
+                        rank.key=key;pending.insert(rank);entry.rank=Some(rank);
+                    }
+                    remapped.insert(key,entry);
+                }
+                self.entries=remapped;self.ready=pending;self.topology=new_tops;
+                report.cp21a1_catalog_unchanged+=1;
+                report.cp21a1_catalog_reused+=self.entries.len() as u64;
+                report.cp21a2_catalog_id_remaps+=1;
+                timeline::emit(self.journal.as_ref(),json!({
+                    "schema":1,"kind":"catalog_reconciliation","action":"id_remap_only",
+                    "at_us":now_us(),"graph_generation":state.generation,
+                    "revision":state.revision,"pairs_reused":self.entries.len(),
+                    "pairs_recomputed":0,"pending_preserved":self.ready.len()
+                }),report);
+                return;
+            }
+        }
         let old=std::mem::take(self);
         self.journal=old.journal.clone();
         self.watched=old.watched.clone();
