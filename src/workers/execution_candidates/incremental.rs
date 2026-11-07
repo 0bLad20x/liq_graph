@@ -1178,6 +1178,44 @@ mod tests{
         (state,trigger)
     }
     #[test]
+    fn cp21a2_catalog_delta_revalues_only_pairs_touching_new_pool(){
+        let (mut state,trigger)=fixture_direct2(5);
+        let params=ExecutionParameters::default();
+        let mut index=Index::default();
+        let mut report=Report::default();
+        index.reset(&state,&params,&mut report,trigger.clone());
+        let old_pools=state.pools.clone();
+        let old_prices=state.prices.clone();
+        let old_plan=state.plan.clone();
+        let mut new_pool=state.pools[0].clone();
+        new_pool.address=Pubkey::new_from_array([99;32]);
+        let source=state.prices[0].as_ref().unwrap();
+        let mut new_obs=source.observation.as_ref().clone();
+        new_obs.pool=new_pool.address.to_string();
+        new_obs.slot+=1;
+        new_obs.received_at_us+=1;
+        state.pools.push(new_pool);
+        state.prices.push(Some(Arc::new(SignalPoolPrice{
+            log_weight_units:source.log_weight_units,
+            direction_liquidity_status:source.direction_liquidity_status,
+            observation:Arc::new(new_obs)
+        })));
+        let pair=(state.pools[0].mint_a,state.pools[0].mint_b);
+        state.pair_pools.get_mut(&pair).unwrap().push(5);
+        state.generation+=1;
+        state.revision+=1;
+        index.reconcile_snapshot(&old_pools,&old_prices,old_plan.as_ref(),
+            &state,&params,&mut report,trigger);
+        assert_eq!(index.entries.len(),30);
+        assert_eq!(report.cp21a1_catalog_recomputed,10,
+            "five existing pools x two directed routes, not all thirty");
+        assert_eq!(report.cp21a1_catalog_reused,20);
+        for (&key,entry) in &index.entries{
+            assert_eq!(entry.net,state.economic_score(&witness(&state,key).unwrap(),&params));
+        }
+    }
+
+    #[test]
     fn cp21a2_unknown_routes_are_ranked_by_real_marginal_evidence(){
         let a=Key{topology:0,direct:9,partner:0};
         let b=Key{topology:0,direct:0,partner:9};
